@@ -30,8 +30,7 @@ cd HelloKira
 ../.build/debug/kira run
 ```
 
-`print(value)` is available as a built-in (prints one value per call).
-
 ## License
 
 Apache License 2.0 with a Runtime Library Exception. See `LICENSE`.
+
