@@ -1,3 +1,9 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="Images/KiraBannerDark.png">
+  <source media="(prefers-color-scheme: light)" srcset="Images/KiraBannerLight.png">
+  <img alt="Kira" src="Images/KiraBannerDark.png">
+</picture>
+
 # Kira
 
 Kira is a compiled, statically typed, multi-target programming language built in Swift.
