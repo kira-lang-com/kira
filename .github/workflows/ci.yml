@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "5.9"
+      - name: Build
+        run: swift build -v
+      - name: Test
+        run: swift test -v
+      - name: LSP smoke
+        run: |
+          swift build -c debug --product kira-lsp
+          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":null,"capabilities":{}}}\n' | .build/debug/kira-lsp | head -n 1
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "5.9"
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libffi-dev
+      - name: Build
+        run: swift build -v
+      - name: Test
+        run: swift test -v
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: compnerd/gha-setup-swift@main
+        with:
+          branch: swift-5.9-release
+      - name: Build
+        run: swift build -v
+

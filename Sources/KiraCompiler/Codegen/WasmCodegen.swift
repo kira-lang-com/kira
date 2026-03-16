@@ -1,0 +1,12 @@
+import Foundation
+
+public struct WasmCodegen: Sendable {
+    public init() {}
+
+    /// Emits a minimal valid WebAssembly module.
+    public func emitMinimalModule() -> Data {
+        // 0x00 0x61 0x73 0x6D, version 0x01 0x00 0x00 0x00
+        Data([0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00])
+    }
+}
+

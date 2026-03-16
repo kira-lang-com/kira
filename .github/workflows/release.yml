@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            artifact: macos
+          - os: ubuntu-latest
+            artifact: linux
+          - os: windows-latest
+            artifact: windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swift-actions/setup-swift@v2
+        if: runner.os != 'Windows'
+        with:
+          swift-version: "5.9"
+      - uses: compnerd/gha-setup-swift@main
+        if: runner.os == 'Windows'
+        with:
+          branch: swift-5.9-release
+      - name: Install deps (linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libffi-dev
+      - name: Build
+        run: swift build -c release --product kira
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist/bin dist/lib dist/stdlib
+          cp .build/release/kira dist/bin/
+          cp -R Sources/KiraStdlib/Core Sources/KiraStdlib/Math Sources/KiraStdlib/CTypes dist/stdlib/
+          tar -czf kira-${{ matrix.artifact }}.tar.gz -C dist .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kira-${{ matrix.artifact }}
+          path: kira-${{ matrix.artifact }}.tar.gz
+
