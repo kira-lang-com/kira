@@ -6,12 +6,9 @@ on:
 
 jobs:
   build-macos:
-    runs-on: macos-latest
+    runs-on: macos-13
     steps:
       - uses: actions/checkout@v4
-      - name: Setup Swift
-        run: |
-          swift --version
       - name: Build
         run: swift build -v
       - name: Test
@@ -22,26 +19,24 @@ jobs:
           echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":null,"capabilities":{}}}\n' | .build/debug/kira-lsp | head -n 1
 
   build-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install Swift
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y swift libffi-dev
-      - name: Verify Swift
-        run: swift --version
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "5.9"
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libffi-dev
       - name: Build
         run: swift build -v
       - name: Test
         run: swift test -v
 
   build-windows:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
-      - name: Setup Swift
-        uses: compnerd/gha-setup-swift@main
+      - uses: compnerd/gha-setup-swift@main
         with:
           swift-version: "5.9"
       - name: Build
