@@ -422,7 +422,11 @@ public final class VirtualMachine: @unchecked Sendable {
                     guard slot >= 0, slot < current.locals.count else {
                         throw VMError.invalidBytecode("local slot out of bounds: \(slot) (locals=\(current.locals.count))")
                     }
-                    current.locals[slot] = fiber.operandStack.pop()
+                    let v = fiber.operandStack.pop()
+                    current.locals[slot] = v
+                    if case .reference(let r) = v {
+                        heap.gc.writeBarrier(owner: ObjectRef(0), newRef: r, heap: heap)
+                    }
 
                 case .load_global:
                     let idx = Int(try readU16(fn, &current))
@@ -435,7 +439,11 @@ public final class VirtualMachine: @unchecked Sendable {
                     guard idx >= 0, idx < globals.count else {
                         throw VMError.invalidBytecode("global slot out of bounds: \(idx) (globals=\(globals.count))")
                     }
-                    globals[idx] = fiber.operandStack.pop()
+                    let v = fiber.operandStack.pop()
+                    globals[idx] = v
+                    if case .reference(let r) = v {
+                        heap.gc.writeBarrier(owner: ObjectRef(0), newRef: r, heap: heap)
+                    }
 
                 case .add_int:
                     let b = try fiber.operandStack.popInt()
@@ -610,15 +618,17 @@ public final class VirtualMachine: @unchecked Sendable {
                     fiber.operandStack.push(result)
                 case .ret:
                     let result: KiraValue = (fiber.operandStack.count > 0) ? fiber.operandStack.pop() : .nil_
-                    // Pop frame
-                    _ = fiber.callStack.popLast()
+                    // Pop the finished frame and restore the operand stack to the call-site base depth
+                    // recorded when the frame was pushed.
+                    guard let finished = fiber.callStack.popLast() else {
+                        fiber.state = .dead
+                        return result
+                    }
                     if fiber.callStack.isEmpty {
                         fiber.state = .dead
                         return result
                     }
-                    // Restore stack to base count and push result.
-                    let callerBase = fiber.currentFrame.baseStackCount
-                    fiber.operandStack.truncate(to: callerBase)
+                    fiber.operandStack.truncate(to: finished.baseStackCount)
                     fiber.operandStack.push(result)
                     continue runLoop
 
@@ -645,6 +655,9 @@ public final class VirtualMachine: @unchecked Sendable {
                     let obj = try heap.get(arrRef)
                     guard let arr = obj as? KiraArray else { throw VMError.typeError(expected: "Array", got: .reference(arrRef)) }
                     arr.elements.append(value)
+                    if case .reference(let r) = value {
+                        heap.gc.writeBarrier(owner: arrRef, newRef: r, heap: heap)
+                    }
                     fiber.operandStack.push(.reference(arrRef))
                 case .array_slice:
                     let end = Int(try fiber.operandStack.popInt())
@@ -669,6 +682,9 @@ public final class VirtualMachine: @unchecked Sendable {
                     let obj = try heap.get(arrRef)
                     guard let arr = obj as? KiraArray else { throw VMError.typeError(expected: "Array", got: .reference(arrRef)) }
                     arr.elements[idx] = value
+                    if case .reference(let r) = value {
+                        heap.gc.writeBarrier(owner: arrRef, newRef: r, heap: heap)
+                    }
 
                 case .string_concat:
                     let bRef = try fiber.operandStack.popRef()
@@ -1469,6 +1485,9 @@ public final class VirtualMachine: @unchecked Sendable {
                             obj.fields += Array(repeating: .nil_, count: fieldIndex - obj.fields.count + 1)
                         }
                         obj.fields[fieldIndex] = value
+                        if case .reference(let r) = value {
+                            heap.gc.writeBarrier(owner: objRef, newRef: r, heap: heap)
+                        }
                     }
                 }
 

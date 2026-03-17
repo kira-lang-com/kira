@@ -237,7 +237,10 @@ private final class HeaderVisitor {
             guard !seenFunctions.contains(name) else { return CXChildVisit_Continue }
             seenFunctions.insert(name)
 
-            let returnType = convertType(result, context: .returnType, allowedDirPrefix: allowedDirPrefix)
+            var returnType = convertType(result, context: .returnType, allowedDirPrefix: allowedDirPrefix)
+            if functionReturnHasBoolKeyword(cursor, functionName: name) {
+                returnType = applyBoolFixup(returnType)
+            }
 
             let numArgs = Int(clang_Cursor_getNumArguments(cursor))
             var params: [(name: String?, type: CKiraFFIType)] = []
@@ -247,7 +250,10 @@ private final class HeaderVisitor {
                     let arg = clang_Cursor_getArgument(cursor, UInt32(i))
                     let paramNameRaw = cursorSpelling(arg)
                     let paramName = paramNameRaw.isEmpty ? nil : sanitizeKiraIdentifier(paramNameRaw)
-                    let paramType = convertType(clang_getCursorType(arg), context: .functionParam, allowedDirPrefix: allowedDirPrefix)
+                    var paramType = convertType(clang_getCursorType(arg), context: .functionParam, allowedDirPrefix: allowedDirPrefix)
+                    if cursorHasBoolKeyword(arg) {
+                        paramType = applyBoolFixup(paramType)
+                    }
                     params.append((name: paramName, type: paramType))
                 }
             }
@@ -354,7 +360,10 @@ private final class FieldCollector {
         if clang_getCursorKind(cursor) == CXCursor_FieldDecl {
             let name = sanitizeKiraIdentifier(cursorSpelling(cursor))
             if !name.isEmpty {
-                let t = convertType(clang_getCursorType(cursor), context: .structField, allowedDirPrefix: allowedDirPrefix)
+                var t = convertType(clang_getCursorType(cursor), context: .structField, allowedDirPrefix: allowedDirPrefix)
+                if cursorHasBoolKeyword(cursor) {
+                    t = applyBoolFixup(t)
+                }
                 fields.append((name: name, type: t))
             }
         }
@@ -431,6 +440,54 @@ private func cxStringToSwift(_ str: CXString) -> String {
     return s
 }
 
+private func tokenStrings(for cursor: CXCursor) -> [String] {
+    let tu = clang_Cursor_getTranslationUnit(cursor)
+    let range = clang_getCursorExtent(cursor)
+    var tokens: UnsafeMutablePointer<CXToken>? = nil
+    var numTokens: UInt32 = 0
+    clang_tokenize(tu, range, &tokens, &numTokens)
+    guard let tokens else { return [] }
+    defer { clang_disposeTokens(tu, tokens, numTokens) }
+
+    var out: [String] = []
+    out.reserveCapacity(Int(numTokens))
+    for i in 0..<Int(numTokens) {
+        out.append(cxStringToSwift(clang_getTokenSpelling(tu, tokens.advanced(by: i).pointee)))
+    }
+    return out
+}
+
+private func cursorHasBoolKeyword(_ cursor: CXCursor) -> Bool {
+    for t in tokenStrings(for: cursor) {
+        if t == "bool" || t == "_Bool" { return true }
+    }
+    return false
+}
+
+private func functionReturnHasBoolKeyword(_ cursor: CXCursor, functionName: String) -> Bool {
+    let toks = tokenStrings(for: cursor)
+    guard let nameIndex = toks.firstIndex(of: functionName) else { return false }
+    for t in toks[..<nameIndex] {
+        if t == "bool" || t == "_Bool" { return true }
+    }
+    return false
+}
+
+private func applyBoolFixup(_ type: CKiraFFIType) -> CKiraFFIType {
+    switch type {
+    case .int32:
+        return .bool
+    case .pointer(let t):
+        return .pointer(applyBoolFixup(t))
+    case .constPointer(let t):
+        return .constPointer(applyBoolFixup(t))
+    case .fixedArray(let count, let element):
+        return .fixedArray(count: count, element: applyBoolFixup(element))
+    default:
+        return type
+    }
+}
+
 private func sanitizeKiraIdentifier(_ name: String) -> String {
     // `func` is a hard lexer error in Kira; other keywords should also be avoided in generated output.
     let reserved: Set<String> = [
@@ -477,6 +534,9 @@ private func convertType(_ type: CXType, context: TypeContext, allowedDirPrefix:
     case CXType_UShort:
         return .uint16
     case CXType_Int:
+        // On some platforms, libclang may report `bool` / `_Bool` as `int` when coming from `stdbool.h` macro expansion.
+        let sp = typeSpelling(type)
+        if sp == "bool" || sp == "_Bool" { return .bool }
         return .int32
     case CXType_UInt:
         return .uint32
@@ -518,6 +578,13 @@ private func convertType(_ type: CXType, context: TypeContext, allowedDirPrefix:
         // Arrays decay to pointers in function parameters and most other contexts.
         return .pointer(convertType(elem, context: context, allowedDirPrefix: allowedDirPrefix))
     case CXType_Typedef:
+        // `bool` is typically a macro/type-alias in `stdbool.h`; treat it as C99 `_Bool` for correct ABI size (1 byte).
+        do {
+            let spelling = typeSpelling(type)
+            let name = spelling.hasPrefix("const ") ? String(spelling.dropFirst(6)) : spelling
+            if name == "bool" { return .bool }
+        }
+
         let decl = clang_getTypeDeclaration(type)
         do {
             let loc = clang_getCursorLocation(decl)

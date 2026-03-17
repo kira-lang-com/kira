@@ -81,6 +81,11 @@ public final class VMHeap: @unchecked Sendable {
     public func allocate(_ obj: KiraObject) -> ObjectRef {
         let id = nextId
         nextId += 1
+        // If an incremental GC cycle is already in progress, ensure newly allocated objects
+        // won't be swept in the current cycle before they're linked into the root graph.
+        if gc.phase != .idle {
+            obj.gcColor = .black
+        }
         objects[id] = obj
         gc.allObjectIDs.append(id)
         return ObjectRef(id)
