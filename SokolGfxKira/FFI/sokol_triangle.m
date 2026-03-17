@@ -12,7 +12,6 @@
 static struct {
     sg_pipeline pip;
     sg_bindings bind;
-    sg_pass_action pass_action;
     int frame_count;
     int quit_after_frames;
     void (*kira_init_cb)(void);
@@ -20,25 +19,30 @@ static struct {
     void (*kira_cleanup_cb)(void);
 } state;
 
-static void default_clear_color(float r, float g, float b, float a) {
-    state.pass_action = (sg_pass_action){
+void sokol_triangle_begin_pass(float r, float g, float b, float a) {
+    sg_pass_action action = (sg_pass_action){
         .colors[0] = {
             .load_action = SG_LOADACTION_CLEAR,
             .clear_value = { r, g, b, a },
         }
     };
+    sg_begin_pass(&(sg_pass){
+        .action = action,
+        .swapchain = sglue_swapchain(),
+    });
 }
 
-long long sokol_triangle_frame_index(void) {
-    return (long long)state.frame_count;
+void sokol_triangle_apply_pipeline(void) {
+    sg_apply_pipeline(state.pip);
 }
 
-void sokol_triangle_set_clear_rgba(float r, float g, float b, float a) {
-    state.pass_action.colors[0].load_action = SG_LOADACTION_CLEAR;
-    state.pass_action.colors[0].clear_value.r = r;
-    state.pass_action.colors[0].clear_value.g = g;
-    state.pass_action.colors[0].clear_value.b = b;
-    state.pass_action.colors[0].clear_value.a = a;
+void sokol_triangle_apply_bindings(void) {
+    sg_apply_bindings(&state.bind);
+}
+
+void sokol_triangle_end_pass_commit(void) {
+    sg_end_pass();
+    sg_commit();
 }
 
 static void init(void) {
@@ -109,8 +113,6 @@ static void init(void) {
         .label = "triangle-pipeline",
     });
 
-    // pass_action is configured by sokol_triangle_run(...)
-
     if (state.kira_init_cb) {
         state.kira_init_cb();
     }
@@ -120,15 +122,6 @@ static void frame(void) {
     if (state.kira_frame_cb) {
         state.kira_frame_cb(state.frame_count);
     }
-    sg_begin_pass(&(sg_pass){
-        .action = state.pass_action,
-        .swapchain = sglue_swapchain(),
-    });
-    sg_apply_pipeline(state.pip);
-    sg_apply_bindings(&state.bind);
-    sg_draw(0, 3, 1);
-    sg_end_pass();
-    sg_commit();
 
     state.frame_count += 1;
     if ((state.quit_after_frames > 0) && (state.frame_count > state.quit_after_frames)) {
@@ -152,7 +145,7 @@ void sokol_triangle_run(float clear_r, float clear_g, float clear_b, float clear
     state.kira_init_cb = 0;
     state.kira_frame_cb = 0;
     state.kira_cleanup_cb = 0;
-    default_clear_color(clear_r, clear_g, clear_b, clear_a);
+    (void)clear_r; (void)clear_g; (void)clear_b; (void)clear_a;
     sapp_run(&(sapp_desc){
         .init_cb = init,
         .frame_cb = frame,
@@ -170,7 +163,7 @@ void sokol_triangle_run_callbacks(void (*init_cb)(void), void (*frame_cb)(int), 
     state.kira_init_cb = init_cb;
     state.kira_frame_cb = frame_cb;
     state.kira_cleanup_cb = cleanup_cb;
-    default_clear_color(clear_r, clear_g, clear_b, clear_a);
+    (void)clear_r; (void)clear_g; (void)clear_b; (void)clear_a;
     sapp_run(&(sapp_desc){
         .init_cb = init,
         .frame_cb = frame,

@@ -14,15 +14,11 @@ import Clibffi
 
 #if canImport(Clibffi)
 
-private enum FFICallbackTLS {
-    // Current VM set while executing an `ffi_call` that may trigger native callbacks.
-    // Assumes single-threaded execution (which matches the current VM design).
-    static var currentVM: VirtualMachine?
-}
-
 private final class FFICallback0Context {
+    let vm: Unmanaged<VirtualMachine>
     let functionName: String
-    init(functionName: String) {
+    init(vm: Unmanaged<VirtualMachine>, functionName: String) {
+        self.vm = vm
         self.functionName = functionName
     }
 }
@@ -31,10 +27,13 @@ private struct FFICallback0KeepAlive {
     let closurePtr: UnsafeMutableRawPointer
     let codePtr: UnsafeMutableRawPointer
     let userData: UnsafeMutableRawPointer
+    let cifPtr: UnsafeMutablePointer<ffi_cif>
 
     func destroy() {
         Unmanaged<FFICallback0Context>.fromOpaque(userData).release()
         ffi_closure_free(closurePtr)
+        cifPtr.deinitialize(count: 1)
+        cifPtr.deallocate()
     }
 }
 
@@ -48,8 +47,8 @@ private func ffiCallback0Trampoline(
     _ = ret
     _ = args
     guard let userdata else { return }
-    guard let vm = FFICallbackTLS.currentVM else { return }
     let ctx = Unmanaged<FFICallback0Context>.fromOpaque(userdata).takeUnretainedValue()
+    let vm = ctx.vm.takeUnretainedValue()
     do {
         _ = try vm.run(function: ctx.functionName)
     } catch {
@@ -58,8 +57,10 @@ private func ffiCallback0Trampoline(
 }
 
 private final class FFICallback1I32Context {
+    let vm: Unmanaged<VirtualMachine>
     let functionName: String
-    init(functionName: String) {
+    init(vm: Unmanaged<VirtualMachine>, functionName: String) {
+        self.vm = vm
         self.functionName = functionName
     }
 }
@@ -68,10 +69,16 @@ private struct FFICallback1I32KeepAlive {
     let closurePtr: UnsafeMutableRawPointer
     let codePtr: UnsafeMutableRawPointer
     let userData: UnsafeMutableRawPointer
+    let cifPtr: UnsafeMutablePointer<ffi_cif>
+    let argTypesPtr: UnsafeMutablePointer<UnsafeMutablePointer<ffi_type>?>
 
     func destroy() {
         Unmanaged<FFICallback1I32Context>.fromOpaque(userData).release()
         ffi_closure_free(closurePtr)
+        argTypesPtr.deinitialize(count: 1)
+        argTypesPtr.deallocate()
+        cifPtr.deinitialize(count: 1)
+        cifPtr.deallocate()
     }
 }
 
@@ -84,12 +91,15 @@ private func ffiCallback1I32Trampoline(
     _ = cif
     _ = ret
     guard let userdata else { return }
-    guard let vm = FFICallbackTLS.currentVM else { return }
     guard let args else { return }
 
     let ctx = Unmanaged<FFICallback1I32Context>.fromOpaque(userdata).takeUnretainedValue()
+    let vm = ctx.vm.takeUnretainedValue()
     let arg0Ptr = args[0]
-    let v: Int32 = arg0Ptr?.load(as: Int32.self) ?? 0
+    var v: Int32 = 0
+    if let arg0Ptr {
+        memcpy(&v, arg0Ptr, MemoryLayout<Int32>.size)
+    }
     do {
         _ = try vm.run(function: ctx.functionName, args: [.int(Int64(v))])
     } catch {
@@ -698,26 +708,40 @@ public final class VirtualMachine: @unchecked Sendable {
                     }
 
                     // Prepare a cif for: void callback(void)
-                    var cif = ffi_cif()
-                    var retType = ffi_type_void
-                    let status = ffi_prep_cif(&cif, FFI_DEFAULT_ABI, 0, &retType, nil)
-                    guard status == FFI_OK else { throw VMError.invalidBytecode("ffi_callback0 cif preparation failed") }
+                    let cifPtr = UnsafeMutablePointer<ffi_cif>.allocate(capacity: 1)
+                    cifPtr.initialize(to: ffi_cif())
+                    let status = ffi_prep_cif(
+                        cifPtr,
+                        FFI_DEFAULT_ABI,
+                        0,
+                        UnsafeMutablePointer(mutating: &ffi_type_void),
+                        nil
+                    )
+                    guard status == FFI_OK else {
+                        cifPtr.deinitialize(count: 1)
+                        cifPtr.deallocate()
+                        throw VMError.invalidBytecode("ffi_callback0 cif preparation failed")
+                    }
 
                     var codePtr: UnsafeMutableRawPointer?
                     guard let closurePtr = ffi_closure_alloc(MemoryLayout<ffi_closure>.size, &codePtr) else {
+                        cifPtr.deinitialize(count: 1)
+                        cifPtr.deallocate()
                         throw VMError.invalidBytecode("ffi_callback0 closure allocation failed")
                     }
                     guard let codePtr else {
                         ffi_closure_free(closurePtr)
+                        cifPtr.deinitialize(count: 1)
+                        cifPtr.deallocate()
                         throw VMError.invalidBytecode("ffi_callback0 closure code pointer is null")
                     }
 
-                    let ctx = FFICallback0Context(functionName: nameStr.value)
+                    let ctx = FFICallback0Context(vm: Unmanaged.passUnretained(self), functionName: nameStr.value)
                     let userData = Unmanaged.passRetained(ctx).toOpaque()
 
                     let prepStatus = ffi_prep_closure_loc(
                         closurePtr.assumingMemoryBound(to: ffi_closure.self),
-                        &cif,
+                        cifPtr,
                         ffiCallback0Trampoline,
                         userData,
                         codePtr
@@ -725,10 +749,12 @@ public final class VirtualMachine: @unchecked Sendable {
                     guard prepStatus == FFI_OK else {
                         Unmanaged<FFICallback0Context>.fromOpaque(userData).release()
                         ffi_closure_free(closurePtr)
+                        cifPtr.deinitialize(count: 1)
+                        cifPtr.deallocate()
                         throw VMError.invalidBytecode("ffi_callback0 closure preparation failed")
                     }
 
-                    ffiCallback0s.append(.init(closurePtr: closurePtr, codePtr: codePtr, userData: userData))
+                    ffiCallback0s.append(.init(closurePtr: closurePtr, codePtr: codePtr, userData: userData, cifPtr: cifPtr))
                     fiber.operandStack.push(.nativePointer(codePtr))
                     #else
                     throw VMError.invalidBytecode("ffi_callback0 unsupported on this platform")
@@ -742,29 +768,48 @@ public final class VirtualMachine: @unchecked Sendable {
                     }
 
                     // Prepare a cif for: void callback(int32)
-                    var cif = ffi_cif()
-                    var retType = ffi_type_void
-                    var argTypes: [UnsafeMutablePointer<ffi_type>?] = [UnsafeMutablePointer(mutating: &ffi_type_sint32)]
-                    let status = argTypes.withUnsafeMutableBufferPointer { buf in
-                        ffi_prep_cif(&cif, FFI_DEFAULT_ABI, 1, &retType, buf.baseAddress)
+                    let cifPtr = UnsafeMutablePointer<ffi_cif>.allocate(capacity: 1)
+                    cifPtr.initialize(to: ffi_cif())
+                    let argTypesPtr = UnsafeMutablePointer<UnsafeMutablePointer<ffi_type>?>.allocate(capacity: 1)
+                    argTypesPtr.initialize(to: UnsafeMutablePointer(mutating: &ffi_type_sint32))
+                    let status = ffi_prep_cif(
+                        cifPtr,
+                        FFI_DEFAULT_ABI,
+                        1,
+                        UnsafeMutablePointer(mutating: &ffi_type_void),
+                        argTypesPtr
+                    )
+                    guard status == FFI_OK else {
+                        argTypesPtr.deinitialize(count: 1)
+                        argTypesPtr.deallocate()
+                        cifPtr.deinitialize(count: 1)
+                        cifPtr.deallocate()
+                        throw VMError.invalidBytecode("ffi_callback1_i32 cif preparation failed")
                     }
-                    guard status == FFI_OK else { throw VMError.invalidBytecode("ffi_callback1_i32 cif preparation failed") }
 
                     var codePtr: UnsafeMutableRawPointer?
                     guard let closurePtr = ffi_closure_alloc(MemoryLayout<ffi_closure>.size, &codePtr) else {
+                        argTypesPtr.deinitialize(count: 1)
+                        argTypesPtr.deallocate()
+                        cifPtr.deinitialize(count: 1)
+                        cifPtr.deallocate()
                         throw VMError.invalidBytecode("ffi_callback1_i32 closure allocation failed")
                     }
                     guard let codePtr else {
                         ffi_closure_free(closurePtr)
+                        argTypesPtr.deinitialize(count: 1)
+                        argTypesPtr.deallocate()
+                        cifPtr.deinitialize(count: 1)
+                        cifPtr.deallocate()
                         throw VMError.invalidBytecode("ffi_callback1_i32 closure code pointer is null")
                     }
 
-                    let ctx = FFICallback1I32Context(functionName: nameStr.value)
+                    let ctx = FFICallback1I32Context(vm: Unmanaged.passUnretained(self), functionName: nameStr.value)
                     let userData = Unmanaged.passRetained(ctx).toOpaque()
 
                     let prepStatus = ffi_prep_closure_loc(
                         closurePtr.assumingMemoryBound(to: ffi_closure.self),
-                        &cif,
+                        cifPtr,
                         ffiCallback1I32Trampoline,
                         userData,
                         codePtr
@@ -772,10 +817,14 @@ public final class VirtualMachine: @unchecked Sendable {
                     guard prepStatus == FFI_OK else {
                         Unmanaged<FFICallback1I32Context>.fromOpaque(userData).release()
                         ffi_closure_free(closurePtr)
+                        argTypesPtr.deinitialize(count: 1)
+                        argTypesPtr.deallocate()
+                        cifPtr.deinitialize(count: 1)
+                        cifPtr.deallocate()
                         throw VMError.invalidBytecode("ffi_callback1_i32 closure preparation failed")
                     }
 
-                    ffiCallback1I32s.append(.init(closurePtr: closurePtr, codePtr: codePtr, userData: userData))
+                    ffiCallback1I32s.append(.init(closurePtr: closurePtr, codePtr: codePtr, userData: userData, cifPtr: cifPtr, argTypesPtr: argTypesPtr))
                     fiber.operandStack.push(.nativePointer(codePtr))
                     #else
                     throw VMError.invalidBytecode("ffi_callback1_i32 unsupported on this platform")
@@ -1210,8 +1259,6 @@ public final class VirtualMachine: @unchecked Sendable {
                     }
                     defer { retDeallocator() }
 
-                    FFICallbackTLS.currentVM = self
-                    defer { FFICallbackTLS.currentVM = nil }
                     boxedArgs.withUnsafeMutableBufferPointer { argBuf in
                         ffi_call(
                             &cif,

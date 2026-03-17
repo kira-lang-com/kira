@@ -22,7 +22,19 @@ extern function sokol_triangle_run(clear_r: CFloat, clear_g: CFloat, clear_b: CF
 extern function sokol_triangle_run_callbacks(init_cb: CPointer<CVoid>, frame_cb: CPointer<CVoid>, cleanup_cb: CPointer<CVoid>, clear_r: CFloat, clear_g: CFloat, clear_b: CFloat, clear_a: CFloat, quit_after_frames: CInt32) -> CVoid
 
 @ffi(lib: "FFI/libsokol_triangle.dylib")
-extern function sokol_triangle_set_clear_rgba(r: CFloat, g: CFloat, b: CFloat, a: CFloat) -> CVoid
+extern function sokol_triangle_begin_pass(r: CFloat, g: CFloat, b: CFloat, a: CFloat) -> CVoid
+
+@ffi(lib: "FFI/libsokol_triangle.dylib")
+extern function sokol_triangle_apply_pipeline() -> CVoid
+
+@ffi(lib: "FFI/libsokol_triangle.dylib")
+extern function sokol_triangle_apply_bindings() -> CVoid
+
+@ffi(lib: "FFI/libsokol_triangle.dylib")
+extern function sg_draw(base_element: CInt32, num_elements: CInt32, num_instances: CInt32) -> CVoid
+
+@ffi(lib: "FFI/libsokol_triangle.dylib")
+extern function sokol_triangle_end_pass_commit() -> CVoid
 
 function on_init() {
     print("on_init()")
@@ -32,10 +44,16 @@ function on_frame(frame_index: Int) {
     // Toggle clear color every ~60 frames.
     let m = frame_index % 120
     if m < 60 {
-        sokol_triangle_set_clear_rgba(r: 0.2, g: 0.2, b: 0.4, a: 1.0)
+        sokol_triangle_begin_pass(r: 0.2, g: 0.2, b: 0.4, a: 1.0)
     } else {
-        sokol_triangle_set_clear_rgba(r: 0.4, g: 0.2, b: 0.2, a: 1.0)
+        sokol_triangle_begin_pass(r: 0.4, g: 0.2, b: 0.2, a: 1.0)
     }
+
+    // The actual frame render calls now live in Kira.
+    sokol_triangle_apply_pipeline()
+    sokol_triangle_apply_bindings()
+    sg_draw(base_element: 0, num_elements: 3, num_instances: 1)
+    sokol_triangle_end_pass_commit()
 }
 
 function on_cleanup() {
