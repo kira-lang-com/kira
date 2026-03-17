@@ -15,7 +15,31 @@ static struct {
     sg_pass_action pass_action;
     int frame_count;
     int quit_after_frames;
+    void (*kira_init_cb)(void);
+    void (*kira_frame_cb)(void);
+    void (*kira_cleanup_cb)(void);
 } state;
+
+static void default_clear_color(float r, float g, float b, float a) {
+    state.pass_action = (sg_pass_action){
+        .colors[0] = {
+            .load_action = SG_LOADACTION_CLEAR,
+            .clear_value = { r, g, b, a },
+        }
+    };
+}
+
+int sokol_triangle_frame_index(void) {
+    return state.frame_count;
+}
+
+void sokol_triangle_set_clear_rgba(float r, float g, float b, float a) {
+    state.pass_action.colors[0].load_action = SG_LOADACTION_CLEAR;
+    state.pass_action.colors[0].clear_value.r = r;
+    state.pass_action.colors[0].clear_value.g = g;
+    state.pass_action.colors[0].clear_value.b = b;
+    state.pass_action.colors[0].clear_value.a = a;
+}
 
 static void init(void) {
     sg_setup(&(sg_desc){
@@ -86,9 +110,16 @@ static void init(void) {
     });
 
     // pass_action is configured by sokol_triangle_run(...)
+
+    if (state.kira_init_cb) {
+        state.kira_init_cb();
+    }
 }
 
 static void frame(void) {
+    if (state.kira_frame_cb) {
+        state.kira_frame_cb();
+    }
     sg_begin_pass(&(sg_pass){
         .action = state.pass_action,
         .swapchain = sglue_swapchain(),
@@ -106,6 +137,9 @@ static void frame(void) {
 }
 
 static void cleanup(void) {
+    if (state.kira_cleanup_cb) {
+        state.kira_cleanup_cb();
+    }
     sg_shutdown();
 }
 
@@ -115,12 +149,28 @@ extern "C" {
 void sokol_triangle_run(float clear_r, float clear_g, float clear_b, float clear_a, int quit_after_frames) {
     state.frame_count = 0;
     state.quit_after_frames = quit_after_frames;
-    state.pass_action = (sg_pass_action){
-        .colors[0] = {
-            .load_action = SG_LOADACTION_CLEAR,
-            .clear_value = { clear_r, clear_g, clear_b, clear_a },
-        }
-    };
+    state.kira_init_cb = 0;
+    state.kira_frame_cb = 0;
+    state.kira_cleanup_cb = 0;
+    default_clear_color(clear_r, clear_g, clear_b, clear_a);
+    sapp_run(&(sapp_desc){
+        .init_cb = init,
+        .frame_cb = frame,
+        .cleanup_cb = cleanup,
+        .width = 800,
+        .height = 600,
+        .window_title = "Sokol Triangle (Kira)",
+        .icon.sokol_default = true,
+    });
+}
+
+void sokol_triangle_run_callbacks(void (*init_cb)(void), void (*frame_cb)(void), void (*cleanup_cb)(void), float clear_r, float clear_g, float clear_b, float clear_a, int quit_after_frames) {
+    state.frame_count = 0;
+    state.quit_after_frames = quit_after_frames;
+    state.kira_init_cb = init_cb;
+    state.kira_frame_cb = frame_cb;
+    state.kira_cleanup_cb = cleanup_cb;
+    default_clear_color(clear_r, clear_g, clear_b, clear_a);
     sapp_run(&(sapp_desc){
         .init_cb = init,
         .frame_cb = frame,

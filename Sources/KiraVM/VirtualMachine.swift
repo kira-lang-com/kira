@@ -10,6 +10,55 @@ import Glibc
 import Clibffi
 #endif
 
+// MARK: - FFI callback support
+
+#if canImport(Clibffi)
+
+private enum FFICallbackTLS {
+    // Current VM set while executing an `ffi_call` that may trigger native callbacks.
+    // Assumes single-threaded execution (which matches the current VM design).
+    static var currentVM: VirtualMachine?
+}
+
+private final class FFICallback0Context {
+    let functionName: String
+    init(functionName: String) {
+        self.functionName = functionName
+    }
+}
+
+private struct FFICallback0KeepAlive {
+    let closurePtr: UnsafeMutableRawPointer
+    let codePtr: UnsafeMutableRawPointer
+    let userData: UnsafeMutableRawPointer
+
+    func destroy() {
+        Unmanaged<FFICallback0Context>.fromOpaque(userData).release()
+        ffi_closure_free(closurePtr)
+    }
+}
+
+private func ffiCallback0Trampoline(
+    cif: UnsafeMutablePointer<ffi_cif>?,
+    ret: UnsafeMutableRawPointer?,
+    args: UnsafeMutablePointer<UnsafeMutableRawPointer?>?,
+    userdata: UnsafeMutableRawPointer?
+) {
+    _ = cif
+    _ = ret
+    _ = args
+    guard let userdata else { return }
+    guard let vm = FFICallbackTLS.currentVM else { return }
+    let ctx = Unmanaged<FFICallback0Context>.fromOpaque(userdata).takeUnretainedValue()
+    do {
+        _ = try vm.run(function: ctx.functionName)
+    } catch {
+        vm.output("[ffi_callback0] error: \(error)")
+    }
+}
+
+#endif
+
 public enum VMError: Error, CustomStringConvertible, Sendable {
     case invalidBytecode(String)
     case invalidOpcode(UInt8)
@@ -152,6 +201,10 @@ public final class VirtualMachine: @unchecked Sendable {
     private var gcTickCounter: Int = 0
     private let gcTickThreshold: Int = 512
 
+    #if canImport(Clibffi)
+    private var ffiCallback0s: [FFICallback0KeepAlive] = []
+    #endif
+
     public init(module: BytecodeModule, output: @escaping @Sendable (String) -> Void = { Swift.print($0) }) {
         self.module = module
         self.output = output
@@ -163,6 +216,14 @@ public final class VirtualMachine: @unchecked Sendable {
             let ref = heap.allocate(closure)
             globals[i] = .reference(ref)
         }
+    }
+
+    deinit {
+        #if canImport(Clibffi)
+        for cb in ffiCallback0s {
+            cb.destroy()
+        }
+        #endif
     }
 
     public func run(function name: String, args: [KiraValue] = []) throws -> KiraValue {
@@ -573,6 +634,50 @@ public final class VirtualMachine: @unchecked Sendable {
                     #else
                     throw VMError.invalidBytecode("ffi_load unsupported on this platform")
                     #endif
+                case .ffi_callback0:
+                    #if canImport(Clibffi)
+                    let nameRef = try fiber.operandStack.popRef()
+                    let obj = try heap.get(nameRef)
+                    guard let nameStr = obj as? KiraString else {
+                        throw VMError.typeError(expected: "String", got: .reference(nameRef))
+                    }
+
+                    // Prepare a cif for: void callback(void)
+                    var cif = ffi_cif()
+                    var retType = ffi_type_void
+                    let status = ffi_prep_cif(&cif, FFI_DEFAULT_ABI, 0, &retType, nil)
+                    guard status == FFI_OK else { throw VMError.invalidBytecode("ffi_callback0 cif preparation failed") }
+
+                    var codePtr: UnsafeMutableRawPointer?
+                    guard let closurePtr = ffi_closure_alloc(MemoryLayout<ffi_closure>.size, &codePtr) else {
+                        throw VMError.invalidBytecode("ffi_callback0 closure allocation failed")
+                    }
+                    guard let codePtr else {
+                        ffi_closure_free(closurePtr)
+                        throw VMError.invalidBytecode("ffi_callback0 closure code pointer is null")
+                    }
+
+                    let ctx = FFICallback0Context(functionName: nameStr.value)
+                    let userData = Unmanaged.passRetained(ctx).toOpaque()
+
+                    let prepStatus = ffi_prep_closure_loc(
+                        closurePtr.assumingMemoryBound(to: ffi_closure.self),
+                        &cif,
+                        ffiCallback0Trampoline,
+                        userData,
+                        codePtr
+                    )
+                    guard prepStatus == FFI_OK else {
+                        Unmanaged<FFICallback0Context>.fromOpaque(userData).release()
+                        ffi_closure_free(closurePtr)
+                        throw VMError.invalidBytecode("ffi_callback0 closure preparation failed")
+                    }
+
+                    ffiCallback0s.append(.init(closurePtr: closurePtr, codePtr: codePtr, userData: userData))
+                    fiber.operandStack.push(.nativePointer(codePtr))
+                    #else
+                    throw VMError.invalidBytecode("ffi_callback0 unsupported on this platform")
+                    #endif
                 case .ffi_call:
                     #if canImport(Clibffi)
                     let argc = Int(try readU8(fn, &current))
@@ -763,6 +868,8 @@ public final class VirtualMachine: @unchecked Sendable {
                     }
                     defer { retDeallocator() }
 
+                    FFICallbackTLS.currentVM = self
+                    defer { FFICallbackTLS.currentVM = nil }
                     boxedArgs.withUnsafeMutableBufferPointer { argBuf in
                         ffi_call(
                             &cif,

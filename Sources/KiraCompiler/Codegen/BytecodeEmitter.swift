@@ -130,6 +130,8 @@ public struct BytecodeEmitter: Sendable {
                     var bytes: [UInt8] = [argCount, returnType]
                     bytes.append(contentsOf: argumentTypes)
                     append(.ffi_call, bytes, irIndex: i)
+                case .ffiCallback0:
+                    append(.ffi_callback0, [], irIndex: i)
                 case .print:
                     append(.print, [], irIndex: i)
                 case .makeColor:

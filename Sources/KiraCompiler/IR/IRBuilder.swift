@@ -193,6 +193,14 @@ public struct IRBuilder {
                     try emitExpr(c.arguments[0].value)
                     emitter.emit(.print)
                     emitter.emit(.pushNil)
+                } else if case .identifier(let name, _) = c.callee, name == "ffi_callback0" {
+                    // Compiler intrinsic: ffi_callback0("functionName") -> CPointer<CVoid>
+                    guard c.arguments.count == 1 else {
+                        emitter.emit(.pushNil)
+                        return
+                    }
+                    try emitExpr(c.arguments[0].value)
+                    emitter.emit(.ffiCallback0)
                 } else if case .identifier(let name, _) = c.callee, name == "Color", exprType(e) == .named("Color") {
                     // Compiler intrinsic: Color(r:g:b:a:) -> Color.
                     // Expects exactly 4 Float arguments.
@@ -353,6 +361,9 @@ private struct StackEmitter {
             depth -= Int(argCount) // args
             depth -= 1 // pointer
             depth += 1 // return
+        case .ffiCallback0:
+            // Pops function name string; pushes native pointer.
+            break
         case .print:
             // Pops value and pushes nothing; by convention, callers can push nil to represent Void.
             depth -= 1
@@ -401,6 +412,8 @@ private func computeMaxStack(_ insts: [KiraIRInst]) -> Int {
             depth -= Int(argCount)
             depth -= 1
             depth += 1
+        case .ffiCallback0:
+            break
         case .print:
             depth -= 1
         case .makeColor:

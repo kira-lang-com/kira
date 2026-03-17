@@ -95,6 +95,7 @@ public enum Instruction: UInt8, Sendable {
     // FFI
     case ffi_call = 0xC0
     case ffi_load = 0xC1
+    case ffi_callback0 = 0xC2
 
     // Coroutines / fibers
     case fiber_new = 0xD0      // operand: UInt16 function index

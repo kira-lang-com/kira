@@ -80,6 +80,7 @@ public enum KiraIRInst: Sendable, Equatable {
     case call(argCount: UInt8)
     case ffiLoad
     case ffiCall(argCount: UInt8, returnType: UInt8, argumentTypes: [UInt8])
+    case ffiCallback0
     case print
     case makeColor
     case ret

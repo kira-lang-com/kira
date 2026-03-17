@@ -30,6 +30,7 @@ public struct TypeChecker: Sendable {
     public func typeCheck(module: ModuleAST, registry: ConstructRegistry, target: PlatformTarget) throws -> TypedModule {
         var symbols = SymbolTable()
         var typeInfo = TypeInfo()
+        let cHandleTypes = collectCHandleTypes(module: module)
 
         // Register types and constructs first.
         for decl in module.declarations {
@@ -67,7 +68,7 @@ public struct TypeChecker: Sendable {
                 let params = fn.parameters.map { typeSystem.resolve($0.type) }
                 let ret = fn.returnType.map(typeSystem.resolve) ?? .void
 
-                let proto = try parseFFIPrototype(for: fn)
+                let proto = try parseFFIPrototype(for: fn, cHandleTypes: cHandleTypes)
                 symbols.addFFIPrototype(functionName: fn.name, proto: proto)
 
                 try symbols.addFunction(.init(
@@ -124,14 +125,14 @@ public struct TypeChecker: Sendable {
         return .auto
     }
 
-    private func parseFFIPrototype(for fn: ExternFunctionDecl) throws -> FFIPrototype {
+    private func parseFFIPrototype(for fn: ExternFunctionDecl, cHandleTypes: Set<String>) throws -> FFIPrototype {
         guard let ffiAnn = fn.annotations.first(where: { $0.name == "ffi" }) else {
             return FFIPrototype(
                 library: nil,
                 symbol: fn.name,
                 linkage: .dynamic,
-                returnType: mapFFIType(fn.returnType),
-                argumentTypes: fn.parameters.map { mapFFIType($0.type) }
+                returnType: mapFFIType(fn.returnType, cHandleTypes: cHandleTypes),
+                argumentTypes: fn.parameters.map { mapFFIType($0.type, cHandleTypes: cHandleTypes) }
             )
         }
 
@@ -158,19 +159,20 @@ public struct TypeChecker: Sendable {
             library: lib,
             symbol: fn.name,
             linkage: linkage,
-            returnType: mapFFIType(fn.returnType),
-            argumentTypes: fn.parameters.map { mapFFIType($0.type) }
+            returnType: mapFFIType(fn.returnType, cHandleTypes: cHandleTypes),
+            argumentTypes: fn.parameters.map { mapFFIType($0.type, cHandleTypes: cHandleTypes) }
         )
     }
 
-    private func mapFFIType(_ ref: TypeRef?) -> FFIPrototype.TypeTag {
+    private func mapFFIType(_ ref: TypeRef?, cHandleTypes: Set<String>) -> FFIPrototype.TypeTag {
         guard let ref else { return .void }
-        return mapFFIType(ref)
+        return mapFFIType(ref, cHandleTypes: cHandleTypes)
     }
 
-    private func mapFFIType(_ ref: TypeRef) -> FFIPrototype.TypeTag {
+    private func mapFFIType(_ ref: TypeRef, cHandleTypes: Set<String>) -> FFIPrototype.TypeTag {
         switch ref.kind {
         case .named(let n):
+            if cHandleTypes.contains(n) { return .uint32 }
             switch n {
             case "Void", "CVoid": return .void
             case "Bool", "CBool": return .uint8
@@ -195,10 +197,26 @@ public struct TypeChecker: Sendable {
             }
             return .pointer
         case .optional(let inner):
-            return mapFFIType(inner)
+            return mapFFIType(inner, cHandleTypes: cHandleTypes)
         default:
             return .pointer
         }
+    }
+
+    private func collectCHandleTypes(module: ModuleAST) -> Set<String> {
+        var result: Set<String> = []
+        for decl in module.declarations {
+            guard case .type(let td) = decl else { continue }
+            guard td.annotations.contains(where: { $0.name == "CStruct" }) else { continue }
+            guard td.fields.count == 1 else { continue }
+            let f = td.fields[0]
+            guard f.name == "id" else { continue }
+            guard let ty = f.type else { continue }
+            if case .named(let n) = ty.kind, n == "CUInt32" {
+                result.insert(td.name)
+            }
+        }
+        return result
     }
 
     private func isFFIConvertible(got: KiraType, expected: KiraType) -> Bool {
@@ -301,6 +319,9 @@ public struct TypeChecker: Sendable {
             } else if name == "print" {
                 // Built-in intrinsic. Accepts any single value and returns Void.
                 result = .function(params: [.unknown], returns: .void)
+            } else if name == "ffi_callback0" {
+                // Built-in intrinsic. Creates a C-callable callback pointer for a Kira function name.
+                result = .function(params: [.string], returns: .pointer(.named("CVoid")))
             } else {
                 throw SemanticError.unknownIdentifier(name, r.start)
             }
