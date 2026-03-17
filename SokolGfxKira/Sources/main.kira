@@ -1,0 +1,26 @@
+import Kira.Fondation
+
+// Sokol headers (downloaded):
+// - SokolGfxKira/FFI/sokol_gfx.h
+// - SokolGfxKira/FFI/sokol_app.h
+// - SokolGfxKira/FFI/sokol_glue.h
+//
+// Triangle dylib (built):  SokolGfxKira/FFI/libsokol_triangle.dylib
+// Bindings (generated):    SokolGfxKira/FFI/sokol_gfx.kira
+//
+// Regenerate bindings:
+//   ../.build/debug/kira bindgen FFI/sokol_gfx.h --lib sokol --out FFI/sokol_gfx.kira
+//
+// Rebuild triangle dylib:
+//   clang -dynamiclib -O2 -fPIC -ObjC -fobjc-arc -framework Cocoa -framework Metal -framework MetalKit -framework QuartzCore \\
+//     -o FFI/libsokol_triangle.dylib FFI/sokol_triangle.m
+
+@ffi(lib: "FFI/libsokol_triangle.dylib")
+extern function sokol_triangle_run(clear_r: CFloat, clear_g: CFloat, clear_b: CFloat, clear_a: CFloat, quit_after_frames: CInt32) -> CVoid
+
+@Main
+function main() {
+    print("Launching Sokol triangle…")
+    // Set `quit_after_frames` to 0 to keep the window open.
+    sokol_triangle_run(clear_r: 0.1, clear_g: 0.1, clear_b: 0.1, clear_a: 1.0, quit_after_frames: 180)
+}
