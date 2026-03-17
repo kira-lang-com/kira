@@ -6,6 +6,14 @@ import Kira.Fondation
 // Note: `kira run` currently compiles only `Sources/main.kira`, so we keep the
 // demo self-contained here (no importing the generated bindings yet).
 
+@CStruct
+type hk_color {
+    var r: CFloat
+    var g: CFloat
+    var b: CFloat
+    var a: CFloat
+}
+
 // libc puts (resolved via dlsym on the main image with @ffi(lib: "")).
 @ffi(lib: "")
 extern function puts(s: CPointer<CInt8>) -> CInt32
@@ -20,6 +28,17 @@ extern function hk_mul(a: CFloat, b: CFloat) -> CFloat
 
 @ffi(lib: "FFI/libhello_ffi.dylib")
 extern function hk_square(x: CFloat) -> CFloat
+
+@ffi(lib: "FFI/libhello_ffi.dylib")
+extern function hk_color_add(a: hk_color, b: hk_color) -> hk_color
+
+@ffi(lib: "FFI/libhello_ffi.dylib")
+extern function hk_invoke_callback(cb: CPointer<CVoid>, value: CInt32) -> CVoid
+
+function on_cb(value: Int) {
+    print("hk_invoke_callback -> on_cb(value:)")
+    print(value)
+}
 
 @Doc("The main function")
 @Main
@@ -53,6 +72,20 @@ function main() {
 
     // C stdlib call
     puts("Hello from C (puts)!")
+
+    // Struct-by-value roundtrip
+    let c1 = hk_color(r: 0.1, g: 0.2, b: 0.3, a: 1.0)
+    let c2 = hk_color(r: 1.0, g: 0.0, b: 0.0, a: 0.0)
+    let c3 = hk_color_add(a: c1, b: c2)
+    print("hk_color_add ->")
+    print(c3.r)
+    print(c3.g)
+    print(c3.b)
+    print(c3.a)
+
+    // Callback (int32 -> Int)
+    let cb = ffi_callback1_i32("on_cb")
+    hk_invoke_callback(cb: cb, value: 42)
     
     return
 }

@@ -19,6 +19,21 @@ void hk_draw(int base_element, int num_elements, int num_instances) {
     (void)num_instances;
 }
 
+hk_color hk_color_add(hk_color a, hk_color b) {
+    hk_color c;
+    c.r = a.r + b.r;
+    c.g = a.g + b.g;
+    c.b = a.b + b.b;
+    c.a = a.a + b.a;
+    return c;
+}
+
+void hk_invoke_callback(void (*cb)(int), int value) {
+    if (cb) {
+        cb(value);
+    }
+}
+
 int hk_add(int a, int b) {
     return a + b;
 }
@@ -30,4 +45,3 @@ float hk_mul(float a, float b) {
 float hk_square(float x) {
     return x * x;
 }
-

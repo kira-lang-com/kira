@@ -41,8 +41,8 @@ public struct IRBuilder {
         }
         insts.append(.ffiCall(
             argCount: UInt8(proto.argumentTypes.count),
-            returnType: proto.returnType.rawValue,
-            argumentTypes: proto.argumentTypes.map(\.rawValue)
+            returnType: proto.returnType.bytes,
+            argumentTypes: proto.argumentTypes.map(\.bytes)
         ))
         insts.append(.ret)
 
@@ -174,14 +174,23 @@ public struct IRBuilder {
                     emitter.emit(.notBool)
                 }
             case .assign(let a):
-                try emitExpr(a.value)
-                if case .identifier(let name, _) = a.target {
-                    let slot = allocLocal(name, type: exprType(a.value) ?? .unknown)
-                    emitter.emit(.storeLocal(slot))
-                    emitter.emit(.loadLocal(slot))
-                } else {
-                    emitter.emit(.pop)
+                if case .member(let m) = a.target,
+                   case .named(let typeName) = (exprType(m.base) ?? .unknown),
+                   let f = symbols.lookupField(typeName: typeName, name: m.name) {
+                    try emitExpr(m.base)
+                    try emitExpr(a.value)
+                    emitter.emit(.storeField(UInt16(f.index)))
                     emitter.emit(.pushNil)
+                } else {
+                    try emitExpr(a.value)
+                    if case .identifier(let name, _) = a.target {
+                        let slot = allocLocal(name, type: exprType(a.value) ?? .unknown)
+                        emitter.emit(.storeLocal(slot))
+                        emitter.emit(.loadLocal(slot))
+                    } else {
+                        emitter.emit(.pop)
+                        emitter.emit(.pushNil)
+                    }
                 }
             case .call(let c):
                 if case .identifier(let name, _) = c.callee, name == "print" {
@@ -193,6 +202,30 @@ public struct IRBuilder {
                     try emitExpr(c.arguments[0].value)
                     emitter.emit(.print)
                     emitter.emit(.pushNil)
+                } else if case .identifier(let typeName, _) = c.callee, symbols.cStructTypes.contains(typeName) {
+                    // @CStruct constructor: TypeName(field1:..., field2:...)
+                    let fieldMap = symbols.fields[typeName] ?? [:]
+                    let fieldCount = fieldMap.count
+
+                    emitter.emit(.newObject(fieldCount: UInt16(fieldCount)))
+
+                    var argsByIndex: [Expr?] = Array(repeating: nil, count: fieldCount)
+                    var used: Set<Int> = []
+                    for (pos, a) in c.arguments.enumerated() {
+                        if let label = a.label, let info = fieldMap[label] {
+                            used.insert(info.index)
+                            argsByIndex[info.index] = a.value
+                        } else if a.label == nil, pos < fieldCount, !used.contains(pos) {
+                            used.insert(pos)
+                            argsByIndex[pos] = a.value
+                        }
+                    }
+
+                    for i in 0..<fieldCount {
+                        emitter.emit(.dup)
+                        try emitExpr(argsByIndex[i] ?? .nilLiteral(c.range))
+                        emitter.emit(.storeField(UInt16(i)))
+                    }
                 } else if case .identifier(let name, _) = c.callee, name == "ffi_callback0" {
                     // Compiler intrinsic: ffi_callback0("functionName") -> CPointer<CVoid>
                     guard c.arguments.count == 1 else {
@@ -201,6 +234,14 @@ public struct IRBuilder {
                     }
                     try emitExpr(c.arguments[0].value)
                     emitter.emit(.ffiCallback0)
+                } else if case .identifier(let name, _) = c.callee, name == "ffi_callback1_i32" {
+                    // Compiler intrinsic: ffi_callback1_i32("functionName") -> CPointer<CVoid>
+                    guard c.arguments.count == 1 else {
+                        emitter.emit(.pushNil)
+                        return
+                    }
+                    try emitExpr(c.arguments[0].value)
+                    emitter.emit(.ffiCallback1I32)
                 } else if case .identifier(let name, _) = c.callee, name == "Color", exprType(e) == .named("Color") {
                     // Compiler intrinsic: Color(r:g:b:a:) -> Color.
                     // Expects exactly 4 Float arguments.
@@ -216,8 +257,14 @@ public struct IRBuilder {
                     emitter.emit(.call(argCount: UInt8(c.arguments.count)))
                 }
             case .member(let m):
-                _ = m.base
-                emitter.emit(.loadGlobalSymbol(m.name))
+                if case .named(let typeName) = (exprType(m.base) ?? .unknown),
+                   let f = symbols.lookupField(typeName: typeName, name: m.name) {
+                    try emitExpr(m.base)
+                    emitter.emit(.loadField(UInt16(f.index)))
+                } else {
+                    _ = m.base
+                    emitter.emit(.loadGlobalSymbol(m.name))
+                }
             case .shaderMacro(let sm):
                 emitter.emit(.pushString("shader:\(sm.functionName)"))
             }
@@ -331,6 +378,12 @@ private struct StackEmitter {
             depth += 1
         case .storeLocal, .storeGlobalSymbol:
             depth -= 1
+        case .newObject:
+            depth += 1
+        case .loadField:
+            break
+        case .storeField:
+            depth -= 2
         case .pop:
             depth -= 1
         case .dup:
@@ -364,6 +417,9 @@ private struct StackEmitter {
         case .ffiCallback0:
             // Pops function name string; pushes native pointer.
             break
+        case .ffiCallback1I32:
+            // Pops function name string; pushes native pointer.
+            break
         case .print:
             // Pops value and pushes nothing; by convention, callers can push nil to represent Void.
             depth -= 1
@@ -386,6 +442,12 @@ private func computeMaxStack(_ insts: [KiraIRInst]) -> Int {
             depth += 1
         case .storeLocal, .storeGlobalSymbol:
             depth -= 1
+        case .newObject:
+            depth += 1
+        case .loadField:
+            break
+        case .storeField:
+            depth -= 2
         case .pop:
             depth -= 1
         case .dup:
@@ -413,6 +475,8 @@ private func computeMaxStack(_ insts: [KiraIRInst]) -> Int {
             depth -= 1
             depth += 1
         case .ffiCallback0:
+            break
+        case .ffiCallback1I32:
             break
         case .print:
             depth -= 1

@@ -46,6 +46,10 @@ public enum KiraIRInst: Sendable, Equatable {
     case loadGlobalSymbol(String)
     case storeGlobalSymbol(String)
 
+    case newObject(fieldCount: UInt16)
+    case loadField(UInt16)
+    case storeField(UInt16)
+
     case addInt
     case subInt
     case mulInt
@@ -79,8 +83,9 @@ public enum KiraIRInst: Sendable, Equatable {
 
     case call(argCount: UInt8)
     case ffiLoad
-    case ffiCall(argCount: UInt8, returnType: UInt8, argumentTypes: [UInt8])
+    case ffiCall(argCount: UInt8, returnType: [UInt8], argumentTypes: [[UInt8]])
     case ffiCallback0
+    case ffiCallback1I32
     case print
     case makeColor
     case ret

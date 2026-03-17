@@ -29,8 +29,8 @@ static void default_clear_color(float r, float g, float b, float a) {
     };
 }
 
-int sokol_triangle_frame_index(void) {
-    return state.frame_count;
+long long sokol_triangle_frame_index(void) {
+    return (long long)state.frame_count;
 }
 
 void sokol_triangle_set_clear_rgba(float r, float g, float b, float a) {

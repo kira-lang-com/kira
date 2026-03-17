@@ -24,6 +24,12 @@ hk_buffer hk_make_buffer(const hk_buffer* desc);
 
 void hk_draw(int base_element, int num_elements, int num_instances);
 
+// Struct-by-value example
+hk_color hk_color_add(hk_color a, hk_color b);
+
+// Callback example (function pointer)
+void hk_invoke_callback(void (*cb)(int), int value);
+
 // --- Dumb math functions ---
 
 // Adds two integers

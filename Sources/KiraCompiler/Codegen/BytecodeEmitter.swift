@@ -91,6 +91,12 @@ public struct BytecodeEmitter: Sendable {
                 case .storeGlobalSymbol(let name):
                     guard let sym = globalIndex[name] else { throw BytecodeEmitError.unknownGlobalSymbol(name) }
                     append(.store_global, [UInt8(sym >> 8), UInt8(sym & 0xff)], irIndex: i)
+                case .newObject(let fieldCount):
+                    append(.new_object, [UInt8(fieldCount >> 8), UInt8(fieldCount & 0xff)], irIndex: i)
+                case .loadField(let fieldIndex):
+                    append(.load_field, [UInt8(fieldIndex >> 8), UInt8(fieldIndex & 0xff)], irIndex: i)
+                case .storeField(let fieldIndex):
+                    append(.store_field, [UInt8(fieldIndex >> 8), UInt8(fieldIndex & 0xff)], irIndex: i)
                 case .addInt: append(.add_int, [], irIndex: i)
                 case .subInt: append(.sub_int, [], irIndex: i)
                 case .mulInt: append(.mul_int, [], irIndex: i)
@@ -127,11 +133,14 @@ public struct BytecodeEmitter: Sendable {
                 case .ffiLoad:
                     append(.ffi_load, [], irIndex: i)
                 case .ffiCall(let argCount, let returnType, let argumentTypes):
-                    var bytes: [UInt8] = [argCount, returnType]
-                    bytes.append(contentsOf: argumentTypes)
+                    var bytes: [UInt8] = [argCount]
+                    bytes.append(contentsOf: returnType)
+                    for a in argumentTypes { bytes.append(contentsOf: a) }
                     append(.ffi_call, bytes, irIndex: i)
                 case .ffiCallback0:
                     append(.ffi_callback0, [], irIndex: i)
+                case .ffiCallback1I32:
+                    append(.ffi_callback1_i32, [], irIndex: i)
                 case .print:
                     append(.print, [], irIndex: i)
                 case .makeColor:

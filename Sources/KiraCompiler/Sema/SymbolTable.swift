@@ -26,15 +26,34 @@ public struct FFIPrototype: Sendable {
         case float32 = 9, float64 = 10
         case pointer = 11
         case cstring = 12
+        case cstruct = 13
+    }
+
+    public struct TypeEncoding: Sendable, Equatable {
+        public var bytes: [UInt8]
+
+        public init(bytes: [UInt8]) {
+            self.bytes = bytes
+        }
+
+        public static func scalar(_ tag: TypeTag) -> TypeEncoding {
+            TypeEncoding(bytes: [tag.rawValue])
+        }
+
+        public static func cStruct(_ fields: [TypeEncoding]) -> TypeEncoding {
+            var out: [UInt8] = [TypeTag.cstruct.rawValue, UInt8(clamping: fields.count)]
+            for f in fields { out.append(contentsOf: f.bytes) }
+            return TypeEncoding(bytes: out)
+        }
     }
 
     public var library: String?
     public var symbol: String
     public var linkage: FFILinkage
-    public var returnType: TypeTag
-    public var argumentTypes: [TypeTag]
+    public var returnType: TypeEncoding
+    public var argumentTypes: [TypeEncoding]
 
-    public init(library: String?, symbol: String, linkage: FFILinkage, returnType: TypeTag, argumentTypes: [TypeTag]) {
+    public init(library: String?, symbol: String, linkage: FFILinkage, returnType: TypeEncoding, argumentTypes: [TypeEncoding]) {
         self.library = library
         self.symbol = symbol
         self.linkage = linkage
@@ -48,6 +67,8 @@ public struct SymbolTable: Sendable {
     public private(set) var types: Set<String> = []
     public private(set) var methods: [String: [String: KiraType]] = [:] // TypeName -> method -> fnType
     public private(set) var ffi: [String: FFIPrototype] = [:]
+    public private(set) var cStructTypes: Set<String> = []
+    public private(set) var fields: [String: [String: (index: Int, type: KiraType)]] = [:] // TypeName -> field -> (index, type)
 
     public init() {}
 
@@ -68,6 +89,16 @@ public struct SymbolTable: Sendable {
         methods[typeName, default: [:]][methodName] = methodType
     }
 
+    public mutating func addCStruct(typeName: String, fields: [(name: String, type: KiraType)]) {
+        cStructTypes.insert(typeName)
+        var map: [String: (index: Int, type: KiraType)] = [:]
+        map.reserveCapacity(fields.count)
+        for (i, f) in fields.enumerated() {
+            map[f.name] = (i, f.type)
+        }
+        self.fields[typeName] = map
+    }
+
     public func lookupValue(_ name: String) -> KiraType? {
         if let fn = functions[name] { return fn.type }
         return nil
@@ -75,5 +106,9 @@ public struct SymbolTable: Sendable {
 
     public func lookupMethod(typeName: String, name: String) -> KiraType? {
         methods[typeName]?[name]
+    }
+
+    public func lookupField(typeName: String, name: String) -> (index: Int, type: KiraType)? {
+        fields[typeName]?[name]
     }
 }

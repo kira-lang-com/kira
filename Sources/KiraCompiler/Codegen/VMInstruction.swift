@@ -88,6 +88,7 @@ public enum Instruction: UInt8, Sendable {
     case ffi_call = 0xC0
     case ffi_load = 0xC1
     case ffi_callback0 = 0xC2
+    case ffi_callback1_i32 = 0xC3
 
     case fiber_new = 0xD0
     case fiber_resume = 0xD1
