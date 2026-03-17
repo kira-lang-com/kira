@@ -4,7 +4,7 @@ public struct IRBuilder {
     public init() {}
 
     public func build(from typed: TypedModule) throws -> KiraIRModule {
-        let fns: [KiraIRFunction] = try typed.ast.declarations.compactMap { decl in
+        var fns: [KiraIRFunction] = try typed.ast.declarations.compactMap { decl in
             switch decl {
             case .function(let fn):
                 return try buildFunction(fn: fn, symbols: typed.symbols, typeInfo: typed.typeInfo)
@@ -14,7 +14,194 @@ public struct IRBuilder {
                 return nil
             }
         }
+        if let initFn = try buildGlobalInit(declarations: typed.ast.declarations, symbols: typed.symbols, typeInfo: typed.typeInfo) {
+            fns.append(initFn)
+        }
         return KiraIRModule(functions: fns)
+    }
+
+    private func buildGlobalInit(
+        declarations: [Decl],
+        symbols: SymbolTable,
+        typeInfo: TypeInfo
+    ) throws -> KiraIRFunction? {
+        let globals: [VarDeclStmt] = declarations.compactMap {
+            if case .globalVar(let gv) = $0 { return gv }
+            return nil
+        }
+        guard !globals.isEmpty else { return nil }
+
+        var emitter = StackEmitter()
+        func exprType(_ e: Expr) -> KiraType? { typeInfo.exprTypes[e.range] }
+
+        func emitExpr(_ e: Expr) throws {
+            switch e {
+            case .intLiteral(let v, _):
+                emitter.emit(.pushInt(v))
+            case .floatLiteral(let v, _):
+                emitter.emit(.pushFloat(v))
+            case .stringLiteral(let s, _):
+                emitter.emit(.pushString(s))
+            case .boolLiteral(let b, _):
+                emitter.emit(.pushBool(b))
+            case .nilLiteral:
+                emitter.emit(.pushNil)
+            case .identifier(let name, _):
+                emitter.emit(.loadGlobalSymbol(name))
+            case .unary(let u):
+                try emitExpr(u.expr)
+                switch u.op {
+                case .negate:
+                    let t = exprType(u.expr) ?? .int
+                    emitter.emit((t == .float || t == .double) ? .negFloat : .negInt)
+                case .not:
+                    emitter.emit(.notBool)
+                }
+            case .binary(let b):
+                try emitExpr(b.lhs)
+                try emitExpr(b.rhs)
+                switch b.op {
+                case .add:
+                    let t = exprType(b.lhs) ?? .int
+                    emitter.emit((t == .float || t == .double) ? .addFloat : .addInt)
+                case .sub:
+                    let t = exprType(b.lhs) ?? .int
+                    emitter.emit((t == .float || t == .double) ? .subFloat : .subInt)
+                case .mul:
+                    let t = exprType(b.lhs) ?? .int
+                    emitter.emit((t == .float || t == .double) ? .mulFloat : .mulInt)
+                case .div:
+                    let t = exprType(b.lhs) ?? .int
+                    emitter.emit((t == .float || t == .double) ? .divFloat : .divInt)
+                case .mod:
+                    emitter.emit(.modInt)
+                case .eq:
+                    let t = exprType(b.lhs) ?? .int
+                    emitter.emit((t == .float || t == .double) ? .eqFloat : .eqInt)
+                case .lt:
+                    let t = exprType(b.lhs) ?? .int
+                    emitter.emit((t == .float || t == .double) ? .ltFloat : .ltInt)
+                case .gt:
+                    let t = exprType(b.lhs) ?? .int
+                    emitter.emit((t == .float || t == .double) ? .gtFloat : .gtInt)
+                case .lte:
+                    let t = exprType(b.lhs) ?? .int
+                    emitter.emit((t == .float || t == .double) ? .gtFloat : .gtInt)
+                    emitter.emit(.notBool)
+                case .gte:
+                    let t = exprType(b.lhs) ?? .int
+                    emitter.emit((t == .float || t == .double) ? .ltFloat : .ltInt)
+                    emitter.emit(.notBool)
+                case .and:
+                    emitter.emit(.andBool)
+                case .or:
+                    emitter.emit(.orBool)
+                case .neq:
+                    let t = exprType(b.lhs) ?? .int
+                    emitter.emit((t == .float || t == .double) ? .eqFloat : .eqInt)
+                    emitter.emit(.notBool)
+                }
+            case .call(let c):
+                if case .identifier(let name, _) = c.callee, name == "print" {
+                    guard c.arguments.count == 1 else { emitter.emit(.pushNil); return }
+                    try emitExpr(c.arguments[0].value)
+                    emitter.emit(.print)
+                    emitter.emit(.pushNil)
+                    return
+                }
+                if case .identifier(let typeName, _) = c.callee, symbols.cStructTypes.contains(typeName) {
+                    let fieldMap = symbols.fields[typeName] ?? [:]
+                    let fieldCount = fieldMap.count
+                    emitter.emit(.newObject(fieldCount: UInt16(fieldCount)))
+
+                    var argsByIndex: [Expr?] = Array(repeating: nil, count: fieldCount)
+                    var used: Set<Int> = []
+                    for (pos, a) in c.arguments.enumerated() {
+                        if let label = a.label, let info = fieldMap[label] {
+                            used.insert(info.index)
+                            argsByIndex[info.index] = a.value
+                        } else if a.label == nil, pos < fieldCount, !used.contains(pos) {
+                            used.insert(pos)
+                            argsByIndex[pos] = a.value
+                        }
+                    }
+                    for i in 0..<fieldCount {
+                        emitter.emit(.dup)
+                        try emitExpr(argsByIndex[i] ?? .nilLiteral(c.range))
+                        emitter.emit(.storeField(UInt16(i)))
+                    }
+                    return
+                }
+                if case .identifier(let name, _) = c.callee, name == "ffi_callback0" {
+                    guard c.arguments.count == 1 else { emitter.emit(.pushNil); return }
+                    try emitExpr(c.arguments[0].value)
+                    emitter.emit(.ffiCallback0)
+                    return
+                }
+                if case .identifier(let name, _) = c.callee, name == "ffi_callback1_i32" {
+                    guard c.arguments.count == 1 else { emitter.emit(.pushNil); return }
+                    try emitExpr(c.arguments[0].value)
+                    emitter.emit(.ffiCallback1I32)
+                    return
+                }
+                if case .identifier(let name, _) = c.callee, name == "Color", exprType(e) == .named("Color") {
+                    guard c.arguments.count == 4 else { emitter.emit(.pushNil); return }
+                    for a in c.arguments { try emitExpr(a.value) }
+                    emitter.emit(.makeColor)
+                    return
+                }
+
+                try emitExpr(c.callee)
+                for a in c.arguments { try emitExpr(a.value) }
+                emitter.emit(.call(argCount: UInt8(c.arguments.count)))
+            case .member(let m):
+                if case .named(let typeName) = (exprType(m.base) ?? .unknown),
+                   let f = symbols.lookupField(typeName: typeName, name: m.name) {
+                    try emitExpr(m.base)
+                    emitter.emit(.loadField(UInt16(f.index)))
+                } else {
+                    emitter.emit(.loadGlobalSymbol(m.name))
+                }
+            case .assign(let a):
+                // Global init treats identifier assignments as global symbol stores.
+                if case .member(let m) = a.target,
+                   case .named(let typeName) = (exprType(m.base) ?? .unknown),
+                   let f = symbols.lookupField(typeName: typeName, name: m.name) {
+                    try emitExpr(m.base)
+                    try emitExpr(a.value)
+                    emitter.emit(.storeField(UInt16(f.index)))
+                    emitter.emit(.pushNil)
+                } else {
+                    try emitExpr(a.value)
+                    if case .identifier(let name, _) = a.target, symbols.globals[name] != nil {
+                        emitter.emit(.storeGlobalSymbol(name))
+                        emitter.emit(.loadGlobalSymbol(name))
+                    } else {
+                        emitter.emit(.pop)
+                        emitter.emit(.pushNil)
+                    }
+                }
+            case .shaderMacro(let sm):
+                emitter.emit(.pushString("shader:\(sm.functionName)"))
+            }
+        }
+
+        for gv in globals {
+            try emitExpr(gv.initializer)
+            emitter.emit(.storeGlobalSymbol(gv.name))
+        }
+        emitter.emit(.pushNil)
+        emitter.emit(.ret)
+
+        return KiraIRFunction(
+            name: "__kira_init_globals",
+            params: [],
+            returnType: .void,
+            localCount: 0,
+            maxStackDepth: emitter.maxDepth,
+            instructions: emitter.instructions,
+            executionMode: .auto
+        )
     }
 
     private func buildExternFunction(fn: ExternFunctionDecl, symbols: SymbolTable) throws -> KiraIRFunction {
@@ -184,9 +371,17 @@ public struct IRBuilder {
                 } else {
                     try emitExpr(a.value)
                     if case .identifier(let name, _) = a.target {
-                        let slot = allocLocal(name, type: exprType(a.value) ?? .unknown)
-                        emitter.emit(.storeLocal(slot))
-                        emitter.emit(.loadLocal(slot))
+                        if let existing = locals[name] {
+                            emitter.emit(.storeLocal(existing.slot))
+                            emitter.emit(.loadLocal(existing.slot))
+                        } else if symbols.globals[name] != nil {
+                            emitter.emit(.storeGlobalSymbol(name))
+                            emitter.emit(.loadGlobalSymbol(name))
+                        } else {
+                            let slot = allocLocal(name, type: exprType(a.value) ?? .unknown)
+                            emitter.emit(.storeLocal(slot))
+                            emitter.emit(.loadLocal(slot))
+                        }
                     } else {
                         emitter.emit(.pop)
                         emitter.emit(.pushNil)

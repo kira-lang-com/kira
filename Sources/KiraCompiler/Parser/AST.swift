@@ -68,11 +68,25 @@ public struct ImportDecl: Sendable {
 public enum Decl: Sendable {
     case function(FunctionDecl)
     case externFunction(ExternFunctionDecl)
+    case `typealias`(TypealiasDecl)
     case type(TypeDecl)
     case `protocol`(ProtocolDecl)
     case `enum`(EnumDecl)
     case construct(ConstructDecl)
     case constructInstance(ConstructInstanceDecl)
+    case globalVar(VarDeclStmt)
+}
+
+public struct TypealiasDecl: Sendable {
+    public var name: String
+    public var target: TypeRef
+    public var range: SourceRange
+
+    public init(name: String, target: TypeRef, range: SourceRange) {
+        self.name = name
+        self.target = target
+        self.range = range
+    }
 }
 
 public struct Parameter: Sendable {

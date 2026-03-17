@@ -4,6 +4,7 @@ public enum Keyword: String, CaseIterable, Sendable {
     case `let`
     case `var`
     case `type`
+    case `typealias`
     case `function`
     case `construct`
     case `protocol`

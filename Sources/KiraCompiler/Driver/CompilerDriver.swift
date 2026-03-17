@@ -19,12 +19,24 @@ public struct CompilerDriver: Sendable {
     public init() {}
 
     public func compile(source: SourceText, target: PlatformTarget) throws -> CompilerOutput {
-        let lexer = Lexer()
-        let primaryTokens = try lexer.lex(source)
-        var primaryParser = Parser(tokens: primaryTokens)
-        let primaryModule = try primaryParser.parseModule()
+        return try compile(sources: [source], target: target)
+    }
 
-        let stdlibSources = try loadStdlibSources(for: primaryModule.imports)
+    public func compile(sources: [SourceText], target: PlatformTarget) throws -> CompilerOutput {
+        let lexer = Lexer()
+        var primaryImports: [ImportDecl] = []
+        var primaryDecls: [Decl] = []
+        var primaryRange: SourceRange?
+        for s in sources {
+            let toks = try lexer.lex(s)
+            var p = Parser(tokens: toks)
+            let m = try p.parseModule()
+            if primaryRange == nil { primaryRange = m.range }
+            primaryImports.append(contentsOf: m.imports)
+            primaryDecls.append(contentsOf: m.declarations)
+        }
+
+        let stdlibSources = try loadStdlibSources(for: primaryImports)
         var importedDecls: [Decl] = []
         var importedImports: [ImportDecl] = []
         for s in stdlibSources {
@@ -36,9 +48,12 @@ public struct CompilerDriver: Sendable {
         }
 
         let module = ModuleAST(
-            imports: primaryModule.imports + importedImports,
-            declarations: importedDecls + primaryModule.declarations,
-            range: primaryModule.range
+            imports: primaryImports + importedImports,
+            declarations: importedDecls + primaryDecls,
+            range: primaryRange ?? SourceRange(
+                start: SourceLocation(file: "", offset: 0, line: 0, column: 0),
+                end: SourceLocation(file: "", offset: 0, line: 0, column: 0)
+            )
         )
 
         // Build construct registry.

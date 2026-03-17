@@ -260,13 +260,79 @@ public final class VirtualMachine: @unchecked Sendable {
         self.module = module
         self.output = output
         self.trace = ProcessInfo.processInfo.environment["KIRA_VM_TRACE"] == "1"
-        self.globals = Array(repeating: .nil_, count: max(256, module.functions.count))
+        let requiredGlobals = Self.requiredGlobalSlots(for: module)
+        self.globals = Array(repeating: .nil_, count: max(256, requiredGlobals))
         // Preload function refs into globals.
         for i in 0..<module.functions.count {
             let closure = KiraClosure(functionIndex: i, captures: [])
             let ref = heap.allocate(closure)
             globals[i] = .reference(ref)
         }
+    }
+
+    private static func requiredGlobalSlots(for module: BytecodeModule) -> Int {
+        func readU16(_ code: [UInt8], _ ip: inout Int) -> UInt16? {
+            guard ip + 2 <= code.count else { return nil }
+            let hi = UInt16(code[ip])
+            let lo = UInt16(code[ip + 1])
+            ip += 2
+            return (hi << 8) | lo
+        }
+
+        func readU8(_ code: [UInt8], _ ip: inout Int) -> UInt8? {
+            guard ip + 1 <= code.count else { return nil }
+            let v = code[ip]
+            ip += 1
+            return v
+        }
+
+        func skipFFITypeDesc(_ code: [UInt8], _ ip: inout Int) {
+            guard let tag = readU8(code, &ip) else { ip = code.count; return }
+            if tag == 13 {
+                guard let fc = readU8(code, &ip) else { ip = code.count; return }
+                for _ in 0..<Int(fc) { skipFFITypeDesc(code, &ip) }
+                return
+            }
+            if tag == 14 {
+                skipFFITypeDesc(code, &ip)
+                return
+            }
+        }
+
+        var maxGlobalIndex = max(0, module.functions.count - 1)
+        for fn in module.functions {
+            let code = fn.code
+            var ip = 0
+            while ip < code.count {
+                let opcodeByte = code[ip]
+                ip += 1
+                guard let op = Instruction(rawValue: opcodeByte) else { break }
+                switch op {
+                case .load_global, .store_global:
+                    guard let idx = readU16(code, &ip) else { break }
+                    maxGlobalIndex = max(maxGlobalIndex, Int(idx))
+                case .push_int, .push_float, .push_string,
+                     .load_field, .store_field,
+                     .jump, .jump_if_true, .jump_if_false, .jump_if_nil,
+                     .call_native, .new_object,
+                     .fiber_new, .unwrap_or_jump, .line_number:
+                    ip += 2
+                case .load_local, .store_local, .call, .tail_call, .string_interpolate, .load_capture:
+                    ip += 1
+                case .make_closure:
+                    ip += 2
+                    guard let captureCount = readU8(code, &ip) else { break }
+                    ip += Int(captureCount)
+                case .ffi_call:
+                    guard let argc = readU8(code, &ip) else { break }
+                    skipFFITypeDesc(code, &ip) // return type
+                    for _ in 0..<Int(argc) { skipFFITypeDesc(code, &ip) }
+                default:
+                    break
+                }
+            }
+        }
+        return maxGlobalIndex + 1
     }
 
     deinit {
@@ -836,6 +902,7 @@ public final class VirtualMachine: @unchecked Sendable {
                     indirect enum FFITypeDesc {
                         case scalar(UInt8)
                         case cstruct([FFITypeDesc])
+                        case pointer(FFITypeDesc)
                     }
 
                     func readFFITypeDesc() throws -> FFITypeDesc {
@@ -846,6 +913,9 @@ public final class VirtualMachine: @unchecked Sendable {
                             fields.reserveCapacity(fieldCount)
                             for _ in 0..<fieldCount { fields.append(try readFFITypeDesc()) }
                             return .cstruct(fields)
+                        }
+                        if tag == 14 {
+                            return .pointer(try readFFITypeDesc())
                         }
                         return .scalar(tag)
                     }
@@ -917,6 +987,8 @@ public final class VirtualMachine: @unchecked Sendable {
                                 t.deallocate()
                             }
                             return t
+                        case .pointer:
+                            return UnsafeMutablePointer(mutating: &ffi_type_pointer)
                         }
                     }
 
@@ -1004,12 +1076,35 @@ public final class VirtualMachine: @unchecked Sendable {
                             }
                             let totalSize = alignUp(offset, to: maxAlign)
                             return .cstruct(fields: fieldLayouts, offsets: offsets, size: totalSize, alignment: maxAlign)
+                        case .pointer:
+                            let sa = scalarSizeAlign(tag: 11)
+                            return .scalar(tag: 11, size: sa.size, alignment: sa.alignment)
                         }
                     }
 
                     func pack(_ v: KiraValue, layout: FFILayout, into dst: UnsafeMutableRawPointer) throws {
                         switch layout {
                         case .scalar(let tag, _, _):
+                            if case .nil_ = v {
+                                switch tag {
+                                case 1: dst.storeBytes(of: Int8(0), as: Int8.self); return
+                                case 2: dst.storeBytes(of: Int16(0), as: Int16.self); return
+                                case 3: dst.storeBytes(of: Int32(0), as: Int32.self); return
+                                case 4: dst.storeBytes(of: Int64(0), as: Int64.self); return
+                                case 5: dst.storeBytes(of: UInt8(0), as: UInt8.self); return
+                                case 6: dst.storeBytes(of: UInt16(0), as: UInt16.self); return
+                                case 7: dst.storeBytes(of: UInt32(0), as: UInt32.self); return
+                                case 8: dst.storeBytes(of: UInt64(0), as: UInt64.self); return
+                                case 9: dst.storeBytes(of: Float(0), as: Float.self); return
+                                case 10: dst.storeBytes(of: Double(0), as: Double.self); return
+                                case 11:
+                                    let p: UnsafeMutableRawPointer? = nil
+                                    dst.storeBytes(of: p, as: UnsafeMutableRawPointer?.self)
+                                    return
+                                default:
+                                    break
+                                }
+                            }
                             switch tag {
                             case 1:
                                 let iv = Int8(truncatingIfNeeded: try v.asInt())
@@ -1065,7 +1160,11 @@ public final class VirtualMachine: @unchecked Sendable {
                                 }
                                 dst.storeBytes(of: p, as: UnsafeMutableRawPointer?.self)
                             }
-                        case .cstruct(let fields, let offsets, _, _):
+                        case .cstruct(let fields, let offsets, let size, _):
+                            if case .nil_ = v {
+                                memset(dst, 0, max(1, size))
+                                return
+                            }
                             guard case .reference(let r) = v else { throw VMError.typeError(expected: "CStruct", got: v) }
                             let obj = try heap.get(r)
                             guard obj.fields.count >= fields.count else {
@@ -1127,6 +1226,40 @@ public final class VirtualMachine: @unchecked Sendable {
                         let v = args[i]
 
                         switch desc {
+                        case .pointer(let pointeeDesc):
+                            // If the caller already provides a pointer, pass it through.
+                            if case .nativePointer(let np) = v {
+                                let p: UnsafeMutableRawPointer? = np
+                                let ptr = box(p).assumingMemoryBound(to: UnsafeMutableRawPointer?.self)
+                                boxedArgs.append(UnsafeMutableRawPointer(ptr))
+                                deallocators.append { ptr.deinitialize(count: 1); ptr.deallocate() }
+                                continue
+                            }
+                            if case .nil_ = v {
+                                let p: UnsafeMutableRawPointer? = nil
+                                let ptr = box(p).assumingMemoryBound(to: UnsafeMutableRawPointer?.self)
+                                boxedArgs.append(UnsafeMutableRawPointer(ptr))
+                                deallocators.append { ptr.deinitialize(count: 1); ptr.deallocate() }
+                                continue
+                            }
+
+                            // Otherwise, box the pointee value for the duration of the call.
+                            let pointeeLayout = layout(for: pointeeDesc)
+                            let pointeeMem = UnsafeMutableRawPointer.allocate(
+                                byteCount: max(1, pointeeLayout.size),
+                                alignment: max(1, pointeeLayout.alignment)
+                            )
+                            memset(pointeeMem, 0, max(1, pointeeLayout.size))
+                            try pack(v, layout: pointeeLayout, into: pointeeMem)
+
+                            let p: UnsafeMutableRawPointer? = pointeeMem
+                            let ptr = box(p).assumingMemoryBound(to: UnsafeMutableRawPointer?.self)
+                            boxedArgs.append(UnsafeMutableRawPointer(ptr))
+                            deallocators.append {
+                                ptr.deinitialize(count: 1)
+                                ptr.deallocate()
+                                pointeeMem.deallocate()
+                            }
                         case .scalar(let tag) where tag != 13:
                             switch tag {
                             case 1: // int8
@@ -1241,6 +1374,11 @@ public final class VirtualMachine: @unchecked Sendable {
                         retPtr = UnsafeMutableRawPointer(ptr)
                         retDeallocator = { ptr.deinitialize(count: 1); ptr.deallocate() }
                     case .scalar(let tag) where tag == 11 || tag == 12:
+                        let ptr = UnsafeMutablePointer<UnsafeMutableRawPointer?>.allocate(capacity: 1)
+                        ptr.initialize(to: nil)
+                        retPtr = UnsafeMutableRawPointer(ptr)
+                        retDeallocator = { ptr.deinitialize(count: 1); ptr.deallocate() }
+                    case .pointer:
                         let ptr = UnsafeMutablePointer<UnsafeMutableRawPointer?>.allocate(capacity: 1)
                         ptr.initialize(to: nil)
                         retPtr = UnsafeMutableRawPointer(ptr)

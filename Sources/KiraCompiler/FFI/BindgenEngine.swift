@@ -14,6 +14,7 @@ public indirect enum CKiraFFIType: Sendable {
     case opaquePointer               // void* or unknown pointer
     case named(String)               // typedef name not resolved to primitive
     case functionPointer             // function pointer — emitted as CPointer<CVoid>
+    case fixedArray(count: Int, element: CKiraFFIType) // fixed-size array in a struct field
 }
 
 public struct ParsedCFunction: Sendable {
@@ -141,7 +142,7 @@ public struct BindgenEngine: Sendable {
         guard let tu else { return "// error: failed to parse header \(headerPath)" }
         defer { clang_disposeTranslationUnit(tu) }
 
-        let visitor = HeaderVisitor()
+        let visitor = HeaderVisitor(allowedDir: headerDir)
         visitor.walk(translationUnit: tu)
         return emitKira(parsed: visitor.parsed, libraryName: libraryName, platform: platform.resolved)
     }
@@ -181,9 +182,32 @@ private final class HeaderVisitor {
     private var enumIndexByName: [String: Int] = [:]
     private var seenTypedefs: Set<String> = []
 
+    private let allowedDirPrefix: String
+
+    init(allowedDir: String) {
+        // Include the input header plus any headers in the same directory (project headers),
+        // but exclude system headers. This is required for multi-header libraries (e.g. sokol_glue.h).
+        if allowedDir.hasSuffix("/") {
+            self.allowedDirPrefix = allowedDir
+        } else {
+            self.allowedDirPrefix = allowedDir + "/"
+        }
+    }
+
     func walk(translationUnit tu: CXTranslationUnit) {
         let root = clang_getTranslationUnitCursor(tu)
         clang_visitChildren(root, headerVisitorCallback, Unmanaged.passUnretained(self).toOpaque())
+    }
+
+    private func isFromUserHeaders(_ cursor: CXCursor) -> Bool {
+        let loc = clang_getCursorLocation(cursor)
+        var file: CXFile?
+        clang_getSpellingLocation(loc, &file, nil, nil, nil)
+        guard let file else { return false }
+        let path = cxStringToSwift(clang_getFileName(file))
+        if path.isEmpty { return false }
+        if path.hasPrefix(allowedDirPrefix) { return true }
+        return false
     }
 
     func visit(cursor: CXCursor) -> CXChildVisitResult {
@@ -191,7 +215,7 @@ private final class HeaderVisitor {
 
         switch kind {
         case CXCursor_FunctionDecl:
-            guard isFromMainFile(cursor) else { return CXChildVisit_Continue }
+            guard isFromUserHeaders(cursor) else { return CXChildVisit_Continue }
 
             let name = cursorSpelling(cursor)
             guard !name.isEmpty else { return CXChildVisit_Continue }
@@ -213,7 +237,7 @@ private final class HeaderVisitor {
             guard !seenFunctions.contains(name) else { return CXChildVisit_Continue }
             seenFunctions.insert(name)
 
-            let returnType = convertType(result)
+            let returnType = convertType(result, context: .returnType, allowedDirPrefix: allowedDirPrefix)
 
             let numArgs = Int(clang_Cursor_getNumArguments(cursor))
             var params: [(name: String?, type: CKiraFFIType)] = []
@@ -222,8 +246,8 @@ private final class HeaderVisitor {
                 for i in 0..<numArgs {
                     let arg = clang_Cursor_getArgument(cursor, UInt32(i))
                     let paramNameRaw = cursorSpelling(arg)
-                    let paramName = paramNameRaw.isEmpty ? nil : paramNameRaw
-                    let paramType = convertType(clang_getCursorType(arg))
+                    let paramName = paramNameRaw.isEmpty ? nil : sanitizeKiraIdentifier(paramNameRaw)
+                    let paramType = convertType(clang_getCursorType(arg), context: .functionParam, allowedDirPrefix: allowedDirPrefix)
                     params.append((name: paramName, type: paramType))
                 }
             }
@@ -232,11 +256,10 @@ private final class HeaderVisitor {
             return CXChildVisit_Continue
 
         case CXCursor_StructDecl:
-            guard isFromMainFile(cursor) else { return CXChildVisit_Continue }
+            guard isFromUserHeaders(cursor) else { return CXChildVisit_Continue }
 
             let name = cursorSpelling(cursor)
-            guard !name.isEmpty else { return CXChildVisit_Continue }
-            guard !name.hasPrefix("(") else { return CXChildVisit_Continue }
+            guard isValidCDeclName(name) else { return CXChildVisit_Continue }
 
             let fields = collectStructFields(cursor: cursor)
 
@@ -251,11 +274,10 @@ private final class HeaderVisitor {
             return CXChildVisit_Continue
 
         case CXCursor_EnumDecl:
-            guard isFromMainFile(cursor) else { return CXChildVisit_Continue }
+            guard isFromUserHeaders(cursor) else { return CXChildVisit_Continue }
 
             let name = cursorSpelling(cursor)
-            guard !name.isEmpty else { return CXChildVisit_Continue }
-            guard !name.hasPrefix("(") else { return CXChildVisit_Continue }
+            guard isValidCDeclName(name) else { return CXChildVisit_Continue }
 
             let cases = collectEnumCases(cursor: cursor)
 
@@ -270,13 +292,13 @@ private final class HeaderVisitor {
             return CXChildVisit_Continue
 
         case CXCursor_TypedefDecl:
-            guard isFromMainFile(cursor) else { return CXChildVisit_Continue }
+            guard isFromUserHeaders(cursor) else { return CXChildVisit_Continue }
 
             let alias = cursorSpelling(cursor)
             guard !alias.isEmpty else { return CXChildVisit_Continue }
             guard !seenTypedefs.contains(alias) else { return CXChildVisit_Continue }
 
-            let underlying = convertType(clang_getTypedefDeclUnderlyingType(cursor))
+            let underlying = convertType(clang_getTypedefDeclUnderlyingType(cursor), context: .typedefUnderlying, allowedDirPrefix: allowedDirPrefix)
 
             // Skip function pointer typedefs (emitted as CPointer<CVoid> in-place).
             if case .functionPointer = underlying { return CXChildVisit_Continue }
@@ -293,8 +315,22 @@ private final class HeaderVisitor {
         }
     }
 
+    private func isValidCDeclName(_ name: String) -> Bool {
+        if name.isEmpty { return false }
+        if name.hasPrefix("(") { return false }
+        if name.contains(" ") { return false }
+        // libclang may surface anonymous declarations using a synthesized spelling like:
+        // "enum (unnamed at file.h:line:col)".
+        if name.contains("(anonymous") { return false }
+        if name.contains("(unnamed") { return false }
+        if name.hasPrefix("enum ") { return false }
+        if name.hasPrefix("struct ") { return false }
+        if name.hasPrefix("union ") { return false }
+        return true
+    }
+
     private func collectStructFields(cursor: CXCursor) -> [(name: String, type: CKiraFFIType)] {
-        let collector = FieldCollector()
+        let collector = FieldCollector(allowedDirPrefix: allowedDirPrefix)
         clang_visitChildren(cursor, fieldCollectorCallback, Unmanaged.passUnretained(collector).toOpaque())
         return collector.fields
     }
@@ -308,12 +344,17 @@ private final class HeaderVisitor {
 
 private final class FieldCollector {
     var fields: [(name: String, type: CKiraFFIType)] = []
+    private let allowedDirPrefix: String
+
+    init(allowedDirPrefix: String) {
+        self.allowedDirPrefix = allowedDirPrefix
+    }
 
     func visit(cursor: CXCursor) -> CXChildVisitResult {
         if clang_getCursorKind(cursor) == CXCursor_FieldDecl {
-            let name = cursorSpelling(cursor)
+            let name = sanitizeKiraIdentifier(cursorSpelling(cursor))
             if !name.isEmpty {
-                let t = convertType(clang_getCursorType(cursor))
+                let t = convertType(clang_getCursorType(cursor), context: .structField, allowedDirPrefix: allowedDirPrefix)
                 fields.append((name: name, type: t))
             }
         }
@@ -326,7 +367,7 @@ private final class EnumCaseCollector {
 
     func visit(cursor: CXCursor) -> CXChildVisitResult {
         if clang_getCursorKind(cursor) == CXCursor_EnumConstantDecl {
-            let name = cursorSpelling(cursor)
+            let name = sanitizeKiraIdentifier(cursorSpelling(cursor))
             if !name.isEmpty {
                 cases.append((name: name, value: clang_getEnumConstantDeclValue(cursor)))
             }
@@ -390,7 +431,38 @@ private func cxStringToSwift(_ str: CXString) -> String {
     return s
 }
 
-private func convertType(_ type: CXType) -> CKiraFFIType {
+private func sanitizeKiraIdentifier(_ name: String) -> String {
+    // `func` is a hard lexer error in Kira; other keywords should also be avoided in generated output.
+    let reserved: Set<String> = [
+        "func",
+        "function",
+        "type",
+        "enum",
+        "protocol",
+        "construct",
+        "extern",
+        "import",
+        "return",
+        "if",
+        "else",
+        "let",
+        "var",
+        "async",
+    ]
+    if reserved.contains(name) {
+        return name + "_"
+    }
+    return name
+}
+
+private enum TypeContext {
+    case functionParam
+    case returnType
+    case structField
+    case typedefUnderlying
+}
+
+private func convertType(_ type: CXType, context: TypeContext, allowedDirPrefix: String) -> CKiraFFIType {
     switch type.kind {
     case CXType_Void:
         return .void
@@ -429,24 +501,46 @@ private func convertType(_ type: CXType) -> CKiraFFIType {
             return .functionPointer
         }
         if clang_isConstQualifiedType(pointee) != 0 {
-            return .constPointer(convertType(pointee))
+            return .constPointer(convertType(pointee, context: context, allowedDirPrefix: allowedDirPrefix))
         }
-        return .pointer(convertType(pointee))
+        return .pointer(convertType(pointee, context: context, allowedDirPrefix: allowedDirPrefix))
     case CXType_ConstantArray, CXType_IncompleteArray:
         let elem = clang_getArrayElementType(type)
-        return .pointer(convertType(elem))
+        if type.kind == CXType_ConstantArray,
+           context == .structField || context == .typedefUnderlying
+        {
+            let count64 = clang_getArraySize(type)
+            let count = Int(count64)
+            if count > 0 {
+                return .fixedArray(count: count, element: convertType(elem, context: .structField, allowedDirPrefix: allowedDirPrefix))
+            }
+        }
+        // Arrays decay to pointers in function parameters and most other contexts.
+        return .pointer(convertType(elem, context: context, allowedDirPrefix: allowedDirPrefix))
     case CXType_Typedef:
         let decl = clang_getTypeDeclaration(type)
-        if clang_Location_isFromMainFile(clang_getCursorLocation(decl)) == 0 {
-            return convertType(clang_getCanonicalType(type))
+        do {
+            let loc = clang_getCursorLocation(decl)
+            var file: CXFile?
+            clang_getSpellingLocation(loc, &file, nil, nil, nil)
+            if let file {
+                let path = cxStringToSwift(clang_getFileName(file))
+                if !path.isEmpty, !path.hasPrefix(allowedDirPrefix) {
+                    return convertType(clang_getCanonicalType(type), context: context, allowedDirPrefix: allowedDirPrefix)
+                }
+            } else {
+                return convertType(clang_getCanonicalType(type), context: context, allowedDirPrefix: allowedDirPrefix)
+            }
         }
         let spelling = typeSpelling(type)
         let name = spelling.hasPrefix("const ") ? String(spelling.dropFirst(6)) : spelling
         return .named(name)
     case CXType_Elaborated:
-        return convertType(clang_Type_getNamedType(type))
+        return convertType(clang_Type_getNamedType(type), context: context, allowedDirPrefix: allowedDirPrefix)
     case CXType_Record:
-        let spelling = typeSpelling(type)
+        var spelling = typeSpelling(type)
+        if spelling.hasPrefix("const ") { spelling = String(spelling.dropFirst(6)) }
+        if spelling.hasPrefix("volatile ") { spelling = String(spelling.dropFirst(9)) }
         let name = spelling
             .replacingOccurrences(of: "struct ", with: "")
             .replacingOccurrences(of: "union ", with: "")
@@ -459,13 +553,93 @@ private func convertType(_ type: CXType) -> CKiraFFIType {
     default:
         let canonical = clang_getCanonicalType(type)
         if canonical.kind != type.kind {
-            return convertType(canonical)
+            return convertType(canonical, context: context, allowedDirPrefix: allowedDirPrefix)
         }
         return .opaquePointer
     }
 }
 
 #endif
+
+private struct FixedArrayDef: Hashable {
+    let count: Int
+    let element: CKiraFFIType
+    let elementSig: String
+
+    init(count: Int, element: CKiraFFIType) {
+        self.count = count
+        self.element = element
+        self.elementSig = typeSignature(element)
+    }
+
+    static func == (lhs: FixedArrayDef, rhs: FixedArrayDef) -> Bool {
+        lhs.count == rhs.count && lhs.elementSig == rhs.elementSig
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(count)
+        hasher.combine(elementSig)
+    }
+}
+
+private func typeSignature(_ type: CKiraFFIType) -> String {
+    switch type {
+    case .void: return "void"
+    case .bool: return "bool"
+    case .int8: return "i8"
+    case .int16: return "i16"
+    case .int32: return "i32"
+    case .int64: return "i64"
+    case .uint8: return "u8"
+    case .uint16: return "u16"
+    case .uint32: return "u32"
+    case .uint64: return "u64"
+    case .float32: return "f32"
+    case .float64: return "f64"
+    case .pointer(let t): return "ptr(\(typeSignature(t)))"
+    case .constPointer(let t): return "cptr(\(typeSignature(t)))"
+    case .opaquePointer: return "opqptr"
+    case .named(let n): return "named(\(n))"
+    case .functionPointer: return "fnptr"
+    case .fixedArray(let count, let element): return "arr\(count)(\(typeSignature(element)))"
+    }
+}
+
+private func fnv1a32Hex(_ s: String) -> String {
+    var hash: UInt32 = 2166136261
+    for b in s.utf8 {
+        hash ^= UInt32(b)
+        hash = hash &* 16777619
+    }
+    return String(format: "%08x", hash)
+}
+
+private func sanitizeIdentifierFragment(_ s: String) -> String {
+    var out = ""
+    out.reserveCapacity(s.count)
+    for scalar in s.unicodeScalars {
+        if (scalar.value >= 48 && scalar.value <= 57) || // 0-9
+            (scalar.value >= 65 && scalar.value <= 90) || // A-Z
+            (scalar.value >= 97 && scalar.value <= 122) || // a-z
+            scalar.value == 95 // _
+        {
+            out.unicodeScalars.append(scalar)
+        } else {
+            out.append("_")
+        }
+    }
+    while out.contains("__") { out = out.replacingOccurrences(of: "__", with: "_") }
+    return out.trimmingCharacters(in: CharacterSet(charactersIn: "_"))
+}
+
+private func fixedArrayTypeName(count: Int, element: CKiraFFIType) -> String {
+    let elemFrag = sanitizeIdentifierFragment(typeToKiraString(element))
+    let h = fnv1a32Hex("\(count)|\(typeSignature(element))")
+    if elemFrag.isEmpty {
+        return "CArray\(count)_\(h)"
+    }
+    return "CArray\(count)_\(elemFrag)_\(h)"
+}
 
 private func emitKira(parsed: ParsedHeader, libraryName: String, platform: BindgenPlatform) -> String {
     var out: [String] = []
@@ -474,6 +648,61 @@ private func emitKira(parsed: ParsedHeader, libraryName: String, platform: Bindg
     out.append("// Platform: \(platform.nameForComment)")
     out.append("// Do not edit manually — regenerate with: kira bindgen <header.h> --lib \(libraryName)")
     out.append("")
+
+    // Fixed-size arrays inside C structs are emitted as @CStruct wrappers so their layout matches C.
+    var arrayDefs: Set<FixedArrayDef> = []
+    func collectArrays(from type: CKiraFFIType) {
+        switch type {
+        case .fixedArray(let count, let element):
+            arrayDefs.insert(.init(count: count, element: element))
+            collectArrays(from: element)
+        case .pointer(let t), .constPointer(let t):
+            collectArrays(from: t)
+        default:
+            break
+        }
+    }
+    for td in parsed.typedefs { collectArrays(from: td.underlying) }
+    for s in parsed.structs {
+        for f in s.fields { collectArrays(from: f.type) }
+    }
+
+    var orderedArrayDefs: [FixedArrayDef] = []
+    orderedArrayDefs.reserveCapacity(arrayDefs.count)
+    var visitedArrayDefs: Set<FixedArrayDef> = []
+    func topoVisit(_ def: FixedArrayDef) {
+        if visitedArrayDefs.contains(def) { return }
+        visitedArrayDefs.insert(def)
+        // Recursively walk element to find nested fixed arrays.
+        func walkNested(_ t: CKiraFFIType) {
+            switch t {
+            case .fixedArray(let c, let e):
+                topoVisit(.init(count: c, element: e))
+            case .pointer(let p), .constPointer(let p):
+                walkNested(p)
+            default:
+                break
+            }
+        }
+        walkNested(def.element)
+        orderedArrayDefs.append(def)
+    }
+    let sortedArrayDefs = arrayDefs.sorted {
+        fixedArrayTypeName(count: $0.count, element: $0.element) < fixedArrayTypeName(count: $1.count, element: $1.element)
+    }
+    for def in sortedArrayDefs {
+        topoVisit(def)
+    }
+
+    for def in orderedArrayDefs {
+        out.append("@CStruct")
+        out.append("type \(fixedArrayTypeName(count: def.count, element: def.element)) {")
+        for i in 0..<def.count {
+            out.append("    var _\(i): \(typeToKiraString(def.element))")
+        }
+        out.append("}")
+        out.append("")
+    }
 
     let structNames = Set(parsed.structs.map(\.name))
     let typedefAliases = Set(parsed.typedefs.map(\.alias))
@@ -508,13 +737,16 @@ private func emitKira(parsed: ParsedHeader, libraryName: String, platform: Bindg
         out.append("")
     }
 
-    for e in parsed.enums {
-        out.append("@CEnum")
-        out.append("type \(e.name) {")
-        for c in e.cases {
-            out.append("    \(c.name) = \(c.value)")
+    if !parsed.enums.isEmpty {
+        out.append("// Enum constants (C enums are represented as CInt32 at the ABI level)")
+        var seen: Set<String> = []
+        for e in parsed.enums {
+            for c in e.cases {
+                if seen.contains(c.name) { continue }
+                seen.insert(c.name)
+                out.append("let \(c.name) = \(c.value)")
+            }
         }
-        out.append("}")
         out.append("")
     }
 
@@ -580,6 +812,8 @@ private func typeToKiraString(_ type: CKiraFFIType) -> String {
     case .opaquePointer: return "CPointer<CVoid>"
     case .functionPointer: return "CPointer<CVoid>"
     case .named(let n): return n
+    case .fixedArray(let count, let element):
+        return fixedArrayTypeName(count: count, element: element)
     }
 }
 

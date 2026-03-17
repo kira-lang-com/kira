@@ -33,6 +33,9 @@ public struct DocExtractor: Sendable {
             switch decl {
             case .construct(let c):
                 symbols.append(DocSymbol(kind: .construct, moduleName: moduleName, name: c.name, doc: nil, properties: []))
+            case .typealias:
+                // Typealiases are implementation details and not part of the public docs for now.
+                break
             case .type(let t):
                 let props = t.fields.map { f in
                     let sig = f.type.map { typeSystemString($0) } ?? "<inferred>"
@@ -60,6 +63,9 @@ public struct DocExtractor: Sendable {
                 }
                 let kind: DocSymbol.Kind = (ci.constructName == "Widget") ? .widget : .type
                 symbols.append(DocSymbol(kind: kind, moduleName: moduleName, name: ci.name, doc: docString(from: ci.annotations), properties: props))
+            case .globalVar:
+                // Global vars are runtime storage, not part of the public API docs for now.
+                break
             }
         }
 

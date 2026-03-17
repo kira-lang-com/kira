@@ -27,6 +27,7 @@ public struct FFIPrototype: Sendable {
         case pointer = 11
         case cstring = 12
         case cstruct = 13
+        case pointerTo = 14
     }
 
     public struct TypeEncoding: Sendable, Equatable {
@@ -44,6 +45,10 @@ public struct FFIPrototype: Sendable {
             var out: [UInt8] = [TypeTag.cstruct.rawValue, UInt8(clamping: fields.count)]
             for f in fields { out.append(contentsOf: f.bytes) }
             return TypeEncoding(bytes: out)
+        }
+
+        public static func pointerTo(_ pointee: TypeEncoding) -> TypeEncoding {
+            TypeEncoding(bytes: [TypeTag.pointerTo.rawValue] + pointee.bytes)
         }
     }
 
@@ -64,6 +69,7 @@ public struct FFIPrototype: Sendable {
 
 public struct SymbolTable: Sendable {
     public private(set) var functions: [String: FunctionSymbol] = [:]
+    public private(set) var globals: [String: KiraType] = [:]
     public private(set) var types: Set<String> = []
     public private(set) var methods: [String: [String: KiraType]] = [:] // TypeName -> method -> fnType
     public private(set) var ffi: [String: FFIPrototype] = [:]
@@ -79,6 +85,13 @@ public struct SymbolTable: Sendable {
             throw SemanticError.duplicateSymbol(sym.name, sym.range.start)
         }
         functions[sym.name] = sym
+    }
+
+    public mutating func addGlobal(name: String, type: KiraType, range: SourceRange) throws {
+        if functions[name] != nil || globals[name] != nil {
+            throw SemanticError.duplicateSymbol(name, range.start)
+        }
+        globals[name] = type
     }
 
     public mutating func addFFIPrototype(functionName: String, proto: FFIPrototype) {
@@ -101,6 +114,7 @@ public struct SymbolTable: Sendable {
 
     public func lookupValue(_ name: String) -> KiraType? {
         if let fn = functions[name] { return fn.type }
+        if let g = globals[name] { return g }
         return nil
     }
 

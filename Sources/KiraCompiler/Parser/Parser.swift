@@ -32,6 +32,11 @@ public struct Parser {
                 continue
             }
 
+            if matchKeyword(.typealias) {
+                decls.append(.typealias(try parseTypealiasDecl(startLoc: previous().range.start)))
+                continue
+            }
+
             if matchKeyword(.type) {
                 decls.append(.type(try parseTypeDecl(annotations: annotations, startLoc: previous().range.start)))
                 continue
@@ -51,6 +56,26 @@ public struct Parser {
                 let startLoc = previous().range.start
                 _ = try expectKeyword(.function)
                 decls.append(.externFunction(try parseExternFunctionDecl(annotations: annotations, startLoc: startLoc)))
+                continue
+            }
+
+            if matchKeyword(.let) || matchKeyword(.var) {
+                let isVar = previous().kind == .keyword(.var)
+                let startLoc = previous().range.start
+                let (name, _) = try expectIdentifier("global variable name")
+                var explicitType: TypeRef?
+                if match(.colon) {
+                    explicitType = try parseTypeRef()
+                }
+                _ = try expect(.equal, "=")
+                let initExpr = try parseExpression()
+                decls.append(.globalVar(.init(
+                    isVar: isVar,
+                    name: name,
+                    explicitType: explicitType,
+                    initializer: initExpr,
+                    range: SourceRange(start: startLoc, end: initExpr.range.end)
+                )))
                 continue
             }
 
@@ -89,6 +114,16 @@ public struct Parser {
         let end = previous().range.end
         consumeSeparators()
         return ImportDecl(modulePath: parts.joined(separator: "."), alias: alias, range: SourceRange(start: startLoc, end: end))
+    }
+
+    // MARK: - Typealias
+
+    private mutating func parseTypealiasDecl(startLoc: SourceLocation) throws -> TypealiasDecl {
+        let (name, _) = try expectIdentifier("typealias name")
+        _ = try expect(.equal, "=")
+        let target = try parseTypeRef()
+        let end = target.range.end
+        return TypealiasDecl(name: name, target: target, range: SourceRange(start: startLoc, end: end))
     }
 
     // MARK: - Annotations

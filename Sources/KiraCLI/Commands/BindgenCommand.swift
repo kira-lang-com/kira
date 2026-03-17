@@ -21,8 +21,7 @@ enum BindgenCommand {
             }
         }
         guard let lib, let out else { throw CLIError.missingArgument("--lib/--out") }
-        let header = try String(contentsOfFile: headerPath, encoding: .utf8)
-        let kira = BindgenEngine().generate(headerText: header, libraryName: lib)
+        let kira = BindgenEngine().generate(headerPath: headerPath, libraryName: lib, platform: .current)
         try kira.write(to: URL(fileURLWithPath: out), atomically: true, encoding: .utf8)
     }
 }

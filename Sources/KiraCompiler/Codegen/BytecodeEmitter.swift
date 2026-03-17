@@ -17,7 +17,16 @@ public struct BytecodeEmitter: Sendable {
 
     public func emit(module: KiraIRModule) throws -> Data {
         let functionNames = module.functions.map(\.name)
-        let globalIndex: [String: UInt16] = Dictionary(uniqueKeysWithValues: functionNames.enumerated().map { ($0.element, UInt16($0.offset)) })
+        var globalIndex: [String: UInt16] = Dictionary(uniqueKeysWithValues: functionNames.enumerated().map { ($0.element, UInt16($0.offset)) })
+
+        func internGlobal(_ name: String) throws -> UInt16 {
+            if let i = globalIndex[name] { return i }
+            let next = globalIndex.count
+            guard next <= Int(UInt16.max) else { throw BytecodeEmitError.unknownGlobalSymbol(name) }
+            let idx = UInt16(next)
+            globalIndex[name] = idx
+            return idx
+        }
 
         var intConstants: [Int64] = []
         var floatConstants: [Double] = []
@@ -86,10 +95,10 @@ public struct BytecodeEmitter: Sendable {
                 case .storeLocal(let slot):
                     append(.store_local, [slot], irIndex: i)
                 case .loadGlobalSymbol(let name):
-                    guard let sym = globalIndex[name] else { throw BytecodeEmitError.unknownGlobalSymbol(name) }
+                    let sym = try internGlobal(name)
                     append(.load_global, [UInt8(sym >> 8), UInt8(sym & 0xff)], irIndex: i)
                 case .storeGlobalSymbol(let name):
-                    guard let sym = globalIndex[name] else { throw BytecodeEmitError.unknownGlobalSymbol(name) }
+                    let sym = try internGlobal(name)
                     append(.store_global, [UInt8(sym >> 8), UInt8(sym & 0xff)], irIndex: i)
                 case .newObject(let fieldCount):
                     append(.new_object, [UInt8(fieldCount >> 8), UInt8(fieldCount & 0xff)], irIndex: i)

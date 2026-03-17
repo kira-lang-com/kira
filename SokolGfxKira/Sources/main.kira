@@ -1,71 +1,138 @@
 import Kira.Fondation
 
-// Sokol headers (downloaded):
-// - SokolGfxKira/FFI/sokol_gfx.h
-// - SokolGfxKira/FFI/sokol_app.h
-// - SokolGfxKira/FFI/sokol_glue.h
+// Pure-Kira Sokol triangle:
+// - Sokol implementation dylib (build): `SokolGfxKira/FFI/libsokol.dylib`
+// - Bindings (generated):              `SokolGfxKira/Sources/sokol.kira`
 //
-// Triangle dylib (built):  SokolGfxKira/FFI/libsokol_triangle.dylib
-// Bindings (generated):    SokolGfxKira/FFI/sokol_gfx.kira
+// Rebuild the Sokol dylib (macOS/Metal):
+//   clang -dynamiclib -O2 -fPIC -x objective-c -fobjc-arc -framework Cocoa -framework Metal -framework MetalKit -framework QuartzCore \
+//     -o FFI/libsokol.dylib FFI/sokol_impl.c
 //
 // Regenerate bindings:
-//   ../.build/debug/kira bindgen FFI/sokol_gfx.h --lib sokol --out FFI/sokol_gfx.kira
-//
-// Rebuild triangle dylib:
-//   clang -dynamiclib -O2 -fPIC -ObjC -fobjc-arc -framework Cocoa -framework Metal -framework MetalKit -framework QuartzCore \\
-//     -o FFI/libsokol_triangle.dylib FFI/sokol_triangle.m
+//   ../.build/debug/kira bindgen FFI/sokol_all.h --lib FFI/libsokol.dylib --out Sources/sokol.kira
 
-@ffi(lib: "FFI/libsokol_triangle.dylib")
-extern function sokol_triangle_run(clear_r: CFloat, clear_g: CFloat, clear_b: CFloat, clear_a: CFloat, quit_after_frames: CInt32) -> CVoid
+// libc
+@ffi(lib: "")
+extern function malloc(size: CUInt64) -> CPointer<CVoid>
 
-@ffi(lib: "FFI/libsokol_triangle.dylib")
-extern function sokol_triangle_run_callbacks(init_cb: CPointer<CVoid>, frame_cb: CPointer<CVoid>, cleanup_cb: CPointer<CVoid>, clear_r: CFloat, clear_g: CFloat, clear_b: CFloat, clear_a: CFloat, quit_after_frames: CInt32) -> CVoid
+@ffi(lib: "")
+extern function free(ptr: CPointer<CVoid>) -> CVoid
 
-@ffi(lib: "FFI/libsokol_triangle.dylib")
-extern function sokol_triangle_begin_pass(r: CFloat, g: CFloat, b: CFloat, a: CFloat) -> CVoid
+@ffi(lib: "")
+extern function memcpy(dst: CPointer<CVoid>, src: CPointer<vertex_blob>, n: CUInt64) -> CPointer<CVoid>
 
-@ffi(lib: "FFI/libsokol_triangle.dylib")
-extern function sokol_triangle_apply_pipeline() -> CVoid
-
-@ffi(lib: "FFI/libsokol_triangle.dylib")
-extern function sokol_triangle_apply_bindings() -> CVoid
-
-@ffi(lib: "FFI/libsokol_triangle.dylib")
-extern function sg_draw(base_element: CInt32, num_elements: CInt32, num_instances: CInt32) -> CVoid
-
-@ffi(lib: "FFI/libsokol_triangle.dylib")
-extern function sokol_triangle_end_pass_commit() -> CVoid
-
-function on_init() {
-    print("on_init()")
+@CStruct
+type vertex_blob {
+    var f00: CFloat
+    var f01: CFloat
+    var f02: CFloat
+    var f03: CFloat
+    var f04: CFloat
+    var f05: CFloat
+    var f06: CFloat
+    var f07: CFloat
+    var f08: CFloat
+    var f09: CFloat
+    var f10: CFloat
+    var f11: CFloat
+    var f12: CFloat
+    var f13: CFloat
+    var f14: CFloat
+    var f15: CFloat
+    var f16: CFloat
+    var f17: CFloat
+    var f18: CFloat
+    var f19: CFloat
+    var f20: CFloat
 }
 
-function on_frame(frame_index: Int) {
+// Global state (initialized in on_init).
+var g_frame: Int = 0
+var g_pip: sg_pipeline = sg_pipeline()
+var g_bind: sg_bindings = sg_bindings()
+
+function on_init() {
+    let env = sglue_environment()
+    sg_setup(desc: sg_desc(environment: env))
+
+    // Vertex data (3 vertices, pos=float3 + color=float4).
+    let verts = vertex_blob(
+        f00: 0.0,  f01: 0.5,  f02: 0.5,  f03: 1.0,  f04: 0.0,  f05: 0.0,  f06: 1.0,
+        f07: 0.5,  f08: -0.5, f09: 0.5,  f10: 0.0,  f11: 1.0,  f12: 0.0,  f13: 1.0,
+        f14: -0.5, f15: -0.5, f16: 0.5,  f17: 0.0,  f18: 0.0,  f19: 1.0,  f20: 1.0)
+    let vsize: Int = 21 * 4
+    let vmem = malloc(size: vsize)
+    memcpy(dst: vmem, src: verts, n: vsize)
+
+    let vbuf = sg_make_buffer(desc: sg_buffer_desc(
+        size: vsize,
+        data: sg_range(ptr: vmem, size: vsize),
+        label: "triangle-vertices"))
+    free(ptr: vmem)
+
+    g_bind = sg_bindings(vertex_buffers: CArray8_sg_buffer_db72bc86(_0: vbuf))
+
+    let vs_src = "#include <metal_stdlib>\nusing namespace metal;\nstruct vs_in {\n  float3 pos [[attribute(0)]];\n  float4 color [[attribute(1)]];\n};\nstruct vs_out {\n  float4 pos [[position]];\n  float4 color;\n};\nvertex vs_out vs_main(vs_in in [[stage_in]]) {\n  vs_out out;\n  out.pos = float4(in.pos, 1.0);\n  out.color = in.color;\n  return out;\n}\n"
+
+    let fs_src = "#include <metal_stdlib>\nusing namespace metal;\nstruct vs_out {\n  float4 pos [[position]];\n  float4 color;\n};\nfragment float4 fs_main(vs_out in [[stage_in]]) {\n  return in.color;\n}\n"
+
+    let shd = sg_make_shader(desc: sg_shader_desc(
+        vertex_func: sg_shader_function(source: vs_src, entry: "vs_main"),
+        fragment_func: sg_shader_function(source: fs_src, entry: "fs_main"),
+        label: "triangle-shader"))
+
+    let attrs = CArray16_sg_vertex_attr_state_00ae92e5(
+        _0: sg_vertex_attr_state(format: SG_VERTEXFORMAT_FLOAT3),
+        _1: sg_vertex_attr_state(format: SG_VERTEXFORMAT_FLOAT4))
+    let layout = sg_vertex_layout_state(attrs: attrs)
+
+    g_pip = sg_make_pipeline(desc: sg_pipeline_desc(
+        shader: shd,
+        layout: layout,
+        label: "triangle-pipeline"))
+}
+
+function on_frame() {
     // Toggle clear color every ~60 frames.
-    let m = frame_index % 120
+    let m = g_frame % 120
+    var clear: sg_color = sg_color()
     if m < 60 {
-        sokol_triangle_begin_pass(r: 0.2, g: 0.2, b: 0.4, a: 1.0)
+        clear = sg_color(r: 0.2, g: 0.2, b: 0.4, a: 1.0)
     } else {
-        sokol_triangle_begin_pass(r: 0.4, g: 0.2, b: 0.2, a: 1.0)
+        clear = sg_color(r: 0.4, g: 0.2, b: 0.2, a: 1.0)
     }
 
-    // The actual frame render calls now live in Kira.
-    sokol_triangle_apply_pipeline()
-    sokol_triangle_apply_bindings()
+    let ca0 = sg_color_attachment_action(load_action: SG_LOADACTION_CLEAR, clear_value: clear)
+    let action = sg_pass_action(colors: CArray8_sg_color_attachment_action_008186e2(_0: ca0))
+    let pass = sg_pass(action: action, swapchain: sglue_swapchain())
+
+    sg_begin_pass(pass: pass)
+    sg_apply_pipeline(pip: g_pip)
+    sg_apply_bindings(bindings: g_bind)
     sg_draw(base_element: 0, num_elements: 3, num_instances: 1)
-    sokol_triangle_end_pass_commit()
+    sg_end_pass()
+    sg_commit()
+
+    g_frame = g_frame + 1
+    if g_frame > 180 {
+        sapp_quit()
+    }
 }
 
 function on_cleanup() {
-    print("on_cleanup()")
+    sg_shutdown()
 }
 
 @Main
 function main() {
-    print("Launching Sokol triangle…")
-    // Set `quit_after_frames` to 0 to keep the window open.
-    let init_cb = ffi_callback0("on_init")
-    let frame_cb = ffi_callback1_i32("on_frame")
-    let cleanup_cb = ffi_callback0("on_cleanup")
-    sokol_triangle_run_callbacks(init_cb: init_cb, frame_cb: frame_cb, cleanup_cb: cleanup_cb, clear_r: 0.1, clear_g: 0.1, clear_b: 0.1, clear_a: 1.0, quit_after_frames: 180)
+    print("Launching Sokol triangle (pure Kira)…")
+    let desc = sapp_desc(
+        init_cb: ffi_callback0("on_init"),
+        frame_cb: ffi_callback0("on_frame"),
+        cleanup_cb: ffi_callback0("on_cleanup"),
+        width: 800,
+        height: 600,
+        window_title: "Sokol Triangle (Kira)",
+        icon: sapp_icon_desc(sokol_default: 1))
+    sapp_run(desc: desc)
 }

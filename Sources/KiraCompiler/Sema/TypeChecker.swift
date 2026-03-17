@@ -32,9 +32,27 @@ public struct TypeChecker: Sendable {
         var typeInfo = TypeInfo()
         let cHandleTypes = collectCHandleTypes(module: module)
 
+        // Collect typealias declarations for simple alias expansion (used heavily by bindgen output).
+        var typeAliases: [String: TypeRef] = [:]
+        for decl in module.declarations {
+            if case .typealias(let td) = decl {
+                typeAliases[td.name] = td.target
+            }
+        }
+
+        func resolve(_ ref: TypeRef) -> KiraType {
+            typeSystem.resolve(expandTypeRefAliases(ref, typeAliases: typeAliases))
+        }
+        func resolve(_ ref: TypeRef?) -> KiraType {
+            guard let ref else { return .void }
+            return resolve(ref)
+        }
+
         // Register types and constructs first.
         for decl in module.declarations {
             switch decl {
+            case .typealias(let td):
+                symbols.addType(td.name)
             case .type(let td):
                 symbols.addType(td.name)
             case .enum(let ed):
@@ -53,7 +71,7 @@ public struct TypeChecker: Sendable {
             guard case .type(let td) = decl else { continue }
             guard td.annotations.contains(where: { $0.name == "CStruct" }) else { continue }
             let fieldSchemas: [(name: String, type: KiraType)] = td.fields.map { f in
-                let ty = f.type.map(typeSystem.resolve) ?? .unknown
+                let ty = f.type.map(resolve) ?? .unknown
                 return (f.name, ty)
             }
             symbols.addCStruct(typeName: td.name, fields: fieldSchemas)
@@ -62,8 +80,8 @@ public struct TypeChecker: Sendable {
         // Register functions.
         for decl in module.declarations {
             if case .function(let fn) = decl {
-                let params = fn.parameters.map { typeSystem.resolve($0.type) }
-                let ret = fn.returnType.map(typeSystem.resolve) ?? .void
+                let params = fn.parameters.map { resolve($0.type) }
+                let ret = resolve(fn.returnType)
                 let mode: FunctionSymbol.ExecutionMode = executionMode(from: fn.annotations)
                 if target.isWasm, mode == .runtime {
                     throw SemanticError.runtimeNotSupportedOnWasm(fn.range.start)
@@ -76,10 +94,10 @@ public struct TypeChecker: Sendable {
                     range: fn.range
                 ))
             } else if case .externFunction(let fn) = decl {
-                let params = fn.parameters.map { typeSystem.resolve($0.type) }
-                let ret = fn.returnType.map(typeSystem.resolve) ?? .void
+                let params = fn.parameters.map { resolve($0.type) }
+                let ret = resolve(fn.returnType)
 
-                let proto = try parseFFIPrototype(for: fn, cHandleTypes: cHandleTypes, symbols: symbols)
+                let proto = try parseFFIPrototype(for: fn, cHandleTypes: cHandleTypes, symbols: symbols, typeAliases: typeAliases)
                 symbols.addFFIPrototype(functionName: fn.name, proto: proto)
 
                 try symbols.addFunction(.init(
@@ -90,6 +108,28 @@ public struct TypeChecker: Sendable {
                     range: fn.range
                 ))
             }
+        }
+
+        // Register and type-check global variables (module scope).
+        // Globals are available to all functions and can be used to hold long-lived state (e.g. FFI handles).
+        let globalScope = LocalScope(parent: nil, symbols: symbols)
+        for decl in module.declarations {
+            guard case .globalVar(let gv) = decl else { continue }
+            let initType = try typeCheckExpr(gv.initializer, scope: globalScope, symbols: symbols, expected: nil, typeInfo: &typeInfo)
+            let finalType: KiraType
+            if let explicit = gv.explicitType.map(resolve) {
+                if explicit == .float, case .int = initType, isIntLiteral(gv.initializer) {
+                    finalType = .float
+                } else if explicit == initType {
+                    finalType = explicit
+                } else {
+                    throw SemanticError.typeMismatch(expected: explicit, got: initType, gv.range.start, hint: coercionHint(expected: explicit, expr: gv.initializer))
+                }
+            } else {
+                finalType = initType
+            }
+            try symbols.addGlobal(name: gv.name, type: finalType, range: gv.range)
+            globalScope.define(gv.name, type: finalType)
         }
 
         // Add construct-derived methods (modifier chain).
@@ -121,7 +161,7 @@ public struct TypeChecker: Sendable {
                 if case .function(_, let r) = fnType { expectedReturn = r } else { expectedReturn = .void }
                 let scope = LocalScope(parent: nil, symbols: symbols)
                 for p in fn.parameters {
-                    scope.define(p.name, type: typeSystem.resolve(p.type))
+                    scope.define(p.name, type: resolve(p.type))
                 }
                 _ = try typeCheckBlock(fn.body, scope: scope, symbols: symbols, expectedReturn: expectedReturn, typeInfo: &typeInfo)
             }
@@ -136,15 +176,23 @@ public struct TypeChecker: Sendable {
         return .auto
     }
 
-    private func parseFFIPrototype(for fn: ExternFunctionDecl, cHandleTypes: Set<String>, symbols: SymbolTable) throws -> FFIPrototype {
+    private func parseFFIPrototype(
+        for fn: ExternFunctionDecl,
+        cHandleTypes: Set<String>,
+        symbols: SymbolTable,
+        typeAliases: [String: TypeRef]
+    ) throws -> FFIPrototype {
+        let expandedReturnType = fn.returnType.map { expandTypeRefAliases($0, typeAliases: typeAliases) }
+        let expandedParams: [TypeRef] = fn.parameters.map { expandTypeRefAliases($0.type, typeAliases: typeAliases) }
+
         guard let ffiAnn = fn.annotations.first(where: { $0.name == "ffi" }) else {
             var visiting: Set<String> = []
             return FFIPrototype(
                 library: nil,
                 symbol: fn.name,
                 linkage: .dynamic,
-                returnType: encodeFFIType(fn.returnType, cHandleTypes: cHandleTypes, symbols: symbols, visiting: &visiting),
-                argumentTypes: fn.parameters.map { encodeFFIType($0.type, cHandleTypes: cHandleTypes, symbols: symbols, visiting: &visiting) }
+                returnType: encodeFFIType(expandedReturnType, cHandleTypes: cHandleTypes, symbols: symbols, visiting: &visiting),
+                argumentTypes: expandedParams.map { encodeFFIType($0, cHandleTypes: cHandleTypes, symbols: symbols, visiting: &visiting) }
             )
         }
 
@@ -172,9 +220,47 @@ public struct TypeChecker: Sendable {
             library: lib,
             symbol: fn.name,
             linkage: linkage,
-            returnType: encodeFFIType(fn.returnType, cHandleTypes: cHandleTypes, symbols: symbols, visiting: &visiting),
-            argumentTypes: fn.parameters.map { encodeFFIType($0.type, cHandleTypes: cHandleTypes, symbols: symbols, visiting: &visiting) }
+            returnType: encodeFFIType(expandedReturnType, cHandleTypes: cHandleTypes, symbols: symbols, visiting: &visiting),
+            argumentTypes: expandedParams.map { encodeFFIType($0, cHandleTypes: cHandleTypes, symbols: symbols, visiting: &visiting) }
         )
+    }
+
+    private func expandTypeRefAliases(_ ref: TypeRef, typeAliases: [String: TypeRef]) -> TypeRef {
+        var visiting: Set<String> = []
+        return expandTypeRefAliases(ref, typeAliases: typeAliases, visiting: &visiting)
+    }
+
+    private func expandTypeRefAliases(
+        _ ref: TypeRef,
+        typeAliases: [String: TypeRef],
+        visiting: inout Set<String>
+    ) -> TypeRef {
+        switch ref.kind {
+        case .named(let name):
+            guard let target = typeAliases[name] else { return ref }
+            guard !visiting.contains(name) else { return ref }
+            visiting.insert(name)
+            let expanded = expandTypeRefAliases(target, typeAliases: typeAliases, visiting: &visiting)
+            visiting.remove(name)
+            return TypeRef(kind: expanded.kind, range: ref.range)
+        case .applied(let base, let args):
+            let expandedArgs = args.map { expandTypeRefAliases($0, typeAliases: typeAliases, visiting: &visiting) }
+            return TypeRef(kind: .applied(base, expandedArgs), range: ref.range)
+        case .array(let inner):
+            let e = expandTypeRefAliases(inner, typeAliases: typeAliases, visiting: &visiting)
+            return TypeRef(kind: .array(e), range: ref.range)
+        case .dictionary(let k, let v):
+            let ek = expandTypeRefAliases(k, typeAliases: typeAliases, visiting: &visiting)
+            let ev = expandTypeRefAliases(v, typeAliases: typeAliases, visiting: &visiting)
+            return TypeRef(kind: .dictionary(key: ek, value: ev), range: ref.range)
+        case .optional(let inner):
+            let e = expandTypeRefAliases(inner, typeAliases: typeAliases, visiting: &visiting)
+            return TypeRef(kind: .optional(e), range: ref.range)
+        case .function(let ps, let r):
+            let eps = ps.map { expandTypeRefAliases($0, typeAliases: typeAliases, visiting: &visiting) }
+            let er = expandTypeRefAliases(r, typeAliases: typeAliases, visiting: &visiting)
+            return TypeRef(kind: .function(params: eps, returns: er), range: ref.range)
+        }
     }
 
     private func encodeFFIType(
@@ -199,7 +285,8 @@ public struct TypeChecker: Sendable {
         case .applied(let base, let args):
             if base == "CPointer", let first = args.first {
                 if case .named(let n) = first.kind, n == "CInt8" { return .scalar(.cstring) }
-                return .scalar(.pointer)
+                let pointee = encodeFFIType(first, cHandleTypes: cHandleTypes, symbols: symbols, visiting: &visiting)
+                return .pointerTo(pointee)
             }
             return .scalar(.pointer)
         case .optional(let inner):
@@ -221,7 +308,9 @@ public struct TypeChecker: Sendable {
             return .scalar(.float64)
         case .bool:
             return .scalar(.uint8)
-        case .pointer:
+        case .pointer(let inner):
+            // Preserve C string encoding inside C structs so `CPointer<CInt8>` fields can accept `String`.
+            if inner == .named("CInt8") { return .scalar(.cstring) }
             return .scalar(.pointer)
         case .optional(let inner):
             return encodeFFIType(inner, cHandleTypes: cHandleTypes, symbols: symbols, visiting: &visiting)
@@ -306,6 +395,9 @@ public struct TypeChecker: Sendable {
 
         // nil -> pointer
         if case .optional = got, case .pointer = expected { return true }
+
+        // CPointer<*> -> CPointer<*> (ABI-compatible; used heavily for FFI, e.g. void*).
+        if case .pointer = got, case .pointer = expected { return true }
 
         return false
     }
@@ -448,12 +540,12 @@ public struct TypeChecker: Sendable {
             if case .identifier(let typeName, _) = c.callee, symbols.cStructTypes.contains(typeName) {
                 let fieldMap = symbols.fields[typeName] ?? [:]
                 let fieldCount = fieldMap.count
-                if c.arguments.count != fieldCount {
+                if c.arguments.count > fieldCount {
                     throw SemanticError.typeMismatch(
                         expected: .named(typeName),
                         got: .void,
                         c.range.start,
-                        hint: "\(typeName) expects \(fieldCount) arguments"
+                        hint: "\(typeName) expects at most \(fieldCount) arguments"
                     )
                 }
 
@@ -486,9 +578,7 @@ public struct TypeChecker: Sendable {
                     .sorted(by: { $0.index < $1.index })
                 for f in ordered {
                     let expectedType = f.type
-                    guard let argExpr = argsByIndex[f.index] else {
-                        throw SemanticError.typeMismatch(expected: expectedType, got: .void, c.range.start, hint: "missing field '\(f.name)'")
-                    }
+                    guard let argExpr = argsByIndex[f.index] else { continue }
                     let got = try typeCheckExpr(argExpr, scope: scope, symbols: symbols, expected: expectedType == .unknown ? nil : expectedType, typeInfo: &typeInfo)
                     if expectedType != .unknown, got != expectedType {
                         // Reuse FFI convertibility rules for C types.
@@ -545,6 +635,15 @@ public struct TypeChecker: Sendable {
                     )
                 }
                 if got != expectedType, !(isExternCallee && isFFIConvertible(got: got, expected: expectedType)) {
+                    let canBoxCStructPointer: Bool = {
+                        guard isExternCallee else { return false }
+                        guard case .named(let gotName) = got, symbols.cStructTypes.contains(gotName) else { return false }
+                        guard case .pointer(let inner) = expectedType, case .named(let expectedName) = inner else { return false }
+                        return gotName == expectedName
+                    }()
+                    if canBoxCStructPointer {
+                        continue
+                    }
                     throw SemanticError.typeMismatch(expected: expectedType, got: got, arg.range.start, hint: coercionHint(expected: expectedType, expr: arg.value))
                 }
             }

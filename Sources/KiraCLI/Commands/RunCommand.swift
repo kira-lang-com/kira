@@ -8,20 +8,24 @@ enum RunCommand {
         let fm = FileManager.default
         let cwd = URL(fileURLWithPath: fm.currentDirectoryPath)
         let sourcesDir = cwd.appendingPathComponent("Sources", isDirectory: true)
-        let sourceFiles = try fm.contentsOfDirectory(at: sourcesDir, includingPropertiesForKeys: nil)
-            .filter { $0.pathExtension == "kira" }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        guard let entry = sourceFiles.first(where: { $0.lastPathComponent == "main.kira" }) ?? sourceFiles.first else {
+        let sourceFiles = try collectKiraSources(in: sourcesDir)
+        guard !sourceFiles.isEmpty else {
             throw CLIError.message("No .kira sources found in Sources/")
         }
 
-        let text = try String(contentsOf: entry, encoding: .utf8)
+        let sources: [SourceText] = try sourceFiles.map { url in
+            let text = try String(contentsOf: url, encoding: .utf8)
+            return SourceText(file: url.path, text: text)
+        }
         let driver = CompilerDriver()
-        let output = try driver.compile(source: SourceText(file: entry.path, text: text), target: defaultTargetForHost())
+        let output = try driver.compile(sources: sources, target: defaultTargetForHost())
         guard let bc = output.bytecode else { throw CLIError.message("No bytecode emitted.") }
 
         let module = try BytecodeLoader().load(data: bc)
         let vm = VirtualMachine(module: module)
+        if module.functions.contains(where: { $0.name == "__kira_init_globals" }) {
+            _ = try vm.run(function: "__kira_init_globals")
+        }
         _ = try vm.run(function: "main")
     }
 
@@ -35,5 +39,18 @@ enum RunCommand {
         #else
         return .macOS(arch: .arm64)
         #endif
+    }
+
+    private static func collectKiraSources(in dir: URL) throws -> [URL] {
+        let fm = FileManager.default
+        guard let e = fm.enumerator(at: dir, includingPropertiesForKeys: [.isRegularFileKey]) else { return [] }
+        var out: [URL] = []
+        for case let u as URL in e {
+            if u.pathExtension == "kira" {
+                out.append(u)
+            }
+        }
+        out.sort { $0.path < $1.path }
+        return out
     }
 }
