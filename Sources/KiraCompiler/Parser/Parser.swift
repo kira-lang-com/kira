@@ -47,6 +47,13 @@ public struct Parser {
                 continue
             }
 
+            if matchKeyword(.extern) {
+                let startLoc = previous().range.start
+                _ = try expectKeyword(.function)
+                decls.append(.externFunction(try parseExternFunctionDecl(annotations: annotations, startLoc: startLoc)))
+                continue
+            }
+
             let isAsync = matchKeyword(.async)
             if matchKeyword(.function) {
                 decls.append(.function(try parseFunctionDecl(annotations: annotations, isAsync: isAsync, startLoc: previous().range.start)))
@@ -152,6 +159,18 @@ public struct Parser {
         let body = try parseBlock()
         let end = body.range.end
         return FunctionDecl(annotations: annotations, isAsync: isAsync, name: name, parameters: params, returnType: returnType, body: body, range: SourceRange(start: startLoc, end: end))
+    }
+
+    private mutating func parseExternFunctionDecl(annotations: [Annotation], startLoc: SourceLocation) throws -> ExternFunctionDecl {
+        let (name, _) = try expectIdentifier("function name")
+        let (params, _) = try parseParameterList()
+        var returnType: TypeRef?
+        if match(.arrow) {
+            returnType = try parseTypeRef()
+        }
+        let end = previous().range.end
+        consumeSeparators()
+        return ExternFunctionDecl(annotations: annotations, name: name, parameters: params, returnType: returnType, range: SourceRange(start: startLoc, end: end))
     }
 
     private mutating func parseTypeDecl(annotations: [Annotation], startLoc: SourceLocation) throws -> TypeDecl {
@@ -617,6 +636,12 @@ public struct Parser {
     private mutating func parsePrimary() throws -> Expr {
         let tok = current()
         switch tok.kind {
+        case .dot:
+            let start = tok.range.start
+            _ = advance()
+            let (name, _) = try expectIdentifier("member name")
+            let end = previous().range.end
+            return .identifier(name, SourceRange(start: start, end: end))
         case .identifier(let name):
             _ = advance()
             if name == "true" { return .boolLiteral(true, tok.range) }

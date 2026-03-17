@@ -5,10 +5,58 @@ public struct IRBuilder {
 
     public func build(from typed: TypedModule) throws -> KiraIRModule {
         let fns: [KiraIRFunction] = try typed.ast.declarations.compactMap { decl in
-            guard case .function(let fn) = decl else { return nil }
-            return try buildFunction(fn: fn, symbols: typed.symbols, typeInfo: typed.typeInfo)
+            switch decl {
+            case .function(let fn):
+                return try buildFunction(fn: fn, symbols: typed.symbols, typeInfo: typed.typeInfo)
+            case .externFunction(let fn):
+                return try buildExternFunction(fn: fn, symbols: typed.symbols)
+            default:
+                return nil
+            }
         }
         return KiraIRModule(functions: fns)
+    }
+
+    private func buildExternFunction(fn: ExternFunctionDecl, symbols: SymbolTable) throws -> KiraIRFunction {
+        let fnSym = symbols.functions[fn.name]!
+        guard case .function(let params, let ret) = fnSym.type else {
+            return KiraIRFunction(name: fn.name, params: [], returnType: .void, localCount: 0, maxStackDepth: 0, instructions: [], executionMode: .auto)
+        }
+        guard let proto = symbols.ffi[fn.name] else {
+            return KiraIRFunction(name: fn.name, params: params, returnType: ret, localCount: params.count, maxStackDepth: 0, instructions: [.pushNil, .ret], executionMode: .auto)
+        }
+
+        var insts: [KiraIRInst] = []
+        insts.reserveCapacity(6 + params.count)
+
+        if let lib = proto.library {
+            insts.append(.pushString(lib))
+        } else {
+            insts.append(.pushNil)
+        }
+        insts.append(.pushString(proto.symbol))
+        insts.append(.ffiLoad)
+        for i in 0..<params.count {
+            insts.append(.loadLocal(UInt8(i)))
+        }
+        insts.append(.ffiCall(
+            argCount: UInt8(proto.argumentTypes.count),
+            returnType: proto.returnType.rawValue,
+            argumentTypes: proto.argumentTypes.map(\.rawValue)
+        ))
+        insts.append(.ret)
+
+        let maxStack = computeMaxStack(insts)
+
+        return KiraIRFunction(
+            name: fn.name,
+            params: params,
+            returnType: ret,
+            localCount: params.count,
+            maxStackDepth: maxStack,
+            instructions: insts,
+            executionMode: .auto
+        )
     }
 
     private func buildFunction(fn: FunctionDecl, symbols: SymbolTable, typeInfo: TypeInfo) throws -> KiraIRFunction {
@@ -297,6 +345,14 @@ private struct StackEmitter {
             depth -= Int(argCount) // args
             depth -= 1 // callee
             depth += 1 // return
+        case .ffiLoad:
+            // Pops: libName, symbolName; pushes native pointer.
+            depth -= 1
+        case .ffiCall(let argCount, _, _):
+            // Pops: args + pointer; pushes return.
+            depth -= Int(argCount) // args
+            depth -= 1 // pointer
+            depth += 1 // return
         case .print:
             // Pops value and pushes nothing; by convention, callers can push nil to represent Void.
             depth -= 1
@@ -308,4 +364,52 @@ private struct StackEmitter {
         }
         if depth < 0 { depth = 0 }
     }
+}
+
+private func computeMaxStack(_ insts: [KiraIRInst]) -> Int {
+    var depth = 0
+    var maxDepth = 0
+    for inst in insts {
+        switch inst {
+        case .pushInt, .pushFloat, .pushString, .pushBool, .pushNil, .loadLocal, .loadGlobalSymbol:
+            depth += 1
+        case .storeLocal, .storeGlobalSymbol:
+            depth -= 1
+        case .pop:
+            depth -= 1
+        case .dup:
+            depth += 1
+        case .swap:
+            break
+        case .addInt, .subInt, .mulInt, .divInt, .modInt,
+             .addFloat, .subFloat, .mulFloat, .divFloat,
+             .eqInt, .eqFloat, .ltInt, .ltFloat, .gtInt, .gtFloat,
+             .andBool, .orBool:
+            depth -= 1
+        case .negInt, .negFloat, .notBool, .intToFloat, .floatToInt:
+            break
+        case .jump, .jumpIfTrue, .jumpIfFalse:
+            if case .jump = inst { break }
+            depth -= 1
+        case .call(let argCount):
+            depth -= Int(argCount)
+            depth -= 1
+            depth += 1
+        case .ffiLoad:
+            depth -= 1
+        case .ffiCall(let argCount, _, _):
+            depth -= Int(argCount)
+            depth -= 1
+            depth += 1
+        case .print:
+            depth -= 1
+        case .makeColor:
+            depth -= 3
+        case .ret:
+            depth = 0
+        }
+        if depth < 0 { depth = 0 }
+        if depth > maxDepth { maxDepth = depth }
+    }
+    return maxDepth
 }

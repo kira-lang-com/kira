@@ -67,6 +67,7 @@ public struct ImportDecl: Sendable {
 
 public enum Decl: Sendable {
     case function(FunctionDecl)
+    case externFunction(ExternFunctionDecl)
     case type(TypeDecl)
     case `protocol`(ProtocolDecl)
     case `enum`(EnumDecl)
@@ -102,6 +103,22 @@ public struct FunctionDecl: Sendable {
         self.parameters = parameters
         self.returnType = returnType
         self.body = body
+        self.range = range
+    }
+}
+
+public struct ExternFunctionDecl: Sendable {
+    public var annotations: [Annotation]
+    public var name: String
+    public var parameters: [Parameter]
+    public var returnType: TypeRef?
+    public var range: SourceRange
+
+    public init(annotations: [Annotation], name: String, parameters: [Parameter], returnType: TypeRef?, range: SourceRange) {
+        self.annotations = annotations
+        self.name = name
+        self.parameters = parameters
+        self.returnType = returnType
         self.range = range
     }
 }

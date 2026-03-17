@@ -6,6 +6,10 @@ import Darwin
 import Glibc
 #endif
 
+#if canImport(Clibffi)
+import Clibffi
+#endif
+
 public enum VMError: Error, CustomStringConvertible, Sendable {
     case invalidBytecode(String)
     case invalidOpcode(UInt8)
@@ -130,6 +134,7 @@ public final class VirtualMachine: @unchecked Sendable {
     public var globals: [KiraValue]
     public var debugger: VMDebugger?
     public var output: @Sendable (String) -> Void
+    private let trace: Bool
 
     public struct NativeFunction: @unchecked Sendable {
         public var arity: Int
@@ -150,6 +155,7 @@ public final class VirtualMachine: @unchecked Sendable {
     public init(module: BytecodeModule, output: @escaping @Sendable (String) -> Void = { Swift.print($0) }) {
         self.module = module
         self.output = output
+        self.trace = ProcessInfo.processInfo.environment["KIRA_VM_TRACE"] == "1"
         self.globals = Array(repeating: .nil_, count: max(256, module.functions.count))
         // Preload function refs into globals.
         for i in 0..<module.functions.count {
@@ -170,7 +176,7 @@ public final class VirtualMachine: @unchecked Sendable {
     }
 
     public func run(fiber: VMFiber) throws -> KiraValue {
-        while true {
+        runLoop: while true {
             if case .suspended(let v) = fiber.state { return v }
             guard let frame = fiber.callStack.last else { return .nil_ }
             let fn = try function(at: frame.functionIndex)
@@ -180,17 +186,32 @@ public final class VirtualMachine: @unchecked Sendable {
                 let opcodeByte = fn.code[current.ip]
                 current.ip += 1
                 guard let opcode = Instruction(rawValue: opcodeByte) else { throw VMError.invalidOpcode(opcodeByte) }
+                if trace {
+                    output("[vm] \(fn.name) ip=\(current.ip - 1) op=0x\(String(opcodeByte, radix: 16)) stack=\(fiber.operandStack.count)")
+                }
 
                 switch opcode {
                 case .push_int:
                     let idx = try readU16(fn, &current)
-                    fiber.operandStack.push(.int(module.integers[Int(idx)]))
+                    let i = Int(idx)
+                    guard i >= 0, i < module.integers.count else {
+                        throw VMError.invalidBytecode("integer constant index out of bounds: \(i)")
+                    }
+                    fiber.operandStack.push(.int(module.integers[i]))
                 case .push_float:
                     let idx = try readU16(fn, &current)
-                    fiber.operandStack.push(.float(module.floats[Int(idx)]))
+                    let i = Int(idx)
+                    guard i >= 0, i < module.floats.count else {
+                        throw VMError.invalidBytecode("float constant index out of bounds: \(i)")
+                    }
+                    fiber.operandStack.push(.float(module.floats[i]))
                 case .push_string:
                     let idx = try readU16(fn, &current)
-                    let s = module.strings[Int(idx)]
+                    let i = Int(idx)
+                    guard i >= 0, i < module.strings.count else {
+                        throw VMError.invalidBytecode("string constant index out of bounds: \(i)")
+                    }
+                    let s = module.strings[i]
                     let ref = heap.allocate(KiraString(s))
                     fiber.operandStack.push(.reference(ref))
                 case .push_bool_true:
@@ -211,16 +232,28 @@ public final class VirtualMachine: @unchecked Sendable {
 
                 case .load_local:
                     let slot = Int(try readU8(fn, &current))
+                    guard slot >= 0, slot < current.locals.count else {
+                        throw VMError.invalidBytecode("local slot out of bounds: \(slot) (locals=\(current.locals.count))")
+                    }
                     fiber.operandStack.push(current.locals[slot])
                 case .store_local:
                     let slot = Int(try readU8(fn, &current))
+                    guard slot >= 0, slot < current.locals.count else {
+                        throw VMError.invalidBytecode("local slot out of bounds: \(slot) (locals=\(current.locals.count))")
+                    }
                     current.locals[slot] = fiber.operandStack.pop()
 
                 case .load_global:
                     let idx = Int(try readU16(fn, &current))
+                    guard idx >= 0, idx < globals.count else {
+                        throw VMError.invalidBytecode("global slot out of bounds: \(idx) (globals=\(globals.count))")
+                    }
                     fiber.operandStack.push(globals[idx])
                 case .store_global:
                     let idx = Int(try readU16(fn, &current))
+                    guard idx >= 0, idx < globals.count else {
+                        throw VMError.invalidBytecode("global slot out of bounds: \(idx) (globals=\(globals.count))")
+                    }
                     globals[idx] = fiber.operandStack.pop()
 
                 case .add_int:
@@ -367,19 +400,23 @@ public final class VirtualMachine: @unchecked Sendable {
 
                 case .call:
                     let argc = Int(try readU8(fn, &current))
+                    if fiber.operandStack.count <= argc {
+                        throw VMError.invalidBytecode("stack underflow in call (argc=\(argc))")
+                    }
                     let callee = fiber.operandStack.peek(argc)
                     try pushCallFrame(fiber: fiber, callee: callee, argCount: argc)
                     // Save updated caller frame.
                     fiber.callStack[fiber.callStack.count - 2] = current
-                    // Switch to callee frame.
-                    current = fiber.currentFrame
-                    continue
+                    // Start executing the callee frame (reload `fn` from the new top of stack).
+                    continue runLoop
                 case .tail_call:
                     let argc = Int(try readU8(fn, &current))
+                    if fiber.operandStack.count <= argc {
+                        throw VMError.invalidBytecode("stack underflow in tail_call (argc=\(argc))")
+                    }
                     let callee = fiber.operandStack.peek(argc)
                     try tailCall(fiber: fiber, callee: callee, argCount: argc)
-                    current = fiber.currentFrame
-                    continue
+                    continue runLoop
                 case .call_native:
                     let idx = Int(try readU16(fn, &current))
                     guard idx < nativeFunctions.count else { throw VMError.invalidBytecode("native index out of range") }
@@ -402,8 +439,7 @@ public final class VirtualMachine: @unchecked Sendable {
                     let callerBase = fiber.currentFrame.baseStackCount
                     fiber.operandStack.truncate(to: callerBase)
                     fiber.operandStack.push(result)
-                    current = fiber.currentFrame
-                    continue
+                    continue runLoop
 
                 case .new_object:
                     _ = try readU16(fn, &current)
@@ -498,6 +534,9 @@ public final class VirtualMachine: @unchecked Sendable {
                     captures.reserveCapacity(captureCount)
                     for _ in 0..<captureCount {
                         let slot = Int(try readU8(fn, &current))
+                        guard slot >= 0, slot < current.locals.count else {
+                            throw VMError.invalidBytecode("closure capture slot out of bounds: \(slot) (locals=\(current.locals.count))")
+                        }
                         captures.append(current.locals[slot])
                     }
                     let ref = heap.allocate(KiraClosure(functionIndex: fidx, captures: captures))
@@ -535,7 +574,239 @@ public final class VirtualMachine: @unchecked Sendable {
                     throw VMError.invalidBytecode("ffi_load unsupported on this platform")
                     #endif
                 case .ffi_call:
-                    throw VMError.invalidBytecode("ffi_call not implemented in scaffold")
+                    #if canImport(Clibffi)
+                    let argc = Int(try readU8(fn, &current))
+                    let retTag = try readU8(fn, &current)
+                    var argTags: [UInt8] = []
+                    argTags.reserveCapacity(argc)
+                    for _ in 0..<argc { argTags.append(try readU8(fn, &current)) }
+
+                    // Pop arguments (in call order) and then the function pointer.
+                    var args: [KiraValue] = []
+                    args.reserveCapacity(argc)
+                    for _ in 0..<argc { args.append(fiber.operandStack.pop()) }
+                    args.reverse()
+
+                    let fnPtrVal = fiber.operandStack.pop()
+                    let fnPtr: UnsafeMutableRawPointer?
+                    switch fnPtrVal {
+                    case .nativePointer(let p):
+                        fnPtr = p
+                    case .nil_:
+                        fnPtr = nil
+                    default:
+                        throw VMError.typeError(expected: "Pointer", got: fnPtrVal)
+                    }
+                    guard let fnPtr else { throw VMError.invalidBytecode("ffi_call null function pointer") }
+
+                    func ffiType(for tag: UInt8) -> UnsafeMutablePointer<ffi_type> {
+                        switch tag {
+                        case 0: return UnsafeMutablePointer(mutating: &ffi_type_void)
+                        case 1: return UnsafeMutablePointer(mutating: &ffi_type_sint8)
+                        case 2: return UnsafeMutablePointer(mutating: &ffi_type_sint16)
+                        case 3: return UnsafeMutablePointer(mutating: &ffi_type_sint32)
+                        case 4: return UnsafeMutablePointer(mutating: &ffi_type_sint64)
+                        case 5: return UnsafeMutablePointer(mutating: &ffi_type_uint8)
+                        case 6: return UnsafeMutablePointer(mutating: &ffi_type_uint16)
+                        case 7: return UnsafeMutablePointer(mutating: &ffi_type_uint32)
+                        case 8: return UnsafeMutablePointer(mutating: &ffi_type_uint64)
+                        case 9: return UnsafeMutablePointer(mutating: &ffi_type_float)
+                        case 10: return UnsafeMutablePointer(mutating: &ffi_type_double)
+                        case 11, 12: return UnsafeMutablePointer(mutating: &ffi_type_pointer)
+                        default: return UnsafeMutablePointer(mutating: &ffi_type_pointer)
+                        }
+                    }
+
+                    var argTypes: [UnsafeMutablePointer<ffi_type>?] = argTags.map { ffiType(for: $0) }
+                    var cif = ffi_cif()
+                    let status: ffi_status = argTypes.withUnsafeMutableBufferPointer { argTypeBuf in
+                        let retTypePtr = ffiType(for: retTag)
+                        return ffi_prep_cif(
+                            &cif,
+                            FFI_DEFAULT_ABI,
+                            UInt32(argc),
+                            retTypePtr,
+                            argTypeBuf.baseAddress
+                        )
+                    }
+                    guard status == FFI_OK else { throw VMError.invalidBytecode("ffi_cif preparation failed") }
+
+                    func box<T>(_ value: T) -> UnsafeMutableRawPointer {
+                        let ptr = UnsafeMutablePointer<T>.allocate(capacity: 1)
+                        ptr.initialize(to: value)
+                        return UnsafeMutableRawPointer(ptr)
+                    }
+
+                    var boxedArgs: [UnsafeMutableRawPointer?] = []
+                    boxedArgs.reserveCapacity(argc)
+                    var deallocators: [() -> Void] = []
+                    deallocators.reserveCapacity(argc)
+
+                    for i in 0..<argc {
+                        let tag = argTags[i]
+                        let v = args[i]
+
+                        switch tag {
+                        case 1: // int8
+                            let iv = Int8(truncatingIfNeeded: try v.asInt())
+                            let ptr = box(iv).assumingMemoryBound(to: Int8.self)
+                            boxedArgs.append(UnsafeMutableRawPointer(ptr))
+                            deallocators.append { ptr.deinitialize(count: 1); ptr.deallocate() }
+                        case 2:
+                            let iv = Int16(truncatingIfNeeded: try v.asInt())
+                            let ptr = box(iv).assumingMemoryBound(to: Int16.self)
+                            boxedArgs.append(UnsafeMutableRawPointer(ptr))
+                            deallocators.append { ptr.deinitialize(count: 1); ptr.deallocate() }
+                        case 3:
+                            let iv = Int32(truncatingIfNeeded: try v.asInt())
+                            let ptr = box(iv).assumingMemoryBound(to: Int32.self)
+                            boxedArgs.append(UnsafeMutableRawPointer(ptr))
+                            deallocators.append { ptr.deinitialize(count: 1); ptr.deallocate() }
+                        case 4:
+                            let iv = Int64(try v.asInt())
+                            let ptr = box(iv).assumingMemoryBound(to: Int64.self)
+                            boxedArgs.append(UnsafeMutableRawPointer(ptr))
+                            deallocators.append { ptr.deinitialize(count: 1); ptr.deallocate() }
+                        case 5:
+                            let iv = UInt8(truncatingIfNeeded: try v.asInt())
+                            let ptr = box(iv).assumingMemoryBound(to: UInt8.self)
+                            boxedArgs.append(UnsafeMutableRawPointer(ptr))
+                            deallocators.append { ptr.deinitialize(count: 1); ptr.deallocate() }
+                        case 6:
+                            let iv = UInt16(truncatingIfNeeded: try v.asInt())
+                            let ptr = box(iv).assumingMemoryBound(to: UInt16.self)
+                            boxedArgs.append(UnsafeMutableRawPointer(ptr))
+                            deallocators.append { ptr.deinitialize(count: 1); ptr.deallocate() }
+                        case 7:
+                            let iv = UInt32(truncatingIfNeeded: try v.asInt())
+                            let ptr = box(iv).assumingMemoryBound(to: UInt32.self)
+                            boxedArgs.append(UnsafeMutableRawPointer(ptr))
+                            deallocators.append { ptr.deinitialize(count: 1); ptr.deallocate() }
+                        case 8:
+                            let iv = UInt64(bitPattern: try v.asInt())
+                            let ptr = box(iv).assumingMemoryBound(to: UInt64.self)
+                            boxedArgs.append(UnsafeMutableRawPointer(ptr))
+                            deallocators.append { ptr.deinitialize(count: 1); ptr.deallocate() }
+                        case 9:
+                            let fv = try v.asFloat32()
+                            let ptr = box(fv).assumingMemoryBound(to: Float.self)
+                            boxedArgs.append(UnsafeMutableRawPointer(ptr))
+                            deallocators.append { ptr.deinitialize(count: 1); ptr.deallocate() }
+                        case 10:
+                            let fv = try v.asFloat64()
+                            let ptr = box(fv).assumingMemoryBound(to: Double.self)
+                            boxedArgs.append(UnsafeMutableRawPointer(ptr))
+                            deallocators.append { ptr.deinitialize(count: 1); ptr.deallocate() }
+                        case 12: // cstring
+                            switch v {
+                            case .reference(let r):
+                                let o = try heap.get(r)
+                                guard let s = o as? KiraString else { throw VMError.typeError(expected: "String", got: v) }
+                                let cstr = strdup(s.value)
+                                let ptr = box(cstr).assumingMemoryBound(to: UnsafeMutablePointer<CChar>?.self)
+                                boxedArgs.append(UnsafeMutableRawPointer(ptr))
+                                deallocators.append {
+                                    let p = ptr.pointee
+                                    if let p { free(p) }
+                                    ptr.deinitialize(count: 1)
+                                    ptr.deallocate()
+                                }
+                            case .nil_:
+                                let ptr = box(UnsafeMutablePointer<CChar>(nil)).assumingMemoryBound(to: UnsafeMutablePointer<CChar>?.self)
+                                boxedArgs.append(UnsafeMutableRawPointer(ptr))
+                                deallocators.append { ptr.deinitialize(count: 1); ptr.deallocate() }
+                            default:
+                                throw VMError.typeError(expected: "String|nil", got: v)
+                            }
+                        default: // pointer / unknown
+                            let p: UnsafeMutableRawPointer?
+                            switch v {
+                            case .nativePointer(let np): p = np
+                            case .nil_: p = nil
+                            default: throw VMError.typeError(expected: "Pointer|nil", got: v)
+                            }
+                            let ptr = box(p).assumingMemoryBound(to: UnsafeMutableRawPointer?.self)
+                            boxedArgs.append(UnsafeMutableRawPointer(ptr))
+                            deallocators.append { ptr.deinitialize(count: 1); ptr.deallocate() }
+                        }
+                    }
+
+                    defer { for d in deallocators.reversed() { d() } }
+
+                    let retPtr: UnsafeMutableRawPointer
+                    let retDeallocator: () -> Void
+                    switch retTag {
+                    case 0:
+                        let ptr = UnsafeMutableRawPointer.allocate(byteCount: 8, alignment: 8)
+                        retPtr = ptr
+                        retDeallocator = { ptr.deallocate() }
+                    case 9:
+                        let ptr = UnsafeMutablePointer<Float>.allocate(capacity: 1)
+                        ptr.initialize(to: 0)
+                        retPtr = UnsafeMutableRawPointer(ptr)
+                        retDeallocator = { ptr.deinitialize(count: 1); ptr.deallocate() }
+                    case 10:
+                        let ptr = UnsafeMutablePointer<Double>.allocate(capacity: 1)
+                        ptr.initialize(to: 0)
+                        retPtr = UnsafeMutableRawPointer(ptr)
+                        retDeallocator = { ptr.deinitialize(count: 1); ptr.deallocate() }
+                    case 11, 12:
+                        let ptr = UnsafeMutablePointer<UnsafeMutableRawPointer?>.allocate(capacity: 1)
+                        ptr.initialize(to: nil)
+                        retPtr = UnsafeMutableRawPointer(ptr)
+                        retDeallocator = { ptr.deinitialize(count: 1); ptr.deallocate() }
+                    default:
+                        let ptr = UnsafeMutablePointer<Int64>.allocate(capacity: 1)
+                        ptr.initialize(to: 0)
+                        retPtr = UnsafeMutableRawPointer(ptr)
+                        retDeallocator = { ptr.deinitialize(count: 1); ptr.deallocate() }
+                    }
+                    defer { retDeallocator() }
+
+                    boxedArgs.withUnsafeMutableBufferPointer { argBuf in
+                        ffi_call(
+                            &cif,
+                            unsafeBitCast(fnPtr, to: (@convention(c) () -> Void).self),
+                            retPtr,
+                            argBuf.baseAddress
+                        )
+                    }
+
+                    let retVal: KiraValue
+                    switch retTag {
+                    case 0:
+                        retVal = .nil_
+                    case 1:
+                        retVal = .int(Int64(Int8(retPtr.load(as: Int64.self))))
+                    case 2:
+                        retVal = .int(Int64(Int16(retPtr.load(as: Int64.self))))
+                    case 3:
+                        retVal = .int(Int64(Int32(retPtr.load(as: Int64.self))))
+                    case 4:
+                        retVal = .int(retPtr.load(as: Int64.self))
+                    case 5:
+                        retVal = .int(Int64(UInt8(truncatingIfNeeded: UInt64(bitPattern: retPtr.load(as: Int64.self)))))
+                    case 6:
+                        retVal = .int(Int64(UInt16(truncatingIfNeeded: UInt64(bitPattern: retPtr.load(as: Int64.self)))))
+                    case 7:
+                        retVal = .int(Int64(UInt32(truncatingIfNeeded: UInt64(bitPattern: retPtr.load(as: Int64.self)))))
+                    case 8:
+                        retVal = .int(Int64(bitPattern: UInt64(bitPattern: retPtr.load(as: Int64.self))))
+                    case 9:
+                        retVal = .float(Double(retPtr.load(as: Float.self)))
+                    case 10:
+                        retVal = .float(retPtr.load(as: Double.self))
+                    case 11, 12:
+                        let p = retPtr.load(as: UnsafeMutableRawPointer?.self)
+                        if let p { retVal = .nativePointer(p) } else { retVal = .nil_ }
+                    default:
+                        retVal = .nil_
+                    }
+
+                    fiber.operandStack.push(retVal)
+                    #else
+                    throw VMError.invalidBytecode("ffi_call unsupported on this platform")
+                    #endif
 
                 case .fiber_new:
                     let fidx = Int(try readU16(fn, &current))
@@ -696,6 +967,24 @@ public final class VirtualMachine: @unchecked Sendable {
             }
             return "<\(obj.type.name) \(r.id)>"
         }
+    }
+}
+
+private extension KiraValue {
+    func asInt() throws -> Int64 {
+        if case .int(let i) = self { return i }
+        if case .bool(let b) = self { return b ? 1 : 0 }
+        throw VMError.typeError(expected: "Int", got: self)
+    }
+
+    func asFloat64() throws -> Double {
+        if case .float(let f) = self { return f }
+        if case .int(let i) = self { return Double(i) }
+        throw VMError.typeError(expected: "Float", got: self)
+    }
+
+    func asFloat32() throws -> Float {
+        Float(try asFloat64())
     }
 }
 

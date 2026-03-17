@@ -36,6 +36,17 @@ func makeTargets() -> [Target] {
     ))
     compilerDeps.append("Clibffi")
     vmDeps.append("Clibffi")
+
+    targets.append(.systemLibrary(
+        name: "Clibclang",
+        path: "Sources/Clibclang",
+        pkgConfig: "libclang",
+        providers: [
+            .brew(["llvm"]),
+            .apt(["libclang-dev"])
+        ]
+    ))
+    compilerDeps.append("Clibclang")
     #endif
 
     targets.append(contentsOf: [
