@@ -124,6 +124,12 @@ public struct BytecodeEmitter: Sendable {
                     append(.jump_if_false, [UInt8(u >> 8), UInt8(u & 0xff)], irIndex: i)
                 case .call(let argCount):
                     append(.call, [argCount], irIndex: i)
+                case .ffiLoad:
+                    append(.ffi_load, [], irIndex: i)
+                case .ffiCall(let argCount, let returnType, let argumentTypes):
+                    var bytes: [UInt8] = [argCount, returnType]
+                    bytes.append(contentsOf: argumentTypes)
+                    append(.ffi_call, bytes, irIndex: i)
                 case .print:
                     append(.print, [], irIndex: i)
                 case .makeColor:

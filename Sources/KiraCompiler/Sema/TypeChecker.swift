@@ -56,7 +56,27 @@ public struct TypeChecker: Sendable {
                 if target.isWasm, mode == .runtime {
                     throw SemanticError.runtimeNotSupportedOnWasm(fn.range.start)
                 }
-                try symbols.addFunction(.init(name: fn.name, type: .function(params: params, returns: ret), executionMode: mode, range: fn.range))
+                try symbols.addFunction(.init(
+                    name: fn.name,
+                    type: .function(params: params, returns: ret),
+                    executionMode: mode,
+                    isExtern: false,
+                    range: fn.range
+                ))
+            } else if case .externFunction(let fn) = decl {
+                let params = fn.parameters.map { typeSystem.resolve($0.type) }
+                let ret = fn.returnType.map(typeSystem.resolve) ?? .void
+
+                let proto = try parseFFIPrototype(for: fn)
+                symbols.addFFIPrototype(functionName: fn.name, proto: proto)
+
+                try symbols.addFunction(.init(
+                    name: fn.name,
+                    type: .function(params: params, returns: ret),
+                    executionMode: .auto,
+                    isExtern: true,
+                    range: fn.range
+                ))
             }
         }
 
@@ -102,6 +122,111 @@ public struct TypeChecker: Sendable {
         if annotations.contains(where: { $0.name == "Native" }) { return .native }
         if annotations.contains(where: { $0.name == "Runtime" }) { return .runtime }
         return .auto
+    }
+
+    private func parseFFIPrototype(for fn: ExternFunctionDecl) throws -> FFIPrototype {
+        guard let ffiAnn = fn.annotations.first(where: { $0.name == "ffi" }) else {
+            return FFIPrototype(
+                library: nil,
+                symbol: fn.name,
+                linkage: .dynamic,
+                returnType: mapFFIType(fn.returnType),
+                argumentTypes: fn.parameters.map { mapFFIType($0.type) }
+            )
+        }
+
+        var lib: String?
+        var linkage: FFILinkage = .dynamic
+        for a in ffiAnn.arguments {
+            guard let label = a.label else { continue }
+            switch label {
+            case "lib":
+                if case .stringLiteral(let s, _) = a.value {
+                    lib = s.isEmpty ? nil : s
+                }
+            case "linkage":
+                if case .identifier(let s, _) = a.value {
+                    if s == "static" { linkage = .static }
+                    else if s == "dynamic" { linkage = .dynamic }
+                }
+            default:
+                break
+            }
+        }
+
+        return FFIPrototype(
+            library: lib,
+            symbol: fn.name,
+            linkage: linkage,
+            returnType: mapFFIType(fn.returnType),
+            argumentTypes: fn.parameters.map { mapFFIType($0.type) }
+        )
+    }
+
+    private func mapFFIType(_ ref: TypeRef?) -> FFIPrototype.TypeTag {
+        guard let ref else { return .void }
+        return mapFFIType(ref)
+    }
+
+    private func mapFFIType(_ ref: TypeRef) -> FFIPrototype.TypeTag {
+        switch ref.kind {
+        case .named(let n):
+            switch n {
+            case "Void", "CVoid": return .void
+            case "Bool", "CBool": return .uint8
+            case "Int": return .int64
+            case "CInt8": return .int8
+            case "CInt16": return .int16
+            case "CInt32": return .int32
+            case "CInt64": return .int64
+            case "CUInt8": return .uint8
+            case "CUInt16": return .uint16
+            case "CUInt32": return .uint32
+            case "CUInt64": return .uint64
+            case "CFloat": return .float32
+            case "Float": return .float64
+            case "CDouble", "Double": return .float64
+            default: return .pointer
+            }
+        case .applied(let base, let args):
+            if base == "CPointer", let first = args.first {
+                if case .named(let n) = first.kind, n == "CInt8" { return .cstring }
+                return .pointer
+            }
+            return .pointer
+        case .optional(let inner):
+            return mapFFIType(inner)
+        default:
+            return .pointer
+        }
+    }
+
+    private func isFFIConvertible(got: KiraType, expected: KiraType) -> Bool {
+        // String -> CPointer<CInt8>
+        if expected == .pointer(.named("CInt8")), got == .string { return true }
+
+        // Int -> C integer types
+        if got == .int {
+            switch expected {
+            case .named("CInt8"), .named("CInt16"), .named("CInt32"), .named("CInt64"),
+                 .named("CUInt8"), .named("CUInt16"), .named("CUInt32"), .named("CUInt64"):
+                return true
+            default:
+                break
+            }
+        }
+
+        // Bool -> CBool
+        if got == .bool, expected == .named("CBool") { return true }
+
+        // Float/Double -> C float types
+        if got == .float, expected == .named("CFloat") { return true }
+        if got == .double, expected == .named("CDouble") { return true }
+
+        // nil -> pointer
+        if case .optional = got, case .pointer = expected { return true }
+
+        return false
     }
 
     private func typeCheckBlock(_ block: BlockStmt, scope: LocalScope, symbols: SymbolTable, expectedReturn: KiraType, typeInfo: inout TypeInfo) throws -> KiraType {
@@ -245,6 +370,12 @@ public struct TypeChecker: Sendable {
 
             let calleeType = try typeCheckExpr(c.callee, scope: scope, symbols: symbols, expected: nil, typeInfo: &typeInfo)
             guard case .function(let params, let returns) = calleeType else { throw SemanticError.notCallable(c.range.start) }
+            let isExternCallee: Bool = {
+                if case .identifier(let name, _) = c.callee {
+                    return symbols.functions[name]?.isExtern == true
+                }
+                return false
+            }()
             if c.arguments.count != params.count {
                 throw SemanticError.typeMismatch(expected: .function(params: params, returns: returns), got: calleeType, c.range.start, hint: "argument count mismatch")
             }
@@ -262,7 +393,7 @@ public struct TypeChecker: Sendable {
                         hint: "use 12.0 or declare the target type explicitly"
                     )
                 }
-                if got != expectedType {
+                if got != expectedType, !(isExternCallee && isFFIConvertible(got: got, expected: expectedType)) {
                     throw SemanticError.typeMismatch(expected: expectedType, got: got, arg.range.start, hint: coercionHint(expected: expectedType, expr: arg.value))
                 }
             }

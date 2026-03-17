@@ -45,6 +45,8 @@ public struct DocExtractor: Sendable {
                 symbols.append(DocSymbol(kind: .protocol, moduleName: moduleName, name: p.name, doc: docString(from: p.annotations), properties: []))
             case .function(let f):
                 symbols.append(DocSymbol(kind: .function, moduleName: moduleName, name: f.name, doc: docString(from: f.annotations), properties: []))
+            case .externFunction(let f):
+                symbols.append(DocSymbol(kind: .function, moduleName: moduleName, name: f.name, doc: docString(from: f.annotations), properties: []))
             case .constructInstance(let ci):
                 let fields = ci.members.compactMap { m -> TypeDecl.Field? in
                     if case .field(let f) = m.kind { return f }

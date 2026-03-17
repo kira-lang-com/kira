@@ -1,5 +1,25 @@
 import Kira.Graphics
 import Kira.Fondation
+// FFI example (macOS):
+// - Bindgen input: HelloKira/FFI/hello_ffi.h
+// - Bindgen output: HelloKira/FFI/hello_ffi.kira
+// Note: `kira run` currently compiles only `Sources/main.kira`, so we keep the
+// demo self-contained here (no importing the generated bindings yet).
+
+// libc puts (resolved via dlsym on the main image with @ffi(lib: "")).
+@ffi(lib: "")
+extern function puts(s: CPointer<CInt8>) -> CInt32
+
+// Functions declared in `HelloKira/FFI/hello_ffi.h` and implemented in
+// `HelloKira/FFI/hello_ffi.c` (built as `HelloKira/FFI/libhello_ffi.dylib`).
+@ffi(lib: "FFI/libhello_ffi.dylib")
+extern function hk_add(a: CInt32, b: CInt32) -> CInt32
+
+@ffi(lib: "FFI/libhello_ffi.dylib")
+extern function hk_mul(a: CFloat, b: CFloat) -> CFloat
+
+@ffi(lib: "FFI/libhello_ffi.dylib")
+extern function hk_square(x: CFloat) -> CFloat
 
 @Doc("The main function")
 @Main
@@ -9,15 +29,31 @@ function main() {
     let z = x + y
     
     print("hi !")
+    
     var xy = 12.0
-    
     print(xy)
-    xy = 13.0
     
+    xy = 13.0
     print(xy)
     
     let Color = Color(r: 1.0, g: 0.0, b: 0.0, a: 1.0)
     print(Color)
+
+    print("hk_add(2, 3) =")
+    let sum = hk_add(2, 3)
+    print(sum)
+
+    print("hk_mul(2.5, 4.0) =")
+    let mul = hk_mul(2.5, 4.0)
+    print(mul)
+
+    print("hk_square(5.0) =")
+    let sq = hk_square(5.0)
+    print(sq)
+
+    // C stdlib call
+    puts("Hello from C (puts)!")
+    
     return
 }
 
