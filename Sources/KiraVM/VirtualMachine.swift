@@ -675,8 +675,16 @@ public final class VirtualMachine: @unchecked Sendable {
                     }
                     #if canImport(Darwin)
                     let handle = dlopen(libName.isEmpty ? nil : libName, RTLD_NOW)
-                    guard let handle else { throw VMError.invalidBytecode("dlopen failed") }
-                    guard let ptr = dlsym(handle, symStr.value) else { throw VMError.invalidBytecode("dlsym failed") }
+                    guard let handle else {
+                        let errPtr = dlerror()
+                        let err = errPtr.map { String(cString: $0) } ?? "unknown error"
+                        throw VMError.invalidBytecode("dlopen failed for '\(libName)': \(err)")
+                    }
+                    guard let ptr = dlsym(handle, symStr.value) else {
+                        let errPtr = dlerror()
+                        let err = errPtr.map { String(cString: $0) } ?? "unknown error"
+                        throw VMError.invalidBytecode("dlsym failed for '\(symStr.value)' in '\(libName)': \(err)")
+                    }
                     fiber.operandStack.push(.nativePointer(UnsafeMutableRawPointer(mutating: ptr)))
                     #else
                     throw VMError.invalidBytecode("ffi_load unsupported on this platform")
