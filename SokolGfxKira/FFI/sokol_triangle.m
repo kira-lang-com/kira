@@ -16,7 +16,7 @@ static struct {
     int frame_count;
     int quit_after_frames;
     void (*kira_init_cb)(void);
-    void (*kira_frame_cb)(void);
+    void (*kira_frame_cb)(int frame_index);
     void (*kira_cleanup_cb)(void);
 } state;
 
@@ -118,7 +118,7 @@ static void init(void) {
 
 static void frame(void) {
     if (state.kira_frame_cb) {
-        state.kira_frame_cb();
+        state.kira_frame_cb(state.frame_count);
     }
     sg_begin_pass(&(sg_pass){
         .action = state.pass_action,
@@ -164,7 +164,7 @@ void sokol_triangle_run(float clear_r, float clear_g, float clear_b, float clear
     });
 }
 
-void sokol_triangle_run_callbacks(void (*init_cb)(void), void (*frame_cb)(void), void (*cleanup_cb)(void), float clear_r, float clear_g, float clear_b, float clear_a, int quit_after_frames) {
+void sokol_triangle_run_callbacks(void (*init_cb)(void), void (*frame_cb)(int), void (*cleanup_cb)(void), float clear_r, float clear_g, float clear_b, float clear_a, int quit_after_frames) {
     state.frame_count = 0;
     state.quit_after_frames = quit_after_frames;
     state.kira_init_cb = init_cb;

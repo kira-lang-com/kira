@@ -22,19 +22,15 @@ extern function sokol_triangle_run(clear_r: CFloat, clear_g: CFloat, clear_b: CF
 extern function sokol_triangle_run_callbacks(init_cb: CPointer<CVoid>, frame_cb: CPointer<CVoid>, cleanup_cb: CPointer<CVoid>, clear_r: CFloat, clear_g: CFloat, clear_b: CFloat, clear_a: CFloat, quit_after_frames: CInt32) -> CVoid
 
 @ffi(lib: "FFI/libsokol_triangle.dylib")
-extern function sokol_triangle_frame_index() -> Int
-
-@ffi(lib: "FFI/libsokol_triangle.dylib")
 extern function sokol_triangle_set_clear_rgba(r: CFloat, g: CFloat, b: CFloat, a: CFloat) -> CVoid
 
 function on_init() {
     print("on_init()")
 }
 
-function on_frame() {
+function on_frame(frame_index: Int) {
     // Toggle clear color every ~60 frames.
-    let i = sokol_triangle_frame_index()
-    let m = i % 120
+    let m = frame_index % 120
     if m < 60 {
         sokol_triangle_set_clear_rgba(r: 0.2, g: 0.2, b: 0.4, a: 1.0)
     } else {
@@ -51,7 +47,7 @@ function main() {
     print("Launching Sokol triangle…")
     // Set `quit_after_frames` to 0 to keep the window open.
     let init_cb = ffi_callback0("on_init")
-    let frame_cb = ffi_callback0("on_frame")
+    let frame_cb = ffi_callback1_i32("on_frame")
     let cleanup_cb = ffi_callback0("on_cleanup")
     sokol_triangle_run_callbacks(init_cb: init_cb, frame_cb: frame_cb, cleanup_cb: cleanup_cb, clear_r: 0.1, clear_g: 0.1, clear_b: 0.1, clear_a: 1.0, quit_after_frames: 180)
 }
