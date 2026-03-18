@@ -4,6 +4,8 @@ import Foundation
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#elseif canImport(WinSDK)
+import WinSDK
 #endif
 
 #if canImport(Clibffi)
@@ -765,12 +767,56 @@ public final class VirtualMachine: @unchecked Sendable {
                     default:
                         throw VMError.typeError(expected: "String|nil", got: libVal)
                     }
-                    #if canImport(Darwin)
-                    let handle = dlopen(libName.isEmpty ? nil : libName, RTLD_NOW)
+                    #if os(Windows)
+                    let handles = loadWindowsHandles(for: libName)
+                    guard !handles.isEmpty else {
+                        let code = GetLastError()
+                        throw VMError.invalidBytecode("LoadLibrary failed for '\(libName)': \(code)")
+                    }
+                    var resolved: UnsafeMutableRawPointer?
+                    for h in handles {
+                        let sym = symStr.value.withCString { GetProcAddress(h, $0) }
+                        if let sym {
+                            resolved = unsafeBitCast(sym, to: UnsafeMutableRawPointer.self)
+                            break
+                        }
+                    }
+                    guard let ptr = resolved else {
+                        let code = GetLastError()
+                        throw VMError.invalidBytecode("GetProcAddress failed for '\(symStr.value)' in '\(libName)': \(code)")
+                    }
+                    fiber.operandStack.push(.nativePointer(ptr))
+                    #elseif canImport(Darwin) || canImport(Glibc)
+                    func hasExtension(_ path: String) -> Bool {
+                        let last = (path as NSString).lastPathComponent
+                        return last.contains(".")
+                    }
+
+                    var attempted: [String] = []
+                    var handle: UnsafeMutableRawPointer?
+                    let requested = libName.isEmpty ? nil : libName
+                    handle = dlopen(requested, RTLD_NOW)
+
+                    if handle == nil, !libName.isEmpty, !hasExtension(libName) {
+                        #if canImport(Darwin)
+                        let candidates = [libName + ".dylib"]
+                        #else
+                        let candidates = [libName + ".so"]
+                        #endif
+                        for candidate in candidates {
+                            attempted.append(candidate)
+                            if let h = dlopen(candidate, RTLD_NOW) {
+                                handle = h
+                                break
+                            }
+                        }
+                    }
+
                     guard let handle else {
                         let errPtr = dlerror()
                         let err = errPtr.map { String(cString: $0) } ?? "unknown error"
-                        throw VMError.invalidBytecode("dlopen failed for '\(libName)': \(err)")
+                        let attemptNote = attempted.isEmpty ? "" : " (tried: \(attempted.joined(separator: ", ")))"
+                        throw VMError.invalidBytecode("dlopen failed for '\(libName)': \(err)\(attemptNote)")
                     }
                     guard let ptr = dlsym(handle, symStr.value) else {
                         let errPtr = dlerror()
@@ -839,7 +885,7 @@ public final class VirtualMachine: @unchecked Sendable {
                     ffiCallback0s.append(.init(closurePtr: closurePtr, codePtr: codePtr, userData: userData, cifPtr: cifPtr))
                     fiber.operandStack.push(.nativePointer(codePtr))
                     #else
-                    throw VMError.invalidBytecode("ffi_callback0 unsupported on this platform")
+                    throw VMError.invalidBytecode("ffi_callback0 requires libffi; rebuild with libffi support (on Windows set KIRA_WINDOWS_LIBFFI=1 and provide libffi on PATH/LIB)")
                     #endif
                 case .ffi_callback1_i32:
                     #if canImport(Clibffi)
@@ -909,7 +955,7 @@ public final class VirtualMachine: @unchecked Sendable {
                     ffiCallback1I32s.append(.init(closurePtr: closurePtr, codePtr: codePtr, userData: userData, cifPtr: cifPtr, argTypesPtr: argTypesPtr))
                     fiber.operandStack.push(.nativePointer(codePtr))
                     #else
-                    throw VMError.invalidBytecode("ffi_callback1_i32 unsupported on this platform")
+                    throw VMError.invalidBytecode("ffi_callback1_i32 requires libffi; rebuild with libffi support (on Windows set KIRA_WINDOWS_LIBFFI=1 and provide libffi on PATH/LIB)")
                     #endif
                 case .ffi_call:
                     #if canImport(Clibffi)
@@ -1433,7 +1479,7 @@ public final class VirtualMachine: @unchecked Sendable {
 
                     fiber.operandStack.push(retVal)
                     #else
-                    throw VMError.invalidBytecode("ffi_call unsupported on this platform")
+                    throw VMError.invalidBytecode("ffi_call requires libffi; rebuild with libffi support (on Windows set KIRA_WINDOWS_LIBFFI=1 and provide libffi on PATH/LIB)")
                     #endif
 
                 case .fiber_new:
@@ -1635,3 +1681,31 @@ private extension VMFiber {
         return tmp
     }
 }
+
+#if os(Windows)
+private func loadWindowsHandles(for libName: String) -> [HMODULE] {
+    var handles: [HMODULE] = []
+    let candidates: [String]
+    if libName.isEmpty {
+        candidates = ["ucrtbase.dll", "msvcrt.dll"]
+    } else {
+        candidates = [libName]
+    }
+
+    for name in candidates {
+        let handle = name.withCString { LoadLibraryA($0) }
+        if let handle {
+            handles.append(handle)
+        }
+    }
+
+    if handles.isEmpty {
+        let main = GetModuleHandleA(nil)
+        if let main {
+            handles.append(main)
+        }
+    }
+
+    return handles
+}
+#endif

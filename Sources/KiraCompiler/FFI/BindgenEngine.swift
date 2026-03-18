@@ -155,7 +155,7 @@ public struct BindgenEngine: Sendable {
         _ = headerPath
         _ = libraryName
         _ = platform
-        return "// error: libclang is not available. Install llvm: brew install llvm"
+        return "// error: libclang is not available. \(Self.libclangInstallHint())"
     }
     #endif
 
@@ -169,6 +169,18 @@ public struct BindgenEngine: Sendable {
             return "// error: failed to create temporary header for bindgen"
         }
         return generate(headerPath: tmpURL.path, libraryName: libraryName, platform: .current)
+    }
+
+    private static func libclangInstallHint() -> String {
+        #if os(macOS)
+        return "Install LLVM: brew install llvm"
+        #elseif os(Linux)
+        return "Install libclang development headers, for example: sudo apt-get install libclang-dev"
+        #elseif os(Windows)
+        return "Install LLVM and make libclang available to SwiftPM on PATH."
+        #else
+        return "Install LLVM/libclang for your platform."
+        #endif
     }
 }
 

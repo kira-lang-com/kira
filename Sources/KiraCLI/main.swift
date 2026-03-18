@@ -11,7 +11,10 @@ enum KiraCLI {
     }
 
     static func dispatch(args: [String]) throws {
-        let command = args.first ?? "version"
+        guard let command = args.first else {
+            print(interface())
+            return
+        }
         let rest = Array(args.dropFirst())
 
         switch command {
@@ -33,29 +36,47 @@ enum KiraCLI {
             try PackageCommand.run(args: rest)
         case "lsp":
             try LSPCommand.run(args: rest)
+        case "install":
+            try InstallCommand.run(args: rest)
         case "help", "-h", "--help":
-            print(usage())
+            print(interface())
         default:
             throw CLIError.unknownCommand(command)
         }
     }
 
-    static func usage() -> String {
+    static func interface() -> String {
         """
-        kira <command> [args]
+        OVERVIEW: Kira command-line tools for projects, builds, docs, packages, and language tooling.
 
-        Commands:
-          new <name>
+        USAGE: kira <command> [arguments]
+
+        PROJECT COMMANDS:
+          new <name>                                         Create a new Kira project.
           build [--target ios|android|macos|linux|windows|wasm] [--release]
-          run
-          watch
-          bindgen <header.h> --lib <name> --out <file.kira>
+                                                             Compile the current project.
+          run                                                Compile and run the current project in the VM.
+          watch                                              Rebuild on source changes.
           doc [--all|--only-documented] --out <dir> [--force] [--clean]
-          package add <name> <version>
-          package remove <name>
-          package update
-          lsp
-          version
+                                                             Generate API docs.
+          package add <name> <version>                       Add a package dependency.
+          package remove <name>                              Remove a package dependency.
+          package update                                     Rewrite the package manifest.
+
+        TOOLCHAIN COMMANDS:
+          install                                            Install the release toolchain to ~/.kira/toolchain/\(KiraCLIInfo.version).
+          install --dev                                      Install the current local debug toolchain and refresh ~/.kira/toolchain/current.
+          lsp                                                Launch the Kira language server.
+          bindgen <header.h> --lib <name> --out <file.kira> Generate Kira FFI bindings from a C header.
+          version                                            Print the installed Kira version.
+
+        EXAMPLES:
+          kira new HelloKira
+          kira build --target windows
+          kira doc --out docs --clean
+          kira install --dev
+
+        Add ~/.kira/toolchain/current/bin to PATH if you want the installed toolchain available globally.
         """
     }
 }

@@ -24,16 +24,13 @@ public struct BinaryPatcher: Sendable {
     public init() {}
 
     public func patch(at entry: UnsafeMutableRawPointer, to target: UnsafeRawPointer) throws {
-        #if os(iOS) || os(Android) || os(WASI)
+        #if os(iOS) || os(Android) || os(WASI) || os(Windows)
         throw BinaryPatchError.unsupported
         #else
         let pageSize = Int(getpagesize())
         let addr = Int(bitPattern: entry)
         guard addr != 0 else { throw BinaryPatchError.invalidAddress }
         let pageStart = addr & ~(pageSize - 1)
-        #if os(Windows)
-        throw BinaryPatchError.unsupported
-        #else
         if mprotect(UnsafeMutableRawPointer(bitPattern: pageStart), pageSize, PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
             throw BinaryPatchError.protectFailed
         }
@@ -65,7 +62,6 @@ public struct BinaryPatcher: Sendable {
         #endif
         #else
         throw BinaryPatchError.unsupported
-        #endif
         #endif
         #endif
     }

@@ -1,5 +1,18 @@
 // swift-tools-version: 5.9
 import PackageDescription
+import Foundation
+
+let enableWindowsLibffi = ProcessInfo.processInfo.environment["KIRA_WINDOWS_LIBFFI"] == "1"
+let packageRoot = URL(fileURLWithPath: #file).deletingLastPathComponent()
+let windowsLibffiLibPath = packageRoot.appendingPathComponent("Sources/ClibffiWindows/lib").path
+let windowsLibffiLinkerSettings: [LinkerSetting] = enableWindowsLibffi
+    ? [
+        .unsafeFlags(
+            ["-Xlinker", "/LIBPATH:\(windowsLibffiLibPath)", "-Xlinker", "libffi-8.lib"],
+            .when(platforms: [.windows])
+        )
+    ]
+    : []
 
 let package = Package(
     name: "Kira",
@@ -24,7 +37,16 @@ func makeTargets() -> [Target] {
     ]
     var vmDeps: [Target.Dependency] = []
 
-    #if !os(Windows)
+    #if os(Windows)
+    if enableWindowsLibffi {
+        targets.append(.systemLibrary(
+            name: "Clibffi",
+            path: "Sources/ClibffiWindows"
+        ))
+        compilerDeps.append("Clibffi")
+        vmDeps.append("Clibffi")
+    }
+    #else
     targets.append(.systemLibrary(
         name: "Clibffi",
         path: "Sources/Clibffi",
@@ -71,12 +93,14 @@ func makeTargets() -> [Target] {
         .target(
             name: "KiraCompiler",
             dependencies: compilerDeps,
-            path: "Sources/KiraCompiler"
+            path: "Sources/KiraCompiler",
+            linkerSettings: windowsLibffiLinkerSettings
         ),
         .target(
             name: "KiraVM",
             dependencies: vmDeps,
-            path: "Sources/KiraVM"
+            path: "Sources/KiraVM",
+            linkerSettings: windowsLibffiLinkerSettings
         ),
         .executableTarget(
             name: "KiraCLI",
@@ -85,29 +109,34 @@ func makeTargets() -> [Target] {
                 "KiraVM",
                 "KiraStdlib",
             ],
-            path: "Sources/KiraCLI"
+            path: "Sources/KiraCLI",
+            linkerSettings: windowsLibffiLinkerSettings
         ),
         .executableTarget(
             name: "KiraLSP",
             dependencies: [
                 "KiraCompiler",
             ],
-            path: "KiraLSP/Sources/KiraLSP"
+            path: "KiraLSP/Sources/KiraLSP",
+            linkerSettings: windowsLibffiLinkerSettings
         ),
         .testTarget(
             name: "KiraCompilerTests",
             dependencies: ["KiraCompiler"],
-            path: "Tests/KiraCompilerTests"
+            path: "Tests/KiraCompilerTests",
+            linkerSettings: windowsLibffiLinkerSettings
         ),
         .testTarget(
             name: "KiraVMTests",
             dependencies: ["KiraVM", "KiraCompiler"],
-            path: "Tests/KiraVMTests"
+            path: "Tests/KiraVMTests",
+            linkerSettings: windowsLibffiLinkerSettings
         ),
         .testTarget(
             name: "KiraIntegrationTests",
             dependencies: ["KiraCompiler", "KiraVM"],
-            path: "Tests/KiraIntegrationTests"
+            path: "Tests/KiraIntegrationTests",
+            linkerSettings: windowsLibffiLinkerSettings
         ),
     ])
 
