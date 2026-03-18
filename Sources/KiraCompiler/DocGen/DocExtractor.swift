@@ -77,6 +77,8 @@ public struct DocExtractor: Sendable {
         case .named(let n): return n
         case .applied(let b, let args):
             return "\(b)<\(args.map(typeSystemString).joined(separator: ", "))>"
+        case .fixedArray(let element, let count):
+            return "CArray<\(typeSystemString(element)), \(count)>"
         case .array(let inner): return "[\(typeSystemString(inner))]"
         case .dictionary(let k, let v): return "[\(typeSystemString(k)): \(typeSystemString(v))]"
         case .optional(let inner): return "\(typeSystemString(inner))?"

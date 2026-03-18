@@ -12,43 +12,19 @@ import Kira.Fondation
 //   clang -dynamiclib -O2 -fPIC -x objective-c -fobjc-arc -framework Cocoa -framework Metal -framework MetalKit -framework QuartzCore \
 //     -o FFI/libsokol.dylib FFI/sokol_impl.c
 //
-// Regenerate bindings (libclang required):
+// Regenerate Sokol bindings (libclang required):
 //   ../.build/debug/kira bindgen FFI/sokol_all.h --lib FFI/libsokol.dylib --out Sources/sokol.kira
 
-// libc
-@ffi(lib: "")
-extern function malloc(size: CUInt64) -> CPointer<CVoid>
+let TRIANGLE_VERTS: CArray<CFloat, 21> = [
+    0.0, 0.5, 0.5, 1.0, 0.0, 0.0, 1.0,
+    0.5, -0.5, 0.5, 0.0, 1.0, 0.0, 1.0,
+    -0.5, -0.5, 0.5, 0.0, 0.0, 1.0, 1.0,
+]
 
-@ffi(lib: "")
-extern function free(ptr: CPointer<CVoid>) -> CVoid
-
-@ffi(lib: "")
-extern function memcpy(dst: CPointer<CVoid>, src: CPointer<vertex_blob>, n: CUInt64) -> CPointer<CVoid>
-
-@CStruct
-type vertex_blob {
-    var f00: CFloat
-    var f01: CFloat
-    var f02: CFloat
-    var f03: CFloat
-    var f04: CFloat
-    var f05: CFloat
-    var f06: CFloat
-    var f07: CFloat
-    var f08: CFloat
-    var f09: CFloat
-    var f10: CFloat
-    var f11: CFloat
-    var f12: CFloat
-    var f13: CFloat
-    var f14: CFloat
-    var f15: CFloat
-    var f16: CFloat
-    var f17: CFloat
-    var f18: CFloat
-    var f19: CFloat
-    var f20: CFloat
-}
+let METAL_VS: String = "#include <metal_stdlib>\nusing namespace metal;\nstruct vs_in {\n  float3 pos [[attribute(0)]];\n  float4 color [[attribute(1)]];\n};\nstruct vs_out {\n  float4 pos [[position]];\n  float4 color;\n};\nvertex vs_out vs_main(vs_in in [[stage_in]]) {\n  vs_out out;\n  out.pos = float4(in.pos, 1.0);\n  out.color = in.color;\n  return out;\n}\n"
+let METAL_FS: String = "#include <metal_stdlib>\nusing namespace metal;\nstruct vs_out {\n  float4 pos [[position]];\n  float4 color;\n};\nfragment float4 fs_main(vs_out in [[stage_in]]) {\n  return in.color;\n}\n"
+let D3D11_VS: String = "struct vs_in { float3 pos : POSITION; float4 color : COLOR0; }; struct vs_out { float4 pos : SV_Position; float4 color : COLOR0; }; vs_out vs_main(vs_in input) { vs_out outp; outp.pos = float4(input.pos, 1.0); outp.color = input.color; return outp; }"
+let D3D11_FS: String = "struct vs_out { float4 pos : SV_Position; float4 color : COLOR0; }; float4 fs_main(vs_out input) : SV_Target { return input.color; }"
 
 // Global state (initialized in on_init).
 var g_frame: Int = 0
@@ -56,32 +32,19 @@ var g_pip: sg_pipeline = sg_pipeline()
 var g_bind: sg_bindings = sg_bindings()
 
 function on_init() {
-    kira_sg_setup()
+    sg_setup(desc: sg_desc(environment: sglue_environment()))
 
-    // Vertex data (3 vertices, pos=float3 + color=float4).
-    let verts = vertex_blob(
-        f00: 0.0,  f01: 0.5,  f02: 0.5,  f03: 1.0,  f04: 0.0,  f05: 0.0,  f06: 1.0,
-        f07: 0.5,  f08: -0.5, f09: 0.5,  f10: 0.0,  f11: 1.0,  f12: 0.0,  f13: 1.0,
-        f14: -0.5, f15: -0.5, f16: 0.5,  f17: 0.0,  f18: 0.0,  f19: 1.0,  f20: 1.0)
-    let vsize: Int = 21 * 4
-    let vmem = malloc(size: vsize)
-    memcpy(dst: vmem, src: verts, n: vsize)
-
+    let vsize = sizeOf(CArray<CFloat, 21>)
     let vbuf = sg_make_buffer(desc: sg_buffer_desc(
         size: vsize,
-        data: sg_range(ptr: vmem, size: vsize),
+        data: sg_range(ptr: TRIANGLE_VERTS, size: vsize),
         label: "triangle-vertices"))
-    free(ptr: vmem)
+    g_bind = sg_bindings(vertex_buffers: CArray8_sg_buffer(_0: vbuf))
 
-    g_bind = sg_bindings(vertex_buffers: CArray8_sg_buffer_db72bc86(_0: vbuf))
-
-    var vs_src = "#include <metal_stdlib>\nusing namespace metal;\nstruct vs_in {\n  float3 pos [[attribute(0)]];\n  float4 color [[attribute(1)]];\n};\nstruct vs_out {\n  float4 pos [[position]];\n  float4 color;\n};\nvertex vs_out vs_main(vs_in in [[stage_in]]) {\n  vs_out out;\n  out.pos = float4(in.pos, 1.0);\n  out.color = in.color;\n  return out;\n}\n"
-    var fs_src = "#include <metal_stdlib>\nusing namespace metal;\nstruct vs_out {\n  float4 pos [[position]];\n  float4 color;\n};\nfragment float4 fs_main(vs_out in [[stage_in]]) {\n  return in.color;\n}\n"
-    let is_d3d11 = kira_is_d3d11() == 1
-    if is_d3d11 {
-        vs_src = "struct vs_in { float3 pos : POSITION; float4 color : COLOR0; }; struct vs_out { float4 pos : SV_Position; float4 color : COLOR0; }; vs_out vs_main(vs_in input) { vs_out outp; outp.pos = float4(input.pos, 1.0); outp.color = input.color; return outp; }"
-        fs_src = "struct vs_out { float4 pos : SV_Position; float4 color : COLOR0; }; float4 fs_main(vs_out input) : SV_Target { return input.color; }"
-    }
+    let is_d3d11 = sg_query_backend() == SG_BACKEND_D3D11
+    let backend = is_d3d11 ? "d3d11" : "metal"
+    let vs_src = is_d3d11 ? D3D11_VS : METAL_VS
+    let fs_src = is_d3d11 ? D3D11_FS : METAL_FS
 
     var vs_func = sg_shader_function(source: vs_src, entry: "vs_main")
     var fs_func = sg_shader_function(source: fs_src, entry: "fs_main")
@@ -100,7 +63,7 @@ function on_init() {
         glsl_name: nil,
         hlsl_sem_name: "COLOR",
         hlsl_sem_index: 0)
-    let shader_attrs = CArray16_sg_shader_vertex_attr_a6db04bd(
+    let shader_attrs = CArray16_sg_shader_vertex_attr(
         _0: attr_pos,
         _1: attr_col)
 
@@ -108,9 +71,9 @@ function on_init() {
         vertex_func: vs_func,
         fragment_func: fs_func,
         attrs: shader_attrs,
-        label: "triangle-shader"))
+        label: backend))
 
-    let attrs = CArray16_sg_vertex_attr_state_00ae92e5(
+    let attrs = CArray16_sg_vertex_attr_state(
         _0: sg_vertex_attr_state(format: SG_VERTEXFORMAT_FLOAT3),
         _1: sg_vertex_attr_state(format: SG_VERTEXFORMAT_FLOAT4))
     let layout = sg_vertex_layout_state(attrs: attrs)
@@ -132,7 +95,7 @@ function on_frame() {
     }
 
     let ca0 = sg_color_attachment_action(load_action: SG_LOADACTION_CLEAR, clear_value: clear)
-    let action = sg_pass_action(colors: CArray8_sg_color_attachment_action_008186e2(_0: ca0))
+    let action = sg_pass_action(colors: CArray8_sg_color_attachment_action(_0: ca0))
     let pass = sg_pass(action: action, swapchain: sglue_swapchain())
 
     sg_begin_pass(pass: pass)
@@ -155,11 +118,11 @@ function on_cleanup() {
 @Main
 function main() {
     print("Launching Sokol triangle (pure Kira)…")
-    kira_sapp_run(
-        init_cb: ffi_callback0("on_init"),
-        frame_cb: ffi_callback0("on_frame"),
-        cleanup_cb: ffi_callback0("on_cleanup"),
+    sapp_run(desc: sapp_desc(
+        init_cb: on_init,
+        frame_cb: on_frame,
+        cleanup_cb: on_cleanup,
         width: 800,
         height: 600,
-        window_title: "Sokol Triangle (Kira)")
+        window_title: "Sokol Triangle (Kira)"))
 }

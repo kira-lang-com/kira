@@ -47,6 +47,7 @@ public enum KiraIRInst: Sendable, Equatable {
     case storeGlobalSymbol(String)
 
     case newObject(fieldCount: UInt16)
+    case makeFFIArray(count: UInt16, elementType: [UInt8])
     case loadField(UInt16)
     case storeField(UInt16)
 

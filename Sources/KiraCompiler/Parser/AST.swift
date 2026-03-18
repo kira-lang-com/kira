@@ -26,6 +26,7 @@ public struct TypeRef: Sendable {
     public indirect enum Kind: Sendable {
         case named(String)
         case applied(String, [TypeRef])
+        case fixedArray(element: TypeRef, count: Int)
         case array(TypeRef)
         case dictionary(key: TypeRef, value: TypeRef)
         case optional(TypeRef)
@@ -281,8 +282,11 @@ public indirect enum Expr: Sendable {
     case stringLiteral(String, SourceRange)
     case boolLiteral(Bool, SourceRange)
     case nilLiteral(SourceRange)
+    case sizeOf(SizeOfExpr)
+    case arrayLiteral(ArrayLiteralExpr)
     case unary(UnaryExpr)
     case binary(BinaryExpr)
+    case conditional(ConditionalExpr)
     case call(CallExpr)
     case member(MemberExpr)
     case assign(AssignExpr)
@@ -296,13 +300,34 @@ public indirect enum Expr: Sendable {
         case .stringLiteral(_, let r): return r
         case .boolLiteral(_, let r): return r
         case .nilLiteral(let r): return r
+        case .sizeOf(let s): return s.range
+        case .arrayLiteral(let a): return a.range
         case .unary(let u): return u.range
         case .binary(let b): return b.range
+        case .conditional(let c): return c.range
         case .call(let c): return c.range
         case .member(let m): return m.range
         case .assign(let a): return a.range
         case .shaderMacro(let s): return s.range
         }
+    }
+}
+
+public struct SizeOfExpr: Sendable {
+    public var type: TypeRef
+    public var range: SourceRange
+    public init(type: TypeRef, range: SourceRange) {
+        self.type = type
+        self.range = range
+    }
+}
+
+public struct ArrayLiteralExpr: Sendable {
+    public var elements: [Expr]
+    public var range: SourceRange
+    public init(elements: [Expr], range: SourceRange) {
+        self.elements = elements
+        self.range = range
     }
 }
 
@@ -326,6 +351,19 @@ public struct BinaryExpr: Sendable {
         self.op = op
         self.lhs = lhs
         self.rhs = rhs
+        self.range = range
+    }
+}
+
+public struct ConditionalExpr: Sendable {
+    public var condition: Expr
+    public var thenExpr: Expr
+    public var elseExpr: Expr
+    public var range: SourceRange
+    public init(condition: Expr, thenExpr: Expr, elseExpr: Expr, range: SourceRange) {
+        self.condition = condition
+        self.thenExpr = thenExpr
+        self.elseExpr = elseExpr
         self.range = range
     }
 }

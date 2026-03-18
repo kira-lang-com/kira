@@ -20,6 +20,88 @@ public struct IRBuilder {
         return KiraIRModule(functions: fns)
     }
 
+    private func ffiTypeEncoding(for type: KiraType, symbols: SymbolTable) -> FFIPrototype.TypeEncoding {
+        switch type {
+        case .int:
+            return .scalar(.int64)
+        case .float:
+            return .scalar(.float64)
+        case .double:
+            return .scalar(.float64)
+        case .bool:
+            return .scalar(.uint8)
+        case .void:
+            return .scalar(.void)
+        case .pointer(let inner):
+            if inner == .named("CInt8") {
+                return .scalar(.cstring)
+            }
+            return .pointerTo(.scalar(.void))
+        case .fixedArray(let element, let count):
+            let encoded = ffiTypeEncoding(for: element, symbols: symbols)
+            return .cStruct(Array(repeating: encoded, count: count))
+        case .named(let name):
+            if symbols.cStructTypes.contains(name) {
+                let orderedFields = (symbols.fields[name] ?? [:])
+                    .values
+                    .sorted(by: { $0.index < $1.index })
+                let fields = orderedFields.map { ffiTypeEncoding(for: $0.type, symbols: symbols) }
+                return .cStruct(fields)
+            }
+            switch name {
+            case "Void", "CVoid":
+                return .scalar(.void)
+            case "Bool", "CBool":
+                return .scalar(.uint8)
+            case "Int":
+                return .scalar(.int64)
+            case "CInt8":
+                return .scalar(.int8)
+            case "CInt16":
+                return .scalar(.int16)
+            case "CInt32":
+                return .scalar(.int32)
+            case "CInt64":
+                return .scalar(.int64)
+            case "CUInt8":
+                return .scalar(.uint8)
+            case "CUInt16":
+                return .scalar(.uint16)
+            case "CUInt32":
+                return .scalar(.uint32)
+            case "CUInt64":
+                return .scalar(.uint64)
+            case "CFloat":
+                return .scalar(.float32)
+            case "Float":
+                return .scalar(.float64)
+            case "CDouble", "Double":
+                return .scalar(.float64)
+            default:
+                return .scalar(.pointer)
+            }
+        case .optional(let inner):
+            return ffiTypeEncoding(for: inner, symbols: symbols)
+        default:
+            return .scalar(.pointer)
+        }
+    }
+
+    private enum DirectFFICallbackKind {
+        case callback0
+        case callback1I32
+    }
+
+    private func directFFICallbackKind(for expr: Expr, expected: KiraType?, symbols: SymbolTable) -> DirectFFICallbackKind? {
+        guard expected == .pointer(.named("CVoid")) else { return nil }
+        guard case .identifier(let name, _) = expr else { return nil }
+        guard let fn = symbols.functions[name], !fn.isExtern else { return nil }
+        guard case .function(let params, let returns) = fn.type, returns == .void else { return nil }
+        if params.isEmpty { return .callback0 }
+        if params.count == 1, params[0] == .int { return .callback1I32 }
+        return nil
+    }
+
     private func buildGlobalInit(
         declarations: [Decl],
         symbols: SymbolTable,
@@ -34,7 +116,18 @@ public struct IRBuilder {
         var emitter = StackEmitter()
         func exprType(_ e: Expr) -> KiraType? { typeInfo.exprTypes[e.range] }
 
-        func emitExpr(_ e: Expr) throws {
+        func emitExpr(_ e: Expr, coercedTo expected: KiraType? = nil) throws {
+            if let callbackKind = directFFICallbackKind(for: e, expected: expected, symbols: symbols),
+               case .identifier(let name, _) = e {
+                emitter.emit(.pushString(name))
+                switch callbackKind {
+                case .callback0:
+                    emitter.emit(.ffiCallback0)
+                case .callback1I32:
+                    emitter.emit(.ffiCallback1I32)
+                }
+                return
+            }
             switch e {
             case .intLiteral(let v, _):
                 emitter.emit(.pushInt(v))
@@ -46,6 +139,18 @@ public struct IRBuilder {
                 emitter.emit(.pushBool(b))
             case .nilLiteral:
                 emitter.emit(.pushNil)
+            case .sizeOf:
+                emitter.emit(.pushInt(typeInfo.sizeOfValues[e.range] ?? 0))
+            case .arrayLiteral(let literal):
+                guard case .fixedArray(let elementType, let count) = (exprType(e) ?? .unknown) else {
+                    emitter.emit(.pushNil)
+                    return
+                }
+                for element in literal.elements {
+                    try emitExpr(element)
+                }
+                let encoding = ffiTypeEncoding(for: elementType, symbols: symbols)
+                emitter.emit(.makeFFIArray(count: UInt16(count), elementType: encoding.bytes))
             case .identifier(let name, _):
                 emitter.emit(.loadGlobalSymbol(name))
             case .unary(let u):
@@ -101,6 +206,16 @@ public struct IRBuilder {
                     emitter.emit((t == .float || t == .double) ? .eqFloat : .eqInt)
                     emitter.emit(.notBool)
                 }
+            case .conditional(let c):
+                let baseDepth = emitter.currentDepth()
+                try emitExpr(c.condition)
+                let jumpIfFalseIndex = emitter.emitPlaceholderJumpIfFalse()
+                try emitExpr(c.thenExpr)
+                let jumpOverElseIndex = emitter.emitPlaceholderJump()
+                emitter.patchJump(at: jumpIfFalseIndex, to: emitter.currentOffset())
+                emitter.restoreDepth(baseDepth)
+                try emitExpr(c.elseExpr)
+                emitter.patchJump(at: jumpOverElseIndex, to: emitter.currentOffset())
             case .call(let c):
                 if case .identifier(let name, _) = c.callee, name == "print" {
                     guard c.arguments.count == 1 else { emitter.emit(.pushNil); return }
@@ -112,6 +227,10 @@ public struct IRBuilder {
                 if case .identifier(let typeName, _) = c.callee, symbols.cStructTypes.contains(typeName) {
                     let fieldMap = symbols.fields[typeName] ?? [:]
                     let fieldCount = fieldMap.count
+                    var fieldTypes: [KiraType] = Array(repeating: .unknown, count: fieldCount)
+                    for info in fieldMap.values {
+                        fieldTypes[info.index] = info.type
+                    }
                     emitter.emit(.newObject(fieldCount: UInt16(fieldCount)))
 
                     var argsByIndex: [Expr?] = Array(repeating: nil, count: fieldCount)
@@ -127,7 +246,7 @@ public struct IRBuilder {
                     }
                     for i in 0..<fieldCount {
                         emitter.emit(.dup)
-                        try emitExpr(argsByIndex[i] ?? .nilLiteral(c.range))
+                        try emitExpr(argsByIndex[i] ?? .nilLiteral(c.range), coercedTo: fieldTypes[i])
                         emitter.emit(.storeField(UInt16(i)))
                     }
                     return
@@ -151,8 +270,20 @@ public struct IRBuilder {
                     return
                 }
 
+                let expectedParams: [KiraType]
+                if case .identifier(let name, _) = c.callee,
+                   symbols.functions[name]?.isExtern == true,
+                   case .function(let params, _) = exprType(c.callee) ?? symbols.lookupValue(name) ?? .unknown {
+                    expectedParams = params
+                } else {
+                    expectedParams = []
+                }
+
                 try emitExpr(c.callee)
-                for a in c.arguments { try emitExpr(a.value) }
+                for (index, a) in c.arguments.enumerated() {
+                    let expectedArg = index < expectedParams.count ? expectedParams[index] : nil
+                    try emitExpr(a.value, coercedTo: expectedArg)
+                }
                 emitter.emit(.call(argCount: UInt8(c.arguments.count)))
             case .member(let m):
                 if case .named(let typeName) = (exprType(m.base) ?? .unknown),
@@ -287,7 +418,18 @@ public struct IRBuilder {
             return false
         }
 
-        func emitExpr(_ e: Expr) throws {
+        func emitExpr(_ e: Expr, coercedTo expected: KiraType? = nil) throws {
+            if let callbackKind = directFFICallbackKind(for: e, expected: expected, symbols: symbols),
+               case .identifier(let name, _) = e {
+                emitter.emit(.pushString(name))
+                switch callbackKind {
+                case .callback0:
+                    emitter.emit(.ffiCallback0)
+                case .callback1I32:
+                    emitter.emit(.ffiCallback1I32)
+                }
+                return
+            }
             switch e {
             case .intLiteral(let v, _):
                 emitter.emit(.pushInt(v))
@@ -299,6 +441,18 @@ public struct IRBuilder {
                 emitter.emit(.pushBool(b))
             case .nilLiteral:
                 emitter.emit(.pushNil)
+            case .sizeOf:
+                emitter.emit(.pushInt(typeInfo.sizeOfValues[e.range] ?? 0))
+            case .arrayLiteral(let literal):
+                guard case .fixedArray(let elementType, let count) = (exprType(e) ?? .unknown) else {
+                    emitter.emit(.pushNil)
+                    return
+                }
+                for element in literal.elements {
+                    try emitExpr(element)
+                }
+                let encoding = ffiTypeEncoding(for: elementType, symbols: symbols)
+                emitter.emit(.makeFFIArray(count: UInt16(count), elementType: encoding.bytes))
             case .identifier(let name, _):
                 if let binding = locals[name] {
                     emitter.emit(.loadLocal(binding.slot))
@@ -360,6 +514,16 @@ public struct IRBuilder {
                     emitter.emit((t == .float || t == .double) ? .eqFloat : .eqInt)
                     emitter.emit(.notBool)
                 }
+            case .conditional(let c):
+                let baseDepth = emitter.currentDepth()
+                try emitExpr(c.condition)
+                let jumpIfFalseIndex = emitter.emitPlaceholderJumpIfFalse()
+                try emitExpr(c.thenExpr)
+                let jumpOverElseIndex = emitter.emitPlaceholderJump()
+                emitter.patchJump(at: jumpIfFalseIndex, to: emitter.currentOffset())
+                emitter.restoreDepth(baseDepth)
+                try emitExpr(c.elseExpr)
+                emitter.patchJump(at: jumpOverElseIndex, to: emitter.currentOffset())
             case .assign(let a):
                 if case .member(let m) = a.target,
                    case .named(let typeName) = (exprType(m.base) ?? .unknown),
@@ -401,6 +565,10 @@ public struct IRBuilder {
                     // @CStruct constructor: TypeName(field1:..., field2:...)
                     let fieldMap = symbols.fields[typeName] ?? [:]
                     let fieldCount = fieldMap.count
+                    var fieldTypes: [KiraType] = Array(repeating: .unknown, count: fieldCount)
+                    for info in fieldMap.values {
+                        fieldTypes[info.index] = info.type
+                    }
 
                     emitter.emit(.newObject(fieldCount: UInt16(fieldCount)))
 
@@ -418,7 +586,7 @@ public struct IRBuilder {
 
                     for i in 0..<fieldCount {
                         emitter.emit(.dup)
-                        try emitExpr(argsByIndex[i] ?? .nilLiteral(c.range))
+                        try emitExpr(argsByIndex[i] ?? .nilLiteral(c.range), coercedTo: fieldTypes[i])
                         emitter.emit(.storeField(UInt16(i)))
                     }
                 } else if case .identifier(let name, _) = c.callee, name == "ffi_callback0" {
@@ -447,8 +615,20 @@ public struct IRBuilder {
                     for a in c.arguments { try emitExpr(a.value) }
                     emitter.emit(.makeColor)
                 } else {
+                    let expectedParams: [KiraType]
+                    if case .identifier(let name, _) = c.callee,
+                       symbols.functions[name]?.isExtern == true,
+                       case .function(let params, _) = exprType(c.callee) ?? symbols.lookupValue(name) ?? .unknown {
+                        expectedParams = params
+                    } else {
+                        expectedParams = []
+                    }
+
                     try emitExpr(c.callee)
-                    for a in c.arguments { try emitExpr(a.value) }
+                    for (index, a) in c.arguments.enumerated() {
+                        let expectedArg = index < expectedParams.count ? expectedParams[index] : nil
+                        try emitExpr(a.value, coercedTo: expectedArg)
+                    }
                     emitter.emit(.call(argCount: UInt8(c.arguments.count)))
                 }
             case .member(let m):
@@ -567,6 +747,12 @@ private struct StackEmitter {
 
     func currentOffset() -> Int { instructions.count }
 
+    func currentDepth() -> Int { depth }
+
+    mutating func restoreDepth(_ value: Int) {
+        depth = max(0, value)
+    }
+
     mutating func adjustDepth(_ inst: KiraIRInst) {
         switch inst {
         case .pushInt, .pushFloat, .pushString, .pushBool, .pushNil, .loadLocal, .loadGlobalSymbol:
@@ -574,6 +760,9 @@ private struct StackEmitter {
         case .storeLocal, .storeGlobalSymbol:
             depth -= 1
         case .newObject:
+            depth += 1
+        case .makeFFIArray(let count, _):
+            depth -= Int(count)
             depth += 1
         case .loadField:
             break
@@ -638,6 +827,9 @@ private func computeMaxStack(_ insts: [KiraIRInst]) -> Int {
         case .storeLocal, .storeGlobalSymbol:
             depth -= 1
         case .newObject:
+            depth += 1
+        case .makeFFIArray(let count, _):
+            depth -= Int(count)
             depth += 1
         case .loadField:
             break

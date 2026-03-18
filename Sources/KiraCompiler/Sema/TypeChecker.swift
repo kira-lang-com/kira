@@ -3,10 +3,12 @@ import Foundation
 public struct TypeInfo: Sendable {
     public var exprTypes: [SourceRange: KiraType]
     public var varTypes: [SourceRange: KiraType]
+    public var sizeOfValues: [SourceRange: Int64]
 
-    public init(exprTypes: [SourceRange: KiraType] = [:], varTypes: [SourceRange: KiraType] = [:]) {
+    public init(exprTypes: [SourceRange: KiraType] = [:], varTypes: [SourceRange: KiraType] = [:], sizeOfValues: [SourceRange: Int64] = [:]) {
         self.exprTypes = exprTypes
         self.varTypes = varTypes
+        self.sizeOfValues = sizeOfValues
     }
 }
 
@@ -77,6 +79,12 @@ public struct TypeChecker: Sendable {
             symbols.addCStruct(typeName: td.name, fields: fieldSchemas)
         }
 
+        for decl in module.declarations {
+            if case .typealias(let td) = decl {
+                symbols.addTypeAlias(td.name, target: resolve(td.target))
+            }
+        }
+
         // Register functions.
         for decl in module.declarations {
             if case .function(let fn) = decl {
@@ -115,9 +123,15 @@ public struct TypeChecker: Sendable {
         let globalScope = LocalScope(parent: nil, symbols: symbols)
         for decl in module.declarations {
             guard case .globalVar(let gv) = decl else { continue }
-            let initType = try typeCheckExpr(gv.initializer, scope: globalScope, symbols: symbols, expected: nil, typeInfo: &typeInfo)
+            let explicitType = gv.explicitType.map(resolve)
+            let expectedInitType: KiraType? = {
+                guard let explicitType else { return nil }
+                if case .fixedArray = explicitType { return explicitType }
+                return nil
+            }()
+            let initType = try typeCheckExpr(gv.initializer, scope: globalScope, symbols: symbols, expected: expectedInitType, typeInfo: &typeInfo)
             let finalType: KiraType
-            if let explicit = gv.explicitType.map(resolve) {
+            if let explicit = explicitType {
                 if explicit == .float, case .int = initType, isIntLiteral(gv.initializer) {
                     finalType = .float
                 } else if explicit == initType {
@@ -246,6 +260,9 @@ public struct TypeChecker: Sendable {
         case .applied(let base, let args):
             let expandedArgs = args.map { expandTypeRefAliases($0, typeAliases: typeAliases, visiting: &visiting) }
             return TypeRef(kind: .applied(base, expandedArgs), range: ref.range)
+        case .fixedArray(let element, let count):
+            let expanded = expandTypeRefAliases(element, typeAliases: typeAliases, visiting: &visiting)
+            return TypeRef(kind: .fixedArray(element: expanded, count: count), range: ref.range)
         case .array(let inner):
             let e = expandTypeRefAliases(inner, typeAliases: typeAliases, visiting: &visiting)
             return TypeRef(kind: .array(e), range: ref.range)
@@ -289,6 +306,9 @@ public struct TypeChecker: Sendable {
                 return .pointerTo(pointee)
             }
             return .scalar(.pointer)
+        case .fixedArray(let element, let count):
+            let encoded = encodeFFIType(element, cHandleTypes: cHandleTypes, symbols: symbols, visiting: &visiting)
+            return .cStruct(Array(repeating: encoded, count: count))
         case .optional(let inner):
             return encodeFFIType(inner, cHandleTypes: cHandleTypes, symbols: symbols, visiting: &visiting)
         default:
@@ -312,6 +332,9 @@ public struct TypeChecker: Sendable {
             // Preserve C string encoding inside C structs so `CPointer<CInt8>` fields can accept `String`.
             if inner == .named("CInt8") { return .scalar(.cstring) }
             return .scalar(.pointer)
+        case .fixedArray(let element, let count):
+            let encoded = encodeFFIType(element, cHandleTypes: cHandleTypes, symbols: symbols, visiting: &visiting)
+            return .cStruct(Array(repeating: encoded, count: count))
         case .optional(let inner):
             return encodeFFIType(inner, cHandleTypes: cHandleTypes, symbols: symbols, visiting: &visiting)
         default:
@@ -399,7 +422,108 @@ public struct TypeChecker: Sendable {
         // CPointer<*> -> CPointer<*> (ABI-compatible; used heavily for FFI, e.g. void*).
         if case .pointer = got, case .pointer = expected { return true }
 
+        if case .fixedArray(let element, _) = got, case .pointer(let pointee) = expected {
+            if pointee == element { return true }
+            if pointee == .named("CVoid") { return true }
+        }
+
         return false
+    }
+
+    private func isCIntegerType(_ type: KiraType) -> Bool {
+        switch type {
+        case .named("CInt8"), .named("CInt16"), .named("CInt32"), .named("CInt64"),
+             .named("CUInt8"), .named("CUInt16"), .named("CUInt32"), .named("CUInt64"):
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func isDirectFFICallback(_ expr: Expr, expected: KiraType, symbols: SymbolTable) -> Bool {
+        guard expected == .pointer(.named("CVoid")) else { return false }
+        guard case .identifier(let name, _) = expr else { return false }
+        guard let fn = symbols.functions[name], !fn.isExtern else { return false }
+        guard case .function(let params, let returns) = fn.type, returns == .void else { return false }
+        if params.isEmpty { return true }
+        if params.count == 1, params[0] == .int { return true }
+        return false
+    }
+
+    private func resolveSizeOfType(_ ref: TypeRef, symbols: SymbolTable) -> KiraType {
+        switch ref.kind {
+        case .named(let name):
+            if let alias = symbols.typeAliases[name] { return alias }
+            return typeSystem.resolve(ref)
+        case .applied(let base, let args):
+            if base == "CPointer", let first = args.first {
+                return .pointer(resolveSizeOfType(first, symbols: symbols))
+            }
+            return typeSystem.resolve(ref)
+        case .fixedArray(let element, let count):
+            return .fixedArray(resolveSizeOfType(element, symbols: symbols), count)
+        case .array(let inner):
+            return .array(resolveSizeOfType(inner, symbols: symbols))
+        case .dictionary(let key, let value):
+            return .dictionary(
+                key: resolveSizeOfType(key, symbols: symbols),
+                value: resolveSizeOfType(value, symbols: symbols)
+            )
+        case .optional(let inner):
+            return .optional(resolveSizeOfType(inner, symbols: symbols))
+        case .function(let params, let returns):
+            return .function(
+                params: params.map { resolveSizeOfType($0, symbols: symbols) },
+                returns: resolveSizeOfType(returns, symbols: symbols)
+            )
+        }
+    }
+
+    private func alignUp(_ value: Int, to alignment: Int) -> Int {
+        guard alignment > 1 else { return value }
+        let mask = alignment - 1
+        return (value + mask) & ~mask
+    }
+
+    private func sizeAlign(of type: KiraType, symbols: SymbolTable) -> (size: Int, alignment: Int)? {
+        switch type {
+        case .void, .named("CVoid"):
+            return (0, 1)
+        case .bool, .named("CBool"), .named("CInt8"), .named("CUInt8"):
+            return (1, 1)
+        case .named("CInt16"), .named("CUInt16"):
+            return (2, 2)
+        case .named("CInt32"), .named("CUInt32"), .named("CFloat"):
+            return (4, 4)
+        case .int, .float, .double, .named("CInt64"), .named("CUInt64"), .named("CDouble"):
+            return (8, 8)
+        case .pointer, .string:
+            return (
+                MemoryLayout<UnsafeMutableRawPointer?>.size,
+                MemoryLayout<UnsafeMutableRawPointer?>.alignment
+            )
+        case .fixedArray(let element, let count):
+            guard let elementLayout = sizeAlign(of: element, symbols: symbols) else { return nil }
+            let stride = alignUp(elementLayout.size, to: elementLayout.alignment)
+            return (stride * max(0, count), elementLayout.alignment)
+        case .named(let name):
+            if let alias = symbols.typeAliases[name] {
+                return sizeAlign(of: alias, symbols: symbols)
+            }
+            guard let fieldMap = symbols.fields[name] else { return nil }
+            let orderedFields = fieldMap.values.sorted(by: { $0.index < $1.index })
+            var offset = 0
+            var maxAlignment = 1
+            for field in orderedFields {
+                guard let fieldLayout = sizeAlign(of: field.type, symbols: symbols) else { return nil }
+                maxAlignment = max(maxAlignment, fieldLayout.alignment)
+                offset = alignUp(offset, to: fieldLayout.alignment)
+                offset += fieldLayout.size
+            }
+            return (alignUp(offset, to: maxAlignment), maxAlignment)
+        default:
+            return nil
+        }
     }
 
     private func typeCheckBlock(_ block: BlockStmt, scope: LocalScope, symbols: SymbolTable, expectedReturn: KiraType, typeInfo: inout TypeInfo) throws -> KiraType {
@@ -414,9 +538,15 @@ public struct TypeChecker: Sendable {
         switch stmt {
         case .variable(let vd):
             // Initializer is checked without expected-type coercion; explicit type is handled here.
-            let initType = try typeCheckExpr(vd.initializer, scope: scope, symbols: symbols, expected: nil, typeInfo: &typeInfo)
+            let explicitType = vd.explicitType.map(typeSystem.resolve)
+            let expectedInitType: KiraType? = {
+                guard let explicitType else { return nil }
+                if case .fixedArray = explicitType { return explicitType }
+                return nil
+            }()
+            let initType = try typeCheckExpr(vd.initializer, scope: scope, symbols: symbols, expected: expectedInitType, typeInfo: &typeInfo)
             let finalType: KiraType
-            if let explicit = vd.explicitType.map(typeSystem.resolve) {
+            if let explicit = explicitType {
                 // Coercion only when explicit target type declared, and only from int literal to float.
                 if explicit == .float, case .int = initType, isIntLiteral(vd.initializer) {
                     finalType = .float
@@ -493,6 +623,33 @@ public struct TypeChecker: Sendable {
             result = .bool
         case .nilLiteral:
             result = .optional(.unknown)
+        case .sizeOf(let s):
+            let targetType = resolveSizeOfType(s.type, symbols: symbols)
+            guard let layout = sizeAlign(of: targetType, symbols: symbols) else {
+                throw SemanticError.typeMismatch(expected: .named("C-layout type"), got: targetType, s.range.start, hint: "sizeOf expects a concrete C-layout type")
+            }
+            typeInfo.sizeOfValues[expr.range] = Int64(layout.size)
+            result = .int
+        case .arrayLiteral(let literal):
+            guard let expected else {
+                throw SemanticError.typeMismatch(expected: .named("CArray"), got: .unknown, literal.range.start, hint: "array literals currently require an explicit CArray<T, N> context")
+            }
+            guard case .fixedArray(let elementType, let count) = expected else {
+                throw SemanticError.typeMismatch(expected: expected, got: .unknown, literal.range.start, hint: "array literals currently initialize CArray<T, N> values")
+            }
+            if literal.elements.count != count {
+                throw SemanticError.typeMismatch(expected: expected, got: .unknown, literal.range.start, hint: "expected \(count) elements, got \(literal.elements.count)")
+            }
+            for element in literal.elements {
+                let got = try typeCheckExpr(element, scope: scope, symbols: symbols, expected: elementType, typeInfo: &typeInfo)
+                if got == elementType {
+                    continue
+                }
+                if !isFFIConvertible(got: got, expected: elementType) {
+                    throw SemanticError.typeMismatch(expected: elementType, got: got, element.range.start, hint: coercionHint(expected: elementType, expr: element))
+                }
+            }
+            result = expected
         case .unary(let u):
             let t = try typeCheckExpr(u.expr, scope: scope, symbols: symbols, expected: nil, typeInfo: &typeInfo)
             switch u.op {
@@ -513,10 +670,25 @@ public struct TypeChecker: Sendable {
                 else { throw SemanticError.typeMismatch(expected: lt, got: rt, b.range.start, hint: "operands must have the same numeric type") }
             case .eq, .neq, .lt, .gt, .lte, .gte:
                 if lt == rt { result = .bool }
+                else if (lt == .int && isCIntegerType(rt)) || (rt == .int && isCIntegerType(lt)) {
+                    result = .bool
+                }
                 else { throw SemanticError.typeMismatch(expected: lt, got: rt, b.range.start, hint: "operands must have the same type") }
             case .and, .or:
                 if lt == .bool && rt == .bool { result = .bool }
                 else { throw SemanticError.typeMismatch(expected: .bool, got: lt, b.range.start, hint: "logical operators require Bool") }
+            }
+        case .conditional(let c):
+            let conditionType = try typeCheckExpr(c.condition, scope: scope, symbols: symbols, expected: .bool, typeInfo: &typeInfo)
+            if conditionType != .bool {
+                throw SemanticError.typeMismatch(expected: .bool, got: conditionType, c.condition.range.start, hint: "use a Bool condition")
+            }
+            let thenType = try typeCheckExpr(c.thenExpr, scope: scope, symbols: symbols, expected: expected, typeInfo: &typeInfo)
+            let elseType = try typeCheckExpr(c.elseExpr, scope: scope, symbols: symbols, expected: expected ?? thenType, typeInfo: &typeInfo)
+            if thenType == elseType {
+                result = thenType
+            } else {
+                throw SemanticError.typeMismatch(expected: thenType, got: elseType, c.elseExpr.range.start, hint: "both branches of ?: must have the same type")
             }
         case .member(let m):
             let baseTy = try typeCheckExpr(m.base, scope: scope, symbols: symbols, expected: nil, typeInfo: &typeInfo)
@@ -581,6 +753,9 @@ public struct TypeChecker: Sendable {
                     guard let argExpr = argsByIndex[f.index] else { continue }
                     let got = try typeCheckExpr(argExpr, scope: scope, symbols: symbols, expected: expectedType == .unknown ? nil : expectedType, typeInfo: &typeInfo)
                     if expectedType != .unknown, got != expectedType {
+                        if isDirectFFICallback(argExpr, expected: expectedType, symbols: symbols) {
+                            continue
+                        }
                         // Reuse FFI convertibility rules for C types.
                         if !isFFIConvertible(got: got, expected: expectedType) {
                             throw SemanticError.typeMismatch(expected: expectedType, got: got, argExpr.range.start, hint: "field '\(f.name)' expects \(expectedType)")
@@ -635,6 +810,9 @@ public struct TypeChecker: Sendable {
                     )
                 }
                 if got != expectedType, !(isExternCallee && isFFIConvertible(got: got, expected: expectedType)) {
+                    if isExternCallee, isDirectFFICallback(arg.value, expected: expectedType, symbols: symbols) {
+                        continue
+                    }
                     let canBoxCStructPointer: Bool = {
                         guard isExternCallee else { return false }
                         guard case .named(let gotName) = got, symbols.cStructTypes.contains(gotName) else { return false }

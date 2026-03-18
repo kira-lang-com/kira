@@ -257,6 +257,7 @@ public final class VirtualMachine: @unchecked Sendable {
     private var ffiCallback0s: [FFICallback0KeepAlive] = []
     private var ffiCallback1I32s: [FFICallback1I32KeepAlive] = []
     #endif
+    private var ownedFFIAllocations: [() -> Void] = []
 
     public init(module: BytecodeModule, output: @escaping @Sendable (String) -> Void = { Swift.print($0) }) {
         self.module = module
@@ -319,6 +320,9 @@ public final class VirtualMachine: @unchecked Sendable {
                      .call_native, .new_object,
                      .fiber_new, .unwrap_or_jump, .line_number:
                     ip += 2
+                case .make_ffi_array:
+                    ip += 2
+                    skipFFITypeDesc(code, &ip)
                 case .load_local, .store_local, .call, .tail_call, .string_interpolate, .load_capture:
                     ip += 1
                 case .make_closure:
@@ -338,6 +342,9 @@ public final class VirtualMachine: @unchecked Sendable {
     }
 
     deinit {
+        for cleanup in ownedFFIAllocations.reversed() {
+            cleanup()
+        }
         #if canImport(Clibffi)
         for cb in ffiCallback0s {
             cb.destroy()
@@ -641,6 +648,8 @@ public final class VirtualMachine: @unchecked Sendable {
                         fields: Array(repeating: .nil_, count: max(0, fieldCount))
                     ))
                     fiber.operandStack.push(.reference(ref))
+                case .make_ffi_array:
+                    try executeMakeFFIArray(fn: fn, frame: &current, fiber: fiber)
                 case .new_array:
                     let count = Int(try fiber.operandStack.popInt())
                     let elements = Array(repeating: KiraValue.nil_, count: max(0, count))
@@ -1210,6 +1219,9 @@ public final class VirtualMachine: @unchecked Sendable {
                                 case .nil_:
                                     let pp: UnsafeMutablePointer<CChar>? = nil
                                     dst.storeBytes(of: pp, as: UnsafeMutablePointer<CChar>?.self)
+                                case .nativePointer(let nativePointer):
+                                    let pp: UnsafeMutablePointer<CChar>? = nativePointer.assumingMemoryBound(to: CChar.self)
+                                    dst.storeBytes(of: pp, as: UnsafeMutablePointer<CChar>?.self)
                                 default:
                                     throw VMError.typeError(expected: "String|nil", got: v)
                                 }
@@ -1392,6 +1404,11 @@ public final class VirtualMachine: @unchecked Sendable {
                                 let ptr = box(UnsafeMutablePointer<CChar>(nil)).assumingMemoryBound(to: UnsafeMutablePointer<CChar>?.self)
                                 boxedArgs.append(UnsafeMutableRawPointer(ptr))
                                 deallocators.append { ptr.deinitialize(count: 1); ptr.deallocate() }
+                            case .nativePointer(let nativePointer):
+                                let cString: UnsafeMutablePointer<CChar>? = nativePointer.assumingMemoryBound(to: CChar.self)
+                                let ptr = box(cString).assumingMemoryBound(to: UnsafeMutablePointer<CChar>?.self)
+                                boxedArgs.append(UnsafeMutableRawPointer(ptr))
+                                deallocators.append { ptr.deinitialize(count: 1); ptr.deallocate() }
                             default:
                                 throw VMError.typeError(expected: "String|nil", got: v)
                             }
@@ -1552,6 +1569,10 @@ public final class VirtualMachine: @unchecked Sendable {
         }
     }
 
+    func keepAliveFFIAllocation(_ cleanup: @escaping () -> Void) {
+        ownedFFIAllocations.append(cleanup)
+    }
+
     private func function(at index: Int) throws -> BytecodeFunction {
         guard index >= 0 && index < module.functions.count else { throw VMError.unknownFunction(index) }
         return module.functions[index]
@@ -1650,7 +1671,7 @@ public final class VirtualMachine: @unchecked Sendable {
     }
 }
 
-private extension KiraValue {
+extension KiraValue {
     func asInt() throws -> Int64 {
         if case .int(let i) = self { return i }
         if case .bool(let b) = self { return b ? 1 : 0 }

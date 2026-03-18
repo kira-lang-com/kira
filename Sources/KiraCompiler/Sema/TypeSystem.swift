@@ -9,6 +9,7 @@ public enum KiraType: Hashable, Sendable, CustomStringConvertible {
     case void
     case named(String)
     indirect case pointer(KiraType)
+    indirect case fixedArray(KiraType, Int)
     indirect case array(KiraType)
     indirect case dictionary(key: KiraType, value: KiraType)
     indirect case optional(KiraType)
@@ -25,6 +26,7 @@ public enum KiraType: Hashable, Sendable, CustomStringConvertible {
         case .void: return "Void"
         case .named(let n): return n
         case .pointer(let t): return "CPointer<\(t)>"
+        case .fixedArray(let t, let count): return "CArray<\(t), \(count)>"
         case .array(let t): return "[\(t)]"
         case .dictionary(let k, let v): return "[\(k): \(v)]"
         case .optional(let t): return "\(t)?"
@@ -55,6 +57,8 @@ public struct TypeSystem: Sendable {
             }
             let rendered = "\(base)<\(args.map { resolve($0).description }.joined(separator: ", "))>"
             return .named(rendered)
+        case .fixedArray(let element, let count):
+            return .fixedArray(resolve(element), count)
         case .array(let inner):
             return .array(resolve(inner))
         case .dictionary(let key, let value):

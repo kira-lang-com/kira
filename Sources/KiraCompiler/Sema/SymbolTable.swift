@@ -71,6 +71,7 @@ public struct SymbolTable: Sendable {
     public private(set) var functions: [String: FunctionSymbol] = [:]
     public private(set) var globals: [String: KiraType] = [:]
     public private(set) var types: Set<String> = []
+    public private(set) var typeAliases: [String: KiraType] = [:]
     public private(set) var methods: [String: [String: KiraType]] = [:] // TypeName -> method -> fnType
     public private(set) var ffi: [String: FFIPrototype] = [:]
     public private(set) var cStructTypes: Set<String> = []
@@ -79,6 +80,10 @@ public struct SymbolTable: Sendable {
     public init() {}
 
     public mutating func addType(_ name: String) { types.insert(name) }
+
+    public mutating func addTypeAlias(_ name: String, target: KiraType) {
+        typeAliases[name] = target
+    }
 
     public mutating func addFunction(_ sym: FunctionSymbol) throws {
         if functions[sym.name] != nil {

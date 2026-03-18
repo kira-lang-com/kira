@@ -514,11 +514,27 @@ public struct Parser {
     }
 
     private mutating func parseAssignment() throws -> Expr {
-        var expr = try parseLogicalOr()
+        var expr = try parseConditional()
         if match(.equal) {
             let value = try parseAssignment()
             let range = SourceRange(start: expr.range.start, end: value.range.end)
             expr = .assign(.init(target: expr, value: value, range: range))
+        }
+        return expr
+    }
+
+    private mutating func parseConditional() throws -> Expr {
+        var expr = try parseLogicalOr()
+        if match(.question) {
+            let thenExpr = try parseExpression()
+            _ = try expect(.colon, ":")
+            let elseExpr = try parseConditional()
+            expr = .conditional(.init(
+                condition: expr,
+                thenExpr: thenExpr,
+                elseExpr: elseExpr,
+                range: SourceRange(start: expr.range.start, end: elseExpr.range.end)
+            ))
         }
         return expr
     }
@@ -682,6 +698,11 @@ public struct Parser {
             if name == "true" { return .boolLiteral(true, tok.range) }
             if name == "false" { return .boolLiteral(false, tok.range) }
             if name == "nil" { return .nilLiteral(tok.range) }
+            if name == "sizeOf", match(.lParen) {
+                let targetType = try parseTypeRef()
+                let end = try expect(.rParen, ")").range.end
+                return .sizeOf(.init(type: targetType, range: SourceRange(start: tok.range.start, end: end)))
+            }
             return .identifier(name, tok.range)
         case .intLiteral(let v):
             _ = advance()
@@ -711,6 +732,25 @@ public struct Parser {
             let expr = try parseExpression()
             _ = try expect(.rParen, ")")
             return expr
+        case .lBracket:
+            let start = tok.range.start
+            _ = advance()
+            var elements: [Expr] = []
+            consumeSeparators()
+            while !at(.rBracket) {
+                consumeSeparators()
+                elements.append(try parseExpression())
+                consumeSeparators()
+                if !match(.comma) {
+                    break
+                }
+                consumeSeparators()
+                if at(.rBracket) {
+                    break
+                }
+            }
+            let end = try expect(.rBracket, "]").range.end
+            return .arrayLiteral(.init(elements: elements, range: SourceRange(start: start, end: end)))
         case .hash:
             _ = advance()
             let start = tok.range.start
@@ -778,15 +818,36 @@ public struct Parser {
         let (name, nameRange) = try expectIdentifier("type name")
         var base = TypeRef(kind: .named(name), range: nameRange)
         if match(.lt) {
-            var args: [TypeRef] = []
-            if !at(.gt) {
-                repeat {
-                    args.append(try parseTypeRef())
-                } while match(.comma)
+            if name == "CArray" {
+                let elementType = try parseTypeRef()
+                _ = try expect(.comma, ",")
+                let count: Int
+                switch current().kind {
+                case .intLiteral(let value):
+                    guard value >= 0 else {
+                        throw ParseError.message("CArray element count must be non-negative", current().range.start)
+                    }
+                    guard let parsed = Int(exactly: value) else {
+                        throw ParseError.message("CArray element count is too large", current().range.start)
+                    }
+                    count = parsed
+                    _ = advance()
+                default:
+                    throw ParseError.unexpectedToken(expected: "array length", got: current().kind, at: current().range.start)
+                }
+                let end = try expect(.gt, ">").range.end
+                base = TypeRef(kind: .fixedArray(element: elementType, count: count), range: SourceRange(start: start, end: end))
+            } else {
+                var args: [TypeRef] = []
+                if !at(.gt) {
+                    repeat {
+                        args.append(try parseTypeRef())
+                    } while match(.comma)
+                }
+                _ = try expect(.gt, ">")
+                let end = previous().range.end
+                base = TypeRef(kind: .applied(name, args), range: SourceRange(start: start, end: end))
             }
-            _ = try expect(.gt, ">")
-            let end = previous().range.end
-            base = TypeRef(kind: .applied(name, args), range: SourceRange(start: start, end: end))
         }
         var ty = base
         if match(.question) {

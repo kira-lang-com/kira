@@ -102,6 +102,10 @@ public struct BytecodeEmitter: Sendable {
                     append(.store_global, [UInt8(sym >> 8), UInt8(sym & 0xff)], irIndex: i)
                 case .newObject(let fieldCount):
                     append(.new_object, [UInt8(fieldCount >> 8), UInt8(fieldCount & 0xff)], irIndex: i)
+                case .makeFFIArray(let count, let elementType):
+                    var bytes: [UInt8] = [UInt8(count >> 8), UInt8(count & 0xff)]
+                    bytes.append(contentsOf: elementType)
+                    append(.make_ffi_array, bytes, irIndex: i)
                 case .loadField(let fieldIndex):
                     append(.load_field, [UInt8(fieldIndex >> 8), UInt8(fieldIndex & 0xff)], irIndex: i)
                 case .storeField(let fieldIndex):

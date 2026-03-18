@@ -13,5 +13,19 @@ final class FFITests: XCTestCase {
         XCTAssertTrue(kira.contains("libclang is not available"))
         #endif
     }
-}
 
+    func testBindgenUsesStableFixedArrayNames() {
+        let header = """
+        typedef struct sg_buffer { unsigned int id; } sg_buffer;
+        typedef struct holder { sg_buffer buffers[8]; } holder;
+        """
+        let kira = BindgenEngine().generate(headerText: header, libraryName: "libtest")
+
+        #if canImport(Clibclang)
+        XCTAssertTrue(kira.contains("type CArray8_sg_buffer {"))
+        XCTAssertFalse(kira.contains("CArray8_sg_buffer_"))
+        #else
+        XCTAssertTrue(kira.contains("libclang is not available"))
+        #endif
+    }
+}

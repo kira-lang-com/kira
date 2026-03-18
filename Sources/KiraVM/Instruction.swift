@@ -80,6 +80,7 @@ public enum Instruction: UInt8, Sendable {
     case array_length = 0x92
     case array_append = 0x93
     case array_slice = 0x94
+    case make_ffi_array = 0x95
 
     // String operations
     case string_concat = 0xA0

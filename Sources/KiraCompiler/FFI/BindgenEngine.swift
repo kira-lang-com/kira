@@ -684,15 +684,6 @@ private func typeSignature(_ type: CKiraFFIType) -> String {
     }
 }
 
-private func fnv1a32Hex(_ s: String) -> String {
-    var hash: UInt32 = 2166136261
-    for b in s.utf8 {
-        hash ^= UInt32(b)
-        hash = hash &* 16777619
-    }
-    return String(format: "%08x", hash)
-}
-
 private func sanitizeIdentifierFragment(_ s: String) -> String {
     var out = ""
     out.reserveCapacity(s.count)
@@ -713,11 +704,10 @@ private func sanitizeIdentifierFragment(_ s: String) -> String {
 
 private func fixedArrayTypeName(count: Int, element: CKiraFFIType) -> String {
     let elemFrag = sanitizeIdentifierFragment(typeToKiraString(element))
-    let h = fnv1a32Hex("\(count)|\(typeSignature(element))")
     if elemFrag.isEmpty {
-        return "CArray\(count)_\(h)"
+        return "CArray\(count)"
     }
-    return "CArray\(count)_\(elemFrag)_\(h)"
+    return "CArray\(count)_\(elemFrag)"
 }
 
 private func emitKira(parsed: ParsedHeader, libraryName: String, platform: BindgenPlatform) -> String {
