@@ -2,7 +2,7 @@ import Foundation
 
 enum KiraCLIInfo {
     static let version = "1.0.0"
-    static let stdlibBundleName = "Kira_KiraStdlib.resources"
+    static let stdlibBundleName = "Kira_KiraStdlib.bundle"
 
     static var executableSuffix: String {
         #if os(Windows)
