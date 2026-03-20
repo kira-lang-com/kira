@@ -73,6 +73,7 @@ public enum Instruction: UInt8, Sendable {
     case call_native = 0x81    // operand: UInt16 native index
     case tail_call = 0x82      // operand: UInt8 argCount
     case ret = 0x83
+    case call_protocol_method = 0x84 // operands: UInt16 methodName, UInt8 argCount
 
     // Object creation
     case new_object = 0x90     // operand: UInt16 type descriptor index
@@ -81,6 +82,7 @@ public enum Instruction: UInt8, Sendable {
     case array_append = 0x93
     case array_slice = 0x94
     case make_ffi_array = 0x95
+    case new_typed_object = 0x96 // operands: UInt16 typeName, UInt16 fieldCount
 
     // String operations
     case string_concat = 0xA0

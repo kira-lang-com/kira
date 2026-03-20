@@ -18,6 +18,18 @@ public struct FunctionSymbol: Hashable, Sendable {
     }
 }
 
+public struct MethodSymbol: Hashable, Sendable {
+    public var name: String
+    public var loweredName: String
+    public var type: KiraType
+
+    public init(name: String, loweredName: String, type: KiraType) {
+        self.name = name
+        self.loweredName = loweredName
+        self.type = type
+    }
+}
+
 public struct FFIPrototype: Sendable {
     public enum TypeTag: UInt8, Sendable {
         case void = 0
@@ -72,10 +84,14 @@ public struct SymbolTable: Sendable {
     public private(set) var globals: [String: KiraType] = [:]
     public private(set) var types: Set<String> = []
     public private(set) var typeAliases: [String: KiraType] = [:]
-    public private(set) var methods: [String: [String: KiraType]] = [:] // TypeName -> method -> fnType
+    public private(set) var enumCases: [String: [String: Int64]] = [:]
+    public private(set) var protocolRequirements: [String: [String: MethodSymbol]] = [:]
+    public private(set) var conformances: [String: Set<String>] = [:]
+    public private(set) var methods: [String: [String: MethodSymbol]] = [:] // TypeName -> method -> symbol
     public private(set) var ffi: [String: FFIPrototype] = [:]
     public private(set) var cStructTypes: Set<String> = []
     public private(set) var fields: [String: [String: (index: Int, type: KiraType)]] = [:] // TypeName -> field -> (index, type)
+    public private(set) var staticFields: [String: [String: KiraType]] = [:]
 
     public init() {}
 
@@ -83,6 +99,39 @@ public struct SymbolTable: Sendable {
 
     public mutating func addTypeAlias(_ name: String, target: KiraType) {
         typeAliases[name] = target
+    }
+
+    public mutating func addEnumCases(
+        typeName: String,
+        cases: [(name: String, tag: Int64, range: SourceRange)]
+    ) throws {
+        var map = enumCases[typeName] ?? [:]
+        for enumCase in cases {
+            if map[enumCase.name] != nil {
+                throw SemanticError.duplicateSymbol(enumCase.name, enumCase.range.start)
+            }
+            map[enumCase.name] = enumCase.tag
+        }
+        enumCases[typeName] = map
+    }
+
+    public mutating func addProtocolRequirements(
+        protocolName: String,
+        requirements: [(name: String, type: KiraType)]
+    ) {
+        var map: [String: MethodSymbol] = [:]
+        for requirement in requirements {
+            map[requirement.name] = MethodSymbol(
+                name: requirement.name,
+                loweredName: requirement.name,
+                type: requirement.type
+            )
+        }
+        protocolRequirements[protocolName] = map
+    }
+
+    public mutating func addConformance(typeName: String, protocolName: String) {
+        conformances[typeName, default: []].insert(protocolName)
     }
 
     public mutating func addFunction(_ sym: FunctionSymbol) throws {
@@ -103,12 +152,11 @@ public struct SymbolTable: Sendable {
         ffi[functionName] = proto
     }
 
-    public mutating func addMethod(typeName: String, methodName: String, methodType: KiraType) {
-        methods[typeName, default: [:]][methodName] = methodType
+    public mutating func addMethod(typeName: String, methodName: String, loweredName: String, methodType: KiraType) {
+        methods[typeName, default: [:]][methodName] = MethodSymbol(name: methodName, loweredName: loweredName, type: methodType)
     }
 
-    public mutating func addCStruct(typeName: String, fields: [(name: String, type: KiraType)]) {
-        cStructTypes.insert(typeName)
+    public mutating func addFields(typeName: String, fields: [(name: String, type: KiraType)]) {
         var map: [String: (index: Int, type: KiraType)] = [:]
         map.reserveCapacity(fields.count)
         for (i, f) in fields.enumerated() {
@@ -117,17 +165,46 @@ public struct SymbolTable: Sendable {
         self.fields[typeName] = map
     }
 
+    public mutating func addStaticField(typeName: String, fieldName: String, type: KiraType) {
+        staticFields[typeName, default: [:]][fieldName] = type
+    }
+
+    public mutating func addCStruct(typeName: String, fields: [(name: String, type: KiraType)]) {
+        cStructTypes.insert(typeName)
+        addFields(typeName: typeName, fields: fields)
+    }
+
     public func lookupValue(_ name: String) -> KiraType? {
         if let fn = functions[name] { return fn.type }
         if let g = globals[name] { return g }
         return nil
     }
 
-    public func lookupMethod(typeName: String, name: String) -> KiraType? {
+    public func lookupMethod(typeName: String, name: String) -> MethodSymbol? {
         methods[typeName]?[name]
+    }
+
+    public func lookupEnumCase(typeName: String, name: String) -> Int64? {
+        enumCases[typeName]?[name]
+    }
+
+    public func lookupProtocolRequirement(protocolName: String, name: String) -> MethodSymbol? {
+        protocolRequirements[protocolName]?[name]
+    }
+
+    public func typeConformsToProtocol(typeName: String, protocolName: String) -> Bool {
+        conformances[typeName]?.contains(protocolName) == true
+    }
+
+    public func isProtocol(_ name: String) -> Bool {
+        protocolRequirements[name] != nil
     }
 
     public func lookupField(typeName: String, name: String) -> (index: Int, type: KiraType)? {
         fields[typeName]?[name]
+    }
+
+    public func lookupStaticField(typeName: String, name: String) -> KiraType? {
+        staticFields[typeName]?[name]
     }
 }

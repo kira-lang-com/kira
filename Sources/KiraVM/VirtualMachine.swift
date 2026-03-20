@@ -54,7 +54,7 @@ private func ffiCallback0Trampoline(
     do {
         _ = try vm.run(function: ctx.functionName)
     } catch {
-        vm.output("[ffi_callback0] error: \(error)")
+        vm.output("[ffi_callback0] error in \(ctx.functionName): \(error)")
     }
 }
 
@@ -105,7 +105,7 @@ private func ffiCallback1I32Trampoline(
     do {
         _ = try vm.run(function: ctx.functionName, args: [.int(Int64(v))])
     } catch {
-        vm.output("[ffi_callback1_i32] error: \(error)")
+        vm.output("[ffi_callback1_i32] error in \(ctx.functionName): \(error)")
     }
 }
 
@@ -320,6 +320,10 @@ public final class VirtualMachine: @unchecked Sendable {
                      .call_native, .new_object,
                      .fiber_new, .unwrap_or_jump, .line_number:
                     ip += 2
+                case .new_typed_object:
+                    ip += 4
+                case .call_protocol_method:
+                    ip += 3
                 case .make_ffi_array:
                     ip += 2
                     skipFFITypeDesc(code, &ip)
@@ -607,6 +611,23 @@ public final class VirtualMachine: @unchecked Sendable {
                     fiber.callStack[fiber.callStack.count - 2] = current
                     // Start executing the callee frame (reload `fn` from the new top of stack).
                     continue runLoop
+                case .call_protocol_method:
+                    let methodNameIndex = Int(try readU16(fn, &current))
+                    let argc = Int(try readU8(fn, &current))
+                    guard methodNameIndex >= 0, methodNameIndex < module.strings.count else {
+                        throw VMError.invalidBytecode("protocol method string index out of bounds: \(methodNameIndex)")
+                    }
+                    if fiber.operandStack.count < argc + 1 {
+                        throw VMError.invalidBytecode("stack underflow in call_protocol_method (argc=\(argc))")
+                    }
+                    try pushProtocolCallFrame(
+                        fiber: fiber,
+                        receiver: fiber.operandStack.peek(argc),
+                        methodName: module.strings[methodNameIndex],
+                        argCount: argc
+                    )
+                    fiber.callStack[fiber.callStack.count - 2] = current
+                    continue runLoop
                 case .tail_call:
                     let argc = Int(try readU8(fn, &current))
                     if fiber.operandStack.count <= argc {
@@ -645,6 +666,17 @@ public final class VirtualMachine: @unchecked Sendable {
                     let fieldCount = Int(try readU16(fn, &current))
                     let ref = heap.allocate(KiraObject(
                         type: KiraTypeDescriptor(name: "Object", fieldCount: fieldCount),
+                        fields: Array(repeating: .nil_, count: max(0, fieldCount))
+                    ))
+                    fiber.operandStack.push(.reference(ref))
+                case .new_typed_object:
+                    let typeNameIndex = Int(try readU16(fn, &current))
+                    let fieldCount = Int(try readU16(fn, &current))
+                    guard typeNameIndex >= 0, typeNameIndex < module.strings.count else {
+                        throw VMError.invalidBytecode("type name string index out of bounds: \(typeNameIndex)")
+                    }
+                    let ref = heap.allocate(KiraObject(
+                        type: KiraTypeDescriptor(name: module.strings[typeNameIndex], fieldCount: fieldCount),
                         fields: Array(repeating: .nil_, count: max(0, fieldCount))
                     ))
                     fiber.operandStack.push(.reference(ref))
@@ -1299,7 +1331,8 @@ public final class VirtualMachine: @unchecked Sendable {
                         let desc = argDescs[i]
                         let v = args[i]
 
-                        switch desc {
+                        do {
+                            switch desc {
                         case .pointer(let pointeeDesc):
                             // If the caller already provides a pointer, pass it through.
                             if case .nativePointer(let np) = v {
@@ -1430,6 +1463,9 @@ public final class VirtualMachine: @unchecked Sendable {
                             try pack(v, layout: l, into: ptr)
                             boxedArgs.append(ptr)
                             deallocators.append { ptr.deallocate() }
+                            }
+                        } catch {
+                            throw VMError.invalidBytecode("ffi argument conversion failed for \(fn.name) arg \(i): \(error)")
                         }
                     }
 
@@ -1628,6 +1664,35 @@ public final class VirtualMachine: @unchecked Sendable {
     private func tailCall(fiber: VMFiber, callee: KiraValue, argCount: Int) throws {
         _ = fiber.callStack.popLast()
         try pushCallFrame(fiber: fiber, callee: callee, argCount: argCount)
+    }
+
+    private func pushProtocolCallFrame(fiber: VMFiber, receiver: KiraValue, methodName: String, argCount: Int) throws {
+        guard case .reference(let receiverRef) = receiver else {
+            throw VMError.typeError(expected: "Reference", got: receiver)
+        }
+        let object = try heap.get(receiverRef)
+        let functionName = "__\(object.type.name)_\(methodName)"
+        guard let functionIndex = module.functions.firstIndex(where: { $0.name == functionName }) else {
+            throw VMError.invalidBytecode("protocol dispatch target not found: \(functionName)")
+        }
+        let fn = try function(at: functionIndex)
+        var args: [KiraValue] = []
+        args.reserveCapacity(argCount + 1)
+        for _ in 0..<argCount {
+            args.append(fiber.operandStack.pop())
+        }
+        args.reverse()
+        _ = fiber.operandStack.pop()
+        let base = fiber.operandStack.count
+        var locals = Array(repeating: KiraValue.nil_, count: fn.localCount)
+        if !locals.isEmpty {
+            locals[0] = receiver
+        }
+        for index in 0..<min(args.count, max(0, fn.paramCount - 1)) {
+            locals[index + 1] = args[index]
+        }
+        let frame = VMCallFrame(functionIndex: functionIndex, ip: 0, locals: locals, baseStackCount: base, closure: nil)
+        fiber.callStack.append(frame)
     }
 
     private func readU8(_ fn: BytecodeFunction, _ frame: inout VMCallFrame) throws -> UInt8 {

@@ -72,4 +72,162 @@ final class ParserTests: XCTestCase {
             return XCTFail("expected sizeOf expression")
         }
     }
+
+    func testParsesTypeMethod() throws {
+        let text = """
+        @CStruct
+        type Counter {
+            var value: Int
+
+            function add(delta: Int) -> Int {
+                return self.value + delta
+            }
+        }
+        """
+        let src = SourceText(file: "test.kira", text: text)
+        let toks = try Lexer().lex(src)
+        var p = Parser(tokens: toks)
+        let module = try p.parseModule()
+
+        guard case .type(let td) = try XCTUnwrap(module.declarations.first) else {
+            return XCTFail("expected type declaration")
+        }
+        XCTAssertEqual(td.fields.count, 1)
+        XCTAssertEqual(td.methods.count, 1)
+        XCTAssertEqual(td.methods[0].name, "add")
+    }
+
+    func testParsesCallWithTrailingBlockWithoutParens() throws {
+        let text = """
+        function main() {
+            makeThing {
+                value = 1
+            }
+            return
+        }
+        """
+        let src = SourceText(file: "test.kira", text: text)
+        let toks = try Lexer().lex(src)
+        var p = Parser(tokens: toks)
+        let module = try p.parseModule()
+
+        guard case .function(let fn) = try XCTUnwrap(module.declarations.first) else {
+            return XCTFail("expected function declaration")
+        }
+        guard case .expr(let expr) = fn.body.statements[0] else {
+            return XCTFail("expected expression statement")
+        }
+        guard case .call(let call) = expr else {
+            return XCTFail("expected call expression")
+        }
+        XCTAssertEqual(call.arguments.count, 0)
+        XCTAssertNotNil(call.trailingBlock)
+    }
+
+    func testParsesEnumDeclaration() throws {
+        let text = """
+        enum PixelFormat {
+            case rgba8Unorm
+            case bgra8Unorm
+        }
+        """
+        let src = SourceText(file: "test.kira", text: text)
+        let toks = try Lexer().lex(src)
+        var p = Parser(tokens: toks)
+        let module = try p.parseModule()
+
+        guard case .enum(let enumDecl) = try XCTUnwrap(module.declarations.first) else {
+            return XCTFail("expected enum declaration")
+        }
+        XCTAssertEqual(enumDecl.name, "PixelFormat")
+        XCTAssertEqual(enumDecl.cases.map(\.name), ["rgba8Unorm", "bgra8Unorm"])
+    }
+
+    func testParsesLeadingDotMemberExpression() throws {
+        let text = """
+        function main() {
+            let format: PixelFormat = .bgra8Unorm
+            return
+        }
+        """
+        let src = SourceText(file: "test.kira", text: text)
+        let toks = try Lexer().lex(src)
+        var p = Parser(tokens: toks)
+        let module = try p.parseModule()
+
+        guard case .function(let fn) = try XCTUnwrap(module.declarations.first) else {
+            return XCTFail("expected function declaration")
+        }
+        guard case .variable(let decl) = fn.body.statements[0] else {
+            return XCTFail("expected variable declaration")
+        }
+        guard case .leadingMember(let name, _) = decl.initializer else {
+            return XCTFail("expected leading dot member expression")
+        }
+        XCTAssertEqual(name, "bgra8Unorm")
+    }
+
+    func testParsesTypeProtocolConformance() throws {
+        let text = """
+        protocol Scene {
+            function tick() -> Int
+        }
+
+        type CounterScene: Scene {
+            function tick() -> Int {
+                return 7
+            }
+        }
+        """
+        let src = SourceText(file: "test.kira", text: text)
+        let toks = try Lexer().lex(src)
+        var p = Parser(tokens: toks)
+        let module = try p.parseModule()
+
+        guard case .type(let typeDecl) = module.declarations[1] else {
+            return XCTFail("expected type declaration")
+        }
+        XCTAssertEqual(typeDecl.conformances, ["Scene"])
+    }
+
+    func testParsesStaticTypeField() throws {
+        let text = """
+        type Color {
+            static let black: Color = Color()
+        }
+        """
+        let src = SourceText(file: "test.kira", text: text)
+        let toks = try Lexer().lex(src)
+        var p = Parser(tokens: toks)
+        let module = try p.parseModule()
+
+        guard case .type(let typeDecl) = try XCTUnwrap(module.declarations.first) else {
+            return XCTFail("expected type declaration")
+        }
+        XCTAssertEqual(typeDecl.fields.count, 1)
+        XCTAssertTrue(typeDecl.fields[0].isStatic)
+    }
+
+    func testParsesIfStatementWithoutEatingThenBlockAsTrailingCall() throws {
+        let text = """
+        function main() {
+            let shouldQuit = true
+            if shouldQuit {
+                print(1)
+            }
+            return
+        }
+        """
+        let src = SourceText(file: "test.kira", text: text)
+        let toks = try Lexer().lex(src)
+        var p = Parser(tokens: toks)
+        let module = try p.parseModule()
+
+        guard case .function(let fn) = try XCTUnwrap(module.declarations.first) else {
+            return XCTFail("expected function declaration")
+        }
+        guard case .if = fn.body.statements[1] else {
+            return XCTFail("expected if statement")
+        }
+    }
 }

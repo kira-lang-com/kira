@@ -15,6 +15,7 @@ public enum Keyword: String, CaseIterable, Sendable {
     case `import`
     case `as`
     case `extern`
+    case `static`
     case `async`
     case `await`
     case `if`

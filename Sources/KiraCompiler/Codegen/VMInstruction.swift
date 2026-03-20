@@ -69,6 +69,7 @@ public enum Instruction: UInt8, Sendable {
     case call_native = 0x81
     case tail_call = 0x82
     case ret = 0x83
+    case call_protocol_method = 0x84
 
     case new_object = 0x90
     case new_array = 0x91
@@ -76,6 +77,7 @@ public enum Instruction: UInt8, Sendable {
     case array_append = 0x93
     case array_slice = 0x94
     case make_ffi_array = 0x95
+    case new_typed_object = 0x96
 
     case string_concat = 0xA0
     case string_length = 0xA1

@@ -4,20 +4,63 @@ public struct IRBuilder {
     public init() {}
 
     public func build(from typed: TypedModule) throws -> KiraIRModule {
-        var fns: [KiraIRFunction] = try typed.ast.declarations.compactMap { decl in
+        let instanceFieldInitializers = buildInstanceFieldInitializerMap(
+            declarations: typed.ast.declarations,
+            symbols: typed.symbols
+        )
+        var fns: [KiraIRFunction] = []
+        for decl in typed.ast.declarations {
             switch decl {
             case .function(let fn):
-                return try buildFunction(fn: fn, symbols: typed.symbols, typeInfo: typed.typeInfo)
+                fns.append(try buildFunction(
+                    fn: fn,
+                    symbols: typed.symbols,
+                    typeInfo: typed.typeInfo,
+                    instanceFieldInitializers: instanceFieldInitializers
+                ))
             case .externFunction(let fn):
-                return try buildExternFunction(fn: fn, symbols: typed.symbols)
+                fns.append(try buildExternFunction(fn: fn, symbols: typed.symbols))
+            case .type(let td):
+                for method in td.methods {
+                    fns.append(try buildMethod(
+                        typeName: td.name,
+                        fn: method,
+                        symbols: typed.symbols,
+                        typeInfo: typed.typeInfo,
+                        instanceFieldInitializers: instanceFieldInitializers
+                    ))
+                }
             default:
-                return nil
+                break
             }
         }
-        if let initFn = try buildGlobalInit(declarations: typed.ast.declarations, symbols: typed.symbols, typeInfo: typed.typeInfo) {
+        if let initFn = try buildGlobalInit(
+            declarations: typed.ast.declarations,
+            symbols: typed.symbols,
+            typeInfo: typed.typeInfo,
+            instanceFieldInitializers: instanceFieldInitializers
+        ) {
             fns.append(initFn)
         }
         return KiraIRModule(functions: fns)
+    }
+
+    private func buildInstanceFieldInitializerMap(
+        declarations: [Decl],
+        symbols: SymbolTable
+    ) -> [String: [Expr?]] {
+        var result: [String: [Expr?]] = [:]
+        for decl in declarations {
+            guard case .type(let td) = decl else { continue }
+            let fieldCount = symbols.fields[td.name]?.count ?? td.fields.count
+            var initializers: [Expr?] = Array(repeating: nil, count: fieldCount)
+            for field in td.fields where !field.isStatic {
+                guard let info = symbols.lookupField(typeName: td.name, name: field.name) else { continue }
+                initializers[info.index] = field.initializer
+            }
+            result[td.name] = initializers
+        }
+        return result
     }
 
     private func ffiTypeEncoding(for type: KiraType, symbols: SymbolTable) -> FFIPrototype.TypeEncoding {
@@ -102,16 +145,36 @@ public struct IRBuilder {
         return nil
     }
 
+    private func builderParamTypeName(params: [KiraType], explicitArgumentCount: Int, symbols: SymbolTable) -> String? {
+        guard explicitArgumentCount + 1 == params.count else { return nil }
+        guard case .named(let typeName) = params[explicitArgumentCount] else { return nil }
+        guard symbols.fields[typeName] != nil else { return nil }
+        return typeName
+    }
+
+    private func loweredStaticFieldName(typeName: String, fieldName: String) -> String {
+        "__\(typeName)_static_\(fieldName)"
+    }
+
     private func buildGlobalInit(
         declarations: [Decl],
         symbols: SymbolTable,
-        typeInfo: TypeInfo
+        typeInfo: TypeInfo,
+        instanceFieldInitializers: [String: [Expr?]]
     ) throws -> KiraIRFunction? {
         let globals: [VarDeclStmt] = declarations.compactMap {
             if case .globalVar(let gv) = $0 { return gv }
             return nil
         }
-        guard !globals.isEmpty else { return nil }
+        let staticFields: [(globalName: String, initializer: Expr)] = declarations.flatMap { decl in
+            guard case .type(let td) = decl else {
+                return [(globalName: String, initializer: Expr)]()
+            }
+            return td.fields
+                .filter(\.isStatic)
+                .map { (loweredStaticFieldName(typeName: td.name, fieldName: $0.name), $0.initializer ?? .nilLiteral($0.range)) }
+        }
+        guard !globals.isEmpty || !staticFields.isEmpty else { return nil }
 
         var emitter = StackEmitter()
         func exprType(_ e: Expr) -> KiraType? { typeInfo.exprTypes[e.range] }
@@ -139,6 +202,14 @@ public struct IRBuilder {
                 emitter.emit(.pushBool(b))
             case .nilLiteral:
                 emitter.emit(.pushNil)
+            case .leadingMember(let name, _):
+                let contextualType = exprType(e) ?? expected
+                if case .named(let typeName) = (contextualType ?? .unknown),
+                   let tag = symbols.lookupEnumCase(typeName: typeName, name: name) {
+                    emitter.emit(.pushInt(tag))
+                } else {
+                    emitter.emit(.pushNil)
+                }
             case .sizeOf:
                 emitter.emit(.pushInt(typeInfo.sizeOfValues[e.range] ?? 0))
             case .arrayLiteral(let literal):
@@ -224,14 +295,13 @@ public struct IRBuilder {
                     emitter.emit(.pushNil)
                     return
                 }
-                if case .identifier(let typeName, _) = c.callee, symbols.cStructTypes.contains(typeName) {
-                    let fieldMap = symbols.fields[typeName] ?? [:]
+                if case .identifier(let typeName, _) = c.callee, let fieldMap = symbols.fields[typeName] {
                     let fieldCount = fieldMap.count
                     var fieldTypes: [KiraType] = Array(repeating: .unknown, count: fieldCount)
                     for info in fieldMap.values {
                         fieldTypes[info.index] = info.type
                     }
-                    emitter.emit(.newObject(fieldCount: UInt16(fieldCount)))
+                    emitter.emit(.newTypedObject(typeName: typeName, fieldCount: UInt16(fieldCount)))
 
                     var argsByIndex: [Expr?] = Array(repeating: nil, count: fieldCount)
                     var used: Set<Int> = []
@@ -246,7 +316,10 @@ public struct IRBuilder {
                     }
                     for i in 0..<fieldCount {
                         emitter.emit(.dup)
-                        try emitExpr(argsByIndex[i] ?? .nilLiteral(c.range), coercedTo: fieldTypes[i])
+                        let defaultExpr = i < (instanceFieldInitializers[typeName]?.count ?? 0)
+                            ? instanceFieldInitializers[typeName]![i]
+                            : nil
+                        try emitExpr(argsByIndex[i] ?? defaultExpr ?? .nilLiteral(c.range), coercedTo: fieldTypes[i])
                         emitter.emit(.storeField(UInt16(i)))
                     }
                     return
@@ -269,6 +342,35 @@ public struct IRBuilder {
                     emitter.emit(.makeColor)
                     return
                 }
+                if case .member(let m) = c.callee,
+                   case .named(let protocolName) = (exprType(m.base) ?? .unknown),
+                   symbols.lookupProtocolRequirement(protocolName: protocolName, name: m.name) != nil {
+                    try emitExpr(m.base)
+                    for argument in c.arguments {
+                        try emitExpr(argument.value)
+                    }
+                    emitter.emit(.callProtocolMethod(m.name, argCount: UInt8(c.arguments.count)))
+                    return
+                }
+
+                if case .member(let m) = c.callee,
+                   case .named(let typeName) = (exprType(m.base) ?? .unknown),
+                   let method = symbols.lookupMethod(typeName: typeName, name: m.name) {
+                    emitter.emit(.loadGlobalSymbol(method.loweredName))
+                    try emitExpr(m.base)
+                    let expectedParams: [KiraType]
+                    if case .function(let params, _) = method.type {
+                        expectedParams = params
+                    } else {
+                        expectedParams = []
+                    }
+                    for (index, a) in c.arguments.enumerated() {
+                        let expectedArg = index < expectedParams.count ? expectedParams[index] : nil
+                        try emitExpr(a.value, coercedTo: expectedArg)
+                    }
+                    emitter.emit(.call(argCount: UInt8(c.arguments.count + 1)))
+                    return
+                }
 
                 let expectedParams: [KiraType]
                 if case .identifier(let name, _) = c.callee,
@@ -286,10 +388,19 @@ public struct IRBuilder {
                 }
                 emitter.emit(.call(argCount: UInt8(c.arguments.count)))
             case .member(let m):
-                if case .named(let typeName) = (exprType(m.base) ?? .unknown),
+                if case .identifier(let enumName, _) = m.base,
+                   let tag = symbols.lookupEnumCase(typeName: enumName, name: m.name) {
+                    emitter.emit(.pushInt(tag))
+                } else if case .identifier(let typeName, _) = m.base,
+                          symbols.lookupStaticField(typeName: typeName, name: m.name) != nil {
+                    emitter.emit(.loadGlobalSymbol(loweredStaticFieldName(typeName: typeName, fieldName: m.name)))
+                } else if case .named(let typeName) = (exprType(m.base) ?? .unknown),
                    let f = symbols.lookupField(typeName: typeName, name: m.name) {
                     try emitExpr(m.base)
                     emitter.emit(.loadField(UInt16(f.index)))
+                } else if case .named(let typeName) = (exprType(m.base) ?? .unknown),
+                          let method = symbols.lookupMethod(typeName: typeName, name: m.name) {
+                    emitter.emit(.loadGlobalSymbol(method.loweredName))
                 } else {
                     emitter.emit(.loadGlobalSymbol(m.name))
                 }
@@ -320,6 +431,10 @@ public struct IRBuilder {
         for gv in globals {
             try emitExpr(gv.initializer)
             emitter.emit(.storeGlobalSymbol(gv.name))
+        }
+        for staticField in staticFields {
+            try emitExpr(staticField.initializer)
+            emitter.emit(.storeGlobalSymbol(staticField.globalName))
         }
         emitter.emit(.pushNil)
         emitter.emit(.ret)
@@ -377,8 +492,48 @@ public struct IRBuilder {
         )
     }
 
-    private func buildFunction(fn: FunctionDecl, symbols: SymbolTable, typeInfo: TypeInfo) throws -> KiraIRFunction {
-        let fnSym = symbols.functions[fn.name]!
+    private func buildFunction(
+        fn: FunctionDecl,
+        symbols: SymbolTable,
+        typeInfo: TypeInfo,
+        instanceFieldInitializers: [String: [Expr?]]
+    ) throws -> KiraIRFunction {
+        try buildCallable(
+            fn: fn,
+            loweredName: fn.name,
+            selfType: nil,
+            symbols: symbols,
+            typeInfo: typeInfo,
+            instanceFieldInitializers: instanceFieldInitializers
+        )
+    }
+
+    private func buildMethod(
+        typeName: String,
+        fn: FunctionDecl,
+        symbols: SymbolTable,
+        typeInfo: TypeInfo,
+        instanceFieldInitializers: [String: [Expr?]]
+    ) throws -> KiraIRFunction {
+        try buildCallable(
+            fn: fn,
+            loweredName: "__\(typeName)_\(fn.name)",
+            selfType: .named(typeName),
+            symbols: symbols,
+            typeInfo: typeInfo,
+            instanceFieldInitializers: instanceFieldInitializers
+        )
+    }
+
+    private func buildCallable(
+        fn: FunctionDecl,
+        loweredName: String,
+        selfType: KiraType?,
+        symbols: SymbolTable,
+        typeInfo: TypeInfo,
+        instanceFieldInitializers: [String: [Expr?]]
+    ) throws -> KiraIRFunction {
+        let fnSym = symbols.functions[loweredName]!
         let mode: KiraIRFunction.ExecutionMode
         switch fnSym.executionMode {
         case .auto: mode = .auto
@@ -386,7 +541,7 @@ public struct IRBuilder {
         case .runtime: mode = .runtime
         }
         guard case .function(let params, let ret) = fnSym.type else {
-            return KiraIRFunction(name: fn.name, params: [], returnType: .void, localCount: 0, maxStackDepth: 0, instructions: [], executionMode: mode)
+            return KiraIRFunction(name: loweredName, params: [], returnType: .void, localCount: 0, maxStackDepth: 0, instructions: [], executionMode: mode)
         }
 
         var emitter = StackEmitter()
@@ -396,10 +551,25 @@ public struct IRBuilder {
             var slot: UInt8
             var type: KiraType
         }
+        struct BuilderBinding {
+            var slot: UInt8
+            var typeName: String
+        }
         var locals: [String: LocalBinding] = [:]
+        var builderStack: [BuilderBinding] = []
         var nextLocal: UInt8 = 0
+        var paramOffset = 0
+        let implicitSelfTypeName: String? = {
+            if case .named(let name) = selfType { return name }
+            return nil
+        }()
+        if let selfType {
+            locals["self"] = .init(slot: nextLocal, type: selfType)
+            nextLocal &+= 1
+            paramOffset = 1
+        }
         for (i, p) in fn.parameters.enumerated() {
-            locals[p.name] = .init(slot: nextLocal, type: params[i])
+            locals[p.name] = .init(slot: nextLocal, type: params[i + paramOffset])
             nextLocal &+= 1
         }
 
@@ -409,6 +579,31 @@ public struct IRBuilder {
             locals[name] = .init(slot: slot, type: type)
             nextLocal &+= 1
             return slot
+        }
+
+        func builderBinding() -> BuilderBinding? {
+            builderStack.last
+        }
+
+        func emitDefaultObject(typeName: String) throws {
+            let fieldCount = symbols.fields[typeName]?.count ?? 0
+            emitter.emit(.newTypedObject(typeName: typeName, fieldCount: UInt16(fieldCount)))
+            var fieldTypes: [KiraType] = Array(repeating: .unknown, count: fieldCount)
+            for info in (symbols.fields[typeName] ?? [:]).values {
+                fieldTypes[info.index] = info.type
+            }
+            for index in 0..<fieldCount {
+                emitter.emit(.dup)
+                let defaultExpr = index < (instanceFieldInitializers[typeName]?.count ?? 0)
+                    ? instanceFieldInitializers[typeName]![index]
+                    : nil
+                if let defaultExpr {
+                    try emitExpr(defaultExpr, coercedTo: fieldTypes[index])
+                } else {
+                    emitter.emit(.pushNil)
+                }
+                emitter.emit(.storeField(UInt16(index)))
+            }
         }
 
         func exprType(_ e: Expr) -> KiraType? { typeInfo.exprTypes[e.range] }
@@ -441,6 +636,14 @@ public struct IRBuilder {
                 emitter.emit(.pushBool(b))
             case .nilLiteral:
                 emitter.emit(.pushNil)
+            case .leadingMember(let name, _):
+                let contextualType = exprType(e) ?? expected
+                if case .named(let typeName) = (contextualType ?? .unknown),
+                   let tag = symbols.lookupEnumCase(typeName: typeName, name: name) {
+                    emitter.emit(.pushInt(tag))
+                } else {
+                    emitter.emit(.pushNil)
+                }
             case .sizeOf:
                 emitter.emit(.pushInt(typeInfo.sizeOfValues[e.range] ?? 0))
             case .arrayLiteral(let literal):
@@ -456,6 +659,21 @@ public struct IRBuilder {
             case .identifier(let name, _):
                 if let binding = locals[name] {
                     emitter.emit(.loadLocal(binding.slot))
+                } else if let builder = builderBinding(),
+                          let field = symbols.lookupField(typeName: builder.typeName, name: name) {
+                    emitter.emit(.loadLocal(builder.slot))
+                    emitter.emit(.loadField(UInt16(field.index)))
+                } else if let builder = builderBinding(),
+                          let method = symbols.lookupMethod(typeName: builder.typeName, name: name) {
+                    emitter.emit(.loadGlobalSymbol(method.loweredName))
+                } else if let typeName = implicitSelfTypeName,
+                          let selfBinding = locals["self"],
+                          let field = symbols.lookupField(typeName: typeName, name: name) {
+                    emitter.emit(.loadLocal(selfBinding.slot))
+                    emitter.emit(.loadField(UInt16(field.index)))
+                } else if let typeName = implicitSelfTypeName,
+                          symbols.lookupMethod(typeName: typeName, name: name) != nil {
+                    emitter.emit(.loadGlobalSymbol("__\(typeName)_\(name)"))
                 } else {
                     emitter.emit(.loadGlobalSymbol(name))
                 }
@@ -538,6 +756,19 @@ public struct IRBuilder {
                         if let existing = locals[name] {
                             emitter.emit(.storeLocal(existing.slot))
                             emitter.emit(.loadLocal(existing.slot))
+                        } else if let builder = builderBinding(),
+                                  let field = symbols.lookupField(typeName: builder.typeName, name: name) {
+                            emitter.emit(.loadLocal(builder.slot))
+                            emitter.emit(.swap)
+                            emitter.emit(.storeField(UInt16(field.index)))
+                            emitter.emit(.pushNil)
+                        } else if let typeName = implicitSelfTypeName,
+                                  let selfBinding = locals["self"],
+                                  let field = symbols.lookupField(typeName: typeName, name: name) {
+                            emitter.emit(.loadLocal(selfBinding.slot))
+                            emitter.emit(.swap)
+                            emitter.emit(.storeField(UInt16(field.index)))
+                            emitter.emit(.pushNil)
                         } else if symbols.globals[name] != nil {
                             emitter.emit(.storeGlobalSymbol(name))
                             emitter.emit(.loadGlobalSymbol(name))
@@ -561,16 +792,15 @@ public struct IRBuilder {
                     try emitExpr(c.arguments[0].value)
                     emitter.emit(.print)
                     emitter.emit(.pushNil)
-                } else if case .identifier(let typeName, _) = c.callee, symbols.cStructTypes.contains(typeName) {
-                    // @CStruct constructor: TypeName(field1:..., field2:...)
-                    let fieldMap = symbols.fields[typeName] ?? [:]
+                } else if case .identifier(let typeName, _) = c.callee, let fieldMap = symbols.fields[typeName] {
+                    // Type constructor: TypeName(field1:..., field2:...)
                     let fieldCount = fieldMap.count
                     var fieldTypes: [KiraType] = Array(repeating: .unknown, count: fieldCount)
                     for info in fieldMap.values {
                         fieldTypes[info.index] = info.type
                     }
 
-                    emitter.emit(.newObject(fieldCount: UInt16(fieldCount)))
+                    emitter.emit(.newTypedObject(typeName: typeName, fieldCount: UInt16(fieldCount)))
 
                     var argsByIndex: [Expr?] = Array(repeating: nil, count: fieldCount)
                     var used: Set<Int> = []
@@ -586,8 +816,14 @@ public struct IRBuilder {
 
                     for i in 0..<fieldCount {
                         emitter.emit(.dup)
-                        try emitExpr(argsByIndex[i] ?? .nilLiteral(c.range), coercedTo: fieldTypes[i])
+                        let defaultExpr = i < (instanceFieldInitializers[typeName]?.count ?? 0)
+                            ? instanceFieldInitializers[typeName]![i]
+                            : nil
+                        try emitExpr(argsByIndex[i] ?? defaultExpr ?? .nilLiteral(c.range), coercedTo: fieldTypes[i])
                         emitter.emit(.storeField(UInt16(i)))
+                    }
+                    if let trailing = c.trailingBlock {
+                        try emitBuilderBlock(trailing, typeName: typeName)
                     }
                 } else if case .identifier(let name, _) = c.callee, name == "ffi_callback0" {
                     // Compiler intrinsic: ffi_callback0("functionName") -> CPointer<CVoid>
@@ -614,6 +850,84 @@ public struct IRBuilder {
                     }
                     for a in c.arguments { try emitExpr(a.value) }
                     emitter.emit(.makeColor)
+                } else if case .member(let m) = c.callee,
+                          case .named(let protocolName) = (exprType(m.base) ?? .unknown),
+                          symbols.lookupProtocolRequirement(protocolName: protocolName, name: m.name) != nil {
+                    try emitExpr(m.base)
+                    for argument in c.arguments {
+                        try emitExpr(argument.value)
+                    }
+                    emitter.emit(.callProtocolMethod(m.name, argCount: UInt8(c.arguments.count)))
+                } else if case .identifier(let name, _) = c.callee,
+                          let builder = builderBinding(),
+                          let method = symbols.lookupMethod(typeName: builder.typeName, name: name) {
+                    emitter.emit(.loadGlobalSymbol(method.loweredName))
+                    emitter.emit(.loadLocal(builder.slot))
+                    let expectedParams: [KiraType]
+                    if case .function(let params, _) = method.type {
+                        expectedParams = params
+                    } else {
+                        expectedParams = []
+                    }
+                    for (index, a) in c.arguments.enumerated() {
+                        let expectedArg = index < expectedParams.count ? expectedParams[index] : nil
+                        try emitExpr(a.value, coercedTo: expectedArg)
+                    }
+                    var callArgCount = c.arguments.count + 1
+                    if let trailing = c.trailingBlock,
+                       let builderType = builderParamTypeName(params: expectedParams, explicitArgumentCount: c.arguments.count, symbols: symbols) {
+                        try emitDefaultObject(typeName: builderType)
+                        try emitBuilderBlock(trailing, typeName: builderType)
+                        callArgCount += 1
+                    }
+                    emitter.emit(.call(argCount: UInt8(callArgCount)))
+                } else if case .identifier(let name, _) = c.callee,
+                          let typeName = implicitSelfTypeName,
+                          let selfBinding = locals["self"],
+                          let method = symbols.lookupMethod(typeName: typeName, name: name) {
+                    emitter.emit(.loadGlobalSymbol(method.loweredName))
+                    emitter.emit(.loadLocal(selfBinding.slot))
+                    let expectedParams: [KiraType]
+                    if case .function(let params, _) = method.type {
+                        expectedParams = params
+                    } else {
+                        expectedParams = []
+                    }
+                    for (index, a) in c.arguments.enumerated() {
+                        let expectedArg = index < expectedParams.count ? expectedParams[index] : nil
+                        try emitExpr(a.value, coercedTo: expectedArg)
+                    }
+                    var callArgCount = c.arguments.count + 1
+                    if let trailing = c.trailingBlock,
+                       let builderType = builderParamTypeName(params: expectedParams, explicitArgumentCount: c.arguments.count, symbols: symbols) {
+                        try emitDefaultObject(typeName: builderType)
+                        try emitBuilderBlock(trailing, typeName: builderType)
+                        callArgCount += 1
+                    }
+                    emitter.emit(.call(argCount: UInt8(callArgCount)))
+                } else if case .member(let m) = c.callee,
+                          case .named(let typeName) = (exprType(m.base) ?? .unknown),
+                          let method = symbols.lookupMethod(typeName: typeName, name: m.name) {
+                    emitter.emit(.loadGlobalSymbol(method.loweredName))
+                    try emitExpr(m.base)
+                    let expectedParams: [KiraType]
+                    if case .function(let params, _) = method.type {
+                        expectedParams = params
+                    } else {
+                        expectedParams = []
+                    }
+                    for (index, a) in c.arguments.enumerated() {
+                        let expectedArg = index < expectedParams.count ? expectedParams[index] : nil
+                        try emitExpr(a.value, coercedTo: expectedArg)
+                    }
+                    var callArgCount = c.arguments.count + 1
+                    if let trailing = c.trailingBlock,
+                       let builderType = builderParamTypeName(params: expectedParams, explicitArgumentCount: c.arguments.count, symbols: symbols) {
+                        try emitDefaultObject(typeName: builderType)
+                        try emitBuilderBlock(trailing, typeName: builderType)
+                        callArgCount += 1
+                    }
+                    emitter.emit(.call(argCount: UInt8(callArgCount)))
                 } else {
                     let expectedParams: [KiraType]
                     if case .identifier(let name, _) = c.callee,
@@ -629,13 +943,50 @@ public struct IRBuilder {
                         let expectedArg = index < expectedParams.count ? expectedParams[index] : nil
                         try emitExpr(a.value, coercedTo: expectedArg)
                     }
+                    if let trailing = c.trailingBlock,
+                       let builderType = builderParamTypeName(params: expectedParams, explicitArgumentCount: c.arguments.count, symbols: symbols) {
+                        try emitDefaultObject(typeName: builderType)
+                        try emitBuilderBlock(trailing, typeName: builderType)
+                    }
                     emitter.emit(.call(argCount: UInt8(c.arguments.count)))
                 }
+                if let trailing = c.trailingBlock,
+                   builderParamTypeName(params: {
+                       if case .identifier(let name, _) = c.callee,
+                          let builder = builderBinding(),
+                          let method = symbols.lookupMethod(typeName: builder.typeName, name: name),
+                          case .function(let params, _) = method.type {
+                           return params
+                       }
+                       if case .member(let m) = c.callee,
+                          case .named(let typeName) = (exprType(m.base) ?? .unknown),
+                          let method = symbols.lookupMethod(typeName: typeName, name: m.name),
+                          case .function(let params, _) = method.type {
+                           return params
+                       }
+                       if case .function(let params, _) = (exprType(c.callee) ?? .unknown) {
+                           return params
+                       }
+                       return []
+                   }(), explicitArgumentCount: c.arguments.count, symbols: symbols) == nil,
+                   case .named(let typeName) = (exprType(e) ?? .unknown),
+                   symbols.fields[typeName] != nil {
+                    try emitBuilderBlock(trailing, typeName: typeName)
+                }
             case .member(let m):
-                if case .named(let typeName) = (exprType(m.base) ?? .unknown),
+                if case .identifier(let enumName, _) = m.base,
+                   let tag = symbols.lookupEnumCase(typeName: enumName, name: m.name) {
+                    emitter.emit(.pushInt(tag))
+                } else if case .identifier(let typeName, _) = m.base,
+                          symbols.lookupStaticField(typeName: typeName, name: m.name) != nil {
+                    emitter.emit(.loadGlobalSymbol(loweredStaticFieldName(typeName: typeName, fieldName: m.name)))
+                } else if case .named(let typeName) = (exprType(m.base) ?? .unknown),
                    let f = symbols.lookupField(typeName: typeName, name: m.name) {
                     try emitExpr(m.base)
                     emitter.emit(.loadField(UInt16(f.index)))
+                } else if case .named(let typeName) = (exprType(m.base) ?? .unknown),
+                          let method = symbols.lookupMethod(typeName: typeName, name: m.name) {
+                    emitter.emit(.loadGlobalSymbol(method.loweredName))
                 } else {
                     _ = m.base
                     emitter.emit(.loadGlobalSymbol(m.name))
@@ -643,6 +994,17 @@ public struct IRBuilder {
             case .shaderMacro(let sm):
                 emitter.emit(.pushString("shader:\(sm.functionName)"))
             }
+        }
+
+        func emitBuilderBlock(_ block: BlockStmt, typeName: String) throws {
+            let slot = allocLocal("__builder_\(nextLocal)", type: .named(typeName))
+            emitter.emit(.storeLocal(slot))
+            builderStack.append(.init(slot: slot, typeName: typeName))
+            for statement in block.statements {
+                try emitStmt(statement)
+            }
+            _ = builderStack.popLast()
+            emitter.emit(.loadLocal(slot))
         }
 
         func emitStmt(_ s: Stmt) throws {
@@ -695,7 +1057,7 @@ public struct IRBuilder {
         }
 
         return KiraIRFunction(
-            name: fn.name,
+            name: loweredName,
             params: params,
             returnType: ret,
             localCount: Int(nextLocal),
@@ -759,7 +1121,7 @@ private struct StackEmitter {
             depth += 1
         case .storeLocal, .storeGlobalSymbol:
             depth -= 1
-        case .newObject:
+        case .newObject, .newTypedObject:
             depth += 1
         case .makeFFIArray(let count, _):
             depth -= Int(count)
@@ -790,6 +1152,10 @@ private struct StackEmitter {
             depth -= Int(argCount) // args
             depth -= 1 // callee
             depth += 1 // return
+        case .callProtocolMethod(_, let argCount):
+            depth -= Int(argCount)
+            depth -= 1
+            depth += 1
         case .ffiLoad:
             // Pops: libName, symbolName; pushes native pointer.
             depth -= 1
@@ -826,7 +1192,7 @@ private func computeMaxStack(_ insts: [KiraIRInst]) -> Int {
             depth += 1
         case .storeLocal, .storeGlobalSymbol:
             depth -= 1
-        case .newObject:
+        case .newObject, .newTypedObject:
             depth += 1
         case .makeFFIArray(let count, _):
             depth -= Int(count)
@@ -852,6 +1218,10 @@ private func computeMaxStack(_ insts: [KiraIRInst]) -> Int {
             if case .jump = inst { break }
             depth -= 1
         case .call(let argCount):
+            depth -= Int(argCount)
+            depth -= 1
+            depth += 1
+        case .callProtocolMethod(_, let argCount):
             depth -= Int(argCount)
             depth -= 1
             depth += 1

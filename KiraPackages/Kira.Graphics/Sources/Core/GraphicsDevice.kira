@@ -1,5 +1,68 @@
+import Kira.Fondation
+
+let GRAPHICS_BACKEND_D3D11: sg_backend = 2
+let GRAPHICS_VERTEXFORMAT_FLOAT2: sg_vertex_format = 2
+let GRAPHICS_VERTEXFORMAT_FLOAT3: sg_vertex_format = 3
+let GRAPHICS_VERTEXFORMAT_FLOAT4: sg_vertex_format = 4
+let GRAPHICS_PRIMITIVE_POINTS: sg_primitive_type = 1
+let GRAPHICS_PRIMITIVE_LINES: sg_primitive_type = 2
+let GRAPHICS_PRIMITIVE_LINE_STRIP: sg_primitive_type = 3
+let GRAPHICS_PRIMITIVE_TRIANGLES: sg_primitive_type = 4
+let GRAPHICS_PRIMITIVE_TRIANGLE_STRIP: sg_primitive_type = 5
+
 @Doc("A graphics device capable of creating resources and pipelines.")
 type GraphicsDevice {
-    function makeCommandBuffer() -> CommandBuffer { return CommandBuffer() }
+    var backend: sg_backend = 0
+
+    function makeBuffer(data: CPointer<CVoid>, size: Int, label: String) -> Buffer {
+        let buffer = sg_make_buffer(desc: sg_buffer_desc(
+            size: size,
+            data: sg_range(ptr: data, size: size),
+            label: label))
+        return Buffer(handle: buffer, size: size, label: label)
+    }
+
+    function makeRenderPipeline(desc: RenderPipelineDescriptor) -> RenderPipeline {
+        let is_d3d11 = backend == GRAPHICS_BACKEND_D3D11
+        let vs_source = is_d3d11 ? desc.d3d11VertexSource : desc.metalVertexSource
+        let fs_source = is_d3d11 ? desc.d3d11FragmentSource : desc.metalFragmentSource
+
+        let vs_func = sg_shader_function(source: vs_source, entry: "vs_main", d3d11_target: "vs_5_0")
+        let fs_func = sg_shader_function(source: fs_source, entry: "fs_main", d3d11_target: "ps_5_0")
+
+        let attr0 = sg_shader_vertex_attr(
+            base_type: SG_SHADERATTRBASETYPE_FLOAT,
+            hlsl_sem_name: "POSITION",
+            hlsl_sem_index: 0)
+        let attr1 = sg_shader_vertex_attr(
+            base_type: SG_SHADERATTRBASETYPE_FLOAT,
+            hlsl_sem_name: "COLOR",
+            hlsl_sem_index: 0)
+        let shader = sg_make_shader(desc: sg_shader_desc(
+            vertex_func: vs_func,
+            fragment_func: fs_func,
+            attrs: CArray16_sg_shader_vertex_attr(
+                _0: attr0,
+                _1: attr1),
+            label: desc.label))
+
+        let layout = sg_vertex_layout_state(attrs: CArray16_sg_vertex_attr_state(
+            _0: sg_vertex_attr_state(format: graphicsVertexFormat(desc.attribute0)),
+            _1: sg_vertex_attr_state(format: graphicsVertexFormat(desc.attribute1))))
+
+        let pipeline = sg_make_pipeline(desc: sg_pipeline_desc(
+            shader: shader,
+            layout: layout,
+            primitive_type: graphicsPrimitive(desc.primitive),
+            label: desc.label))
+        return RenderPipeline(handle: pipeline, primitive: desc.primitive, label: desc.label)
+    }
 }
 
+function graphicsVertexFormat(format: VertexFormat) -> sg_vertex_format {
+    return format == .float2 ? GRAPHICS_VERTEXFORMAT_FLOAT2 : (format == .float4 ? GRAPHICS_VERTEXFORMAT_FLOAT4 : GRAPHICS_VERTEXFORMAT_FLOAT3)
+}
+
+function graphicsPrimitive(primitive: Primitive) -> sg_primitive_type {
+    return primitive == .points ? GRAPHICS_PRIMITIVE_POINTS : (primitive == .lines ? GRAPHICS_PRIMITIVE_LINES : (primitive == .lineStrip ? GRAPHICS_PRIMITIVE_LINE_STRIP : (primitive == .triangleStrip ? GRAPHICS_PRIMITIVE_TRIANGLE_STRIP : GRAPHICS_PRIMITIVE_TRIANGLES)))
+}

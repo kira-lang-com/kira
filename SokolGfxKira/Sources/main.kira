@@ -1,19 +1,4 @@
-import Kira.Fondation
-
-// Pure-Kira Sokol triangle:
-// - Windows DLL: `SokolGfxKira/FFI/libsokol.dll`
-// - macOS dylib: `SokolGfxKira/FFI/libsokol.dylib`
-// - Bindings:    `SokolGfxKira/Sources/sokol.kira`
-//
-// Rebuild the Sokol DLL (Windows/D3D11):
-//   clang -shared -O2 -I FFI -o FFI/libsokol.dll FFI/sokol_impl_win.c -luser32 -lgdi32 -lole32 -luuid -ld3d11 -ldxgi -ld3dcompiler -lwinmm
-//
-// Rebuild the Sokol dylib (macOS/Metal):
-//   clang -dynamiclib -O2 -fPIC -x objective-c -fobjc-arc -framework Cocoa -framework Metal -framework MetalKit -framework QuartzCore \
-//     -o FFI/libsokol.dylib FFI/sokol_impl.c
-//
-// Regenerate Sokol bindings (libclang required):
-//   ../.build/debug/kira bindgen FFI/sokol_all.h --lib FFI/libsokol.dylib --out Sources/sokol.kira
+import Kira.Graphics
 
 let TRIANGLE_VERTS: CArray<CFloat, 21> = [
     0.0, 0.5, 0.5, 1.0, 0.0, 0.0, 1.0,
@@ -26,103 +11,68 @@ let METAL_FS: String = "#include <metal_stdlib>\nusing namespace metal;\nstruct 
 let D3D11_VS: String = "struct vs_in { float3 pos : POSITION; float4 color : COLOR0; }; struct vs_out { float4 pos : SV_Position; float4 color : COLOR0; }; vs_out vs_main(vs_in input) { vs_out outp; outp.pos = float4(input.pos, 1.0); outp.color = input.color; return outp; }"
 let D3D11_FS: String = "struct vs_out { float4 pos : SV_Position; float4 color : COLOR0; }; float4 fs_main(vs_out input) : SV_Target { return input.color; }"
 
-// Global state (initialized in on_init).
-var g_frame: Int = 0
-var g_pip: sg_pipeline = sg_pipeline()
-var g_bind: sg_bindings = sg_bindings()
+type TriangleScene: Scene {
+    var frameCount: Int = 0
+    var pipeline: RenderPipeline = RenderPipeline()
+    var vertexBuffer: Buffer = Buffer()
 
-function on_init() {
-    sg_setup(desc: sg_desc(environment: sglue_environment()))
-
-    let vsize = sizeOf(CArray<CFloat, 21>)
-    let vbuf = sg_make_buffer(desc: sg_buffer_desc(
-        size: vsize,
-        data: sg_range(ptr: TRIANGLE_VERTS, size: vsize),
-        label: "triangle-vertices"))
-    g_bind = sg_bindings(vertex_buffers: CArray8_sg_buffer(_0: vbuf))
-
-    let is_d3d11 = sg_query_backend() == SG_BACKEND_D3D11
-    let backend = is_d3d11 ? "d3d11" : "metal"
-    let vs_src = is_d3d11 ? D3D11_VS : METAL_VS
-    let fs_src = is_d3d11 ? D3D11_FS : METAL_FS
-
-    var vs_func = sg_shader_function(source: vs_src, entry: "vs_main")
-    var fs_func = sg_shader_function(source: fs_src, entry: "fs_main")
-    if is_d3d11 {
-        vs_func = sg_shader_function(source: vs_src, entry: "vs_main", d3d11_target: "vs_5_0")
-        fs_func = sg_shader_function(source: fs_src, entry: "fs_main", d3d11_target: "ps_5_0")
+    function onLoad(device: GraphicsDevice) {
+        vertexBuffer = device.makeBuffer(
+            data: TRIANGLE_VERTS,
+            size: sizeOf(CArray<CFloat, 21>),
+            label: "triangle-vertices")
+        pipeline = device.makeRenderPipeline {
+            metalVertexSource = METAL_VS
+            metalFragmentSource = METAL_FS
+            d3d11VertexSource = D3D11_VS
+            d3d11FragmentSource = D3D11_FS
+            attribute0 = .float3
+            attribute1 = .float4
+            label = "triangle-pipeline"
+        }
+        return
     }
 
-    let attr_pos = sg_shader_vertex_attr(
-        base_type: SG_SHADERATTRBASETYPE_FLOAT,
-        glsl_name: nil,
-        hlsl_sem_name: "POSITION",
-        hlsl_sem_index: 0)
-    let attr_col = sg_shader_vertex_attr(
-        base_type: SG_SHADERATTRBASETYPE_FLOAT,
-        glsl_name: nil,
-        hlsl_sem_name: "COLOR",
-        hlsl_sem_index: 0)
-    let shader_attrs = CArray16_sg_shader_vertex_attr(
-        _0: attr_pos,
-        _1: attr_col)
+    function onFrame(frame: Frame) {
+        frameCount = frameCount + 1
+        let phase = frameCount % 120
+        let clear = phase < 60 ? Color(r: 0.2, g: 0.2, b: 0.4, a: 1.0) : Color(r: 0.4, g: 0.2, b: 0.2, a: 1.0)
+        let pass = frame.defaultPass.withClear(color: clear)
+        let scenePipeline = pipeline
+        let sceneVertexBuffer = vertexBuffer
 
-    let shd = sg_make_shader(desc: sg_shader_desc(
-        vertex_func: vs_func,
-        fragment_func: fs_func,
-        attrs: shader_attrs,
-        label: backend))
+        frame.encode {
+            render(descriptor: pass) {
+                pipeline = scenePipeline
+                setVertex(buffer: sceneVertexBuffer, slot: 0)
+                draw(primitive: .triangles, count: 3)
+            }
+            present()
+        }
 
-    let attrs = CArray16_sg_vertex_attr_state(
-        _0: sg_vertex_attr_state(format: SG_VERTEXFORMAT_FLOAT3),
-        _1: sg_vertex_attr_state(format: SG_VERTEXFORMAT_FLOAT4))
-    let layout = sg_vertex_layout_state(attrs: attrs)
-
-    g_pip = sg_make_pipeline(desc: sg_pipeline_desc(
-        shader: shd,
-        layout: layout,
-        label: "triangle-pipeline"))
-}
-
-function on_frame() {
-    // Toggle clear color every ~60 frames.
-    let m = g_frame % 120
-    var clear: sg_color = sg_color()
-    if m < 60 {
-        clear = sg_color(r: 0.2, g: 0.2, b: 0.4, a: 1.0)
-    } else {
-        clear = sg_color(r: 0.4, g: 0.2, b: 0.2, a: 1.0)
+        let shouldQuit = frame.index > 180
+        if shouldQuit {
+            frame.quit()
+        }
+        return
     }
 
-    let ca0 = sg_color_attachment_action(load_action: SG_LOADACTION_CLEAR, clear_value: clear)
-    let action = sg_pass_action(colors: CArray8_sg_color_attachment_action(_0: ca0))
-    let pass = sg_pass(action: action, swapchain: sglue_swapchain())
-
-    sg_begin_pass(pass: pass)
-    sg_apply_pipeline(pip: g_pip)
-    sg_apply_bindings(bindings: g_bind)
-    sg_draw(base_element: 0, num_elements: 3, num_instances: 1)
-    sg_end_pass()
-    sg_commit()
-
-    g_frame = g_frame + 1
-    if g_frame > 180 {
-        sapp_quit()
+    function onResize(width: Int, height: Int) {
+        return
     }
-}
 
-function on_cleanup() {
-    sg_shutdown()
+    function onUnload() {
+        return
+    }
 }
 
 @Main
 function main() {
-    print("Launching Sokol triangle (pure Kira)…")
-    sapp_run(desc: sapp_desc(
-        init_cb: on_init,
-        frame_cb: on_frame,
-        cleanup_cb: on_cleanup,
-        width: 800,
-        height: 600,
-        window_title: "Sokol Triangle (Kira)"))
+    print("Launching Sokol triangle via Kira.Graphics…")
+    let app = Application {
+        title = "Sokol Triangle (Kira.Graphics)"
+        width = 800
+        height = 600
+    }
+    app.run(scene: TriangleScene())
 }

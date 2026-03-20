@@ -141,14 +141,16 @@ public struct ExternFunctionDecl: Sendable {
 public struct TypeDecl: Sendable {
     public struct Field: Sendable {
         public var annotations: [Annotation]
+        public var isStatic: Bool
         public var isVar: Bool
         public var name: String
         public var type: TypeRef?
         public var initializer: Expr?
         public var range: SourceRange
 
-        public init(annotations: [Annotation], isVar: Bool, name: String, type: TypeRef?, initializer: Expr?, range: SourceRange) {
+        public init(annotations: [Annotation], isStatic: Bool, isVar: Bool, name: String, type: TypeRef?, initializer: Expr?, range: SourceRange) {
             self.annotations = annotations
+            self.isStatic = isStatic
             self.isVar = isVar
             self.name = name
             self.type = type
@@ -159,13 +161,17 @@ public struct TypeDecl: Sendable {
 
     public var annotations: [Annotation]
     public var name: String
+    public var conformances: [String]
     public var fields: [Field]
+    public var methods: [FunctionDecl]
     public var range: SourceRange
 
-    public init(annotations: [Annotation], name: String, fields: [Field], range: SourceRange) {
+    public init(annotations: [Annotation], name: String, conformances: [String], fields: [Field], methods: [FunctionDecl], range: SourceRange) {
         self.annotations = annotations
         self.name = name
+        self.conformances = conformances
         self.fields = fields
+        self.methods = methods
         self.range = range
     }
 }
@@ -277,6 +283,7 @@ public struct IfStmt: Sendable {
 
 public indirect enum Expr: Sendable {
     case identifier(String, SourceRange)
+    case leadingMember(String, SourceRange)
     case intLiteral(Int64, SourceRange)
     case floatLiteral(Double, SourceRange)
     case stringLiteral(String, SourceRange)
@@ -295,6 +302,7 @@ public indirect enum Expr: Sendable {
     public var range: SourceRange {
         switch self {
         case .identifier(_, let r): return r
+        case .leadingMember(_, let r): return r
         case .intLiteral(_, let r): return r
         case .floatLiteral(_, let r): return r
         case .stringLiteral(_, let r): return r

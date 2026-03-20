@@ -3,6 +3,7 @@ import Foundation
 public struct Parser {
     private var tokens: [Token]
     private var index: Int = 0
+    private var disallowBareTrailingBlockCalls: Int = 0
 
     public init(tokens: [Token]) {
         self.tokens = tokens
@@ -186,7 +187,7 @@ public struct Parser {
 
     private mutating func parseFunctionDecl(annotations: [Annotation], isAsync: Bool, startLoc: SourceLocation) throws -> FunctionDecl {
         let (name, _) = try expectIdentifier("function name")
-        let (params, paramsEnd) = try parseParameterList()
+        let (params, _) = try parseParameterList()
         var returnType: TypeRef?
         if match(.arrow) {
             returnType = try parseTypeRef()
@@ -210,16 +211,42 @@ public struct Parser {
 
     private mutating func parseTypeDecl(annotations: [Annotation], startLoc: SourceLocation) throws -> TypeDecl {
         let (name, _) = try expectIdentifier("type name")
+        var conformances: [String] = []
+        if match(.colon) {
+            repeat {
+                conformances.append(try expectIdentifier("protocol name").0)
+            } while match(.comma)
+        }
         _ = try expect(.lBrace, "{")
         consumeSeparators()
         var fields: [TypeDecl.Field] = []
+        var methods: [FunctionDecl] = []
         while !at(.rBrace) && !at(.eof) {
-            let fieldAnnotations = try parseLeadingAnnotations()
+            let memberStart = current().range.start
+            let memberAnnotations = try parseLeadingAnnotations()
             consumeSeparators()
+            let isStatic = matchKeyword(.static)
+            if matchKeyword(.function) || matchKeyword(.async) {
+                if isStatic {
+                    throw ParseError.message("static functions are not supported yet", current().range.start)
+                }
+                let isAsync = previous().kind == .keyword(.async)
+                if isAsync {
+                    _ = try expectKeyword(.function)
+                }
+                let method = try parseFunctionDecl(annotations: memberAnnotations, isAsync: isAsync, startLoc: memberStart)
+                methods.append(method)
+                consumeSeparators()
+                continue
+            }
             let isVar: Bool
-            if matchKeyword(.var) { isVar = true }
-            else if matchKeyword(.let) { isVar = false }
-            else { throw ParseError.message("expected 'var' or 'let' in type body", current().range.start) }
+            if matchKeyword(.var) {
+                isVar = true
+            } else if matchKeyword(.let) {
+                isVar = false
+            } else {
+                throw ParseError.message("expected 'var', 'let', or 'function' in type body", current().range.start)
+            }
             let (fieldName, _) = try expectIdentifier("field name")
             var typeRef: TypeRef?
             if match(.colon) {
@@ -230,12 +257,12 @@ public struct Parser {
                 initializer = try parseExpression()
             }
             let end = previous().range.end
-            fields.append(TypeDecl.Field(annotations: fieldAnnotations, isVar: isVar, name: fieldName, type: typeRef, initializer: initializer, range: SourceRange(start: startLoc, end: end)))
+            fields.append(TypeDecl.Field(annotations: memberAnnotations, isStatic: isStatic, isVar: isVar, name: fieldName, type: typeRef, initializer: initializer, range: SourceRange(start: startLoc, end: end)))
             consumeSeparators()
         }
         _ = try expect(.rBrace, "}")
         let end = previous().range.end
-        return TypeDecl(annotations: annotations, name: name, fields: fields, range: SourceRange(start: startLoc, end: end))
+        return TypeDecl(annotations: annotations, name: name, conformances: conformances, fields: fields, methods: methods, range: SourceRange(start: startLoc, end: end))
     }
 
     private mutating func parseProtocolDecl(annotations: [Annotation], startLoc: SourceLocation) throws -> ProtocolDecl {
@@ -404,7 +431,7 @@ public struct Parser {
                 var initializer: Expr?
                 if match(.equal) { initializer = try parseExpression() }
                 let end = previous().range.end
-                let field = TypeDecl.Field(annotations: memberAnnotations, isVar: isVar, name: fieldName, type: typeRef, initializer: initializer, range: SourceRange(start: memberStart, end: end))
+                let field = TypeDecl.Field(annotations: memberAnnotations, isStatic: false, isVar: isVar, name: fieldName, type: typeRef, initializer: initializer, range: SourceRange(start: memberStart, end: end))
                 members.append(.init(kind: .field(field), range: field.range))
                 consumeSeparators()
                 continue
@@ -494,6 +521,8 @@ public struct Parser {
         }
         if matchKeyword(.if) {
             let start = previous().range.start
+            disallowBareTrailingBlockCalls += 1
+            defer { disallowBareTrailingBlockCalls -= 1 }
             let cond = try parseExpression()
             let thenBlock = try parseBlock()
             var elseBlock: BlockStmt?
@@ -679,6 +708,11 @@ public struct Parser {
                 expr = .call(.init(callee: expr, arguments: args, trailingBlock: trailing, range: SourceRange(start: expr.range.start, end: end)))
                 continue
             }
+            if at(.lBrace), disallowBareTrailingBlockCalls == 0 {
+                let trailing = try parseBlock()
+                expr = .call(.init(callee: expr, arguments: [], trailingBlock: trailing, range: SourceRange(start: expr.range.start, end: trailing.range.end)))
+                continue
+            }
             break
         }
         return expr
@@ -692,7 +726,7 @@ public struct Parser {
             _ = advance()
             let (name, _) = try expectIdentifier("member name")
             let end = previous().range.end
-            return .identifier(name, SourceRange(start: start, end: end))
+            return .leadingMember(name, SourceRange(start: start, end: end))
         case .identifier(let name):
             _ = advance()
             if name == "true" { return .boolLiteral(true, tok.range) }

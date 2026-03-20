@@ -68,21 +68,58 @@ public struct TypeChecker: Sendable {
             }
         }
 
-        // Record @CStruct field schemas (used for constructor and field access typing).
+        // Record type field schemas (used for constructors and field access typing).
         for decl in module.declarations {
             guard case .type(let td) = decl else { continue }
-            guard td.annotations.contains(where: { $0.name == "CStruct" }) else { continue }
-            let fieldSchemas: [(name: String, type: KiraType)] = td.fields.map { f in
+            let fieldSchemas: [(name: String, type: KiraType)] = td.fields.compactMap { f in
+                guard !f.isStatic else { return nil }
                 let ty = f.type.map(resolve) ?? .unknown
                 return (f.name, ty)
             }
+            symbols.addFields(typeName: td.name, fields: fieldSchemas)
+            guard td.annotations.contains(where: { $0.name == "CStruct" }) else { continue }
             symbols.addCStruct(typeName: td.name, fields: fieldSchemas)
+        }
+
+        for decl in module.declarations {
+            guard case .type(let td) = decl else { continue }
+            for field in td.fields where field.isStatic {
+                symbols.addStaticField(
+                    typeName: td.name,
+                    fieldName: field.name,
+                    type: field.type.map(resolve) ?? .unknown
+                )
+            }
+        }
+
+        for decl in module.declarations {
+            guard case .enum(let ed) = decl else { continue }
+            try symbols.addEnumCases(
+                typeName: ed.name,
+                cases: ed.cases.enumerated().map { index, enumCase in
+                    (name: enumCase.name, tag: Int64(index), range: enumCase.range)
+                }
+            )
         }
 
         for decl in module.declarations {
             if case .typealias(let td) = decl {
                 symbols.addTypeAlias(td.name, target: resolve(td.target))
             }
+        }
+
+        for decl in module.declarations {
+            guard case .protocol(let pd) = decl else { continue }
+            let requirements = pd.requirements.map { requirement in
+                (
+                    name: requirement.name,
+                    type: KiraType.function(
+                        params: requirement.parameters.map { resolve($0.type) },
+                        returns: resolve(requirement.returnType)
+                    )
+                )
+            }
+            symbols.addProtocolRequirements(protocolName: pd.name, requirements: requirements)
         }
 
         // Register functions.
@@ -115,6 +152,53 @@ public struct TypeChecker: Sendable {
                     isExtern: true,
                     range: fn.range
                 ))
+            } else if case .type(let td) = decl {
+                for method in td.methods {
+                    let params = [.named(td.name)] + method.parameters.map { resolve($0.type) }
+                    let ret = resolve(method.returnType)
+                    let mode: FunctionSymbol.ExecutionMode = executionMode(from: method.annotations)
+                    if target.isWasm, mode == .runtime {
+                        throw SemanticError.runtimeNotSupportedOnWasm(method.range.start)
+                    }
+                    let loweredName = loweredMethodName(typeName: td.name, methodName: method.name)
+                    try symbols.addFunction(.init(
+                        name: loweredName,
+                        type: .function(params: params, returns: ret),
+                        executionMode: mode,
+                        isExtern: false,
+                        range: method.range
+                    ))
+                    symbols.addMethod(
+                        typeName: td.name,
+                        methodName: method.name,
+                        loweredName: loweredName,
+                        methodType: .function(params: method.parameters.map { resolve($0.type) }, returns: ret)
+                    )
+                }
+            }
+        }
+
+        for decl in module.declarations {
+            guard case .type(let td) = decl else { continue }
+            for protocolName in td.conformances {
+                guard symbols.isProtocol(protocolName) else {
+                    throw SemanticError.unknownIdentifier(protocolName, td.range.start)
+                }
+                let requirements = symbols.protocolRequirements[protocolName] ?? [:]
+                for requirement in requirements.values {
+                    guard let method = symbols.lookupMethod(typeName: td.name, name: requirement.name) else {
+                        throw SemanticError.memberNotFound(base: .named(td.name), name: requirement.name, td.range.start)
+                    }
+                    if method.type != requirement.type {
+                        throw SemanticError.typeMismatch(
+                            expected: requirement.type,
+                            got: method.type,
+                            td.range.start,
+                            hint: "\(td.name) does not satisfy protocol \(protocolName)"
+                        )
+                    }
+                }
+                symbols.addConformance(typeName: td.name, protocolName: protocolName)
             }
         }
 
@@ -124,17 +208,15 @@ public struct TypeChecker: Sendable {
         for decl in module.declarations {
             guard case .globalVar(let gv) = decl else { continue }
             let explicitType = gv.explicitType.map(resolve)
-            let expectedInitType: KiraType? = {
-                guard let explicitType else { return nil }
-                if case .fixedArray = explicitType { return explicitType }
-                return nil
-            }()
+            let expectedInitType = contextualExpectedType(explicitType, for: gv.initializer)
             let initType = try typeCheckExpr(gv.initializer, scope: globalScope, symbols: symbols, expected: expectedInitType, typeInfo: &typeInfo)
             let finalType: KiraType
             if let explicit = explicitType {
                 if explicit == .float, case .int = initType, isIntLiteral(gv.initializer) {
                     finalType = .float
-                } else if explicit == initType {
+                } else if isCIntegerType(explicit), case .int = initType, isIntLiteral(gv.initializer) {
+                    finalType = explicit
+                } else if typesCompatible(got: initType, expected: explicit, symbols: symbols) {
                     finalType = explicit
                 } else {
                     throw SemanticError.typeMismatch(expected: explicit, got: initType, gv.range.start, hint: coercionHint(expected: explicit, expr: gv.initializer))
@@ -144,6 +226,32 @@ public struct TypeChecker: Sendable {
             }
             try symbols.addGlobal(name: gv.name, type: finalType, range: gv.range)
             globalScope.define(gv.name, type: finalType)
+        }
+        for decl in module.declarations {
+            guard case .type(let td) = decl else { continue }
+            for field in td.fields where field.isStatic {
+                let explicitType = field.type.map(resolve)
+                let initializer = field.initializer ?? .nilLiteral(field.range)
+                let expectedInitType = contextualExpectedType(explicitType, for: initializer)
+                let initType = try typeCheckExpr(initializer, scope: globalScope, symbols: symbols, expected: expectedInitType, typeInfo: &typeInfo)
+                let finalType: KiraType
+                if let explicitType {
+                    if explicitType == .float, case .int = initType, isIntLiteral(initializer) {
+                        finalType = .float
+                    } else if isCIntegerType(explicitType), case .int = initType, isIntLiteral(initializer) {
+                        finalType = explicitType
+                    } else if typesCompatible(got: initType, expected: explicitType, symbols: symbols) {
+                        finalType = explicitType
+                    } else {
+                        throw SemanticError.typeMismatch(expected: explicitType, got: initType, field.range.start, hint: coercionHint(expected: explicitType, expr: initializer))
+                    }
+                } else {
+                    finalType = initType
+                }
+                let globalName = loweredStaticFieldName(typeName: td.name, fieldName: field.name)
+                try symbols.addGlobal(name: globalName, type: finalType, range: field.range)
+                globalScope.define(globalName, type: finalType)
+            }
         }
 
         // Add construct-derived methods (modifier chain).
@@ -163,7 +271,12 @@ public struct TypeChecker: Sendable {
                         paramType = .bool
                     }
                 }
-                symbols.addMethod(typeName: ci.name, methodName: sig.name, methodType: .function(params: [paramType], returns: .named(ci.name)))
+                symbols.addMethod(
+                    typeName: ci.name,
+                    methodName: sig.name,
+                    loweredName: sig.name,
+                    methodType: .function(params: [paramType], returns: .named(ci.name))
+                )
             }
         }
 
@@ -178,6 +291,23 @@ public struct TypeChecker: Sendable {
                     scope.define(p.name, type: resolve(p.type))
                 }
                 _ = try typeCheckBlock(fn.body, scope: scope, symbols: symbols, expectedReturn: expectedReturn, typeInfo: &typeInfo)
+            } else if case .type(let td) = decl {
+                for method in td.methods {
+                    let loweredName = loweredMethodName(typeName: td.name, methodName: method.name)
+                    let fnType = symbols.functions[loweredName]!.type
+                    let expectedReturn: KiraType
+                    let scope = LocalScope(parent: nil, symbols: symbols, implicitSelfType: td.name)
+                    if case .function(let params, let r) = fnType {
+                        expectedReturn = r
+                        scope.define("self", type: .named(td.name))
+                        for (index, param) in method.parameters.enumerated() {
+                            scope.define(param.name, type: params[index + 1])
+                        }
+                    } else {
+                        expectedReturn = .void
+                    }
+                    _ = try typeCheckBlock(method.body, scope: scope, symbols: symbols, expectedReturn: expectedReturn, typeInfo: &typeInfo)
+                }
             }
         }
 
@@ -188,6 +318,21 @@ public struct TypeChecker: Sendable {
         if annotations.contains(where: { $0.name == "Native" }) { return .native }
         if annotations.contains(where: { $0.name == "Runtime" }) { return .runtime }
         return .auto
+    }
+
+    private func loweredMethodName(typeName: String, methodName: String) -> String {
+        "__\(typeName)_\(methodName)"
+    }
+
+    private func loweredStaticFieldName(typeName: String, fieldName: String) -> String {
+        "__\(typeName)_static_\(fieldName)"
+    }
+
+    private func builderParamTypeName(params: [KiraType], explicitArgumentCount: Int, symbols: SymbolTable) -> String? {
+        guard explicitArgumentCount + 1 == params.count else { return nil }
+        guard case .named(let typeName) = params[explicitArgumentCount] else { return nil }
+        guard symbols.fields[typeName] != nil else { return nil }
+        return typeName
     }
 
     private func parseFFIPrototype(
@@ -217,7 +362,7 @@ public struct TypeChecker: Sendable {
             switch label {
             case "lib":
                 if case .stringLiteral(let s, _) = a.value {
-                    lib = s.isEmpty ? nil : s
+                    lib = s.isEmpty ? nil : resolveFFILibraryPath(s, declarationFile: fn.range.start.file)
                 }
             case "linkage":
                 if case .identifier(let s, _) = a.value {
@@ -237,6 +382,39 @@ public struct TypeChecker: Sendable {
             returnType: encodeFFIType(expandedReturnType, cHandleTypes: cHandleTypes, symbols: symbols, visiting: &visiting),
             argumentTypes: expandedParams.map { encodeFFIType($0, cHandleTypes: cHandleTypes, symbols: symbols, visiting: &visiting) }
         )
+    }
+
+    private func resolveFFILibraryPath(_ library: String, declarationFile: String) -> String {
+        guard !library.isEmpty else { return library }
+        guard !library.hasPrefix("@rpath/"),
+              !library.hasPrefix("@loader_path/"),
+              !library.hasPrefix("@executable_path/"),
+              !library.hasPrefix("/") else {
+            return library
+        }
+
+        let declarationURL = URL(fileURLWithPath: declarationFile)
+        var candidate = declarationURL.deletingLastPathComponent()
+        while candidate.path != "/" && !candidate.path.isEmpty {
+            if candidate.lastPathComponent == "Sources" {
+                return candidate
+                    .deletingLastPathComponent()
+                    .appendingPathComponent(library, isDirectory: false)
+                    .standardizedFileURL
+                    .path
+            }
+            let parent = candidate.deletingLastPathComponent()
+            if parent.path == candidate.path {
+                break
+            }
+            candidate = parent
+        }
+
+        return declarationURL
+            .deletingLastPathComponent()
+            .appendingPathComponent(library, isDirectory: false)
+            .standardizedFileURL
+            .path
     }
 
     private func expandTypeRefAliases(_ ref: TypeRef, typeAliases: [String: TypeRef]) -> TypeRef {
@@ -539,18 +717,16 @@ public struct TypeChecker: Sendable {
         case .variable(let vd):
             // Initializer is checked without expected-type coercion; explicit type is handled here.
             let explicitType = vd.explicitType.map(typeSystem.resolve)
-            let expectedInitType: KiraType? = {
-                guard let explicitType else { return nil }
-                if case .fixedArray = explicitType { return explicitType }
-                return nil
-            }()
+            let expectedInitType = contextualExpectedType(explicitType, for: vd.initializer)
             let initType = try typeCheckExpr(vd.initializer, scope: scope, symbols: symbols, expected: expectedInitType, typeInfo: &typeInfo)
             let finalType: KiraType
             if let explicit = explicitType {
                 // Coercion only when explicit target type declared, and only from int literal to float.
                 if explicit == .float, case .int = initType, isIntLiteral(vd.initializer) {
                     finalType = .float
-                } else if explicit == initType {
+                } else if isCIntegerType(explicit), case .int = initType, isIntLiteral(vd.initializer) {
+                    finalType = explicit
+                } else if typesCompatible(got: initType, expected: explicit, symbols: symbols) {
                     finalType = explicit
                 } else {
                     throw SemanticError.typeMismatch(expected: explicit, got: initType, vd.range.start, hint: coercionHint(expected: explicit, expr: vd.initializer))
@@ -568,7 +744,7 @@ public struct TypeChecker: Sendable {
                     // Not allowed unless target type was explicitly declared; return type counts as explicit, so allow.
                     return expectedReturn
                 }
-                if got != expectedReturn {
+                if !typesCompatible(got: got, expected: expectedReturn, symbols: symbols) {
                     throw SemanticError.typeMismatch(expected: expectedReturn, got: got, rs.range.start, hint: coercionHint(expected: expectedReturn, expr: value))
                 }
             } else {
@@ -610,9 +786,26 @@ public struct TypeChecker: Sendable {
             } else if name == "ffi_callback1_i32" {
                 // Built-in intrinsic. Creates a C-callable callback pointer for: void callback(CInt32)
                 result = .function(params: [.string], returns: .pointer(.named("CVoid")))
+            } else if let typeName = scope.implicitSelfTypeName() {
+                if let field = symbols.lookupField(typeName: typeName, name: name) {
+                    result = field.type
+                } else if let method = symbols.lookupMethod(typeName: typeName, name: name) {
+                    result = method.type
+                } else {
+                    throw SemanticError.unknownIdentifier(name, r.start)
+                }
             } else {
                 throw SemanticError.unknownIdentifier(name, r.start)
             }
+        case .leadingMember(let name, let r):
+            guard let expectedType = unwrapOptional(expected) else {
+                throw SemanticError.unknownIdentifier(".\(name)", r.start)
+            }
+            guard case .named(let typeName) = expectedType,
+                  symbols.lookupEnumCase(typeName: typeName, name: name) != nil else {
+                throw SemanticError.memberNotFound(base: expectedType, name: name, r.start)
+            }
+            result = .named(typeName)
         case .intLiteral:
             result = .int
         case .floatLiteral:
@@ -662,7 +855,15 @@ public struct TypeChecker: Sendable {
             }
         case .binary(let b):
             let lt = try typeCheckExpr(b.lhs, scope: scope, symbols: symbols, expected: nil, typeInfo: &typeInfo)
-            let rt = try typeCheckExpr(b.rhs, scope: scope, symbols: symbols, expected: nil, typeInfo: &typeInfo)
+            let rhsExpected: KiraType? = {
+                switch b.op {
+                case .eq, .neq, .lt, .gt, .lte, .gte:
+                    return lt
+                default:
+                    return nil
+                }
+            }()
+            let rt = try typeCheckExpr(b.rhs, scope: scope, symbols: symbols, expected: rhsExpected, typeInfo: &typeInfo)
             switch b.op {
             case .add, .sub, .mul, .div, .mod:
                 if lt == .int && rt == .int { result = .int }
@@ -691,6 +892,19 @@ public struct TypeChecker: Sendable {
                 throw SemanticError.typeMismatch(expected: thenType, got: elseType, c.elseExpr.range.start, hint: "both branches of ?: must have the same type")
             }
         case .member(let m):
+            if case .identifier(let enumName, _) = m.base,
+               symbols.types.contains(enumName),
+               symbols.lookupEnumCase(typeName: enumName, name: m.name) != nil {
+                result = .named(enumName)
+                typeInfo.exprTypes[expr.range] = result
+                return result
+            }
+            if case .identifier(let typeName, _) = m.base,
+               let staticFieldType = symbols.lookupStaticField(typeName: typeName, name: m.name) {
+                result = staticFieldType
+                typeInfo.exprTypes[expr.range] = result
+                return result
+            }
             let baseTy = try typeCheckExpr(m.base, scope: scope, symbols: symbols, expected: nil, typeInfo: &typeInfo)
             switch baseTy {
             case .named(let typeName):
@@ -700,7 +914,9 @@ public struct TypeChecker: Sendable {
                     return result
                 }
                 if let mt = symbols.lookupMethod(typeName: typeName, name: m.name) {
-                    result = mt
+                    result = mt.type
+                } else if let requirement = symbols.lookupProtocolRequirement(protocolName: typeName, name: m.name) {
+                    result = requirement.type
                 } else {
                     throw SemanticError.memberNotFound(base: baseTy, name: m.name, m.range.start)
                 }
@@ -708,9 +924,8 @@ public struct TypeChecker: Sendable {
                 throw SemanticError.memberNotFound(base: baseTy, name: m.name, m.range.start)
             }
         case .call(let c):
-            // @CStruct constructor: TypeName(field1:..., field2:...)
-            if case .identifier(let typeName, _) = c.callee, symbols.cStructTypes.contains(typeName) {
-                let fieldMap = symbols.fields[typeName] ?? [:]
+            // Type constructor: TypeName(field1:..., field2:...)
+            if case .identifier(let typeName, _) = c.callee, let fieldMap = symbols.fields[typeName] {
                 let fieldCount = fieldMap.count
                 if c.arguments.count > fieldCount {
                     throw SemanticError.typeMismatch(
@@ -763,6 +978,12 @@ public struct TypeChecker: Sendable {
                     }
                 }
 
+                if let trailing = c.trailingBlock {
+                    let builderScope = scope.push(implicitSelfTypeName: typeName)
+                    builderScope.define("self", type: .named(typeName))
+                    _ = try typeCheckBlock(trailing, scope: builderScope, symbols: symbols, expectedReturn: .void, typeInfo: &typeInfo)
+                }
+
                 result = .named(typeName)
                 typeInfo.exprTypes[expr.range] = result
                 return result
@@ -786,13 +1007,17 @@ public struct TypeChecker: Sendable {
 
             let calleeType = try typeCheckExpr(c.callee, scope: scope, symbols: symbols, expected: nil, typeInfo: &typeInfo)
             guard case .function(let params, let returns) = calleeType else { throw SemanticError.notCallable(c.range.start) }
+            let trailingBuilderType = c.trailingBlock.flatMap { _ in
+                builderParamTypeName(params: params, explicitArgumentCount: c.arguments.count, symbols: symbols)
+            }
             let isExternCallee: Bool = {
                 if case .identifier(let name, _) = c.callee {
                     return symbols.functions[name]?.isExtern == true
                 }
                 return false
             }()
-            if c.arguments.count != params.count {
+            let expectedExplicitArgumentCount = trailingBuilderType == nil ? params.count : (params.count - 1)
+            if c.arguments.count != expectedExplicitArgumentCount {
                 throw SemanticError.typeMismatch(expected: .function(params: params, returns: returns), got: calleeType, c.range.start, hint: "argument count mismatch")
             }
             for (i, arg) in c.arguments.enumerated() {
@@ -809,7 +1034,8 @@ public struct TypeChecker: Sendable {
                         hint: "use 12.0 or declare the target type explicitly"
                     )
                 }
-                if got != expectedType, !(isExternCallee && isFFIConvertible(got: got, expected: expectedType)) {
+                if !typesCompatible(got: got, expected: expectedType, symbols: symbols),
+                   !(isExternCallee && isFFIConvertible(got: got, expected: expectedType)) {
                     if isExternCallee, isDirectFFICallback(arg.value, expected: expectedType, symbols: symbols) {
                         continue
                     }
@@ -826,8 +1052,16 @@ public struct TypeChecker: Sendable {
                 }
             }
             if let trailing = c.trailingBlock {
-                // Builder blocks are type-checked as normal blocks in their own scope.
-                let s = scope.push()
+                let s: LocalScope
+                if let typeName = trailingBuilderType {
+                    s = scope.push(implicitSelfTypeName: typeName)
+                    s.define("self", type: .named(typeName))
+                } else if case .named(let typeName) = returns, symbols.fields[typeName] != nil {
+                    s = scope.push(implicitSelfTypeName: typeName)
+                    s.define("self", type: .named(typeName))
+                } else {
+                    s = scope.push()
+                }
                 _ = try typeCheckBlock(trailing, scope: s, symbols: symbols, expectedReturn: .void, typeInfo: &typeInfo)
             }
             result = returns
@@ -878,16 +1112,54 @@ public struct TypeChecker: Sendable {
         }
         return nil
     }
+
+    private func unwrapOptional(_ type: KiraType?) -> KiraType? {
+        guard let type else { return nil }
+        if case .optional(let inner) = type {
+            return inner
+        }
+        return type
+    }
+
+    private func contextualExpectedType(_ explicitType: KiraType?, for expr: Expr) -> KiraType? {
+        guard let explicitType else { return nil }
+        switch expr {
+        case .arrayLiteral, .leadingMember:
+            return explicitType
+        default:
+            if case .fixedArray = explicitType {
+                return explicitType
+            }
+            return nil
+        }
+    }
+
+    private func typesCompatible(got: KiraType, expected: KiraType, symbols: SymbolTable) -> Bool {
+        if got == expected {
+            return true
+        }
+        if case .pointer = expected {
+            return isFFIConvertible(got: got, expected: expected)
+        }
+        guard case .named(let expectedName) = expected,
+              case .named(let gotName) = got,
+              symbols.isProtocol(expectedName) else {
+            return false
+        }
+        return symbols.typeConformsToProtocol(typeName: gotName, protocolName: expectedName)
+    }
 }
 
 private final class LocalScope {
     private var values: [String: KiraType] = [:]
     private let parent: LocalScope?
     private let symbols: SymbolTable
+    private let implicitSelfType: String?
 
-    init(parent: LocalScope?, symbols: SymbolTable) {
+    init(parent: LocalScope?, symbols: SymbolTable, implicitSelfType: String? = nil) {
         self.parent = parent
         self.symbols = symbols
+        self.implicitSelfType = implicitSelfType
     }
 
     func define(_ name: String, type: KiraType) {
@@ -899,7 +1171,14 @@ private final class LocalScope {
         return parent?.lookup(name)
     }
 
-    func push() -> LocalScope {
-        LocalScope(parent: self, symbols: symbols)
+    func implicitSelfTypeName() -> String? {
+        if let implicitSelfType {
+            return implicitSelfType
+        }
+        return parent?.implicitSelfTypeName()
+    }
+
+    func push(implicitSelfTypeName: String? = nil) -> LocalScope {
+        LocalScope(parent: self, symbols: symbols, implicitSelfType: implicitSelfTypeName)
     }
 }

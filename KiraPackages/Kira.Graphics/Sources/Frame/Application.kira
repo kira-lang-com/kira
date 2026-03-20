@@ -1,0 +1,76 @@
+import Kira.Fondation
+
+@Doc("Application entry point for the first Kira.Graphics slice.")
+type Application {
+    var title: String = "Kira.Graphics"
+    var width: Int = 1280
+    var height: Int = 720
+    var sampleCount: Int = 1
+    var highDPI: Bool = true
+
+    function run(scene: Scene) {
+        graphicsScene = scene
+        graphicsDevice = GraphicsDevice()
+        graphicsFrameIndex = 0
+
+        sapp_run(desc: sapp_desc(
+            init_cb: graphics_on_init,
+            frame_cb: graphics_on_frame,
+            cleanup_cb: graphics_on_cleanup,
+            width: width,
+            height: height,
+            sample_count: sampleCount,
+            high_dpi: highDPI,
+            window_title: title))
+        return
+    }
+}
+
+type GraphicsEmptyScene: Scene {
+    function onLoad(device: GraphicsDevice) {
+        return
+    }
+
+    function onFrame(frame: Frame) {
+        return
+    }
+
+    function onResize(width: Int, height: Int) {
+        return
+    }
+
+    function onUnload() {
+        return
+    }
+}
+
+var graphicsScene: Scene = GraphicsEmptyScene()
+var graphicsDevice: GraphicsDevice = GraphicsDevice()
+var graphicsFrameIndex: Int = 0
+
+function graphics_on_init() {
+    sg_setup(desc: sg_desc(environment: sglue_environment()))
+    graphicsDevice = GraphicsDevice(backend: sg_query_backend())
+    graphicsScene.onLoad(device: graphicsDevice)
+    return
+}
+
+function graphics_on_frame() {
+    let frame = Frame(
+        width: sapp_widthf(),
+        height: sapp_heightf(),
+        time: sapp_frame_count(),
+        delta: sapp_frame_duration(),
+        index: graphicsFrameIndex,
+        device: graphicsDevice,
+        defaultPass: RenderPassDescriptor())
+    graphicsScene.onFrame(frame: frame)
+    graphicsFrameIndex = graphicsFrameIndex + 1
+    return
+}
+
+function graphics_on_cleanup() {
+    graphicsScene.onUnload()
+    sg_shutdown()
+    return
+}

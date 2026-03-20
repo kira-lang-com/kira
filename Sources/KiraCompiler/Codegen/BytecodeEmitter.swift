@@ -102,6 +102,16 @@ public struct BytecodeEmitter: Sendable {
                     append(.store_global, [UInt8(sym >> 8), UInt8(sym & 0xff)], irIndex: i)
                 case .newObject(let fieldCount):
                     append(.new_object, [UInt8(fieldCount >> 8), UInt8(fieldCount & 0xff)], irIndex: i)
+                case .newTypedObject(let typeName, let fieldCount):
+                    let nameIndex = internString(typeName)
+                    append(
+                        .new_typed_object,
+                        [
+                            UInt8(nameIndex >> 8), UInt8(nameIndex & 0xff),
+                            UInt8(fieldCount >> 8), UInt8(fieldCount & 0xff),
+                        ],
+                        irIndex: i
+                    )
                 case .makeFFIArray(let count, let elementType):
                     var bytes: [UInt8] = [UInt8(count >> 8), UInt8(count & 0xff)]
                     bytes.append(contentsOf: elementType)
@@ -143,6 +153,13 @@ public struct BytecodeEmitter: Sendable {
                     append(.jump_if_false, [UInt8(u >> 8), UInt8(u & 0xff)], irIndex: i)
                 case .call(let argCount):
                     append(.call, [argCount], irIndex: i)
+                case .callProtocolMethod(let methodName, let argCount):
+                    let nameIndex = internString(methodName)
+                    append(
+                        .call_protocol_method,
+                        [UInt8(nameIndex >> 8), UInt8(nameIndex & 0xff), argCount],
+                        irIndex: i
+                    )
                 case .ffiLoad:
                     append(.ffi_load, [], irIndex: i)
                 case .ffiCall(let argCount, let returnType, let argumentTypes):
