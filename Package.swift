@@ -17,7 +17,8 @@ let windowsLibffiLinkerSettings: [LinkerSetting] = enableWindowsLibffi
 let package = Package(
     name: "Kira",
     platforms: [
-        .macOS(.v13)
+        .macOS(.v13),
+        .iOS(.v17),
     ],
     products: [
         .library(name: "KiraCompiler", targets: ["KiraCompiler"]),
@@ -25,7 +26,10 @@ let package = Package(
         .executable(name: "kira", targets: ["KiraCLI"]),
         .executable(name: "kira-lsp", targets: ["KiraLSP"]),
     ],
-    dependencies: [],
+    dependencies: [
+        .package(url: "https://github.com/tuist/XcodeProj.git", from: "8.0.0"),
+        .package(url: "https://github.com/kylef/PathKit.git", from: "1.0.1"),
+    ],
     targets: makeTargets()
 )
 
@@ -102,10 +106,21 @@ func makeTargets() -> [Target] {
             path: "Sources/KiraVM",
             linkerSettings: windowsLibffiLinkerSettings
         ),
+        .target(
+            name: "KiraPlatform",
+            dependencies: [
+                "KiraCompiler",
+                .product(name: "PathKit", package: "PathKit"),
+                .product(name: "XcodeProj", package: "XcodeProj"),
+            ],
+            path: "Sources/KiraPlatform",
+            linkerSettings: windowsLibffiLinkerSettings
+        ),
         .executableTarget(
             name: "KiraCLI",
             dependencies: [
                 "KiraCompiler",
+                "KiraPlatform",
                 "KiraVM",
                 "KiraStdlib",
             ],
