@@ -1,0 +1,27 @@
+@Doc("Records GPU commands for a single frame.")
+type CommandBuffer {
+    function render(descriptor: RenderPassDescriptor) -> RenderEncoder {
+        let load_action = descriptor.clearEnabled ? SG_LOADACTION_CLEAR : SG_LOADACTION_LOAD
+        let clear = sg_color(
+            r: descriptor.clearColor.r,
+            g: descriptor.clearColor.g,
+            b: descriptor.clearColor.b,
+            a: descriptor.clearColor.a)
+        let color_action = sg_color_attachment_action(
+            load_action: load_action,
+            store_action: SG_STOREACTION_STORE,
+            clear_value: clear)
+        let pass = sg_pass(
+            action: sg_pass_action(colors: CArray8_sg_color_attachment_action(_0: color_action)),
+            swapchain: sglue_swapchain(),
+            label: descriptor.label)
+        sg_begin_pass(pass: pass)
+        return RenderEncoder()
+    }
+
+    function present() {
+        sg_end_pass()
+        sg_commit()
+        return
+    }
+}

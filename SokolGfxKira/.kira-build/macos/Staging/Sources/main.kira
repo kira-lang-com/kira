@@ -1,0 +1,78 @@
+import Kira.Graphics
+
+let TRIANGLE_VERTS: CArray<CFloat, 21> = [
+    0.0, 0.5, 0.5, 1.0, 0.0, 0.0, 1.0,
+    0.5, -0.5, 0.5, 0.0, 1.0, 0.0, 1.0,
+    -0.5, -0.5, 0.5, 0.0, 0.0, 1.0, 1.0,
+]
+
+let METAL_VS: String = "#include <metal_stdlib>\nusing namespace metal;\nstruct vs_in {\n  float3 pos [[attribute(0)]];\n  float4 color [[attribute(1)]];\n};\nstruct vs_out {\n  float4 pos [[position]];\n  float4 color;\n};\nvertex vs_out vs_main(vs_in in [[stage_in]]) {\n  vs_out out;\n  out.pos = float4(in.pos, 1.0);\n  out.color = in.color;\n  return out;\n}\n"
+let METAL_FS: String = "#include <metal_stdlib>\nusing namespace metal;\nstruct vs_out {\n  float4 pos [[position]];\n  float4 color;\n};\nfragment float4 fs_main(vs_out in [[stage_in]]) {\n  return in.color;\n}\n"
+let D3D11_VS: String = "struct vs_in { float3 pos : POSITION; float4 color : COLOR0; }; struct vs_out { float4 pos : SV_Position; float4 color : COLOR0; }; vs_out vs_main(vs_in input) { vs_out outp; outp.pos = float4(input.pos, 1.0); outp.color = input.color; return outp; }"
+let D3D11_FS: String = "struct vs_out { float4 pos : SV_Position; float4 color : COLOR0; }; float4 fs_main(vs_out input) : SV_Target { return input.color; }"
+
+type TriangleScene: Scene {
+    var frameCount: Int = 0
+    var pipeline: RenderPipeline = RenderPipeline()
+    var vertexBuffer: Buffer = Buffer()
+
+    function onLoad(device: GraphicsDevice) {
+        vertexBuffer = device.makeBuffer(
+            data: TRIANGLE_VERTS,
+            size: sizeOf(CArray<CFloat, 21>),
+            label: "triangle-vertices")
+        pipeline = device.makeRenderPipeline {
+            metalVertexSource = METAL_VS
+            metalFragmentSource = METAL_FS
+            d3d11VertexSource = D3D11_VS
+            d3d11FragmentSource = D3D11_FS
+            attribute0 = .float3
+            attribute1 = .float4
+            label = "triangle-pipeline"
+        }
+        return
+    }
+
+    function onFrame(frame: Frame) {
+        frameCount = frameCount + 1
+        let phase = frameCount % 120
+        let clear = phase < 60 ? Color(r: 0.2, g: 0.2, b: 0.4, a: 1.0) : Color(r: 0.4, g: 0.2, b: 0.2, a: 1.0)
+        let pass = frame.defaultPass.withClear(color: clear)
+        let scenePipeline = pipeline
+        let sceneVertexBuffer = vertexBuffer
+
+        frame.encode {
+            render(descriptor: pass) {
+                pipeline = scenePipeline
+                setVertex(buffer: sceneVertexBuffer, slot: 0)
+                draw(primitive: .triangles, count: 3)
+            }
+            present()
+        }
+
+        let shouldQuit = frame.index > 180
+        if shouldQuit {
+            frame.quit()
+        }
+        return
+    }
+
+    function onResize(width: Int, height: Int) {
+        return
+    }
+
+    function onUnload() {
+        return
+    }
+}
+
+@Main
+function main() {
+    print("Launching Sokol triangle via Kira.Graphics…")
+    let app = Application {
+        title = "Sokol Triangle (Kira.Graphics)"
+        width = 800
+        height = 600
+    }
+    app.run(scene: TriangleScene())
+}

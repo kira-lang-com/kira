@@ -1,0 +1,356 @@
+import Kira.Graphics
+
+// Metal shaders
+let METAL_VS: String = "#include <metal_stdlib>\nusing namespace metal;\nstruct vs_in {\n  float3 pos [[attribute(0)]];\n  float4 color [[attribute(1)]];\n};\nstruct vs_out {\n  float4 pos [[position]];\n  float4 color;\n};\nvertex vs_out vs_main(vs_in in [[stage_in]]) {\n  vs_out out;\n  out.pos = float4(in.pos, 1.0);\n  out.color = in.color;\n  return out;\n}\n"
+let METAL_FS: String = "#include <metal_stdlib>\nusing namespace metal;\nstruct vs_out {\n  float4 pos [[position]];\n  float4 color;\n};\nfragment float4 fs_main(vs_out in [[stage_in]]) {\n  return in.color;\n}\n"
+
+// D3D11 shaders
+let D3D11_VS: String = "struct vs_in { float3 pos : POSITION; float4 color : COLOR0; }; struct vs_out { float4 pos : SV_Position; float4 color : COLOR0; }; vs_out vs_main(vs_in input) { vs_out outp; outp.pos = float4(input.pos, 1.0); outp.color = input.color; return outp; }"
+let D3D11_FS: String = "struct vs_out { float4 pos : SV_Position; float4 color : COLOR0; }; float4 fs_main(vs_out input) : SV_Target { return input.color; }"
+
+enum LayoutMode {
+    case narrow
+    case medium
+    case wide
+}
+
+type UIDemoScene: Scene {
+    var frameCount: Int = 0
+    var windowWidth: Int = 1024
+    var windowHeight: Int = 768
+    var layoutMode: LayoutMode = .wide
+    var needsLayoutUpdate: Bool = true
+    var graphicsDevice: GraphicsDevice = GraphicsDevice()
+
+    var pipeline: RenderPipeline = RenderPipeline()
+    var headerBuffer: Buffer = Buffer()
+    var sidebarBuffer: Buffer = Buffer()
+    var button1Buffer: Buffer = Buffer()
+    var button2Buffer: Buffer = Buffer()
+    var panelBuffer: Buffer = Buffer()
+
+    function determineLayoutMode() -> LayoutMode {
+        // Narrow layout when portrait (width < height)
+        if windowWidth < windowHeight {
+            return .narrow
+        }
+        // Wide layout for desktop (width > height * 1.4)
+        if windowWidth * 10 > windowHeight * 14 {
+            return .wide
+        }
+        return .medium
+    }
+
+    function buildNarrowLayout(device: GraphicsDevice) {
+        // Narrow layout: Stack everything vertically, no sidebar
+        // Header at top
+        let headerVerts: CArray<CFloat, 42> = [
+            -1.0, 1.0, 0.0, 0.12, 0.12, 0.14, 1.0,
+            1.0, 1.0, 0.0, 0.12, 0.12, 0.14, 1.0,
+            -1.0, 0.85, 0.0, 0.12, 0.12, 0.14, 1.0,
+            1.0, 1.0, 0.0, 0.12, 0.12, 0.14, 1.0,
+            1.0, 0.85, 0.0, 0.12, 0.12, 0.14, 1.0,
+            -1.0, 0.85, 0.0, 0.12, 0.12, 0.14, 1.0,
+        ]
+
+        // Bottom navigation bar instead of sidebar
+        let navVerts: CArray<CFloat, 42> = [
+            -1.0, -0.85, 0.0, 0.15, 0.17, 0.2, 1.0,
+            1.0, -0.85, 0.0, 0.15, 0.17, 0.2, 1.0,
+            -1.0, -1.0, 0.0, 0.15, 0.17, 0.2, 1.0,
+            1.0, -0.85, 0.0, 0.15, 0.17, 0.2, 1.0,
+            1.0, -1.0, 0.0, 0.15, 0.17, 0.2, 1.0,
+            -1.0, -1.0, 0.0, 0.15, 0.17, 0.2, 1.0,
+        ]
+
+        // Buttons stacked vertically on left
+        let btn1Verts: CArray<CFloat, 42> = [
+            -0.9, 0.6, 0.0, 0.2, 0.4, 0.8, 1.0,
+            0.9, 0.6, 0.0, 0.3, 0.5, 0.9, 1.0,
+            -0.9, 0.4, 0.0, 0.2, 0.4, 0.8, 1.0,
+            0.9, 0.6, 0.0, 0.3, 0.5, 0.9, 1.0,
+            0.9, 0.4, 0.0, 0.3, 0.5, 0.9, 1.0,
+            -0.9, 0.4, 0.0, 0.2, 0.4, 0.8, 1.0,
+        ]
+
+        let btn2Verts: CArray<CFloat, 42> = [
+            -0.9, 0.2, 0.0, 0.6, 0.3, 0.6, 1.0,
+            0.9, 0.2, 0.0, 0.7, 0.4, 0.7, 1.0,
+            -0.9, 0.0, 0.0, 0.6, 0.3, 0.6, 1.0,
+            0.9, 0.2, 0.0, 0.7, 0.4, 0.7, 1.0,
+            0.9, 0.0, 0.0, 0.7, 0.4, 0.7, 1.0,
+            -0.9, 0.0, 0.0, 0.6, 0.3, 0.6, 1.0,
+        ]
+
+        // Full-width panel
+        let panelVerts: CArray<CFloat, 42> = [
+            -0.9, -0.2, 0.0, 0.2, 0.22, 0.25, 0.95,
+            0.9, -0.2, 0.0, 0.2, 0.22, 0.25, 0.95,
+            -0.9, -0.75, 0.0, 0.2, 0.22, 0.25, 0.95,
+            0.9, -0.2, 0.0, 0.2, 0.22, 0.25, 0.95,
+            0.9, -0.75, 0.0, 0.2, 0.22, 0.25, 0.95,
+            -0.9, -0.75, 0.0, 0.2, 0.22, 0.25, 0.95,
+        ]
+
+        headerBuffer = device.makeBuffer(data: headerVerts, size: sizeOf(CArray<CFloat, 42>), label: "header")
+        sidebarBuffer = device.makeBuffer(data: navVerts, size: sizeOf(CArray<CFloat, 42>), label: "nav")
+        button1Buffer = device.makeBuffer(data: btn1Verts, size: sizeOf(CArray<CFloat, 42>), label: "btn1")
+        button2Buffer = device.makeBuffer(data: btn2Verts, size: sizeOf(CArray<CFloat, 42>), label: "btn2")
+        panelBuffer = device.makeBuffer(data: panelVerts, size: sizeOf(CArray<CFloat, 42>), label: "panel")
+    }
+
+    function buildMediumLayout(device: GraphicsDevice) {
+        // Medium layout: Compact sidebar, adjusted spacing
+        let headerVerts: CArray<CFloat, 42> = [
+            -1.0, 1.0, 0.0, 0.12, 0.12, 0.14, 1.0,
+            1.0, 1.0, 0.0, 0.12, 0.12, 0.14, 1.0,
+            -1.0, 0.92, 0.0, 0.12, 0.12, 0.14, 1.0,
+            1.0, 1.0, 0.0, 0.12, 0.12, 0.14, 1.0,
+            1.0, 0.92, 0.0, 0.12, 0.12, 0.14, 1.0,
+            -1.0, 0.92, 0.0, 0.12, 0.12, 0.14, 1.0,
+        ]
+
+        // Thinner sidebar
+        let sidebarVerts: CArray<CFloat, 42> = [
+            -1.0, 0.92, 0.0, 0.15, 0.17, 0.2, 1.0,
+            -0.88, 0.92, 0.0, 0.15, 0.17, 0.2, 1.0,
+            -1.0, -1.0, 0.0, 0.15, 0.17, 0.2, 1.0,
+            -0.88, 0.92, 0.0, 0.15, 0.17, 0.2, 1.0,
+            -0.88, -1.0, 0.0, 0.15, 0.17, 0.2, 1.0,
+            -1.0, -1.0, 0.0, 0.15, 0.17, 0.2, 1.0,
+        ]
+
+        // Buttons side by side but closer
+        let btn1Verts: CArray<CFloat, 42> = [
+            -0.75, 0.4, 0.0, 0.2, 0.4, 0.8, 1.0,
+            -0.1, 0.4, 0.0, 0.3, 0.5, 0.9, 1.0,
+            -0.75, 0.2, 0.0, 0.2, 0.4, 0.8, 1.0,
+            -0.1, 0.4, 0.0, 0.3, 0.5, 0.9, 1.0,
+            -0.1, 0.2, 0.0, 0.3, 0.5, 0.9, 1.0,
+            -0.75, 0.2, 0.0, 0.2, 0.4, 0.8, 1.0,
+        ]
+
+        let btn2Verts: CArray<CFloat, 42> = [
+            0.1, 0.4, 0.0, 0.6, 0.3, 0.6, 1.0,
+            0.75, 0.4, 0.0, 0.7, 0.4, 0.7, 1.0,
+            0.1, 0.2, 0.0, 0.6, 0.3, 0.6, 1.0,
+            0.75, 0.4, 0.0, 0.7, 0.4, 0.7, 1.0,
+            0.75, 0.2, 0.0, 0.7, 0.4, 0.7, 1.0,
+            0.1, 0.2, 0.0, 0.6, 0.3, 0.6, 1.0,
+        ]
+
+        // Centered panel
+        let panelVerts: CArray<CFloat, 42> = [
+            -0.6, -0.3, 0.0, 0.2, 0.22, 0.25, 0.95,
+            0.6, -0.3, 0.0, 0.2, 0.22, 0.25, 0.95,
+            -0.6, -0.7, 0.0, 0.2, 0.22, 0.25, 0.95,
+            0.6, -0.3, 0.0, 0.2, 0.22, 0.25, 0.95,
+            0.6, -0.7, 0.0, 0.2, 0.22, 0.25, 0.95,
+            -0.6, -0.7, 0.0, 0.2, 0.22, 0.25, 0.95,
+        ]
+
+        headerBuffer = device.makeBuffer(data: headerVerts, size: sizeOf(CArray<CFloat, 42>), label: "header")
+        sidebarBuffer = device.makeBuffer(data: sidebarVerts, size: sizeOf(CArray<CFloat, 42>), label: "sidebar")
+        button1Buffer = device.makeBuffer(data: btn1Verts, size: sizeOf(CArray<CFloat, 42>), label: "btn1")
+        button2Buffer = device.makeBuffer(data: btn2Verts, size: sizeOf(CArray<CFloat, 42>), label: "btn2")
+        panelBuffer = device.makeBuffer(data: panelVerts, size: sizeOf(CArray<CFloat, 42>), label: "panel")
+    }
+
+    function buildWideLayout(device: GraphicsDevice) {
+        // Wide layout: Traditional desktop layout with full sidebar
+        let headerVerts: CArray<CFloat, 42> = [
+            -1.0, 1.0, 0.0, 0.12, 0.12, 0.14, 1.0,
+            1.0, 1.0, 0.0, 0.12, 0.12, 0.14, 1.0,
+            -1.0, 0.95, 0.0, 0.12, 0.12, 0.14, 1.0,
+            1.0, 1.0, 0.0, 0.12, 0.12, 0.14, 1.0,
+            1.0, 0.95, 0.0, 0.12, 0.12, 0.14, 1.0,
+            -1.0, 0.95, 0.0, 0.12, 0.12, 0.14, 1.0,
+        ]
+
+        // Full sidebar
+        let sidebarVerts: CArray<CFloat, 42> = [
+            -1.0, 0.95, 0.0, 0.15, 0.17, 0.2, 1.0,
+            -0.8, 0.95, 0.0, 0.15, 0.17, 0.2, 1.0,
+            -1.0, -1.0, 0.0, 0.15, 0.17, 0.2, 1.0,
+            -0.8, 0.95, 0.0, 0.15, 0.17, 0.2, 1.0,
+            -0.8, -1.0, 0.0, 0.15, 0.17, 0.2, 1.0,
+            -1.0, -1.0, 0.0, 0.15, 0.17, 0.2, 1.0,
+        ]
+
+        // Buttons in main area with good spacing
+        let btn1Verts: CArray<CFloat, 42> = [
+            -0.65, 0.6, 0.0, 0.2, 0.4, 0.8, 1.0,
+            -0.25, 0.6, 0.0, 0.3, 0.5, 0.9, 1.0,
+            -0.65, 0.4, 0.0, 0.2, 0.4, 0.8, 1.0,
+            -0.25, 0.6, 0.0, 0.3, 0.5, 0.9, 1.0,
+            -0.25, 0.4, 0.0, 0.3, 0.5, 0.9, 1.0,
+            -0.65, 0.4, 0.0, 0.2, 0.4, 0.8, 1.0,
+        ]
+
+        let btn2Verts: CArray<CFloat, 42> = [
+            0.25, 0.6, 0.0, 0.6, 0.3, 0.6, 1.0,
+            0.65, 0.6, 0.0, 0.7, 0.4, 0.7, 1.0,
+            0.25, 0.4, 0.0, 0.6, 0.3, 0.6, 1.0,
+            0.65, 0.6, 0.0, 0.7, 0.4, 0.7, 1.0,
+            0.65, 0.4, 0.0, 0.7, 0.4, 0.7, 1.0,
+            0.25, 0.4, 0.0, 0.6, 0.3, 0.6, 1.0,
+        ]
+
+        // Right-side floating panel
+        let panelVerts: CArray<CFloat, 42> = [
+            0.3, -0.2, 0.0, 0.2, 0.22, 0.25, 0.95,
+            0.9, -0.2, 0.0, 0.2, 0.22, 0.25, 0.95,
+            0.3, -0.6, 0.0, 0.2, 0.22, 0.25, 0.95,
+            0.9, -0.2, 0.0, 0.2, 0.22, 0.25, 0.95,
+            0.9, -0.6, 0.0, 0.2, 0.22, 0.25, 0.95,
+            0.3, -0.6, 0.0, 0.2, 0.22, 0.25, 0.95,
+        ]
+
+        headerBuffer = device.makeBuffer(data: headerVerts, size: sizeOf(CArray<CFloat, 42>), label: "header")
+        sidebarBuffer = device.makeBuffer(data: sidebarVerts, size: sizeOf(CArray<CFloat, 42>), label: "sidebar")
+        button1Buffer = device.makeBuffer(data: btn1Verts, size: sizeOf(CArray<CFloat, 42>), label: "btn1")
+        button2Buffer = device.makeBuffer(data: btn2Verts, size: sizeOf(CArray<CFloat, 42>), label: "btn2")
+        panelBuffer = device.makeBuffer(data: panelVerts, size: sizeOf(CArray<CFloat, 42>), label: "panel")
+    }
+
+    function updateLayout(device: GraphicsDevice) {
+        let newMode = determineLayoutMode()
+
+        // Debug: Always show what we're checking
+        if layoutMode == .narrow {
+            print("Current layout: NARROW")
+        }
+        if layoutMode == .medium {
+            print("Current layout: MEDIUM")
+        }
+        if layoutMode == .wide {
+            print("Current layout: WIDE")
+        }
+        if newMode == .narrow {
+            print("New layout would be: NARROW")
+        }
+        if newMode == .medium {
+            print("New layout would be: MEDIUM")
+        }
+        if newMode == .wide {
+            print("New layout would be: WIDE")
+        }
+
+        if newMode != layoutMode {
+            layoutMode = newMode
+            needsLayoutUpdate = true
+            print("Layout mode CHANGED!")
+        }
+
+        if needsLayoutUpdate {
+            if layoutMode == .narrow {
+                buildNarrowLayout(device)
+                print("Layout: NARROW (vertical stack, bottom nav)")
+            }
+            if layoutMode == .medium {
+                buildMediumLayout(device)
+                print("Layout: MEDIUM (compact sidebar)")
+            }
+            if layoutMode == .wide {
+                buildWideLayout(device)
+                print("Layout: WIDE (traditional desktop)")
+            }
+            needsLayoutUpdate = false
+        }
+    }
+
+    function onLoad(device: GraphicsDevice) {
+        graphicsDevice = device
+        pipeline = device.makeRenderPipeline {
+            metalVertexSource = METAL_VS
+            metalFragmentSource = METAL_FS
+            d3d11VertexSource = D3D11_VS
+            d3d11FragmentSource = D3D11_FS
+            attribute0 = .float3
+            attribute1 = .float4
+            label = "ui-pipeline"
+        }
+
+        needsLayoutUpdate = true
+        updateLayout(device)
+        print("=== Adaptive UI Demo Loaded ===")
+        print("Resize window to see layout changes!")
+        print("================================")
+        return
+    }
+
+    function onFrame(frame: Frame) {
+        frameCount = frameCount + 1
+
+        // Check and update layout if window was resized
+        if needsLayoutUpdate {
+            print("needsLayoutUpdate is TRUE - calling updateLayout")
+            updateLayout(graphicsDevice)
+        }
+
+        let phase = frameCount % 120
+        let clear = phase < 60 ? Color(r: 0.08, g: 0.09, b: 0.11, a: 1.0) : Color(r: 0.09, g: 0.08, b: 0.13, a: 1.0)
+        let pass = frame.defaultPass.withClear(color: clear)
+
+        let scenePipeline = pipeline
+        let sceneHeaderBuffer = headerBuffer
+        let sceneSidebarBuffer = sidebarBuffer
+        let sceneButton1Buffer = button1Buffer
+        let sceneButton2Buffer = button2Buffer
+        let scenePanelBuffer = panelBuffer
+
+        frame.encode {
+            render(descriptor: pass) {
+                pipeline = scenePipeline
+                setVertex(buffer: sceneHeaderBuffer, slot: 0)
+                draw(primitive: .triangles, count: 6)
+                setVertex(buffer: sceneSidebarBuffer, slot: 0)
+                draw(primitive: .triangles, count: 6)
+                setVertex(buffer: sceneButton1Buffer, slot: 0)
+                draw(primitive: .triangles, count: 6)
+                setVertex(buffer: sceneButton2Buffer, slot: 0)
+                draw(primitive: .triangles, count: 6)
+                setVertex(buffer: scenePanelBuffer, slot: 0)
+                draw(primitive: .triangles, count: 6)
+            }
+            present()
+        }
+
+        // Demo runs indefinitely to allow testing layout changes
+        // Close window manually to exit
+        return
+    }
+
+    function onResize(width: Int, height: Int) {
+        print("onResize called!")
+        windowWidth = width
+        windowHeight = height
+        needsLayoutUpdate = true
+        print("Window size updated")
+        print("needsLayoutUpdate set to TRUE")
+        return
+    }
+
+    function onUnload() {
+        print("UI Demo unloaded")
+        return
+    }
+}
+
+@Main
+function main() {
+    print("=== Kira Graphics - Adaptive UI Demo ===")
+    print("Features:")
+    print("  - Layout changes based on window aspect ratio")
+    print("  - NARROW (< 0.8): Vertical stack, bottom nav")
+    print("  - MEDIUM (0.8-1.4): Compact sidebar")
+    print("  - WIDE (> 1.4): Traditional desktop layout")
+    print("  - Resize window to see adaptive behavior")
+    print("==========================================")
+    let app = Application {
+        title = "Adaptive UI Demo"
+        width = 1024
+        height = 768
+    }
+    app.run(scene: UIDemoScene())
+}
