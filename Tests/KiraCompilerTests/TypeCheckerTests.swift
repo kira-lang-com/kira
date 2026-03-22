@@ -314,6 +314,26 @@ final class TypeCheckerTests: XCTestCase {
         XCTAssertNotNil(out.bytecode)
     }
 
+    func testStaticMethodCompiles() throws {
+        let src = SourceText(file: "t.kira", text: """
+        type Rectangle {
+            var width: Int = 1
+
+            static function unit() -> Rectangle {
+                return Rectangle(width: 1)
+            }
+        }
+
+        function main() {
+            let rect = Rectangle.unit()
+            print(rect.width)
+            return
+        }
+        """)
+        let out = try CompilerDriver().compile(source: src, target: .macOS(arch: .arm64))
+        XCTAssertNotNil(out.bytecode)
+    }
+
     func testIfStatementCompilesWhenConditionIsLocalBinding() throws {
         let src = SourceText(file: "t.kira", text: """
         function main() {
@@ -337,6 +357,49 @@ final class TypeCheckerTests: XCTestCase {
         function main() {
             let counter = Counter()
             print(counter.value)
+            return
+        }
+        """)
+        let out = try CompilerDriver().compile(source: src, target: .macOS(arch: .arm64))
+        XCTAssertNotNil(out.bytecode)
+    }
+
+    func testWhileLoopCompiles() throws {
+        let src = SourceText(file: "t.kira", text: """
+        function main() {
+            var value = 0
+            while value < 3 {
+                value = value + 1
+            }
+            print(value)
+            return
+        }
+        """)
+        let out = try CompilerDriver().compile(source: src, target: .macOS(arch: .arm64))
+        XCTAssertNotNil(out.bytecode)
+    }
+
+    func testDynamicArrayOperationsCompile() throws {
+        let src = SourceText(file: "t.kira", text: """
+        function main() {
+            var values: [Int] = []
+            values.append(7)
+            values.append(9)
+            values[0] = values[1]
+            print(values.count)
+            print(values[0])
+            return
+        }
+        """)
+        let out = try CompilerDriver().compile(source: src, target: .macOS(arch: .arm64))
+        XCTAssertNotNil(out.bytecode)
+    }
+
+    func testStringCountCompiles() throws {
+        let src = SourceText(file: "t.kira", text: """
+        function main() {
+            let title = "Kira"
+            print(title.count)
             return
         }
         """)

@@ -1,0 +1,153 @@
+import Kira.Graphics
+
+@Doc("Render bridge that submits Foundation draw lists through Kira.Graphics.
+The current implementation favors predictable, simple geometry over aggressive batching.
+It is sufficient for filled panels and placeholder text rendering in the first Foundation slice.")
+type DrawListRenderer {
+    @Doc("Graphics device used to allocate transient buffers and pipelines.")
+    var device: GraphicsDevice = GraphicsDevice()
+    @Doc("Pipeline used for all colored-quad rendering in the current implementation.")
+    var pipeline: RenderPipeline = RenderPipeline()
+
+    @Doc("Render a Foundation draw list through a graphics encoder.
+    Each supported command is translated into one or more transient triangle draws.
+    The current implementation focuses on filled geometry and placeholder text quads.")
+    function render(drawList: DrawList, encoder: RenderEncoder, viewport: Rect) {
+        ensurePipeline()
+        encoder.pipeline = pipeline
+
+        var i = 0
+        while i < drawList.commands.count {
+            match drawList.commands[i] {
+                FilledRect(let bounds, let color, _):
+                    drawQuad(bounds: bounds, color: color, encoder: encoder, viewport: viewport)
+                StrokedRect(let bounds, let color, _, let lineWidth):
+                    drawStroke(bounds: bounds, color: color, lineWidth: lineWidth, encoder: encoder, viewport: viewport)
+                FilledCircle(let center, let radius, let color): {
+                    let bounds = Rect(x: center.x - radius, y: center.y - radius, width: radius * 2.0, height: radius * 2.0)
+                    drawQuad(bounds: bounds, color: color, encoder: encoder, viewport: viewport)
+                }
+                Line(let from, let to, let color, let lineWidth): {
+                    let minX = from.x < to.x ? from.x : to.x
+                    let minY = from.y < to.y ? from.y : to.y
+                    let width = (from.x > to.x ? from.x - to.x : to.x - from.x) + lineWidth
+                    let height = (from.y > to.y ? from.y - to.y : to.y - from.y) + lineWidth
+                    drawQuad(bounds: Rect(x: minX, y: minY, width: width, height: height), color: color, encoder: encoder, viewport: viewport)
+                }
+                Text(_, let glyphs, let color): {
+                    var g = 0
+                    while g < glyphs.count {
+                        drawQuad(bounds: glyphs[g].bounds, color: color, encoder: encoder, viewport: viewport)
+                        g = g + 1
+                    }
+                }
+                Image(let bounds, _, _, let tint):
+                    drawQuad(bounds: bounds, color: tint, encoder: encoder, viewport: viewport)
+                PushClip(_):
+                    ignore()
+                PopClip:
+                    ignore()
+                Shadow(_, _, _):
+                    ignore()
+            }
+            i = i + 1
+        }
+        return
+    }
+
+    @Doc("Ensure the shared quad-rendering pipeline exists.
+    The pipeline is created lazily the first time rendering is requested.
+    Reusing one pipeline keeps the initial Foundation renderer small and stable.")
+    function ensurePipeline() {
+        if pipeline.label.count > 0 {
+            return
+        }
+        pipeline = device.makeRenderPipeline(desc: RenderPipelineDescriptor {
+            metalVertexSource = "#include <metal_stdlib>\nusing namespace metal;\nstruct VSIn { float2 position [[attribute(0)]]; float4 color [[attribute(1)]]; };\nstruct VSOut { float4 position [[position]]; float4 color; };\nvertex VSOut vs_main(VSIn in [[stage_in]]) { VSOut out; out.position = float4(in.position.x, in.position.y, 0.0, 1.0); out.color = in.color; return out; }"
+            metalFragmentSource = "#include <metal_stdlib>\nusing namespace metal;\nstruct VSOut { float4 position [[position]]; float4 color; };\nfragment float4 fs_main(VSOut in [[stage_in]]) { return in.color; }"
+            d3d11VertexSource = "struct VSIn { float2 position : POSITION; float4 color : COLOR; }; struct VSOut { float4 position : SV_POSITION; float4 color : COLOR; }; VSOut vs_main(VSIn input) { VSOut outp; outp.position = float4(input.position.x, input.position.y, 0.0, 1.0); outp.color = input.color; return outp; }"
+            d3d11FragmentSource = "struct VSOut { float4 position : SV_POSITION; float4 color : COLOR; }; float4 fs_main(VSOut input) : SV_Target0 { return input.color; }"
+            attribute0 = .float2
+            attribute1 = .float4
+            primitive = .triangles
+            colorFormat = .bgra8Unorm
+            label = "FoundationUI"
+        })
+        return
+    }
+
+    @Doc("Draw a filled quad for one rectangle in root coordinates.
+    Positions are converted to normalized device coordinates against the supplied viewport.
+    The quad is uploaded as a transient six-vertex triangle list.")
+    function drawQuad(bounds: Rect, color: Color, encoder: RenderEncoder, viewport: Rect) {
+        let left = ndcX(x: bounds.x, viewport: viewport)
+        let right = ndcX(x: bounds.x + bounds.width, viewport: viewport)
+        let top = ndcY(y: bounds.y, viewport: viewport)
+        let bottom = ndcY(y: bounds.y + bounds.height, viewport: viewport)
+
+        let vertices: CArray<CFloat, 36> = [
+            left,  top,    color.r, color.g, color.b, color.a,
+            right, top,    color.r, color.g, color.b, color.a,
+            right, bottom, color.r, color.g, color.b, color.a,
+            left,  top,    color.r, color.g, color.b, color.a,
+            right, bottom, color.r, color.g, color.b, color.a,
+            left,  bottom, color.r, color.g, color.b, color.a,
+        ]
+        let buffer = device.makeBuffer(data: vertices, size: sizeOf(CArray<CFloat, 36>), label: "foundation-quad")
+        encoder.setVertex(buffer: buffer, slot: 0)
+        encoder.draw(primitive: .triangles, count: 6)
+        sg_destroy_buffer(buf: buffer.handle)
+        return
+    }
+
+    @Doc("Draw a stroked rectangle by emitting four thin filled quads.
+    This keeps stroke rendering simple while preserving the command model.
+    The supplied line width is applied on all four edges.")
+    function drawStroke(bounds: Rect, color: Color, lineWidth: Float, encoder: RenderEncoder, viewport: Rect) {
+        drawQuad(bounds: Rect(x: bounds.x, y: bounds.y, width: bounds.width, height: lineWidth), color: color, encoder: encoder, viewport: viewport)
+        drawQuad(bounds: Rect(x: bounds.x, y: bounds.y + bounds.height - lineWidth, width: bounds.width, height: lineWidth), color: color, encoder: encoder, viewport: viewport)
+        drawQuad(bounds: Rect(x: bounds.x, y: bounds.y, width: lineWidth, height: bounds.height), color: color, encoder: encoder, viewport: viewport)
+        drawQuad(bounds: Rect(x: bounds.x + bounds.width - lineWidth, y: bounds.y, width: lineWidth, height: bounds.height), color: color, encoder: encoder, viewport: viewport)
+        return
+    }
+
+    @Doc("Convert an x position in points into normalized device coordinates.
+    The viewport width defines the right edge of the visible region.
+    The result is ready for the current simple pass-through vertex shader.")
+    function ndcX(x: Float, viewport: Rect) -> Float {
+        return ((x - viewport.x) / viewport.width) * 2.0 - 1.0
+    }
+
+    @Doc("Convert a y position in points into normalized device coordinates.
+    Foundation uses a top-left origin, so the y axis is flipped during conversion.
+    The result is ready for the current simple pass-through vertex shader.")
+    function ndcY(y: Float, viewport: Rect) -> Float {
+        return 1.0 - ((y - viewport.y) / viewport.height) * 2.0
+    }
+
+    @Doc("Ignore a draw command that the current renderer does not interpret.
+    Keeping this helper explicit avoids premature exits from the render loop.
+    Unsupported commands remain present in the draw list for future renderers.")
+    function ignore() {
+        return
+    }
+}
+
+@Doc("Colored UI vertex consumed by the current Foundation renderer.
+The first attribute stores clip-space position while the second stores vertex color.
+Each quad draw uploads six of these vertices.")
+@CStruct
+type UIVertex {
+    @Doc("Clip-space x position.")
+    var px: Float
+    @Doc("Clip-space y position.")
+    var py: Float
+    @Doc("Red color channel.")
+    var r: Float
+    @Doc("Green color channel.")
+    var g: Float
+    @Doc("Blue color channel.")
+    var b: Float
+    @Doc("Alpha color channel.")
+    var a: Float
+}

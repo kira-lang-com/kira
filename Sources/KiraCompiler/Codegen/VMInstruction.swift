@@ -78,6 +78,9 @@ public enum Instruction: UInt8, Sendable {
     case array_slice = 0x94
     case make_ffi_array = 0x95
     case new_typed_object = 0x96
+    case make_enum = 0x97
+    case match_enum = 0x98
+    case get_enum_field = 0x99
 
     case string_concat = 0xA0
     case string_length = 0xA1

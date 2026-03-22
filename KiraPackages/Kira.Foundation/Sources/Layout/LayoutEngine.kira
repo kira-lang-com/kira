@@ -1,0 +1,420 @@
+@Doc("Two-pass layout engine used by UIFoundation.
+The first pass measures bottom-up and the second pass places top-down.
+The implementation intentionally favors predictable behavior over hidden heuristics.")
+type LayoutEngine {
+    @Doc("Measure a node and all of its descendants.
+    The parent supplies the available size and the node resolves its own final size from content and descriptor rules.
+    The returned size is also stored back onto `node.measuredSize`.")
+    function measure(node: LayoutNode, available: Size) -> Size {
+        let desc = node.descriptor
+        let innerWidth = (available.width - desc.padding.leading) - desc.padding.trailing
+        let innerHeight = (available.height - desc.padding.top) - desc.padding.bottom
+        let innerAvailable = Size(width: innerWidth, height: innerHeight)
+
+        var i = 0
+        while i < node.children.count {
+            let child = node.children[i]
+            let childAvailable = childAvailableSize(available: innerAvailable, arrange: desc.arrange, childIndex: i, childCount: node.children.count)
+            child.measuredSize = measure(node: child, available: childAvailable)
+            i = i + 1
+        }
+
+        let contentSize = computeContentSize(node: node)
+        let resolvedWidth = resolveSizeMode(mode: desc.width, available: available.width, content: contentSize.width)
+        let resolvedHeight = resolveSizeMode(mode: desc.height, available: available.height, content: contentSize.height)
+        let finalWidth = (resolvedWidth + desc.padding.leading) + desc.padding.trailing
+        let finalHeight = (resolvedHeight + desc.padding.top) + desc.padding.bottom
+        let finalSize = Size(width: finalWidth, height: finalHeight)
+        node.measuredSize = finalSize
+        return finalSize
+    }
+
+    @Doc("Place a measured node and all of its descendants.
+    Placement starts from the supplied origin and writes final child origins into the layout tree.
+    Call this only after `measure(node:available:)` has completed.")
+    function place(node: LayoutNode, origin: Point) {
+        node.placedOrigin = origin
+        let desc = node.descriptor
+        let innerOrigin = Point(x: origin.x + desc.padding.leading, y: origin.y + desc.padding.top)
+        let innerWidth = (node.measuredSize.width - desc.padding.leading) - desc.padding.trailing
+        let innerHeight = (node.measuredSize.height - desc.padding.top) - desc.padding.bottom
+        let innerSize = Size(width: innerWidth, height: innerHeight)
+        placeChildren(node: node, innerOrigin: innerOrigin, innerSize: innerSize)
+    }
+
+    @Doc("Place child nodes according to the container arrangement mode.
+    This helper is called during the place pass once the parent size is known.
+    Each arrangement strategy is handled explicitly for predictability.")
+    function placeChildren(node: LayoutNode, innerOrigin: Point, innerSize: Size) {
+        match node.descriptor.arrange {
+            Stack(let axis, let spacing, let alignment):
+                placeStack(node: node, origin: innerOrigin, available: innerSize, axis: axis, spacing: spacing, alignment: alignment)
+            Absolute: {
+                var i = 0
+                while i < node.children.count {
+                    let child = node.children[i]
+                    let childOrigin = Point(x: innerOrigin.x + child.descriptor.x, y: innerOrigin.y + child.descriptor.y)
+                    place(node: child, origin: childOrigin)
+                    i = i + 1
+                }
+            }
+            Grid(let columns, let spacing, let rowSpacing):
+                placeGrid(node: node, origin: innerOrigin, available: innerSize, columns: columns, spacing: spacing, rowSpacing: rowSpacing)
+            Wrap(let spacing, let rowSpacing, let alignment):
+                placeWrap(node: node, origin: innerOrigin, available: innerSize, spacing: spacing, rowSpacing: rowSpacing, alignment: alignment)
+            Overlay(let alignment): {
+                var i = 0
+                while i < node.children.count {
+                    let child = node.children[i]
+                    let childOrigin = alignedOrigin(child: child.measuredSize, container: innerSize, origin: innerOrigin, alignment: alignment)
+                    place(node: child, origin: childOrigin)
+                    i = i + 1
+                }
+            }
+            Fill:
+                if node.children.count > 0 {
+                    place(node: node.children[0], origin: innerOrigin)
+                }
+        }
+    }
+
+    @Doc("Place children in a linear horizontal or vertical stack.
+    Fill children divide the remaining main-axis space evenly.
+    Cross-axis placement uses the supplied alignment value.")
+    function placeStack(node: LayoutNode, origin: Point, available: Size, axis: Axis, spacing: Float, alignment: CrossAlignment) {
+        let fillCount = stackFillCount(node: node, axis: axis)
+        let fixedTotal = stackFixedTotal(node: node, axis: axis)
+
+        let totalSpacing = node.children.count > 1 ? spacing * Float(node.children.count - 1) : 0.0
+        let mainAvailable = axis == .Horizontal ? available.width : available.height
+        var remaining = mainAvailable
+        remaining = remaining - fixedTotal
+        remaining = remaining - totalSpacing
+        var fillSize = 0.0
+        if fillCount > 0 {
+            if remaining > 0.0 {
+                fillSize = remaining / Float(fillCount)
+            } else {
+                fillSize = 0.0
+            }
+        }
+
+        var cursor = axis == .Horizontal ? origin.x : origin.y
+        var plannedOrigins: [Point] = []
+        var i = 0
+        while i < node.children.count {
+            let mainSize = resolvedChildMainSize(child: node.children[i], axis: axis, fillSize: fillSize)
+            if axis == .Horizontal {
+                node.children[i].measuredSize = Size(width: mainSize, height: node.children[i].measuredSize.height)
+            } else {
+                node.children[i].measuredSize = Size(width: node.children[i].measuredSize.width, height: mainSize)
+            }
+            let crossSize = axis == .Horizontal ? node.children[i].measuredSize.height : node.children[i].measuredSize.width
+            let crossAvailable = axis == .Horizontal ? available.height : available.width
+            let crossOffset = computeCrossOffset(childSize: crossSize, available: crossAvailable, alignment: alignment)
+            let childOrigin = axis == .Horizontal ? Point(x: cursor, y: origin.y + crossOffset) : Point(x: origin.x + crossOffset, y: cursor)
+            plannedOrigins.append(childOrigin)
+            cursor = cursor + mainSize + spacing
+            i = i + 1
+        }
+
+        i = 0
+        while i < node.children.count {
+            place(node: node.children[i], origin: plannedOrigins[i])
+            i = i + 1
+        }
+    }
+
+    @Doc("Place children in a simple fixed-column grid.
+    Each cell uses the widest available column size in the offered width.
+    Row height is determined by the tallest child in the current row.")
+    function placeGrid(node: LayoutNode, origin: Point, available: Size, columns: Int, spacing: Float, rowSpacing: Float) {
+        if columns <= 0 {
+            return
+        }
+        let columnCount = Float(columns)
+        let totalSpacing = columns > 1 ? spacing * Float(columns - 1) : 0.0
+        let cellWidth = (available.width - totalSpacing) / columnCount
+        var i = 0
+        var row = 0
+        while i < node.children.count {
+            let column = i % columns
+            if column == 0 && i > 0 {
+                row = row + 1
+            }
+            let child = node.children[i]
+            let childX = origin.x + Float(column) * (cellWidth + spacing)
+            let childY = origin.y + Float(row) * (child.measuredSize.height + rowSpacing)
+            place(node: child, origin: Point(x: childX, y: childY))
+            i = i + 1
+        }
+    }
+
+    @Doc("Place children in rows that wrap when the available width is exceeded.
+    Row height is determined by the tallest child placed in the current row.
+    Cross-axis alignment is applied inside each row against the final row height.")
+    function placeWrap(node: LayoutNode, origin: Point, available: Size, spacing: Float, rowSpacing: Float, alignment: CrossAlignment) {
+        var i = 0
+        var cursorX = origin.x
+        var cursorY = origin.y
+        var rowHeight = 0.0
+        while i < node.children.count {
+            let child = node.children[i]
+            let childWidth = child.measuredSize.width
+            let childHeight = child.measuredSize.height
+            if cursorX > origin.x && cursorX + childWidth > origin.x + available.width {
+                cursorX = origin.x
+                cursorY = cursorY + rowHeight + rowSpacing
+                rowHeight = 0.0
+            }
+            let crossOffset = computeCrossOffset(childSize: childHeight, available: rowHeight > childHeight ? rowHeight : childHeight, alignment: alignment)
+            place(node: child, origin: Point(x: cursorX, y: cursorY + crossOffset))
+            cursorX = cursorX + childWidth + spacing
+            rowHeight = rowHeight > childHeight ? rowHeight : childHeight
+            i = i + 1
+        }
+    }
+
+    @Doc("Resolve a `SizeMode` into a concrete number of points.
+    Available space and intrinsic content are both considered depending on the selected mode.
+    The returned value excludes outer padding, which is added by the caller.")
+    function resolveSizeMode(mode: SizeMode, available: Float, content: Float) -> Float {
+        match mode {
+            Fixed(let value):
+                return value
+            Fill:
+                return available > 0.0 ? available : 0.0
+            Hug:
+                return content
+            Fraction(let of):
+                return available * of
+            Min(let value):
+                return content > value ? content : value
+            Max(let value):
+                return content < value ? content : value
+            Range(let min, let max): {
+                let lower = content < min ? min : content
+                return lower > max ? max : lower
+            }
+        }
+    }
+
+    @Doc("Compute the cross-axis offset for a child inside a stack-like container.
+    Stretch currently resolves to zero because size expansion happens during measurement.
+    The returned value is added to the child's origin on the cross axis.")
+    function computeCrossOffset(childSize: Float, available: Float, alignment: CrossAlignment) -> Float {
+        match alignment {
+            Start:
+                return 0.0
+            Center:
+                return (available - childSize) / 2.0
+            End:
+                return available - childSize
+            Stretch:
+                return 0.0
+        }
+    }
+
+    @Doc("Compute the aggregate content size implied by a node's measured children.
+    Container arrangement determines whether widths or heights are summed or maximized.
+    Leaf widgets with no children resolve to zero content size.")
+    function computeContentSize(node: LayoutNode) -> Size {
+        let arrange = node.descriptor.arrange
+        match arrange {
+            Stack(let axis, let spacing, _): {
+                if axis == .Horizontal {
+                    var totalWidth = 0.0
+                    var maxHeight = 0.0
+                    var i = 0
+                    while i < node.children.count {
+                        let child = node.children[i]
+                        totalWidth = totalWidth + child.measuredSize.width
+                        maxHeight = maxHeight > child.measuredSize.height ? maxHeight : child.measuredSize.height
+                        i = i + 1
+                    }
+                    if node.children.count > 1 {
+                        totalWidth = totalWidth + spacing * Float(node.children.count - 1)
+                    }
+                    return Size(width: totalWidth, height: maxHeight)
+                }
+                var maxWidth = 0.0
+                var totalHeight = 0.0
+                var i = 0
+                while i < node.children.count {
+                    let child = node.children[i]
+                    maxWidth = maxWidth > child.measuredSize.width ? maxWidth : child.measuredSize.width
+                    totalHeight = totalHeight + child.measuredSize.height
+                    i = i + 1
+                }
+                if node.children.count > 1 {
+                    totalHeight = totalHeight + spacing * Float(node.children.count - 1)
+                }
+                return Size(width: maxWidth, height: totalHeight)
+            }
+            Overlay(_): {
+                var maxWidth = 0.0
+                var maxHeight = 0.0
+                var i = 0
+                while i < node.children.count {
+                    let child = node.children[i]
+                    maxWidth = maxWidth > child.measuredSize.width ? maxWidth : child.measuredSize.width
+                    maxHeight = maxHeight > child.measuredSize.height ? maxHeight : child.measuredSize.height
+                    i = i + 1
+                }
+                return Size(width: maxWidth, height: maxHeight)
+            }
+            Fill:
+                return node.children.count > 0 ? node.children[0].measuredSize : Size.zero
+            Grid(_, _, _): {
+                var maxWidth = 0.0
+                var totalHeight = 0.0
+                var i = 0
+                while i < node.children.count {
+                    let child = node.children[i]
+                    maxWidth = maxWidth > child.measuredSize.width ? maxWidth : child.measuredSize.width
+                    totalHeight = totalHeight + child.measuredSize.height
+                    i = i + 1
+                }
+                return Size(width: maxWidth, height: totalHeight)
+            }
+            Wrap(_, _, _): {
+                var maxWidth = 0.0
+                var totalHeight = 0.0
+                var i = 0
+                while i < node.children.count {
+                    let child = node.children[i]
+                    maxWidth = maxWidth > child.measuredSize.width ? maxWidth : child.measuredSize.width
+                    totalHeight = totalHeight + child.measuredSize.height
+                    i = i + 1
+                }
+                return Size(width: maxWidth, height: totalHeight)
+            }
+            Absolute: {
+                var maxWidth = 0.0
+                var maxHeight = 0.0
+                var i = 0
+                while i < node.children.count {
+                    let child = node.children[i]
+                    let childRight = child.descriptor.x + child.measuredSize.width
+                    let childBottom = child.descriptor.y + child.measuredSize.height
+                    maxWidth = maxWidth > childRight ? maxWidth : childRight
+                    maxHeight = maxHeight > childBottom ? maxHeight : childBottom
+                    i = i + 1
+                }
+                return Size(width: maxWidth, height: maxHeight)
+            }
+        }
+    }
+
+    @Doc("Compute the size offered to a child before that child is measured.
+    Stack containers subtract their total spacing up front on the main axis.
+    Other modes currently forward the full available size unchanged.")
+    function childAvailableSize(available: Size, arrange: ArrangeMode, childIndex: Int, childCount: Int) -> Size {
+        match arrange {
+            Stack(let axis, let spacing, _): {
+                let totalSpacing = childCount > 1 ? spacing * Float(childCount - 1) : 0.0
+                if axis == .Horizontal {
+                    return Size(width: available.width - totalSpacing, height: available.height)
+                }
+                return Size(width: available.width, height: available.height - totalSpacing)
+            }
+            Absolute:
+                return available
+            Grid(_, _, _):
+                return available
+            Wrap(_, _, _):
+                return available
+            Overlay(_):
+                return available
+            Fill:
+                return available
+        }
+    }
+
+    @Doc("Resolve an overlay child origin from a child size and container size.
+    Alignment is applied independently on both axes.
+    The returned point is already expressed in the parent's coordinate space.")
+    function alignedOrigin(child: Size, container: Size, origin: Point, alignment: Alignment) -> Point {
+        let dx = alignment == .TopLeading || alignment == .Leading || alignment == .BottomLeading ? 0.0 : (alignment == .Top || alignment == .Center || alignment == .Bottom ? (container.width - child.width) / 2.0 : container.width - child.width)
+        let dy = alignment == .TopLeading || alignment == .Top || alignment == .TopTrailing ? 0.0 : (alignment == .Leading || alignment == .Center || alignment == .Trailing ? (container.height - child.height) / 2.0 : container.height - child.height)
+        return Point(x: origin.x + dx, y: origin.y + dy)
+    }
+
+    @Doc("Resolve the main-axis size used during stack placement for one child.
+    Fill children consume the computed fill size for the active main axis.
+    Other children use the size measured during the measure pass.")
+    function resolvedChildMainSize(child: LayoutNode, axis: Axis, fillSize: Float) -> Float {
+        if axis == .Horizontal {
+            return isFill(mode: child.descriptor.width) ? fillSize : child.measuredSize.width
+        }
+        return isFill(mode: child.descriptor.height) ? fillSize : child.measuredSize.height
+    }
+
+    @Doc("Return whether a size mode is the fill variant.
+    This helper keeps layout logic explicit without relying on wildcard match cases.
+    It is used during stack placement and measurement bookkeeping.")
+    function isFill(mode: SizeMode) -> Bool {
+        match mode {
+            Fill:
+                return true
+            Fixed(let _):
+                return false
+            Hug:
+                return false
+            Fraction(let _):
+                return false
+            Min(let _):
+                return false
+            Max(let _):
+                return false
+            Range(let _, let _):
+                return false
+        }
+    }
+
+    @Doc("Return the fill-child contribution for one child on the supplied axis.
+    Fill children contribute one and non-fill children contribute zero.
+    This helper keeps the stack-measure loop simple and parser-friendly.")
+    function fillContribution(child: LayoutNode, axis: Axis) -> Int {
+        if axis == .Horizontal {
+            return isFill(mode: child.descriptor.width) ? 1 : 0
+        }
+        return isFill(mode: child.descriptor.height) ? 1 : 0
+    }
+
+    @Doc("Count how many children consume distributed fill space on the main axis.
+    Stack placement uses this to divide remaining space after fixed-size children are accounted for.
+    The count is zero when no child on the axis uses `.Fill`.")
+    function stackFillCount(node: LayoutNode, axis: Axis) -> Int {
+        var total = 0
+        var i = 0
+        while i < node.children.count {
+            total = total + fillContribution(child: node.children[i], axis: axis)
+            i = i + 1
+        }
+        return total
+    }
+
+    @Doc("Return the fixed-size contribution for one child on the supplied axis.
+    Fill children contribute zero because their size is resolved later from remaining space.
+    Non-fill children contribute their measured main-axis size.")
+    function fixedContribution(child: LayoutNode, axis: Axis) -> Float {
+        if axis == .Horizontal {
+            return isFill(mode: child.descriptor.width) ? 0.0 : child.measuredSize.width
+        }
+        return isFill(mode: child.descriptor.height) ? 0.0 : child.measuredSize.height
+    }
+
+    @Doc("Sum the measured main-axis size contributed by non-fill stack children.
+    Stack placement subtracts this total before distributing the remaining space to fill children.
+    The result excludes inter-child spacing, which is handled separately.")
+    function stackFixedTotal(node: LayoutNode, axis: Axis) -> Float {
+        var total = 0.0
+        var i = 0
+        while i < node.children.count {
+            total = total + fixedContribution(child: node.children[i], axis: axis)
+            i = i + 1
+        }
+        return total
+    }
+}

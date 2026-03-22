@@ -83,6 +83,9 @@ public struct macOSPlatformBuilder {
         var text = try String(contentsOf: sokolBindings, encoding: .utf8)
         text = text.replacingOccurrences(of: #"@ffi(lib: "FFI/libsokol.dylib")"#, with: #"@ffi(lib: "")"#)
         text = text.replacingOccurrences(of: #"// Library: FFI/libsokol.dylib"#, with: #"// Library: current process"#)
+        if !text.contains("extern function kira_sg_setup() -> CVoid") {
+            text.append("\n@ffi(lib: \"\")\nextern function kira_sg_setup() -> CVoid\n")
+        }
         try text.write(to: sokolBindings, atomically: true, encoding: .utf8)
 
         let graphicsApplication = stagingRoot
@@ -128,7 +131,10 @@ public struct macOSPlatformBuilder {
                 userInfo: [NSLocalizedDescriptionKey: "Failed to patch Kira.Graphics Application.run for embedded Apple runtime"]
             )
         }
-        applicationText = updatedApplicationText
+        applicationText = updatedApplicationText.replacingOccurrences(
+            of: "    sg_setup(desc: sg_desc(environment: sglue_environment()))",
+            with: "    kira_sg_setup()"
+        )
         try applicationText.write(to: graphicsApplication, atomically: true, encoding: .utf8)
     }
 
@@ -195,6 +201,10 @@ public struct macOSPlatformBuilder {
         #define SOKOL_NO_ENTRY
         #define SOKOL_METAL
         #define SOKOL_METAL_MACOS
+        #define SOKOL_API_IMPL __attribute__((visibility("default")))
+        #define SOKOL_API_DECL extern __attribute__((visibility("default")))
+        #define SOKOL_APP_API_DECL extern __attribute__((visibility("default")))
+        #define SOKOL_GLUE_API_DECL extern __attribute__((visibility("default")))
 
         #import <Metal/Metal.h>
         #import <MetalKit/MetalKit.h>
@@ -204,6 +214,13 @@ public struct macOSPlatformBuilder {
         #include "vendor/sokol/sokol_gfx.h"
         #include "vendor/sokol/sokol_glue.h"
         #include "vendor/sokol/sokol_log.h"
+
+        __attribute__((visibility("default"))) void kira_sg_setup(void) {
+            sg_desc desc = {0};
+            desc.environment = sglue_environment();
+            desc.logger.func = slog_func;
+            sg_setup(&desc);
+        }
         """
     }
 

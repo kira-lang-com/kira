@@ -20,6 +20,7 @@ public enum Keyword: String, CaseIterable, Sendable {
     case `await`
     case `if`
     case `else`
+    case `while`
     case `for`
     case `in`
     case `switch`

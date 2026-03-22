@@ -14,22 +14,10 @@ public struct DocRenderer: Sendable {
             out.append(doc)
             out.append("")
         }
-        if !symbol.properties.isEmpty {
-            out.append("## Properties")
-            out.append("")
-            out.append("<!-- kira:generated:start -->")
-            for p in symbol.properties {
-                out.append("### \(p.name)")
-                out.append("`\((p.signature).trimmingCharacters(in: .whitespaces))`")
-                if let d = p.doc, !d.isEmpty {
-                    out.append(d)
-                }
-                out.append("")
-            }
-            if out.last == "" { _ = out.popLast() }
-            out.append("<!-- kira:generated:end -->")
-            out.append("")
-        }
+        appendSection(title: "Properties", fence: nil, members: symbol.properties, into: &out)
+        appendSection(title: "Methods", fence: "methods", members: symbol.methods, into: &out)
+        appendSection(title: "Variants", fence: "variants", members: symbol.variants, into: &out)
+        appendSection(title: "Requirements", fence: "requirements", members: symbol.requirements, into: &out)
         return out.joined(separator: "\n")
     }
 
@@ -41,22 +29,69 @@ public struct DocRenderer: Sendable {
         }
 
         let existing = try String(contentsOf: url, encoding: .utf8)
-        guard let startRange = existing.range(of: "<!-- kira:generated:start -->"),
-              let endRange = existing.range(of: "<!-- kira:generated:end -->") else {
-            // Fence deleted: treat as fully manual forever.
+        let keys = fenceKeys(in: rendered)
+        guard !keys.isEmpty else {
             return
         }
 
-        guard let newStart = rendered.range(of: "<!-- kira:generated:start -->"),
-              let newEnd = rendered.range(of: "<!-- kira:generated:end -->") else {
-            return
+        var merged = existing
+        for key in keys.reversed() {
+            guard let existingFence = fenceRange(for: key, in: merged),
+                  let renderedFence = fenceRange(for: key, in: rendered) else {
+                return
+            }
+            merged.replaceSubrange(existingFence.range, with: rendered[renderedFence.range])
         }
-
-        let head = existing[..<startRange.lowerBound]
-        let tail = existing[endRange.upperBound...]
-        let middle = rendered[newStart.lowerBound..<newEnd.upperBound]
-        let merged = String(head) + String(middle) + String(tail)
         try merged.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    private func appendSection(title: String, fence: String?, members: [DocSymbol.Member], into out: inout [String]) {
+        guard !members.isEmpty else { return }
+        out.append("## \(title)")
+        out.append("")
+        out.append(fenceStartMarker(fence))
+        for member in members {
+            out.append("### \(member.name)")
+            out.append("`\((member.signature).trimmingCharacters(in: .whitespaces))`")
+            if let doc = member.doc, !doc.isEmpty {
+                out.append(doc)
+            }
+            out.append("")
+        }
+        if out.last == "" { _ = out.popLast() }
+        out.append(fenceEndMarker(fence))
+        out.append("")
+    }
+
+    private func fenceStartMarker(_ fence: String?) -> String {
+        guard let fence else { return "<!-- kira:generated:start -->" }
+        return "<!-- kira:generated:\(fence):start -->"
+    }
+
+    private func fenceEndMarker(_ fence: String?) -> String {
+        guard let fence else { return "<!-- kira:generated:end -->" }
+        return "<!-- kira:generated:\(fence):end -->"
+    }
+
+    private func fenceKeys(in text: String) -> [String] {
+        let regex = try? NSRegularExpression(pattern: #"<!-- kira:generated(?::([a-z]+))?:start -->"#)
+        let nsRange = NSRange(text.startIndex..., in: text)
+        return regex?.matches(in: text, range: nsRange).compactMap { match in
+            if let range = Range(match.range(at: 1), in: text) {
+                return String(text[range])
+            }
+            return ""
+        } ?? []
+    }
+
+    private func fenceRange(for key: String, in text: String) -> (range: Range<String.Index>, inner: Range<String.Index>)? {
+        let start = key.isEmpty ? "<!-- kira:generated:start -->" : "<!-- kira:generated:\(key):start -->"
+        let end = key.isEmpty ? "<!-- kira:generated:end -->" : "<!-- kira:generated:\(key):end -->"
+        guard let startRange = text.range(of: start),
+              let endRange = text.range(of: end, range: startRange.upperBound..<text.endIndex) else {
+            return nil
+        }
+        return (startRange.lowerBound..<endRange.upperBound, startRange.upperBound..<endRange.lowerBound)
     }
 
     private func ensureDirectory(_ url: URL) throws {
@@ -64,4 +99,3 @@ public struct DocRenderer: Sendable {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     }
 }
-

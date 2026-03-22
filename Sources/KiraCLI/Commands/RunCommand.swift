@@ -4,13 +4,33 @@ import KiraVM
 
 enum RunCommand {
     static func run(args: [String]) throws {
-        _ = args
         let fm = FileManager.default
-        let cwd = URL(fileURLWithPath: fm.currentDirectoryPath)
-        let sourcesDir = cwd.appendingPathComponent("Sources", isDirectory: true)
-        let sourceFiles = try collectKiraSources(in: sourcesDir)
+        let sourceFiles: [URL]
+
+        if let input = args.first {
+            let inputURL = URL(fileURLWithPath: input, relativeTo: URL(fileURLWithPath: fm.currentDirectoryPath))
+                .standardizedFileURL
+            var isDirectory: ObjCBool = false
+            guard fm.fileExists(atPath: inputURL.path, isDirectory: &isDirectory) else {
+                throw CLIError.message("Input path not found: \(inputURL.path)")
+            }
+
+            if isDirectory.boolValue {
+                let sourcesDir = inputURL.appendingPathComponent("Sources", isDirectory: true)
+                sourceFiles = try collectKiraSources(in: sourcesDir)
+            } else if inputURL.pathExtension == "kira" {
+                sourceFiles = [inputURL]
+            } else {
+                throw CLIError.message("Expected a .kira file or a project directory: \(inputURL.path)")
+            }
+        } else {
+            let cwd = URL(fileURLWithPath: fm.currentDirectoryPath)
+            let sourcesDir = cwd.appendingPathComponent("Sources", isDirectory: true)
+            sourceFiles = try collectKiraSources(in: sourcesDir)
+        }
+
         guard !sourceFiles.isEmpty else {
-            throw CLIError.message("No .kira sources found in Sources/")
+            throw CLIError.message("No .kira sources found.")
         }
 
         let sources: [SourceText] = try sourceFiles.map { url in

@@ -1,45 +1,100 @@
 import Kira.Fondation
 
-@Doc("Application entry point for the first Kira.Graphics slice.")
+@Doc("Host-side entry point for a Kira.Graphics application.
+Configure window properties with a builder block, then call `run(scene:)`.
+This first slice wires scene lifecycle hooks into the native backend bootstrap.")
 type Application {
+    @Doc("Window title shown by the host platform.
+    Defaults to `Kira.Graphics` so sample projects display a useful name.
+    Set this before startup to brand the application window.")
     var title: String = "Kira.Graphics"
+    @Doc("Initial window width requested at startup.
+    Defaults to 1280 for a desktop-friendly presentation size.
+    The runtime may still clamp or adjust the final drawable width.")
     var width: Int = 1280
+    @Doc("Initial window height requested at startup.
+    Defaults to 720 for a common 16:9 presentation size.
+    The runtime may still clamp or adjust the final drawable height.")
     var height: Int = 720
+    @Doc("Requested multisample count for the default framebuffer.
+    Higher values can improve edge quality at extra cost.
+    Defaults to 1, which disables multisampling.")
     var sampleCount: Int = 1
+    @Doc("Whether the runtime should request a high-DPI drawable when available.
+    Defaults to `true` so Retina-class displays render sharply.
+    Disable this only when explicitly targeting low-resolution rendering.")
     var highDPI: Bool = true
 
+    @Doc("Install the active scene, reset runtime globals, and enter the hosted application loop.
+    On bytecode-driven hosts this hands control to the platform runtime immediately.
+    Apple-native builders patch this body during staging so the generated app delegate can drive the same lifecycle callbacks.")
     function run(scene: Scene) {
         graphicsScene = scene
         graphicsDevice = GraphicsDevice()
         graphicsFrameIndex = 0
 
-
+        sapp_run(desc: sapp_desc(
+            init_cb: graphics_on_init,
+            frame_cb: graphics_on_frame,
+            cleanup_cb: graphics_on_cleanup,
+            width: width,
+            height: height,
+            sample_count: sampleCount,
+            high_dpi: highDPI,
+            window_title: title))
         return
     }
 }
 
+@Doc("Fallback scene used before a real scene is installed.
+This keeps the global lifecycle hooks safe even before `run(scene:)` is called.
+All callbacks are intentionally no-ops.")
 type GraphicsEmptyScene: Scene {
+    @Doc("Receive the graphics device after startup.
+    The empty scene ignores startup work because it is only a placeholder.
+    Real scenes should allocate long-lived resources here.")
     function onLoad(device: GraphicsDevice) {
         return
     }
 
+    @Doc("Advance one frame of scene logic and rendering.
+    The empty scene does nothing so startup remains safe before a real scene is installed.
+    Real scenes should encode rendering work here.")
     function onFrame(frame: Frame) {
         return
     }
 
+    @Doc("Respond to drawable-size changes from the host platform.
+    The empty scene ignores resize notifications by design.
+    Real scenes can rebuild dependent resources here.")
     function onResize(width: Int, height: Int) {
         return
     }
 
+    @Doc("Release scene-owned resources before shutdown.
+    The empty scene has nothing to clean up.
+    Real scenes should drop GPU objects and cached state here.")
     function onUnload() {
         return
     }
 }
 
+@Doc("Global handle to the currently active scene.
+Written by `Application.run(scene:)` and read by native lifecycle hooks.
+Starts as an empty placeholder so callbacks remain safe before startup.")
 var graphicsScene: Scene = GraphicsEmptyScene()
+@Doc("Global graphics device reused by frame callbacks.
+Initialized during startup and refreshed once the backend is known.
+Scene code should usually prefer the device supplied in callbacks instead of this global.")
 var graphicsDevice: GraphicsDevice = GraphicsDevice()
+@Doc("Monotonic frame counter incremented after each frame callback.
+Used to populate `Frame.index` for the active scene.
+Resets when a new application run begins.")
 var graphicsFrameIndex: Int = 0
 
+@Doc("Native startup hook invoked by the platform bridge.
+Initializes Sokol, discovers the active backend, and notifies the current scene.
+This function is part of the internal runtime glue rather than user scene code.")
 function graphics_on_init() {
     sg_setup(desc: sg_desc(environment: sglue_environment()))
     graphicsDevice = GraphicsDevice(backend: sg_query_backend())
@@ -47,6 +102,9 @@ function graphics_on_init() {
     return
 }
 
+@Doc("Native per-frame hook invoked by the platform bridge.
+Builds a `Frame` value from current drawable and timing data, then calls the active scene.
+Increments the global frame counter after the scene finishes.")
 function graphics_on_frame() {
     let frame = Frame(
         width: sapp_widthf(),
@@ -61,16 +119,19 @@ function graphics_on_frame() {
     return
 }
 
+@Doc("Native shutdown hook invoked by the platform bridge.
+Forwards unload notifications to the scene before shutting down the graphics backend.
+This keeps scene cleanup ordered ahead of backend teardown.")
 function graphics_on_cleanup() {
     graphicsScene.onUnload()
     sg_shutdown()
     return
 }
 
+@Doc("Native event hook invoked by the platform bridge.
+The current implementation forwards a simplified resize notification to the scene.
+This is a temporary placeholder until fuller event decoding is implemented.")
 function graphics_on_event(event: CPointer<sapp_event>) {
-    let e = event.pointee
-    if e.type_ == SAPP_EVENTTYPE_RESIZED {
-        graphicsScene.onResize(width: e.window_width, height: e.window_height)
-    }
+    graphicsScene.onResize(width: 0, height: 0)
     return
 }

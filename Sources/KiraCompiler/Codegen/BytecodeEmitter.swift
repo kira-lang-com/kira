@@ -112,14 +112,32 @@ public struct BytecodeEmitter: Sendable {
                         ],
                         irIndex: i
                     )
+                case .newArray:
+                    append(.new_array, [], irIndex: i)
+                case .makeEnum(let tag, let valueCount):
+                    append(.make_enum, [UInt8(tag >> 8), UInt8(tag & 0xff), valueCount], irIndex: i)
                 case .makeFFIArray(let count, let elementType):
                     var bytes: [UInt8] = [UInt8(count >> 8), UInt8(count & 0xff)]
                     bytes.append(contentsOf: elementType)
                     append(.make_ffi_array, bytes, irIndex: i)
+                case .arrayLength:
+                    append(.array_length, [], irIndex: i)
+                case .arrayAppend:
+                    append(.array_append, [], irIndex: i)
                 case .loadField(let fieldIndex):
                     append(.load_field, [UInt8(fieldIndex >> 8), UInt8(fieldIndex & 0xff)], irIndex: i)
                 case .storeField(let fieldIndex):
                     append(.store_field, [UInt8(fieldIndex >> 8), UInt8(fieldIndex & 0xff)], irIndex: i)
+                case .loadIndex:
+                    append(.load_index, [], irIndex: i)
+                case .storeIndex:
+                    append(.store_index, [], irIndex: i)
+                case .matchEnum(let tag):
+                    append(.match_enum, [UInt8(tag >> 8), UInt8(tag & 0xff)], irIndex: i)
+                case .getEnumField(let index):
+                    append(.get_enum_field, [index], irIndex: i)
+                case .stringLength:
+                    append(.string_length, [], irIndex: i)
                 case .addInt: append(.add_int, [], irIndex: i)
                 case .subInt: append(.sub_int, [], irIndex: i)
                 case .mulInt: append(.mul_int, [], irIndex: i)
@@ -195,8 +213,9 @@ public struct BytecodeEmitter: Sendable {
                 let toByte = byteOffsets[toIr]
                 let deltaBytes = toByte - fromByteNext
                 let d16 = Int16(clamping: deltaBytes)
-                let hi = UInt8(bitPattern: Int8(d16 >> 8))
-                let lo = UInt8(bitPattern: Int8(d16 & 0xff))
+                let bits = UInt16(bitPattern: d16)
+                let hi = UInt8((bits >> 8) & 0xff)
+                let lo = UInt8(bits & 0xff)
                 ops[i].operands = [hi, lo]
             }
 

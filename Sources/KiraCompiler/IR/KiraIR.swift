@@ -48,9 +48,18 @@ public enum KiraIRInst: Sendable, Equatable {
 
     case newObject(fieldCount: UInt16)
     case newTypedObject(typeName: String, fieldCount: UInt16)
+    case newArray
+    case makeEnum(tag: UInt16, valueCount: UInt8)
     case makeFFIArray(count: UInt16, elementType: [UInt8])
+    case arrayLength
+    case arrayAppend
     case loadField(UInt16)
     case storeField(UInt16)
+    case loadIndex
+    case storeIndex
+    case matchEnum(tag: UInt16)
+    case getEnumField(index: UInt8)
+    case stringLength
 
     case addInt
     case subInt

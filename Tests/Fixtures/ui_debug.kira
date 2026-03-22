@@ -1,0 +1,99 @@
+import Kira.Foundation
+
+function buildCard() -> Widget {
+    let content = VStack(
+        items: [
+            Text(value: "Kira Foundation", color: Color.white),
+            Text(value: "Scene-driven UI rendered through Kira.Graphics.", color: Color(r: 0.82, g: 0.87, b: 0.94, a: 1.0)),
+            Text(value: "This sample proves layout, draw-list generation, and GPU submission.", color: Color(r: 0.68, g: 0.76, b: 0.88, a: 1.0))
+        ],
+        spacing: 14.0,
+        alignment: CrossAlignment.Start,
+        descriptor: LayoutDescriptor(
+            width: SizeMode.Hug,
+            height: SizeMode.Hug,
+            arrange: ArrangeMode.Stack(axis: Axis.Vertical, spacing: 14.0, alignment: CrossAlignment.Start),
+            padding: EdgeInsets.all(value: 28.0)))
+    return Box(
+        color: Color(r: 0.14, g: 0.18, b: 0.24, a: 1.0),
+        cornerRadius: 18.0,
+        items: [content],
+        descriptor: LayoutDescriptor(
+            width: SizeMode.Hug,
+            height: SizeMode.Hug,
+            arrange: ArrangeMode.Stack(axis: Axis.Vertical, spacing: 0.0, alignment: CrossAlignment.Start)))
+}
+
+function buildRoot() -> Widget {
+    return Box(
+        color: Color(r: 0.05, g: 0.07, b: 0.11, a: 1.0),
+        cornerRadius: 0.0,
+        items: [
+            Box(
+                color: Color.clear,
+                cornerRadius: 0.0,
+                items: [buildCard()],
+                descriptor: LayoutDescriptor(
+                    width: SizeMode.Hug,
+                    height: SizeMode.Hug,
+                    arrange: ArrangeMode.Overlay(alignment: Alignment.Center)))
+        ],
+        descriptor: LayoutDescriptor(
+            width: SizeMode.Fill,
+            height: SizeMode.Fill,
+            arrange: ArrangeMode.Overlay(alignment: Alignment.Center),
+            padding: EdgeInsets.all(value: 36.0)))
+}
+
+function main() {
+    let ui = UIFoundation()
+    let drawList = ui.update(
+        root: buildRoot(),
+        bounds: Rect(x: 0.0, y: 0.0, width: 960.0, height: 640.0),
+        input: InputState.empty)
+
+    print("command-count")
+    print(drawList.commands.count)
+
+    var i = 0
+    while i < drawList.commands.count {
+        match drawList.commands[i] {
+            FilledRect(let bounds, let color, _): {
+                print("rect")
+                print(bounds.x)
+                print(bounds.y)
+                print(bounds.width)
+                print(bounds.height)
+                print(color.r)
+                print(color.g)
+                print(color.b)
+                print(color.a)
+            }
+            Text(let origin, let glyphs, let color): {
+                print("text")
+                print(origin.x)
+                print(origin.y)
+                print(glyphs.count)
+                print(color.r)
+                print(color.g)
+                print(color.b)
+                print(color.a)
+            }
+            StrokedRect(let _, let _, let _, let _):
+                print("stroke")
+            FilledCircle(let _, let _, let _):
+                print("circle")
+            Line(let _, let _, let _, let _):
+                print("line")
+            Image(let _, let _, let _, let _):
+                print("image")
+            PushClip(let _):
+                print("push-clip")
+            PopClip:
+                print("pop-clip")
+            Shadow(let _, let _, let _):
+                print("other")
+        }
+        i = i + 1
+    }
+}

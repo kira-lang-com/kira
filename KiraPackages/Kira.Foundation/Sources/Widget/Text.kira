@@ -1,0 +1,54 @@
+import Kira.Graphics
+
+@Doc("Leaf widget that draws a single line of text-like placeholder geometry.
+The current implementation measures from string length and emits one placeholder glyph run.
+It is sufficient for layout, hit testing, and first-slice visual output.")
+type Text: Widget {
+    @Doc("String content displayed by the widget.")
+    var value: String = ""
+    @Doc("Font description used for measurement and drawing.")
+    var font: Font = Font.system(size: 14.0)
+    @Doc("Color used when drawing the text.")
+    var color: Color = Color.white
+    @Doc("Base descriptor stored on the widget.
+    Width and height default to `.Hug` so the widget measures from text content.
+    Callers can override this to clamp or stretch the widget.")
+    var descriptor: LayoutDescriptor = LayoutDescriptor()
+
+    @Doc("Return the current layout descriptor for the text widget.
+    When width or height are `.Hug`, the descriptor is updated to fixed intrinsic dimensions before returning.
+    This keeps leaf text measurement compatible with the current layout engine.")
+    function layoutDescriptor() -> LayoutDescriptor {
+        let measured = TextLayout().measure(text: value, font: font)
+        if descriptor.width == SizeMode.Hug {
+            descriptor.width = SizeMode.Fixed(value: measured.width)
+        }
+        if descriptor.height == SizeMode.Hug {
+            descriptor.height = SizeMode.Fixed(value: measured.height)
+        }
+        return descriptor
+    }
+
+    @Doc("Emit placeholder text geometry into the draw-list builder.
+    The current implementation converts the string into one placeholder glyph run.
+    Bounds are already resolved to root coordinates by UIFoundation.")
+    function draw(bounds: Rect, builder: DrawListBuilder) {
+        let glyphs = TextLayout().layout(text: value, font: font, origin: Point(x: bounds.x, y: bounds.y))
+        builder.addText(origin: Point(x: bounds.x, y: bounds.y), glyphs: glyphs, color: color)
+        return
+    }
+
+    @Doc("Return the child widgets for this text widget.
+    Text is a leaf widget, so the returned array is always empty.
+    UIFoundation uses this to terminate subtree traversal.")
+    function children() -> [Widget] {
+        return []
+    }
+
+    @Doc("Handle one input event directed at the text widget.
+    The current implementation does not consume input on text leaves.
+    It always returns `false` so events may continue bubbling.")
+    function handleInput(event: InputEvent, bounds: Rect) -> Bool {
+        return false
+    }
+}

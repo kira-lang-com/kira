@@ -1,0 +1,51 @@
+@Doc("Complete layout specification for a widget.
+Each widget returns one descriptor per frame to describe how it should be measured and placed.
+The layout engine resolves these values during the measure and place passes.")
+type LayoutDescriptor {
+    @Doc("Sizing mode used on the horizontal axis.
+    Defaults to `.Hug` so a widget starts from its content size.
+    Change this to `.Fill` or `.Fixed(value:)` when a stronger constraint is required.")
+    var width: SizeMode = .Hug
+    @Doc("Sizing mode used on the vertical axis.
+    Defaults to `.Hug` for content-driven height.
+    Change this when the widget should stretch or clamp vertically.")
+    var height: SizeMode = .Hug
+    @Doc("Child arrangement strategy for container widgets.
+    The default is a vertical stack with zero spacing.
+    Leaf widgets can ignore this because they report no children.")
+    var arrange: ArrangeMode = ArrangeMode.Stack(axis: Axis.Vertical, spacing: 0.0, alignment: CrossAlignment.Start)
+    @Doc("Padding applied inside the widget bounds before placing children.
+    Padding contributes to the final measured size of the widget.
+    Defaults to zero on every edge.")
+    var padding: EdgeInsets = EdgeInsets.zero
+    @Doc("Margin applied outside the widget when a parent lays it out.
+    The current Foundation slice stores the value for future refinement.
+    Defaults to zero on every edge.")
+    var margin: EdgeInsets = EdgeInsets.zero
+    @Doc("Placement mode used by the parent when this widget is a child.
+    Relative widgets participate in the parent's arrangement strategy.
+    Absolute widgets use their own `x` and `y` offsets.")
+    var position: PositionMode = .Relative
+    @Doc("Horizontal offset used when `position` is `.Absolute`.")
+    var x: Float = 0.0
+    @Doc("Vertical offset used when `position` is `.Absolute`.")
+    var y: Float = 0.0
+    @Doc("Layer ordering hint used by overlay-like containers.
+    Higher values are intended to appear above lower values.
+    The current implementation preserves child order and stores this for future sorting.")
+    var zIndex: Int = 0
+    @Doc("Whether child drawing should be clipped to the widget bounds.
+    When enabled, UIFoundation emits clip commands around child rendering.
+    Defaults to `false` for the least surprising baseline behavior.")
+    var clipContent: Bool = false
+}
+
+@Doc("How a child widget is positioned relative to its parent.
+Relative children are laid out by the parent's arrangement mode.
+Absolute children use explicit coordinates inside the nearest layout container.")
+enum PositionMode {
+    @Doc("Position the child according to the parent's arrangement rules.")
+    Relative
+    @Doc("Position the child using explicit `x` and `y` offsets.")
+    Absolute
+}

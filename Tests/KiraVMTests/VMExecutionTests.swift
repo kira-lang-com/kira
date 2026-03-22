@@ -119,6 +119,26 @@ final class VMExecutionTests: XCTestCase {
         XCTAssertEqual(result, .int(12))
     }
 
+    func testWhileLoopExecutes() throws {
+        let src = SourceText(file: "t.kira", text: """
+        function main() {
+            var value = 0
+            while value < 4 {
+                value = value + 1
+            }
+            print(value)
+            return
+        }
+        """)
+        let out = try CompilerDriver().compile(source: src, target: .macOS(arch: .arm64))
+        let bc = try XCTUnwrap(out.bytecode)
+        let module = try BytecodeLoader().load(data: bc)
+        let output = OutputBuffer()
+        let vm = VirtualMachine(module: module, output: { output.lines.append($0) })
+        _ = try vm.run(function: "main")
+        XCTAssertEqual(output.lines, ["4"])
+    }
+
     func testBuilderBlockUsesImplicitSelfForFieldsAndMethods() throws {
         let src = SourceText(file: "t.kira", text: """
         type App {
@@ -367,6 +387,31 @@ final class VMExecutionTests: XCTestCase {
         XCTAssertEqual(output.lines, ["7"])
     }
 
+    func testStaticMethodExecutes() throws {
+        let src = SourceText(file: "t.kira", text: """
+        type Rectangle {
+            var width: Int = 1
+
+            static function unit() -> Rectangle {
+                return Rectangle(width: 9)
+            }
+        }
+
+        function main() {
+            let rect = Rectangle.unit()
+            print(rect.width)
+            return
+        }
+        """)
+        let out = try CompilerDriver().compile(source: src, target: .macOS(arch: .arm64))
+        let bc = try XCTUnwrap(out.bytecode)
+        let module = try BytecodeLoader().load(data: bc)
+        let output = OutputBuffer()
+        let vm = VirtualMachine(module: module, output: { output.lines.append($0) })
+        _ = try vm.run(function: "main")
+        XCTAssertEqual(output.lines, ["9"])
+    }
+
     func testFixedArrayCanFlowIntoOrdinaryPointerParameterAtRuntime() throws {
         let src = SourceText(file: "t.kira", text: """
         type Device {
@@ -427,5 +472,44 @@ final class VMExecutionTests: XCTestCase {
         let vm = VirtualMachine(module: module, output: { output.lines.append($0) })
         _ = try vm.run(function: "main")
         XCTAssertEqual(output.lines, ["7"])
+    }
+
+    func testDynamicArrayOperationsExecute() throws {
+        let src = SourceText(file: "t.kira", text: """
+        function main() {
+            var values: [Int] = []
+            values.append(7)
+            values.append(9)
+            print(values.count)
+            print(values[1])
+            values[0] = 3
+            print(values[0])
+            return
+        }
+        """)
+        let out = try CompilerDriver().compile(source: src, target: .macOS(arch: .arm64))
+        let bc = try XCTUnwrap(out.bytecode)
+        let module = try BytecodeLoader().load(data: bc)
+        let output = OutputBuffer()
+        let vm = VirtualMachine(module: module, output: { output.lines.append($0) })
+        _ = try vm.run(function: "main")
+        XCTAssertEqual(output.lines, ["2", "9", "3"])
+    }
+
+    func testStringCountExecutes() throws {
+        let src = SourceText(file: "t.kira", text: """
+        function main() {
+            let title = "Kira"
+            print(title.count)
+            return
+        }
+        """)
+        let out = try CompilerDriver().compile(source: src, target: .macOS(arch: .arm64))
+        let bc = try XCTUnwrap(out.bytecode)
+        let module = try BytecodeLoader().load(data: bc)
+        let output = OutputBuffer()
+        let vm = VirtualMachine(module: module, output: { output.lines.append($0) })
+        _ = try vm.run(function: "main")
+        XCTAssertEqual(output.lines, ["4"])
     }
 }

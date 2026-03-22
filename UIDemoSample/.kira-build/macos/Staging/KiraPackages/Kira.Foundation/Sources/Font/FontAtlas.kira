@@ -1,0 +1,62 @@
+import Kira.Graphics
+
+@Doc("Simple atlas metadata container used by the current Foundation text path.
+The first implementation keeps a lightweight atlas texture handle and logical glyph entries.
+It is sufficient for stable draw-list output even before richer rasterization is added.")
+type FontAtlas {
+    @Doc("Atlas texture referenced by text draw commands.
+    The current implementation keeps the handle as metadata and may leave it empty.
+    Renderers can inspect this when a future textured glyph path is available.")
+    var texture: Texture = Texture()
+    @Doc("Glyph entries stored for previously measured text runs.
+    The current implementation keeps one entry per measured string style sample.
+    This makes text measurement deterministic across a frame.")
+    var glyphs: [GlyphEntry] = []
+    @Doc("Atlas width in pixels.")
+    var atlasWidth: Int = 2048
+    @Doc("Atlas height in pixels.")
+    var atlasHeight: Int = 2048
+
+    @Doc("Return a glyph entry for a codepoint and font description.
+    The current implementation first scans the cache and falls back to rasterizing a new placeholder glyph.
+    This keeps callers free from optional handling in the first Foundation slice.")
+    function getGlyph(codepoint: Int, font: Font) -> GlyphEntry {
+        var i = 0
+        while i < glyphs.count {
+            let glyph = glyphs[i]
+            if glyph.codepoint == codepoint && glyph.font.path == font.path && glyph.font.size == font.size {
+                return glyph
+            }
+            i = i + 1
+        }
+        return rasterize(codepoint: codepoint, font: font)
+    }
+
+    @Doc("Create and cache a glyph entry for a codepoint and font description.
+    The current implementation generates placeholder atlas coordinates and estimated metrics.
+    The created entry is appended to the atlas cache and returned immediately.")
+    function rasterize(codepoint: Int, font: Font) -> GlyphEntry {
+        let advance = font.size * 0.6
+        let entry = GlyphEntry(codepoint: codepoint, font: font, uv: Rect(x: 0.0, y: 0.0, width: 1.0, height: 1.0), offset: Point.zero, advance: advance, size: Size(width: advance, height: font.size * 1.2))
+        glyphs.append(entry)
+        return entry
+    }
+}
+
+@Doc("Cached glyph metric entry stored by `FontAtlas`.
+Each entry records enough information to place a glyph in a draw list.
+The current implementation uses estimated placeholder atlas data.")
+type GlyphEntry {
+    @Doc("Unicode scalar value for the glyph.")
+    var codepoint: Int = 0
+    @Doc("Font description used to measure the glyph.")
+    var font: Font = Font.system(size: 14.0)
+    @Doc("Atlas UV rectangle reserved for the glyph.")
+    var uv: Rect = Rect.zero
+    @Doc("Baseline offset applied when placing the glyph.")
+    var offset: Point = Point.zero
+    @Doc("Horizontal advance used for the next glyph origin.")
+    var advance: Float = 0.0
+    @Doc("Estimated glyph size in points.")
+    var size: Size = Size.zero
+}

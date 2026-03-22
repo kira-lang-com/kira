@@ -76,6 +76,20 @@ public enum Decl: Sendable {
     case construct(ConstructDecl)
     case constructInstance(ConstructInstanceDecl)
     case globalVar(VarDeclStmt)
+
+    public var range: SourceRange {
+        switch self {
+        case .function(let decl): return decl.range
+        case .externFunction(let decl): return decl.range
+        case .typealias(let decl): return decl.range
+        case .type(let decl): return decl.range
+        case .protocol(let decl): return decl.range
+        case .enum(let decl): return decl.range
+        case .construct(let decl): return decl.range
+        case .constructInstance(let decl): return decl.range
+        case .globalVar(let decl): return decl.range
+        }
+    }
 }
 
 public struct TypealiasDecl: Sendable {
@@ -164,14 +178,16 @@ public struct TypeDecl: Sendable {
     public var conformances: [String]
     public var fields: [Field]
     public var methods: [FunctionDecl]
+    public var statics: [FunctionDecl]
     public var range: SourceRange
 
-    public init(annotations: [Annotation], name: String, conformances: [String], fields: [Field], methods: [FunctionDecl], range: SourceRange) {
+    public init(annotations: [Annotation], name: String, conformances: [String], fields: [Field], methods: [FunctionDecl], statics: [FunctionDecl], range: SourceRange) {
         self.annotations = annotations
         self.name = name
         self.conformances = conformances
         self.fields = fields
         self.methods = methods
+        self.statics = statics
         self.range = range
     }
 }
@@ -198,6 +214,7 @@ public struct EnumDecl: Sendable {
             public var type: TypeRef
             public var range: SourceRange
         }
+        public var annotations: [Annotation]
         public var name: String
         public var associatedValues: [AssociatedValue]
         public var range: SourceRange
@@ -259,6 +276,19 @@ public enum Stmt: Sendable {
     case `return`(ReturnStmt)
     case expr(Expr)
     case `if`(IfStmt)
+    case `while`(WhileStmt)
+    case match(MatchStmt)
+
+    public var range: SourceRange {
+        switch self {
+        case .variable(let stmt): return stmt.range
+        case .return(let stmt): return stmt.range
+        case .expr(let expr): return expr.range
+        case .if(let stmt): return stmt.range
+        case .while(let stmt): return stmt.range
+        case .match(let stmt): return stmt.range
+        }
+    }
 }
 
 public struct VarDeclStmt: Sendable {
@@ -281,6 +311,30 @@ public struct IfStmt: Sendable {
     public var range: SourceRange
 }
 
+public struct WhileStmt: Sendable {
+    public var condition: Expr
+    public var body: BlockStmt
+    public var range: SourceRange
+}
+
+public struct MatchStmt: Sendable {
+    public struct Pattern: Sendable {
+        public var variantName: String
+        public var bindings: [String]
+        public var range: SourceRange
+    }
+
+    public struct Case: Sendable {
+        public var pattern: Pattern
+        public var body: BlockStmt
+        public var range: SourceRange
+    }
+
+    public var value: Expr
+    public var cases: [Case]
+    public var range: SourceRange
+}
+
 public indirect enum Expr: Sendable {
     case identifier(String, SourceRange)
     case leadingMember(String, SourceRange)
@@ -296,6 +350,7 @@ public indirect enum Expr: Sendable {
     case conditional(ConditionalExpr)
     case call(CallExpr)
     case member(MemberExpr)
+    case index(IndexExpr)
     case assign(AssignExpr)
     case shaderMacro(ShaderMacroExpr)
 
@@ -315,6 +370,7 @@ public indirect enum Expr: Sendable {
         case .conditional(let c): return c.range
         case .call(let c): return c.range
         case .member(let m): return m.range
+        case .index(let i): return i.range
         case .assign(let a): return a.range
         case .shaderMacro(let s): return s.range
         }
@@ -396,6 +452,17 @@ public struct MemberExpr: Sendable {
     public init(base: Expr, name: String, range: SourceRange) {
         self.base = base
         self.name = name
+        self.range = range
+    }
+}
+
+public struct IndexExpr: Sendable {
+    public var base: Expr
+    public var index: Expr
+    public var range: SourceRange
+    public init(base: Expr, index: Expr, range: SourceRange) {
+        self.base = base
+        self.index = index
         self.range = range
     }
 }

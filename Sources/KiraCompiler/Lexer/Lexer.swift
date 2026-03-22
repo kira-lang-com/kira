@@ -128,16 +128,14 @@ public struct Lexer {
             if s == "\"" {
                 _ = advanceScalar()
                 var buffer = ""
+                var terminated = false
                 while let c = peekScalar() {
                     if c == "\"" {
                         _ = advanceScalar()
                         let end = location()
                         tokens.append(makeToken(.stringLiteral(buffer), start: start, end: end))
-                        buffer = ""
+                        terminated = true
                         break
-                    }
-                    if c == "\n" {
-                        throw LexerError.unterminatedString(start)
                     }
                     if c == "\\" {
                         _ = advanceScalar()
@@ -154,7 +152,7 @@ public struct Lexer {
                     _ = advanceScalar()
                     buffer.append(Character(c))
                 }
-                if !buffer.isEmpty && (tokens.last?.kind != .stringLiteral(buffer)) {
+                if !terminated {
                     throw LexerError.unterminatedString(start)
                 }
                 continue

@@ -1,0 +1,124 @@
+@Doc("Primary entry point for the Kira Foundation UI layer.
+UIFoundation turns a widget tree into a measured layout tree, dispatches input, and builds a draw list.
+Call `update(root:bounds:input:)` once per frame to drive the full UI pipeline.")
+type UIFoundation {
+    @Doc("Layout engine used for measure and place passes.")
+    var layoutEngine: LayoutEngine = LayoutEngine()
+    @Doc("Font system used for text measurement and atlas metadata.")
+    var fontSystem: FontSystem = FontSystem()
+
+    @Doc("Update the widget tree for one frame and produce a draw list.
+    This builds the layout tree, measures and places widgets, dispatches input, and records draw commands.
+    Call it exactly once per frame for the current root widget.")
+    function update(root: Widget, bounds: Rect, input: InputState) -> DrawList {
+        let layoutRoot = buildLayoutTree(widget: root)
+        layoutEngine.measure(node: layoutRoot, available: Size(width: bounds.width, height: bounds.height))
+        layoutEngine.place(node: layoutRoot, origin: Point(x: bounds.x, y: bounds.y))
+        dispatchInput(root: root, node: layoutRoot, input: input)
+        let builder = DrawListBuilder(commands: [], textures: [], clipDepth: 0, atlasTexture: Texture())
+        builder.atlasTexture = fontSystem.atlasTexture()
+        drawWidget(widget: root, node: layoutRoot, builder: builder)
+        return builder.build()
+    }
+
+    @Doc("Hit test a point against the current widget tree.
+    Layout is recomputed for the supplied bounds before hit testing begins.
+    The deepest matching widget is returned when one contains the point.")
+    function hitTest(point: Point, root: Widget, bounds: Rect) -> Widget {
+        let layoutRoot = buildLayoutTree(widget: root)
+        layoutEngine.measure(node: layoutRoot, available: Size(width: bounds.width, height: bounds.height))
+        layoutEngine.place(node: layoutRoot, origin: Point(x: bounds.x, y: bounds.y))
+        return hitTestNode(point: point, widget: root, node: layoutRoot)
+    }
+
+    @Doc("Measure a widget tree in the supplied bounds without drawing it.
+    This is useful for tests and for host code that needs a size estimate before presenting the UI.
+    The returned size is the root node's measured size.")
+    function measure(widget: Widget, bounds: Rect) -> Size {
+        let node = buildLayoutTree(widget: widget)
+        return layoutEngine.measure(node: node, available: Size(width: bounds.width, height: bounds.height))
+    }
+
+    @Doc("Build an internal layout tree from a widget tree.
+    Each widget contributes one layout node and the same child ordering is preserved recursively.
+    The tree is transient and intended for one frame update.")
+    function buildLayoutTree(widget: Widget) -> LayoutNode {
+        let node = LayoutNode(descriptor: widget.layoutDescriptor(), children: [], measuredSize: Size.zero, placedOrigin: Point.zero)
+        let kids = widget.children()
+        var i = 0
+        while i < kids.count {
+            node.children.append(buildLayoutTree(widget: kids[i]))
+            i = i + 1
+        }
+        return node
+    }
+
+    @Doc("Recursively draw one widget subtree into the supplied builder.
+    The layout node already contains resolved root-space bounds for this frame.
+    Clip commands are emitted around child traversal when requested by the widget descriptor.")
+    function drawWidget(widget: Widget, node: LayoutNode, builder: DrawListBuilder) {
+        let bounds = Rect(x: node.placedOrigin.x, y: node.placedOrigin.y, width: node.measuredSize.width, height: node.measuredSize.height)
+        if node.descriptor.clipContent {
+            builder.pushClip(rect: bounds)
+        }
+        widget.draw(bounds: bounds, builder: builder)
+        let kids = widget.children()
+        var i = 0
+        while i < kids.count {
+            drawWidget(widget: kids[i], node: node.children[i], builder: builder)
+            i = i + 1
+        }
+        if node.descriptor.clipContent {
+            builder.popClip()
+        }
+        return
+    }
+
+    @Doc("Recursively hit test one widget subtree.
+    Children are checked back-to-front so later children win within overlapping bounds.
+    When no descendant matches, the current widget is returned if its bounds contain the point.")
+    function hitTestNode(point: Point, widget: Widget, node: LayoutNode) -> Widget {
+        let bounds = Rect(x: node.placedOrigin.x, y: node.placedOrigin.y, width: node.measuredSize.width, height: node.measuredSize.height)
+        if bounds.contains(point: point) == false {
+            return EmptyWidget()
+        }
+        return widget
+    }
+
+    @Doc("Dispatch current-frame input into the widget tree.
+    The current implementation targets pointer events at the deepest hit widget and routes keyboard/text events to the root.
+    This keeps interaction working for the first Foundation slice without a separate focus system.")
+    function dispatchInput(root: Widget, node: LayoutNode, input: InputState) {
+        if input.modality == .Pointer {
+            let point = input.pointer.position
+            let rootBounds = Rect(x: node.placedOrigin.x, y: node.placedOrigin.y, width: node.measuredSize.width, height: node.measuredSize.height)
+            if input.pointer.pressed {
+                root.handleInput(event: InputEvent.PointerDown(position: point), bounds: rootBounds)
+            }
+            if input.pointer.released {
+                root.handleInput(event: InputEvent.PointerUp(position: point), bounds: rootBounds)
+            }
+            if input.pointer.delta.x != 0.0 || input.pointer.delta.y != 0.0 {
+                root.handleInput(event: InputEvent.PointerMove(position: point), bounds: rootBounds)
+            }
+            if input.scrollDelta.x != 0.0 || input.scrollDelta.y != 0.0 {
+                root.handleInput(event: InputEvent.Scroll(delta: input.scrollDelta), bounds: rootBounds)
+            }
+        }
+
+        var i = 0
+        while i < input.keysPressed.count {
+            root.handleInput(event: InputEvent.KeyDown(key: input.keysPressed[i]), bounds: Rect(x: node.placedOrigin.x, y: node.placedOrigin.y, width: node.measuredSize.width, height: node.measuredSize.height))
+            i = i + 1
+        }
+        i = 0
+        while i < input.keysReleased.count {
+            root.handleInput(event: InputEvent.KeyUp(key: input.keysReleased[i]), bounds: Rect(x: node.placedOrigin.x, y: node.placedOrigin.y, width: node.measuredSize.width, height: node.measuredSize.height))
+            i = i + 1
+        }
+        if input.textInput.count > 0 {
+            root.handleInput(event: InputEvent.TextInput(value: input.textInput), bounds: Rect(x: node.placedOrigin.x, y: node.placedOrigin.y, width: node.measuredSize.width, height: node.measuredSize.height))
+        }
+        return
+    }
+}

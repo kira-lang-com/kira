@@ -97,7 +97,14 @@ public struct TypeChecker: Sendable {
             try symbols.addEnumCases(
                 typeName: ed.name,
                 cases: ed.cases.enumerated().map { index, enumCase in
-                    (name: enumCase.name, tag: Int64(index), range: enumCase.range)
+                    (
+                        name: enumCase.name,
+                        tag: Int64(index),
+                        associatedValues: enumCase.associatedValues.map {
+                            EnumCaseSymbol.AssociatedValue(label: $0.label, type: resolve($0.type))
+                        },
+                        range: enumCase.range
+                    )
                 }
             )
         }
@@ -113,6 +120,7 @@ public struct TypeChecker: Sendable {
             let requirements = pd.requirements.map { requirement in
                 (
                     name: requirement.name,
+                    parameterLabels: requirement.parameters.map { Optional($0.name) },
                     type: KiraType.function(
                         params: requirement.parameters.map { resolve($0.type) },
                         returns: resolve(requirement.returnType)
@@ -172,7 +180,31 @@ public struct TypeChecker: Sendable {
                         typeName: td.name,
                         methodName: method.name,
                         loweredName: loweredName,
+                        parameterLabels: method.parameters.map { Optional($0.name) },
                         methodType: .function(params: method.parameters.map { resolve($0.type) }, returns: ret)
+                    )
+                }
+                for method in td.statics {
+                    let params = method.parameters.map { resolve($0.type) }
+                    let ret = resolve(method.returnType)
+                    let mode: FunctionSymbol.ExecutionMode = executionMode(from: method.annotations)
+                    if target.isWasm, mode == .runtime {
+                        throw SemanticError.runtimeNotSupportedOnWasm(method.range.start)
+                    }
+                    let loweredName = loweredStaticMethodName(typeName: td.name, methodName: method.name)
+                    try symbols.addFunction(.init(
+                        name: loweredName,
+                        type: .function(params: params, returns: ret),
+                        executionMode: mode,
+                        isExtern: false,
+                        range: method.range
+                    ))
+                    symbols.addStaticMethod(
+                        typeName: td.name,
+                        methodName: method.name,
+                        loweredName: loweredName,
+                        parameterLabels: method.parameters.map { Optional($0.name) },
+                        methodType: .function(params: params, returns: ret)
                     )
                 }
             }
@@ -187,14 +219,20 @@ public struct TypeChecker: Sendable {
                 let requirements = symbols.protocolRequirements[protocolName] ?? [:]
                 for requirement in requirements.values {
                     guard let method = symbols.lookupMethod(typeName: td.name, name: requirement.name) else {
-                        throw SemanticError.memberNotFound(base: .named(td.name), name: requirement.name, td.range.start)
+                        throw SemanticError.protocolConformanceMissing(
+                            typeName: td.name,
+                            protocolName: protocolName,
+                            requirement: renderRequirementSignature(name: requirement.name, labels: requirement.parameterLabels, type: requirement.type),
+                            td.range.start
+                        )
                     }
-                    if method.type != requirement.type {
-                        throw SemanticError.typeMismatch(
-                            expected: requirement.type,
-                            got: method.type,
-                            td.range.start,
-                            hint: "\(td.name) does not satisfy protocol \(protocolName)"
+                    if method.parameterLabels != requirement.parameterLabels || method.type != requirement.type {
+                        throw SemanticError.protocolConformanceMismatch(
+                            typeName: td.name,
+                            protocolName: protocolName,
+                            requirement: renderRequirementSignature(name: requirement.name, labels: requirement.parameterLabels, type: requirement.type),
+                            candidate: renderRequirementSignature(name: method.name, labels: method.parameterLabels, type: method.type),
+                            td.range.start
                         )
                     }
                 }
@@ -275,6 +313,7 @@ public struct TypeChecker: Sendable {
                     typeName: ci.name,
                     methodName: sig.name,
                     loweredName: sig.name,
+                    parameterLabels: [nil],
                     methodType: .function(params: [paramType], returns: .named(ci.name))
                 )
             }
@@ -308,6 +347,21 @@ public struct TypeChecker: Sendable {
                     }
                     _ = try typeCheckBlock(method.body, scope: scope, symbols: symbols, expectedReturn: expectedReturn, typeInfo: &typeInfo)
                 }
+                for method in td.statics {
+                    let loweredName = loweredStaticMethodName(typeName: td.name, methodName: method.name)
+                    let fnType = symbols.functions[loweredName]!.type
+                    let expectedReturn: KiraType
+                    let scope = LocalScope(parent: nil, symbols: symbols)
+                    if case .function(let params, let r) = fnType {
+                        expectedReturn = r
+                        for (index, param) in method.parameters.enumerated() {
+                            scope.define(param.name, type: params[index])
+                        }
+                    } else {
+                        expectedReturn = .void
+                    }
+                    _ = try typeCheckBlock(method.body, scope: scope, symbols: symbols, expectedReturn: expectedReturn, typeInfo: &typeInfo)
+                }
             }
         }
 
@@ -324,8 +378,36 @@ public struct TypeChecker: Sendable {
         "__\(typeName)_\(methodName)"
     }
 
+    private func loweredStaticMethodName(typeName: String, methodName: String) -> String {
+        "__\(typeName)_static_\(methodName)"
+    }
+
     private func loweredStaticFieldName(typeName: String, fieldName: String) -> String {
         "__\(typeName)_static_\(fieldName)"
+    }
+
+    private func renderRequirementSignature(name: String, labels: [String?], type: KiraType) -> String {
+        guard case .function(let params, let returns) = type else {
+            return "function \(name)() -> Void"
+        }
+
+        let renderedParams = zip(labels, params).map { label, paramType in
+            if let label, !label.isEmpty {
+                return "\(label): \(paramType)"
+            }
+            return "\(paramType)"
+        }.joined(separator: ", ")
+
+        return "function \(name)(\(renderedParams)) -> \(returns)"
+    }
+
+    private func optionalComparisonCompatible(lhs: KiraType, rhs: KiraType) -> Bool {
+        switch (lhs, rhs) {
+        case (.optional, .optional(.unknown)), (.optional(.unknown), .optional):
+            return true
+        default:
+            return false
+        }
     }
 
     private func builderParamTypeName(params: [KiraType], explicitArgumentCount: Int, symbols: SymbolTable) -> String? {
@@ -768,6 +850,39 @@ public struct TypeChecker: Sendable {
                 _ = try typeCheckBlock(eb, scope: elseScope, symbols: symbols, expectedReturn: expectedReturn, typeInfo: &typeInfo)
             }
             return .void
+        case .while(let whileStmt):
+            let cond = try typeCheckExpr(whileStmt.condition, scope: scope, symbols: symbols, expected: .bool, typeInfo: &typeInfo)
+            if cond != .bool {
+                throw SemanticError.typeMismatch(expected: .bool, got: cond, whileStmt.range.start, hint: nil)
+            }
+            let loopScope = scope.push()
+            _ = try typeCheckBlock(whileStmt.body, scope: loopScope, symbols: symbols, expectedReturn: expectedReturn, typeInfo: &typeInfo)
+            return .void
+        case .match(let matchStmt):
+            let matchedType = try typeCheckExpr(matchStmt.value, scope: scope, symbols: symbols, expected: nil, typeInfo: &typeInfo)
+            guard case .named(let enumName) = matchedType,
+                  symbols.enumCases[enumName] != nil else {
+                throw SemanticError.typeMismatch(expected: .named("Enum"), got: matchedType, matchStmt.range.start, hint: "match currently expects an enum value")
+            }
+            for matchCase in matchStmt.cases {
+                guard let enumCase = symbols.lookupEnumCase(typeName: enumName, name: matchCase.pattern.variantName) else {
+                    throw SemanticError.memberNotFound(base: matchedType, name: matchCase.pattern.variantName, matchCase.pattern.range.start)
+                }
+                if enumCase.associatedValues.count != matchCase.pattern.bindings.count {
+                    throw SemanticError.typeMismatch(
+                        expected: .named(enumName),
+                        got: .void,
+                        matchCase.pattern.range.start,
+                        hint: "\(matchCase.pattern.variantName) expects \(enumCase.associatedValues.count) bound values"
+                    )
+                }
+                let caseScope = scope.push()
+                for (binding, associatedValue) in zip(matchCase.pattern.bindings, enumCase.associatedValues) {
+                    caseScope.define(binding, type: associatedValue.type)
+                }
+                _ = try typeCheckBlock(matchCase.body, scope: caseScope, symbols: symbols, expectedReturn: expectedReturn, typeInfo: &typeInfo)
+            }
+            return .void
         }
     }
 
@@ -802,10 +917,12 @@ public struct TypeChecker: Sendable {
                 throw SemanticError.unknownIdentifier(".\(name)", r.start)
             }
             guard case .named(let typeName) = expectedType,
-                  symbols.lookupEnumCase(typeName: typeName, name: name) != nil else {
+                  let enumCase = symbols.lookupEnumCase(typeName: typeName, name: name) else {
                 throw SemanticError.memberNotFound(base: expectedType, name: name, r.start)
             }
-            result = .named(typeName)
+            result = enumCase.associatedValues.isEmpty
+                ? .named(typeName)
+                : .function(params: enumCase.associatedValues.map(\.type), returns: .named(typeName))
         case .intLiteral:
             result = .int
         case .floatLiteral:
@@ -824,25 +941,46 @@ public struct TypeChecker: Sendable {
             typeInfo.sizeOfValues[expr.range] = Int64(layout.size)
             result = .int
         case .arrayLiteral(let literal):
-            guard let expected else {
-                throw SemanticError.typeMismatch(expected: .named("CArray"), got: .unknown, literal.range.start, hint: "array literals currently require an explicit CArray<T, N> context")
-            }
-            guard case .fixedArray(let elementType, let count) = expected else {
-                throw SemanticError.typeMismatch(expected: expected, got: .unknown, literal.range.start, hint: "array literals currently initialize CArray<T, N> values")
-            }
-            if literal.elements.count != count {
-                throw SemanticError.typeMismatch(expected: expected, got: .unknown, literal.range.start, hint: "expected \(count) elements, got \(literal.elements.count)")
-            }
-            for element in literal.elements {
-                let got = try typeCheckExpr(element, scope: scope, symbols: symbols, expected: elementType, typeInfo: &typeInfo)
-                if got == elementType {
-                    continue
+            if let expected {
+                switch expected {
+                case .fixedArray(let elementType, let count):
+                    if literal.elements.count != count {
+                        throw SemanticError.typeMismatch(expected: expected, got: .unknown, literal.range.start, hint: "expected \(count) elements, got \(literal.elements.count)")
+                    }
+                    for element in literal.elements {
+                        let got = try typeCheckExpr(element, scope: scope, symbols: symbols, expected: elementType, typeInfo: &typeInfo)
+                        if got == elementType {
+                            continue
+                        }
+                        if !isFFIConvertible(got: got, expected: elementType) {
+                            throw SemanticError.typeMismatch(expected: elementType, got: got, element.range.start, hint: coercionHint(expected: elementType, expr: element))
+                        }
+                    }
+                    result = expected
+                case .array(let elementType):
+                    for element in literal.elements {
+                        let got = try typeCheckExpr(element, scope: scope, symbols: symbols, expected: elementType, typeInfo: &typeInfo)
+                        if !typesCompatible(got: got, expected: elementType, symbols: symbols) {
+                            throw SemanticError.typeMismatch(expected: elementType, got: got, element.range.start, hint: coercionHint(expected: elementType, expr: element))
+                        }
+                    }
+                    result = expected
+                default:
+                    throw SemanticError.typeMismatch(expected: expected, got: .unknown, literal.range.start, hint: "array literals initialize array values")
                 }
-                if !isFFIConvertible(got: got, expected: elementType) {
-                    throw SemanticError.typeMismatch(expected: elementType, got: got, element.range.start, hint: coercionHint(expected: elementType, expr: element))
+            } else {
+                guard let first = literal.elements.first else {
+                    throw SemanticError.typeMismatch(expected: .array(.unknown), got: .unknown, literal.range.start, hint: "empty array literals require an explicit type")
                 }
+                let elementType = try typeCheckExpr(first, scope: scope, symbols: symbols, expected: nil, typeInfo: &typeInfo)
+                for element in literal.elements.dropFirst() {
+                    let got = try typeCheckExpr(element, scope: scope, symbols: symbols, expected: elementType, typeInfo: &typeInfo)
+                    if !typesCompatible(got: got, expected: elementType, symbols: symbols) {
+                        throw SemanticError.typeMismatch(expected: elementType, got: got, element.range.start, hint: coercionHint(expected: elementType, expr: element))
+                    }
+                }
+                result = .array(elementType)
             }
-            result = expected
         case .unary(let u):
             let t = try typeCheckExpr(u.expr, scope: scope, symbols: symbols, expected: nil, typeInfo: &typeInfo)
             switch u.op {
@@ -871,6 +1009,7 @@ public struct TypeChecker: Sendable {
                 else { throw SemanticError.typeMismatch(expected: lt, got: rt, b.range.start, hint: "operands must have the same numeric type") }
             case .eq, .neq, .lt, .gt, .lte, .gte:
                 if lt == rt { result = .bool }
+                else if optionalComparisonCompatible(lhs: lt, rhs: rt) { result = .bool }
                 else if (lt == .int && isCIntegerType(rt)) || (rt == .int && isCIntegerType(lt)) {
                     result = .bool
                 }
@@ -894,8 +1033,10 @@ public struct TypeChecker: Sendable {
         case .member(let m):
             if case .identifier(let enumName, _) = m.base,
                symbols.types.contains(enumName),
-               symbols.lookupEnumCase(typeName: enumName, name: m.name) != nil {
-                result = .named(enumName)
+               let enumCase = symbols.lookupEnumCase(typeName: enumName, name: m.name) {
+                result = enumCase.associatedValues.isEmpty
+                    ? .named(enumName)
+                    : .function(params: enumCase.associatedValues.map(\.type), returns: .named(enumName))
                 typeInfo.exprTypes[expr.range] = result
                 return result
             }
@@ -905,8 +1046,29 @@ public struct TypeChecker: Sendable {
                 typeInfo.exprTypes[expr.range] = result
                 return result
             }
+            if case .identifier(let typeName, _) = m.base,
+               let staticMethodType = symbols.lookupStaticMethod(typeName: typeName, name: m.name)?.type {
+                result = staticMethodType
+                typeInfo.exprTypes[expr.range] = result
+                return result
+            }
             let baseTy = try typeCheckExpr(m.base, scope: scope, symbols: symbols, expected: nil, typeInfo: &typeInfo)
             switch baseTy {
+            case .string where m.name == "count":
+                result = .int
+            case .array(let elementType):
+                switch m.name {
+                case "count":
+                    result = .int
+                case "append":
+                    result = .function(params: [elementType], returns: .array(elementType))
+                default:
+                    throw SemanticError.memberNotFound(base: baseTy, name: m.name, m.range.start)
+                }
+            case .fixedArray where m.name == "count":
+                result = .int
+                typeInfo.exprTypes[expr.range] = result
+                return result
             case .named(let typeName):
                 if let f = symbols.lookupField(typeName: typeName, name: m.name) {
                     result = f.type
@@ -923,7 +1085,50 @@ public struct TypeChecker: Sendable {
             default:
                 throw SemanticError.memberNotFound(base: baseTy, name: m.name, m.range.start)
             }
+        case .index(let i):
+            let baseType = try typeCheckExpr(i.base, scope: scope, symbols: symbols, expected: nil, typeInfo: &typeInfo)
+            let indexType = try typeCheckExpr(i.index, scope: scope, symbols: symbols, expected: .int, typeInfo: &typeInfo)
+            guard indexType == .int else {
+                throw SemanticError.typeMismatch(expected: .int, got: indexType, i.index.range.start, hint: "array indices must be Int")
+            }
+            switch baseType {
+            case .array(let elementType):
+                result = elementType
+            case .fixedArray(let elementType, _):
+                result = elementType
+            default:
+                throw SemanticError.typeMismatch(expected: .array(.unknown), got: baseType, i.base.range.start, hint: "subscript access requires an array")
+            }
         case .call(let c):
+            if let enumConstructor = enumConstructorInfo(for: c.callee, expected: expected, symbols: symbols, typeInfo: typeInfo) {
+                let enumCase = enumConstructor.enumCase
+                if c.arguments.count != enumCase.associatedValues.count {
+                    throw SemanticError.typeMismatch(
+                        expected: .named(enumConstructor.enumName),
+                        got: .void,
+                        c.range.start,
+                        hint: "\(enumCase.name) expects \(enumCase.associatedValues.count) arguments"
+                    )
+                }
+                for (index, argument) in c.arguments.enumerated() {
+                    let associatedValue = enumCase.associatedValues[index]
+                    if let expectedLabel = associatedValue.label, argument.label != expectedLabel {
+                        throw SemanticError.typeMismatch(
+                            expected: .named(enumConstructor.enumName),
+                            got: .void,
+                            argument.range.start,
+                            hint: "expected label '\(expectedLabel)'"
+                        )
+                    }
+                    let got = try typeCheckExpr(argument.value, scope: scope, symbols: symbols, expected: associatedValue.type, typeInfo: &typeInfo)
+                    if !typesCompatible(got: got, expected: associatedValue.type, symbols: symbols) {
+                        throw SemanticError.typeMismatch(expected: associatedValue.type, got: got, argument.range.start, hint: coercionHint(expected: associatedValue.type, expr: argument.value))
+                    }
+                }
+                result = .named(enumConstructor.enumName)
+                typeInfo.exprTypes[expr.range] = result
+                return result
+            }
             // Type constructor: TypeName(field1:..., field2:...)
             if case .identifier(let typeName, _) = c.callee, let fieldMap = symbols.fields[typeName] {
                 let fieldCount = fieldMap.count
@@ -1001,6 +1206,30 @@ public struct TypeChecker: Sendable {
                     }
                 }
                 result = .named("Color")
+                typeInfo.exprTypes[expr.range] = result
+                return result
+            }
+            if case .identifier(let name, _) = c.callee, name == "Float" {
+                if c.arguments.count != 1 {
+                    throw SemanticError.typeMismatch(expected: .float, got: .void, c.range.start, hint: "Float expects exactly one argument")
+                }
+                let got = try typeCheckExpr(c.arguments[0].value, scope: scope, symbols: symbols, expected: nil, typeInfo: &typeInfo)
+                if got != .int && got != .float && got != .double {
+                    throw SemanticError.typeMismatch(expected: .int, got: got, c.arguments[0].range.start, hint: "Float expects an Int or Float value")
+                }
+                result = .float
+                typeInfo.exprTypes[expr.range] = result
+                return result
+            }
+            if case .identifier(let name, _) = c.callee, name == "Int" {
+                if c.arguments.count != 1 {
+                    throw SemanticError.typeMismatch(expected: .int, got: .void, c.range.start, hint: "Int expects exactly one argument")
+                }
+                let got = try typeCheckExpr(c.arguments[0].value, scope: scope, symbols: symbols, expected: nil, typeInfo: &typeInfo)
+                if got != .int && got != .float && got != .double {
+                    throw SemanticError.typeMismatch(expected: .float, got: got, c.arguments[0].range.start, hint: "Int expects an Int or Float value")
+                }
+                result = .int
                 typeInfo.exprTypes[expr.range] = result
                 return result
             }
@@ -1130,6 +1359,26 @@ public struct TypeChecker: Sendable {
             if case .fixedArray = explicitType {
                 return explicitType
             }
+            if case .array = explicitType {
+                return explicitType
+            }
+            return nil
+        }
+    }
+
+    private func enumConstructorInfo(for callee: Expr, expected: KiraType?, symbols: SymbolTable, typeInfo: TypeInfo) -> (enumName: String, enumCase: EnumCaseSymbol)? {
+        switch callee {
+        case .member(let member):
+            guard case .identifier(let enumName, _) = member.base else { return nil }
+            return symbols.lookupEnumCase(typeName: enumName, name: member.name).map { (enumName, $0) }
+        case .leadingMember(let name, _):
+            let calleeType = typeInfo.exprTypes[callee.range] ?? expected
+            guard case .function(_, let returns)? = calleeType,
+                  case .named(let enumName) = returns else {
+                return nil
+            }
+            return symbols.lookupEnumCase(typeName: enumName, name: name).map { (enumName, $0) }
+        default:
             return nil
         }
     }

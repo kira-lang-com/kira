@@ -30,6 +30,15 @@ public struct IRBuilder {
                         instanceFieldInitializers: instanceFieldInitializers
                     ))
                 }
+                for method in td.statics {
+                    fns.append(try buildStaticMethod(
+                        typeName: td.name,
+                        fn: method,
+                        symbols: typed.symbols,
+                        typeInfo: typed.typeInfo,
+                        instanceFieldInitializers: instanceFieldInitializers
+                    ))
+                }
             default:
                 break
             }
@@ -179,6 +188,22 @@ public struct IRBuilder {
         var emitter = StackEmitter()
         func exprType(_ e: Expr) -> KiraType? { typeInfo.exprTypes[e.range] }
 
+        func enumConstructorInfo(_ callee: Expr) -> (String, EnumCaseSymbol)? {
+            switch callee {
+            case .member(let member):
+                guard case .identifier(let enumName, _) = member.base else { return nil }
+                return symbols.lookupEnumCase(typeName: enumName, name: member.name).map { (enumName, $0) }
+            case .leadingMember(let name, _):
+                guard case .function(_, let returns)? = exprType(callee),
+                      case .named(let enumName) = returns else {
+                    return nil
+                }
+                return symbols.lookupEnumCase(typeName: enumName, name: name).map { (enumName, $0) }
+            default:
+                return nil
+            }
+        }
+
         func emitExpr(_ e: Expr, coercedTo expected: KiraType? = nil) throws {
             if let callbackKind = directFFICallbackKind(for: e, expected: expected, symbols: symbols),
                case .identifier(let name, _) = e {
@@ -205,23 +230,32 @@ public struct IRBuilder {
             case .leadingMember(let name, _):
                 let contextualType = exprType(e) ?? expected
                 if case .named(let typeName) = (contextualType ?? .unknown),
-                   let tag = symbols.lookupEnumCase(typeName: typeName, name: name) {
-                    emitter.emit(.pushInt(tag))
+                   let enumCase = symbols.lookupEnumCase(typeName: typeName, name: name),
+                   enumCase.associatedValues.isEmpty {
+                    emitter.emit(.pushInt(enumCase.tag))
                 } else {
                     emitter.emit(.pushNil)
                 }
             case .sizeOf:
                 emitter.emit(.pushInt(typeInfo.sizeOfValues[e.range] ?? 0))
             case .arrayLiteral(let literal):
-                guard case .fixedArray(let elementType, let count) = (exprType(e) ?? .unknown) else {
+                switch exprType(e) ?? .unknown {
+                case .fixedArray(let elementType, let count):
+                    for element in literal.elements {
+                        try emitExpr(element)
+                    }
+                    let encoding = ffiTypeEncoding(for: elementType, symbols: symbols)
+                    emitter.emit(.makeFFIArray(count: UInt16(count), elementType: encoding.bytes))
+                case .array(let elementType):
+                    emitter.emit(.pushInt(0))
+                    emitter.emit(.newArray)
+                    for element in literal.elements {
+                        try emitExpr(element, coercedTo: elementType)
+                        emitter.emit(.arrayAppend)
+                    }
+                default:
                     emitter.emit(.pushNil)
-                    return
                 }
-                for element in literal.elements {
-                    try emitExpr(element)
-                }
-                let encoding = ffiTypeEncoding(for: elementType, symbols: symbols)
-                emitter.emit(.makeFFIArray(count: UInt16(count), elementType: encoding.bytes))
             case .identifier(let name, _):
                 emitter.emit(.loadGlobalSymbol(name))
             case .unary(let u):
@@ -342,6 +376,35 @@ public struct IRBuilder {
                     emitter.emit(.makeColor)
                     return
                 }
+                if case .identifier(let name, _) = c.callee, name == "Float" {
+                    guard c.arguments.count == 1 else { emitter.emit(.pushNil); return }
+                    try emitExpr(c.arguments[0].value)
+                    if (exprType(c.arguments[0].value) ?? .unknown) == .int {
+                        emitter.emit(.intToFloat)
+                    }
+                    return
+                }
+                if case .identifier(let name, _) = c.callee, name == "Int" {
+                    guard c.arguments.count == 1 else { emitter.emit(.pushNil); return }
+                    try emitExpr(c.arguments[0].value)
+                    let argumentType = exprType(c.arguments[0].value) ?? .unknown
+                    if argumentType == .float || argumentType == .double {
+                        emitter.emit(.floatToInt)
+                    }
+                    return
+                }
+                if case .member(let m) = c.callee,
+                   case .array = (exprType(m.base) ?? .unknown),
+                   m.name == "append" {
+                    guard c.arguments.count == 1 else {
+                        emitter.emit(.pushNil)
+                        return
+                    }
+                    try emitExpr(m.base)
+                    try emitExpr(c.arguments[0].value)
+                    emitter.emit(.arrayAppend)
+                    return
+                }
                 if case .member(let m) = c.callee,
                    case .named(let protocolName) = (exprType(m.base) ?? .unknown),
                    symbols.lookupProtocolRequirement(protocolName: protocolName, name: m.name) != nil {
@@ -389,11 +452,21 @@ public struct IRBuilder {
                 emitter.emit(.call(argCount: UInt8(c.arguments.count)))
             case .member(let m):
                 if case .identifier(let enumName, _) = m.base,
-                   let tag = symbols.lookupEnumCase(typeName: enumName, name: m.name) {
-                    emitter.emit(.pushInt(tag))
+                   let enumCase = symbols.lookupEnumCase(typeName: enumName, name: m.name),
+                   enumCase.associatedValues.isEmpty {
+                    emitter.emit(.pushInt(enumCase.tag))
+                } else if (exprType(m.base) ?? .unknown) == .string, m.name == "count" {
+                    try emitExpr(m.base)
+                    emitter.emit(.stringLength)
+                } else if case .array = (exprType(m.base) ?? .unknown), m.name == "count" {
+                    try emitExpr(m.base)
+                    emitter.emit(.arrayLength)
                 } else if case .identifier(let typeName, _) = m.base,
                           symbols.lookupStaticField(typeName: typeName, name: m.name) != nil {
                     emitter.emit(.loadGlobalSymbol(loweredStaticFieldName(typeName: typeName, fieldName: m.name)))
+                } else if case .identifier(let typeName, _) = m.base,
+                          let method = symbols.lookupStaticMethod(typeName: typeName, name: m.name) {
+                    emitter.emit(.loadGlobalSymbol(method.loweredName))
                 } else if case .named(let typeName) = (exprType(m.base) ?? .unknown),
                    let f = symbols.lookupField(typeName: typeName, name: m.name) {
                     try emitExpr(m.base)
@@ -404,6 +477,10 @@ public struct IRBuilder {
                 } else {
                     emitter.emit(.loadGlobalSymbol(m.name))
                 }
+            case .index(let i):
+                try emitExpr(i.base)
+                try emitExpr(i.index)
+                emitter.emit(.loadIndex)
             case .assign(let a):
                 // Global init treats identifier assignments as global symbol stores.
                 if case .member(let m) = a.target,
@@ -412,6 +489,12 @@ public struct IRBuilder {
                     try emitExpr(m.base)
                     try emitExpr(a.value)
                     emitter.emit(.storeField(UInt16(f.index)))
+                    emitter.emit(.pushNil)
+                } else if case .index(let i) = a.target {
+                    try emitExpr(i.base)
+                    try emitExpr(i.index)
+                    try emitExpr(a.value)
+                    emitter.emit(.storeIndex)
                     emitter.emit(.pushNil)
                 } else {
                     try emitExpr(a.value)
@@ -525,6 +608,23 @@ public struct IRBuilder {
         )
     }
 
+    private func buildStaticMethod(
+        typeName: String,
+        fn: FunctionDecl,
+        symbols: SymbolTable,
+        typeInfo: TypeInfo,
+        instanceFieldInitializers: [String: [Expr?]]
+    ) throws -> KiraIRFunction {
+        try buildCallable(
+            fn: fn,
+            loweredName: "__\(typeName)_static_\(fn.name)",
+            selfType: nil,
+            symbols: symbols,
+            typeInfo: typeInfo,
+            instanceFieldInitializers: instanceFieldInitializers
+        )
+    }
+
     private func buildCallable(
         fn: FunctionDecl,
         loweredName: String,
@@ -608,6 +708,22 @@ public struct IRBuilder {
 
         func exprType(_ e: Expr) -> KiraType? { typeInfo.exprTypes[e.range] }
 
+        func enumConstructorInfo(_ callee: Expr) -> (String, EnumCaseSymbol)? {
+            switch callee {
+            case .member(let member):
+                guard case .identifier(let enumName, _) = member.base else { return nil }
+                return symbols.lookupEnumCase(typeName: enumName, name: member.name).map { (enumName, $0) }
+            case .leadingMember(let name, _):
+                guard case .function(_, let returns)? = exprType(callee),
+                      case .named(let enumName) = returns else {
+                    return nil
+                }
+                return symbols.lookupEnumCase(typeName: enumName, name: name).map { (enumName, $0) }
+            default:
+                return nil
+            }
+        }
+
         func isIntLiteral(_ e: Expr) -> Bool {
             if case .intLiteral = e { return true }
             return false
@@ -639,23 +755,33 @@ public struct IRBuilder {
             case .leadingMember(let name, _):
                 let contextualType = exprType(e) ?? expected
                 if case .named(let typeName) = (contextualType ?? .unknown),
-                   let tag = symbols.lookupEnumCase(typeName: typeName, name: name) {
-                    emitter.emit(.pushInt(tag))
+                   let enumCase = symbols.lookupEnumCase(typeName: typeName, name: name),
+                   enumCase.associatedValues.isEmpty {
+                    emitter.emit(.pushInt(enumCase.tag))
                 } else {
                     emitter.emit(.pushNil)
                 }
             case .sizeOf:
                 emitter.emit(.pushInt(typeInfo.sizeOfValues[e.range] ?? 0))
             case .arrayLiteral(let literal):
-                guard case .fixedArray(let elementType, let count) = (exprType(e) ?? .unknown) else {
+                switch exprType(e) ?? .unknown {
+                case .fixedArray(let elementType, let count):
+                    for element in literal.elements {
+                        try emitExpr(element)
+                    }
+                    let encoding = ffiTypeEncoding(for: elementType, symbols: symbols)
+                    emitter.emit(.makeFFIArray(count: UInt16(count), elementType: encoding.bytes))
+                case .array(let elementType):
+                    emitter.emit(.pushInt(0))
+                    emitter.emit(.newArray)
+                    for element in literal.elements {
+                        try emitExpr(element, coercedTo: elementType)
+                        emitter.emit(.arrayAppend)
+                    }
+                default:
                     emitter.emit(.pushNil)
                     return
                 }
-                for element in literal.elements {
-                    try emitExpr(element)
-                }
-                let encoding = ffiTypeEncoding(for: elementType, symbols: symbols)
-                emitter.emit(.makeFFIArray(count: UInt16(count), elementType: encoding.bytes))
             case .identifier(let name, _):
                 if let binding = locals[name] {
                     emitter.emit(.loadLocal(binding.slot))
@@ -750,6 +876,12 @@ public struct IRBuilder {
                     try emitExpr(a.value)
                     emitter.emit(.storeField(UInt16(f.index)))
                     emitter.emit(.pushNil)
+                } else if case .index(let i) = a.target {
+                    try emitExpr(i.base)
+                    try emitExpr(i.index)
+                    try emitExpr(a.value)
+                    emitter.emit(.storeIndex)
+                    emitter.emit(.pushNil)
                 } else {
                     try emitExpr(a.value)
                     if case .identifier(let name, _) = a.target {
@@ -792,6 +924,15 @@ public struct IRBuilder {
                     try emitExpr(c.arguments[0].value)
                     emitter.emit(.print)
                     emitter.emit(.pushNil)
+                } else if let (_, enumCase) = enumConstructorInfo(c.callee) {
+                    for argument in c.arguments {
+                        try emitExpr(argument.value)
+                    }
+                    if enumCase.associatedValues.isEmpty {
+                        emitter.emit(.pushInt(enumCase.tag))
+                    } else {
+                        emitter.emit(.makeEnum(tag: UInt16(enumCase.tag), valueCount: UInt8(enumCase.associatedValues.count)))
+                    }
                 } else if case .identifier(let typeName, _) = c.callee, let fieldMap = symbols.fields[typeName] {
                     // Type constructor: TypeName(field1:..., field2:...)
                     let fieldCount = fieldMap.count
@@ -850,6 +991,35 @@ public struct IRBuilder {
                     }
                     for a in c.arguments { try emitExpr(a.value) }
                     emitter.emit(.makeColor)
+                } else if case .identifier(let name, _) = c.callee, name == "Float" {
+                    guard c.arguments.count == 1 else {
+                        emitter.emit(.pushNil)
+                        return
+                    }
+                    try emitExpr(c.arguments[0].value)
+                    if (exprType(c.arguments[0].value) ?? .unknown) == .int {
+                        emitter.emit(.intToFloat)
+                    }
+                } else if case .identifier(let name, _) = c.callee, name == "Int" {
+                    guard c.arguments.count == 1 else {
+                        emitter.emit(.pushNil)
+                        return
+                    }
+                    try emitExpr(c.arguments[0].value)
+                    let argumentType = exprType(c.arguments[0].value) ?? .unknown
+                    if argumentType == .float || argumentType == .double {
+                        emitter.emit(.floatToInt)
+                    }
+                } else if case .member(let m) = c.callee,
+                          case .array = (exprType(m.base) ?? .unknown),
+                          m.name == "append" {
+                    guard c.arguments.count == 1 else {
+                        emitter.emit(.pushNil)
+                        return
+                    }
+                    try emitExpr(m.base)
+                    try emitExpr(c.arguments[0].value)
+                    emitter.emit(.arrayAppend)
                 } else if case .member(let m) = c.callee,
                           case .named(let protocolName) = (exprType(m.base) ?? .unknown),
                           symbols.lookupProtocolRequirement(protocolName: protocolName, name: m.name) != nil {
@@ -975,11 +1145,21 @@ public struct IRBuilder {
                 }
             case .member(let m):
                 if case .identifier(let enumName, _) = m.base,
-                   let tag = symbols.lookupEnumCase(typeName: enumName, name: m.name) {
-                    emitter.emit(.pushInt(tag))
+                   let enumCase = symbols.lookupEnumCase(typeName: enumName, name: m.name),
+                   enumCase.associatedValues.isEmpty {
+                    emitter.emit(.pushInt(enumCase.tag))
+                } else if (exprType(m.base) ?? .unknown) == .string, m.name == "count" {
+                    try emitExpr(m.base)
+                    emitter.emit(.stringLength)
+                } else if case .array = (exprType(m.base) ?? .unknown), m.name == "count" {
+                    try emitExpr(m.base)
+                    emitter.emit(.arrayLength)
                 } else if case .identifier(let typeName, _) = m.base,
                           symbols.lookupStaticField(typeName: typeName, name: m.name) != nil {
                     emitter.emit(.loadGlobalSymbol(loweredStaticFieldName(typeName: typeName, fieldName: m.name)))
+                } else if case .identifier(let typeName, _) = m.base,
+                          let method = symbols.lookupStaticMethod(typeName: typeName, name: m.name) {
+                    emitter.emit(.loadGlobalSymbol(method.loweredName))
                 } else if case .named(let typeName) = (exprType(m.base) ?? .unknown),
                    let f = symbols.lookupField(typeName: typeName, name: m.name) {
                     try emitExpr(m.base)
@@ -991,6 +1171,10 @@ public struct IRBuilder {
                     _ = m.base
                     emitter.emit(.loadGlobalSymbol(m.name))
                 }
+            case .index(let i):
+                try emitExpr(i.base)
+                try emitExpr(i.index)
+                emitter.emit(.loadIndex)
             case .shaderMacro(let sm):
                 emitter.emit(.pushString("shader:\(sm.functionName)"))
             }
@@ -1043,6 +1227,51 @@ public struct IRBuilder {
                     emitter.patchJump(at: jumpOverElseIndex, to: emitter.currentOffset())
                 } else {
                     emitter.patchJump(at: jumpIfFalseIndex, to: emitter.currentOffset())
+                }
+            case .while(let whileStmt):
+                let loopStart = emitter.currentOffset()
+                try emitExpr(whileStmt.condition)
+                let jumpOutIndex = emitter.emitPlaceholderJumpIfFalse()
+                for st in whileStmt.body.statements {
+                    try emitStmt(st)
+                }
+                let loopBackIndex = emitter.emitPlaceholderJump()
+                emitter.patchJump(at: loopBackIndex, to: loopStart)
+                emitter.patchJump(at: jumpOutIndex, to: emitter.currentOffset())
+            case .match(let matchStmt):
+                let matchSlot = allocLocal("__match_\(nextLocal)", type: exprType(matchStmt.value) ?? .unknown)
+                try emitExpr(matchStmt.value)
+                emitter.emit(.storeLocal(matchSlot))
+                var endJumps: [Int] = []
+                let matchedEnumName: String? = {
+                    if case .named(let enumName)? = exprType(matchStmt.value) { return enumName }
+                    return nil
+                }()
+                for matchCase in matchStmt.cases {
+                    guard let matchedEnumName,
+                          let enumCase = symbols.lookupEnumCase(typeName: matchedEnumName, name: matchCase.pattern.variantName) else {
+                        continue
+                    }
+                    emitter.emit(.loadLocal(matchSlot))
+                    emitter.emit(.matchEnum(tag: UInt16(enumCase.tag)))
+                    let nextCaseJump = emitter.emitPlaceholderJumpIfFalse()
+                    for (bindingIndex, binding) in matchCase.pattern.bindings.enumerated() {
+                        let bindingType = bindingIndex < enumCase.associatedValues.count
+                            ? enumCase.associatedValues[bindingIndex].type
+                            : .unknown
+                        let slot = allocLocal(binding, type: bindingType)
+                        emitter.emit(.loadLocal(matchSlot))
+                        emitter.emit(.getEnumField(index: UInt8(bindingIndex)))
+                        emitter.emit(.storeLocal(slot))
+                    }
+                    for statement in matchCase.body.statements {
+                        try emitStmt(statement)
+                    }
+                    endJumps.append(emitter.emitPlaceholderJump())
+                    emitter.patchJump(at: nextCaseJump, to: emitter.currentOffset())
+                }
+                for jump in endJumps {
+                    emitter.patchJump(at: jump, to: emitter.currentOffset())
                 }
             }
         }
@@ -1121,15 +1350,32 @@ private struct StackEmitter {
             depth += 1
         case .storeLocal, .storeGlobalSymbol:
             depth -= 1
-        case .newObject, .newTypedObject:
+        case .newObject, .newTypedObject, .newArray:
+            depth += 1
+        case .makeEnum(_, let valueCount):
+            depth -= Int(valueCount)
             depth += 1
         case .makeFFIArray(let count, _):
             depth -= Int(count)
             depth += 1
+        case .arrayLength:
+            break
+        case .arrayAppend:
+            depth -= 1
         case .loadField:
             break
         case .storeField:
             depth -= 2
+        case .loadIndex:
+            depth -= 1
+        case .storeIndex:
+            depth -= 3
+        case .matchEnum:
+            break
+        case .getEnumField:
+            break
+        case .stringLength:
+            break
         case .pop:
             depth -= 1
         case .dup:
@@ -1192,15 +1438,32 @@ private func computeMaxStack(_ insts: [KiraIRInst]) -> Int {
             depth += 1
         case .storeLocal, .storeGlobalSymbol:
             depth -= 1
-        case .newObject, .newTypedObject:
+        case .newObject, .newTypedObject, .newArray:
+            depth += 1
+        case .makeEnum(_, let valueCount):
+            depth -= Int(valueCount)
             depth += 1
         case .makeFFIArray(let count, _):
             depth -= Int(count)
             depth += 1
+        case .arrayLength:
+            break
+        case .arrayAppend:
+            depth -= 1
         case .loadField:
             break
         case .storeField:
             depth -= 2
+        case .loadIndex:
+            depth -= 1
+        case .storeIndex:
+            depth -= 3
+        case .matchEnum:
+            break
+        case .getEnumField:
+            break
+        case .stringLength:
+            break
         case .pop:
             depth -= 1
         case .dup:

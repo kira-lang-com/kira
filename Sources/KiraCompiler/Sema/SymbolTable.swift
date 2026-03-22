@@ -21,12 +21,36 @@ public struct FunctionSymbol: Hashable, Sendable {
 public struct MethodSymbol: Hashable, Sendable {
     public var name: String
     public var loweredName: String
+    public var parameterLabels: [String?]
     public var type: KiraType
 
-    public init(name: String, loweredName: String, type: KiraType) {
+    public init(name: String, loweredName: String, parameterLabels: [String?], type: KiraType) {
         self.name = name
         self.loweredName = loweredName
+        self.parameterLabels = parameterLabels
         self.type = type
+    }
+}
+
+public struct EnumCaseSymbol: Hashable, Sendable {
+    public struct AssociatedValue: Hashable, Sendable {
+        public var label: String?
+        public var type: KiraType
+
+        public init(label: String?, type: KiraType) {
+            self.label = label
+            self.type = type
+        }
+    }
+
+    public var name: String
+    public var tag: Int64
+    public var associatedValues: [AssociatedValue]
+
+    public init(name: String, tag: Int64, associatedValues: [AssociatedValue]) {
+        self.name = name
+        self.tag = tag
+        self.associatedValues = associatedValues
     }
 }
 
@@ -84,10 +108,11 @@ public struct SymbolTable: Sendable {
     public private(set) var globals: [String: KiraType] = [:]
     public private(set) var types: Set<String> = []
     public private(set) var typeAliases: [String: KiraType] = [:]
-    public private(set) var enumCases: [String: [String: Int64]] = [:]
+    public private(set) var enumCases: [String: [String: EnumCaseSymbol]] = [:]
     public private(set) var protocolRequirements: [String: [String: MethodSymbol]] = [:]
     public private(set) var conformances: [String: Set<String>] = [:]
     public private(set) var methods: [String: [String: MethodSymbol]] = [:] // TypeName -> method -> symbol
+    public private(set) var staticMethods: [String: [String: MethodSymbol]] = [:] // TypeName -> method -> symbol
     public private(set) var ffi: [String: FFIPrototype] = [:]
     public private(set) var cStructTypes: Set<String> = []
     public private(set) var fields: [String: [String: (index: Int, type: KiraType)]] = [:] // TypeName -> field -> (index, type)
@@ -103,27 +128,32 @@ public struct SymbolTable: Sendable {
 
     public mutating func addEnumCases(
         typeName: String,
-        cases: [(name: String, tag: Int64, range: SourceRange)]
+        cases: [(name: String, tag: Int64, associatedValues: [EnumCaseSymbol.AssociatedValue], range: SourceRange)]
     ) throws {
         var map = enumCases[typeName] ?? [:]
         for enumCase in cases {
             if map[enumCase.name] != nil {
                 throw SemanticError.duplicateSymbol(enumCase.name, enumCase.range.start)
             }
-            map[enumCase.name] = enumCase.tag
+            map[enumCase.name] = EnumCaseSymbol(
+                name: enumCase.name,
+                tag: enumCase.tag,
+                associatedValues: enumCase.associatedValues
+            )
         }
         enumCases[typeName] = map
     }
 
     public mutating func addProtocolRequirements(
         protocolName: String,
-        requirements: [(name: String, type: KiraType)]
+        requirements: [(name: String, parameterLabels: [String?], type: KiraType)]
     ) {
         var map: [String: MethodSymbol] = [:]
         for requirement in requirements {
             map[requirement.name] = MethodSymbol(
                 name: requirement.name,
                 loweredName: requirement.name,
+                parameterLabels: requirement.parameterLabels,
                 type: requirement.type
             )
         }
@@ -152,8 +182,22 @@ public struct SymbolTable: Sendable {
         ffi[functionName] = proto
     }
 
-    public mutating func addMethod(typeName: String, methodName: String, loweredName: String, methodType: KiraType) {
-        methods[typeName, default: [:]][methodName] = MethodSymbol(name: methodName, loweredName: loweredName, type: methodType)
+    public mutating func addMethod(typeName: String, methodName: String, loweredName: String, parameterLabels: [String?], methodType: KiraType) {
+        methods[typeName, default: [:]][methodName] = MethodSymbol(
+            name: methodName,
+            loweredName: loweredName,
+            parameterLabels: parameterLabels,
+            type: methodType
+        )
+    }
+
+    public mutating func addStaticMethod(typeName: String, methodName: String, loweredName: String, parameterLabels: [String?], methodType: KiraType) {
+        staticMethods[typeName, default: [:]][methodName] = MethodSymbol(
+            name: methodName,
+            loweredName: loweredName,
+            parameterLabels: parameterLabels,
+            type: methodType
+        )
     }
 
     public mutating func addFields(typeName: String, fields: [(name: String, type: KiraType)]) {
@@ -184,7 +228,11 @@ public struct SymbolTable: Sendable {
         methods[typeName]?[name]
     }
 
-    public func lookupEnumCase(typeName: String, name: String) -> Int64? {
+    public func lookupStaticMethod(typeName: String, name: String) -> MethodSymbol? {
+        staticMethods[typeName]?[name]
+    }
+
+    public func lookupEnumCase(typeName: String, name: String) -> EnumCaseSymbol? {
         enumCases[typeName]?[name]
     }
 

@@ -1,0 +1,32 @@
+@Doc("Per-font glyph cache metadata used by the current text system.
+The cache groups measured glyph entries by one font description.
+This keeps repeated text layout stable within a frame update.")
+type GlyphCache {
+    @Doc("Font associated with the cached entries.")
+    var font: Font = Font.system(size: 14.0)
+    @Doc("Cached glyph entries for the associated font.")
+    var entries: [GlyphEntry] = []
+
+    @Doc("Store a glyph entry in the cache.
+    The entry is appended in insertion order with no deduplication.
+    Use `lookup(codepoint:)` when a previously stored glyph should be reused.")
+    function insert(entry: GlyphEntry) {
+        entries.append(entry)
+        return
+    }
+
+    @Doc("Return a glyph entry for the supplied codepoint.
+    The current implementation returns the first cached match and otherwise falls back to the first stored entry.
+    This keeps the cache API concrete while the text system remains intentionally simple.")
+    function lookup(codepoint: Int) -> GlyphEntry {
+        var i = 0
+        while i < entries.count {
+            let entry = entries[i]
+            if entry.codepoint == codepoint {
+                return entry
+            }
+            i = i + 1
+        }
+        return GlyphEntry()
+    }
+}

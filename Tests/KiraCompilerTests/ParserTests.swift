@@ -94,7 +94,29 @@ final class ParserTests: XCTestCase {
         }
         XCTAssertEqual(td.fields.count, 1)
         XCTAssertEqual(td.methods.count, 1)
+        XCTAssertEqual(td.statics.count, 0)
         XCTAssertEqual(td.methods[0].name, "add")
+    }
+
+    func testParsesStaticTypeMethod() throws {
+        let text = """
+        type Rectangle {
+            static function unit() -> Rectangle {
+                return Rectangle()
+            }
+        }
+        """
+        let src = SourceText(file: "test.kira", text: text)
+        let toks = try Lexer().lex(src)
+        var p = Parser(tokens: toks)
+        let module = try p.parseModule()
+
+        guard case .type(let td) = try XCTUnwrap(module.declarations.first) else {
+            return XCTFail("expected type declaration")
+        }
+        XCTAssertEqual(td.methods.count, 0)
+        XCTAssertEqual(td.statics.count, 1)
+        XCTAssertEqual(td.statics[0].name, "unit")
     }
 
     func testParsesCallWithTrailingBlockWithoutParens() throws {
@@ -229,5 +251,60 @@ final class ParserTests: XCTestCase {
         guard case .if = fn.body.statements[1] else {
             return XCTFail("expected if statement")
         }
+    }
+
+    func testParsesWhileStatement() throws {
+        let text = """
+        function main() {
+            var value = 0
+            while value < 3 {
+                value = value + 1
+            }
+            return
+        }
+        """
+        let src = SourceText(file: "test.kira", text: text)
+        let toks = try Lexer().lex(src)
+        var p = Parser(tokens: toks)
+        let module = try p.parseModule()
+
+        guard case .function(let fn) = try XCTUnwrap(module.declarations.first) else {
+            return XCTFail("expected function declaration")
+        }
+        guard case .while = fn.body.statements[1] else {
+            return XCTFail("expected while statement")
+        }
+    }
+
+    func testParsesArrayIndexExpression() throws {
+        let text = """
+        function main() {
+            let values: [Int] = [1, 2, 3]
+            let first = values[0]
+            return
+        }
+        """
+        let src = SourceText(file: "test.kira", text: text)
+        let toks = try Lexer().lex(src)
+        var p = Parser(tokens: toks)
+        let module = try p.parseModule()
+
+        guard case .function(let fn) = try XCTUnwrap(module.declarations.first) else {
+            return XCTFail("expected function declaration")
+        }
+        guard case .variable(let decl) = fn.body.statements[1] else {
+            return XCTFail("expected variable declaration")
+        }
+        guard case .index(let indexExpr) = decl.initializer else {
+            return XCTFail("expected index expression")
+        }
+        guard case .identifier(let name, _) = indexExpr.base else {
+            return XCTFail("expected identifier base")
+        }
+        guard case .intLiteral(let value, _) = indexExpr.index else {
+            return XCTFail("expected int literal index")
+        }
+        XCTAssertEqual(name, "values")
+        XCTAssertEqual(value, 0)
     }
 }

@@ -1,6 +1,17 @@
 import Foundation
 import KiraStdlib
 
+public enum CompilerDriverError: Error, CustomStringConvertible, Sendable {
+    case circularImport([String])
+
+    public var description: String {
+        switch self {
+        case .circularImport(let chain):
+            return "error: circular import detected: \(chain.joined(separator: " -> "))"
+        }
+    }
+}
+
 public struct CompilerOutput: Sendable {
     public var typed: TypedModule
     public var ir: KiraIRModule
@@ -39,7 +50,8 @@ public struct CompilerDriver: Sendable {
         var importedDecls: [Decl] = []
         var importedImports: [ImportDecl] = []
         let importRoots = importSearchRoots(for: sources)
-        let importedSources = try loadImportedSources(for: primaryImports, searchRoots: importRoots)
+        let packageRegistry = packageRegistry(for: sources, searchRoots: importRoots)
+        let importedSources = try loadImportedSources(for: primaryImports, searchRoots: importRoots, packageRegistry: packageRegistry)
         for s in importedSources {
             let toks = try lexer.lex(s)
             var p = Parser(tokens: toks)
@@ -83,20 +95,21 @@ public struct CompilerDriver: Sendable {
         return CompilerOutput(typed: typed, ir: ir, bytecode: bytecode, wasm: wasm)
     }
 
-    private func loadImportedSources(for imports: [ImportDecl], searchRoots: [URL]) throws -> [SourceText] {
-        var pending = imports
+    private func loadImportedSources(for imports: [ImportDecl], searchRoots: [URL], packageRegistry: [String: URL]) throws -> [SourceText] {
         var loadedModules: Set<String> = []
         var loadedFiles: Set<String> = []
         var result: [SourceText] = []
         let lexer = Lexer()
 
-        while !pending.isEmpty {
-            let current = pending.removeFirst()
-            if !loadedModules.insert(current.modulePath).inserted {
-                continue
+        func visit(_ modulePath: String, stack: [String]) throws {
+            if stack.contains(modulePath) {
+                throw CompilerDriverError.circularImport(stack + [modulePath])
+            }
+            if !loadedModules.insert(modulePath).inserted {
+                return
             }
 
-            let moduleSources = try resolveImportSources(for: current.modulePath, searchRoots: searchRoots)
+            let moduleSources = try resolveImportSources(for: modulePath, searchRoots: searchRoots, packageRegistry: packageRegistry)
             for source in moduleSources {
                 if !loadedFiles.insert(source.file).inserted {
                     continue
@@ -106,19 +119,25 @@ public struct CompilerDriver: Sendable {
                 let toks = try lexer.lex(source)
                 var parser = Parser(tokens: toks)
                 let module = try parser.parseModule()
-                pending.append(contentsOf: module.imports)
+                for importDecl in module.imports {
+                    try visit(importDecl.modulePath, stack: stack + [modulePath])
+                }
             }
+        }
+
+        for importDecl in imports {
+            try visit(importDecl.modulePath, stack: [])
         }
 
         return result
     }
 
-    private func resolveImportSources(for modulePath: String, searchRoots: [URL]) throws -> [SourceText] {
+    private func resolveImportSources(for modulePath: String, searchRoots: [URL], packageRegistry: [String: URL]) throws -> [SourceText] {
+        if let packageSources = try loadPackageSources(for: modulePath, searchRoots: searchRoots, packageRegistry: packageRegistry) {
+            return packageSources
+        }
         if let stdlibSources = try loadStdlibSources(for: modulePath) {
             return stdlibSources
-        }
-        if let packageSources = try loadPackageSources(for: modulePath, searchRoots: searchRoots) {
-            return packageSources
         }
         return []
     }
@@ -155,8 +174,12 @@ public struct CompilerDriver: Sendable {
         return try sourceTexts(from: selected)
     }
 
-    private func loadPackageSources(for modulePath: String, searchRoots: [URL]) throws -> [SourceText]? {
+    private func loadPackageSources(for modulePath: String, searchRoots: [URL], packageRegistry: [String: URL]) throws -> [SourceText]? {
         let fm = FileManager.default
+        if let sourcesDir = packageRegistry[modulePath], fm.fileExists(atPath: sourcesDir.path) {
+            let urls = try collectKiraSources(in: sourcesDir)
+            return try sourceTexts(from: urls)
+        }
         for root in searchRoots {
             let sourcesDir = root
                 .appendingPathComponent("KiraPackages", isDirectory: true)
@@ -167,6 +190,100 @@ public struct CompilerDriver: Sendable {
             return try sourceTexts(from: urls)
         }
         return nil
+    }
+
+    private func packageRegistry(for sources: [SourceText], searchRoots: [URL]) -> [String: URL] {
+        let fm = FileManager.default
+        var registry: [String: URL] = [:]
+
+        func registerPackages(in root: URL) {
+            let packagesDir = root.appendingPathComponent("KiraPackages", isDirectory: true)
+            guard let packageDirs = try? fm.contentsOfDirectory(at: packagesDir, includingPropertiesForKeys: nil) else {
+                return
+            }
+            for dir in packageDirs {
+                let sourcesDir = dir.appendingPathComponent("Sources", isDirectory: true)
+                if fm.fileExists(atPath: sourcesDir.path), registry[dir.lastPathComponent] == nil {
+                    registry[dir.lastPathComponent] = sourcesDir
+                }
+            }
+        }
+
+        func registerDependencies(from projectRoot: URL) {
+            let manifestURL = projectRoot.appendingPathComponent("Kira.toml")
+            guard fm.fileExists(atPath: manifestURL.path),
+                  let dependencyNames = try? dependencyNames(from: manifestURL) else {
+                return
+            }
+            for dependencyName in dependencyNames {
+                let sourcesDir = projectRoot
+                    .appendingPathComponent("KiraPackages", isDirectory: true)
+                    .appendingPathComponent(dependencyName, isDirectory: true)
+                    .appendingPathComponent("Sources", isDirectory: true)
+                if fm.fileExists(atPath: sourcesDir.path), registry[dependencyName] == nil {
+                    registry[dependencyName] = sourcesDir
+                }
+            }
+        }
+
+        for root in searchRoots {
+            registerPackages(in: root)
+            registerDependencies(from: root)
+        }
+        for source in sources {
+            let sourceURL = URL(fileURLWithPath: source.file)
+            var candidate = sourceURL.deletingLastPathComponent()
+            while candidate.path != "/" && !candidate.path.isEmpty {
+                registerPackages(in: candidate)
+                registerDependencies(from: candidate)
+                let parent = candidate.deletingLastPathComponent()
+                if parent.path == candidate.path { break }
+                candidate = parent
+            }
+        }
+
+        return registry
+    }
+
+    private func dependencyNames(from manifestURL: URL) throws -> [String] {
+        let text = try String(contentsOf: manifestURL, encoding: .utf8)
+        var section = ""
+        var names: [String] = []
+
+        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            var line = String(rawLine)
+            if let hash = line.firstIndex(of: "#") {
+                line = String(line[..<hash])
+            }
+
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                continue
+            }
+
+            if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
+                section = String(trimmed.dropFirst().dropLast())
+                continue
+            }
+
+            guard section == "dependencies" else {
+                continue
+            }
+
+            let parts = trimmed.split(separator: "=", maxSplits: 1).map {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            guard let rawName = parts.first, !rawName.isEmpty else {
+                continue
+            }
+
+            let dependencyName = rawName.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            if !dependencyName.isEmpty {
+                names.append(dependencyName)
+            }
+        }
+
+        return names
     }
 
     private func importSearchRoots(for sources: [SourceText]) -> [URL] {

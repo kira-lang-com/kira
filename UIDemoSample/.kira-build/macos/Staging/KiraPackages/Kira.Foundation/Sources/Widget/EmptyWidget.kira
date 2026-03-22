@@ -1,0 +1,32 @@
+@Doc("Non-rendering sentinel widget used when Foundation needs a concrete fallback.
+It occupies no space, emits no draw commands, and never consumes input.
+The type exists so APIs can stay concrete while optional existentials remain limited.")
+type EmptyWidget: Widget {
+    @Doc("Return the default empty layout descriptor.
+    Empty widgets hug to zero size on both axes by default.
+    This keeps the sentinel harmless in measurement and placement.")
+    function layoutDescriptor() -> LayoutDescriptor {
+        return LayoutDescriptor()
+    }
+
+    @Doc("Emit draw commands for the empty widget.
+    The sentinel has no visual appearance and therefore appends nothing.
+    UIFoundation can safely traverse it without side effects.")
+    function draw(bounds: Rect, builder: DrawListBuilder) {
+        return
+    }
+
+    @Doc("Return child widgets for the empty sentinel.
+    The sentinel is always a leaf widget.
+    UIFoundation uses the empty array to terminate traversal immediately.")
+    function children() -> [Widget] {
+        return []
+    }
+
+    @Doc("Handle one input event directed at the empty sentinel.
+    The sentinel never consumes input.
+    It always returns `false` so callers can treat it as a no-op fallback.")
+    function handleInput(event: InputEvent, bounds: Rect) -> Bool {
+        return false
+    }
+}

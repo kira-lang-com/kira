@@ -1,0 +1,47 @@
+@Doc("Environment value store shared across a widget subtree.
+The current implementation stores simple string key-value pairs.
+This keeps global configuration and theme-like values possible without additional runtime machinery.")
+type Environment {
+    @Doc("Entries currently stored in the environment.")
+    var values: [EnvironmentEntry] = []
+
+    @Doc("Store or replace a value for the supplied key.
+    Existing keys are updated in place and missing keys are appended.
+    Use this to seed environment data before a subtree is rendered.")
+    function set(key: String, value: String) {
+        var i = 0
+        while i < values.count {
+            if values[i].key == key {
+                values[i] = EnvironmentEntry(key: key, value: value)
+                return
+            }
+            i = i + 1
+        }
+        values.append(EnvironmentEntry(key: key, value: value))
+        return
+    }
+
+    @Doc("Return the value for the supplied key.
+    The current implementation performs a simple linear scan across stored entries and falls back to the empty string.
+    This keeps the environment API concrete while the first slice stays lightweight.")
+    function get(key: String) -> String {
+        var i = 0
+        while i < values.count {
+            if values[i].key == key {
+                return values[i].value
+            }
+            i = i + 1
+        }
+        return ""
+    }
+}
+
+@Doc("One string key-value pair stored inside an `Environment`.
+Entries are simple value objects so they can be replaced in arrays safely.
+The current Foundation slice keeps environment values string-based for portability.")
+type EnvironmentEntry {
+    @Doc("Lookup key for the environment value.")
+    var key: String = ""
+    @Doc("Stored string value for the key.")
+    var value: String = ""
+}

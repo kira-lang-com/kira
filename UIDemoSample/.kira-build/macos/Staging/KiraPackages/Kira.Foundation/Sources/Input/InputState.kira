@@ -1,0 +1,30 @@
+@Doc("Immutable snapshot of all user input for one Foundation update cycle.
+UIFoundation reads this value once per frame before dispatching widget events.
+Use `InputState.empty` when no external input is available.")
+type InputState {
+    @Doc("Primary modality active for this frame.")
+    var modality: InputModality = .Pointer
+    @Doc("Pointer snapshot for the current frame.
+    The value is meaningful when `modality` is `.Pointer`.
+    Touch-centric code can ignore it.")
+    var pointer: PointerState = .empty
+    @Doc("Touch contacts active for the current frame.
+    The array is meaningful when `modality` is `.Touch`.
+    Pointer-centric code can ignore it.")
+    var touches: [Touch] = []
+    @Doc("Keys that transitioned down on this frame.")
+    var keysPressed: [Key] = []
+    @Doc("Keys that transitioned up on this frame.")
+    var keysReleased: [Key] = []
+    @Doc("Keys that remain held on this frame.")
+    var keysHeld: [Key] = []
+    @Doc("Committed text input for the current frame.")
+    var textInput: String = ""
+    @Doc("Scroll delta sampled for the current frame.")
+    var scrollDelta: Point = Point.zero
+
+    @Doc("Input snapshot with no active interaction.
+    Use this when driving UIFoundation in tests or headless updates.
+    It provides a stable baseline for non-interactive frames.")
+    static let empty: InputState = InputState(modality: InputModality.Pointer, pointer: PointerState(position: Point(x: 0.0, y: 0.0), delta: Point(x: 0.0, y: 0.0), pressed: false, released: false, held: false, button: PointerButton.Primary), touches: [], keysPressed: [], keysReleased: [], keysHeld: [], textInput: "", scrollDelta: Point(x: 0.0, y: 0.0))
+}

@@ -50,6 +50,9 @@ public struct MacroExpander: Sendable {
                 }
             case .member(let m):
                 try walkExpr(m.base)
+            case .index(let i):
+                try walkExpr(i.base)
+                try walkExpr(i.index)
             case .assign(let a):
                 try walkExpr(a.target)
                 try walkExpr(a.value)
@@ -71,6 +74,16 @@ public struct MacroExpander: Sendable {
                 for st in ifs.thenBlock.statements { try walkStmt(st) }
                 if let eb = ifs.elseBlock {
                     for st in eb.statements { try walkStmt(st) }
+                }
+            case .while(let whileStmt):
+                try walkExpr(whileStmt.condition)
+                for st in whileStmt.body.statements { try walkStmt(st) }
+            case .match(let matchStmt):
+                try walkExpr(matchStmt.value)
+                for matchCase in matchStmt.cases {
+                    for statement in matchCase.body.statements {
+                        try walkStmt(statement)
+                    }
                 }
             }
         }

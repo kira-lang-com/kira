@@ -221,21 +221,23 @@ public struct Parser {
         consumeSeparators()
         var fields: [TypeDecl.Field] = []
         var methods: [FunctionDecl] = []
+        var statics: [FunctionDecl] = []
         while !at(.rBrace) && !at(.eof) {
             let memberStart = current().range.start
             let memberAnnotations = try parseLeadingAnnotations()
             consumeSeparators()
             let isStatic = matchKeyword(.static)
             if matchKeyword(.function) || matchKeyword(.async) {
-                if isStatic {
-                    throw ParseError.message("static functions are not supported yet", current().range.start)
-                }
                 let isAsync = previous().kind == .keyword(.async)
                 if isAsync {
                     _ = try expectKeyword(.function)
                 }
                 let method = try parseFunctionDecl(annotations: memberAnnotations, isAsync: isAsync, startLoc: memberStart)
-                methods.append(method)
+                if isStatic {
+                    statics.append(method)
+                } else {
+                    methods.append(method)
+                }
                 consumeSeparators()
                 continue
             }
@@ -262,7 +264,7 @@ public struct Parser {
         }
         _ = try expect(.rBrace, "}")
         let end = previous().range.end
-        return TypeDecl(annotations: annotations, name: name, conformances: conformances, fields: fields, methods: methods, range: SourceRange(start: startLoc, end: end))
+        return TypeDecl(annotations: annotations, name: name, conformances: conformances, fields: fields, methods: methods, statics: statics, range: SourceRange(start: startLoc, end: end))
     }
 
     private mutating func parseProtocolDecl(annotations: [Annotation], startLoc: SourceLocation) throws -> ProtocolDecl {
@@ -295,7 +297,9 @@ public struct Parser {
         consumeSeparators()
         var cases: [EnumDecl.Case] = []
         while !at(.rBrace) && !at(.eof) {
-            _ = try expectKeyword(.case)
+            let caseAnnotations = try parseLeadingAnnotations()
+            consumeSeparators()
+            _ = matchKeyword(.case)
             let (caseName, _) = try expectIdentifier("case name")
             var associated: [EnumDecl.Case.AssociatedValue] = []
             if match(.lParen) {
@@ -319,7 +323,7 @@ public struct Parser {
                 _ = try expect(.rParen, ")")
             }
             let end = previous().range.end
-            cases.append(.init(name: caseName, associatedValues: associated, range: SourceRange(start: startLoc, end: end)))
+            cases.append(.init(annotations: caseAnnotations, name: caseName, associatedValues: associated, range: SourceRange(start: startLoc, end: end)))
             consumeSeparators()
         }
         _ = try expect(.rBrace, "}")
@@ -532,6 +536,62 @@ public struct Parser {
             let end = (elseBlock ?? thenBlock).range.end
             return .if(.init(condition: cond, thenBlock: thenBlock, elseBlock: elseBlock, range: SourceRange(start: start, end: end)))
         }
+        if matchKeyword(.while) {
+            let start = previous().range.start
+            disallowBareTrailingBlockCalls += 1
+            defer { disallowBareTrailingBlockCalls -= 1 }
+            let condition = try parseExpression()
+            let body = try parseBlock()
+            return .while(.init(condition: condition, body: body, range: SourceRange(start: start, end: body.range.end)))
+        }
+        if matchKeyword(.match) {
+            let start = previous().range.start
+            disallowBareTrailingBlockCalls += 1
+            defer { disallowBareTrailingBlockCalls -= 1 }
+            let value = try parseExpression()
+            _ = try expect(.lBrace, "{")
+            consumeSeparators()
+            var cases: [MatchStmt.Case] = []
+            while !at(.rBrace) && !at(.eof) {
+                consumeSeparators()
+                if at(.rBrace) { break }
+                let patternStart = current().range.start
+                let (variantName, _) = try expectIdentifier("enum variant name")
+                var bindings: [String] = []
+                if match(.lParen) {
+                    consumeSeparators()
+                    if !at(.rParen) {
+                        repeat {
+                            consumeSeparators()
+                            _ = matchKeyword(.let)
+                            let (binding, _) = try expectIdentifier("pattern binding")
+                            bindings.append(binding)
+                            consumeSeparators()
+                        } while match(.comma)
+                    }
+                    _ = try expect(.rParen, ")")
+                }
+                let patternEnd = previous().range.end
+                _ = try expect(.colon, ":")
+                consumeSeparators()
+                let body: BlockStmt
+                if at(.lBrace) {
+                    body = try parseBlock()
+                } else {
+                    let statement = try parseStatement()
+                    body = BlockStmt(statements: [statement], range: statement.range)
+                }
+                let pattern = MatchStmt.Pattern(
+                    variantName: variantName,
+                    bindings: bindings,
+                    range: SourceRange(start: patternStart, end: patternEnd)
+                )
+                cases.append(.init(pattern: pattern, body: body, range: SourceRange(start: patternStart, end: body.range.end)))
+                consumeSeparators()
+            }
+            _ = try expect(.rBrace, "}")
+            return .match(.init(value: value, cases: cases, range: SourceRange(start: start, end: previous().range.end)))
+        }
         let expr = try parseExpression()
         return .expr(expr)
     }
@@ -679,6 +739,12 @@ public struct Parser {
             if match(.dot) {
                 let (name, _) = try expectIdentifier("member name")
                 expr = .member(.init(base: expr, name: name, range: SourceRange(start: expr.range.start, end: previous().range.end)))
+                continue
+            }
+            if match(.lBracket) {
+                let index = try parseExpression()
+                let end = try expect(.rBracket, "]").range.end
+                expr = .index(.init(base: expr, index: index, range: SourceRange(start: expr.range.start, end: end)))
                 continue
             }
             if match(.lParen) {

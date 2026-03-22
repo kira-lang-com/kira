@@ -1,0 +1,65 @@
+import Kira.Graphics
+
+@Doc("Single immutable draw command emitted by UIFoundation.
+Commands are intentionally simple and backend-agnostic so layout and rendering stay loosely coupled.
+Renderers interpret these commands each frame to produce actual GPU work.")
+enum DrawCommand {
+    @Doc("Filled rectangle command.
+    Use this for backgrounds, panels, and placeholder glyph geometry.
+    Corner radius is stored for API stability even when a renderer ignores it.")
+    FilledRect(bounds: Rect, color: Color, cornerRadius: Float)
+
+    @Doc("Rectangle stroke command.
+    Use this for outlines, separators, and lightweight borders.
+    Renderers may approximate this as four filled edge quads.")
+    StrokedRect(bounds: Rect, color: Color, cornerRadius: Float, lineWidth: Float)
+
+    @Doc("Filled circle command.
+    Use this for badges, indicators, and circular decoration.
+    Lightweight renderers may approximate this with a filled rectangle fallback.")
+    FilledCircle(center: Point, radius: Float, color: Color)
+
+    @Doc("Line segment command.
+    Use this for separators, rules, and debug overlays.
+    The current renderer approximates non-axis-aligned lines conservatively.")
+    Line(from: Point, to: Point, color: Color, lineWidth: Float)
+
+    @Doc("Text command expressed as precomputed glyph instances.
+    UIFoundation resolves text runs into placeholder glyph bounds before rendering.
+    Renderers can draw these bounds as quads or textured glyphs depending on capability.")
+    Text(origin: Point, glyphs: [GlyphInstance], color: Color)
+
+    @Doc("Image command for drawing a textured rectangle.
+    The texture index refers to the matching entry in `DrawList.textures`.
+    The current renderer preserves the command even if it draws a tinted quad fallback.")
+    Image(bounds: Rect, texture: Int, uv: Rect, tint: Color)
+
+    @Doc("Push a clip rectangle onto the clip stack.
+    Commands that follow should be clipped until a matching pop occurs.
+    The current renderer stores the command even when clipping is not fully enforced.")
+    PushClip(rect: Rect)
+
+    @Doc("Pop the most recently pushed clip rectangle.
+    This restores the previous clip state for following commands.
+    The command remains explicit in the draw list for deterministic replay.")
+    PopClip
+
+    @Doc("Shadow description applied ahead of a following draw operation.
+    The current renderer stores the command for future interpretation and may ignore it.
+    Keeping the command explicit preserves intent in the draw list.")
+    Shadow(offset: Point, blur: Float, color: Color)
+}
+
+@Doc("Resolved glyph instance used by `DrawCommand.Text`.
+Each instance carries screen-space bounds and atlas coordinates for one drawable text element.
+The current Foundation slice may emit one placeholder instance per text run.")
+type GlyphInstance {
+    @Doc("Atlas UV rectangle associated with the glyph instance.
+    Placeholder text rendering uses a normalized unit rectangle.
+    Future textured glyph paths can interpret this directly.")
+    var atlasUV: Rect = Rect.zero
+    @Doc("Screen-space bounds for the glyph instance.
+    Renderers convert this rectangle into one or more quads.
+    The bounds are already expressed in root UI coordinates.")
+    var bounds: Rect = Rect.zero
+}

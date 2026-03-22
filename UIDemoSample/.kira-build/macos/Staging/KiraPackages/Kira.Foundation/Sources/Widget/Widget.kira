@@ -1,0 +1,21 @@
+@Doc("Base protocol implemented by all Foundation widgets.
+Widgets describe layout, emit draw commands, expose child widgets, and optionally handle input.
+UIFoundation walks this protocol surface each frame to build the layout and draw tree.")
+protocol Widget {
+    @Doc("Return the layout descriptor for the widget in its current state.
+    UIFoundation reads this during layout-tree construction before measurement begins.
+    The descriptor should remain self-consistent for the duration of one frame.")
+    function layoutDescriptor() -> LayoutDescriptor
+    @Doc("Emit draw commands for the widget inside the supplied bounds.
+    Bounds are final root-space bounds computed by the layout engine.
+    Widgets should append commands to the builder but not mutate sibling state.")
+    function draw(bounds: Rect, builder: DrawListBuilder)
+    @Doc("Return the widget's child widgets in stable order.
+    Container widgets should preserve their visual order here.
+    Leaf widgets return an empty array.")
+    function children() -> [Widget]
+    @Doc("Handle one input event targeted at the widget.
+    Return `true` when the event was consumed and should not continue to bubble.
+    Bounds are the widget's final root-space bounds for the current frame.")
+    function handleInput(event: InputEvent, bounds: Rect) -> Bool
+}
