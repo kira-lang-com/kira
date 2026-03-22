@@ -78,6 +78,10 @@ public final class VMHeap: @unchecked Sendable {
 
     public init() {}
 
+    public var liveObjectCount: Int {
+        objects.count
+    }
+
     public func allocate(_ obj: KiraObject) -> ObjectRef {
         let id = nextId
         nextId += 1

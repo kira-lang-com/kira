@@ -50,6 +50,48 @@ final class PackageImportTests: XCTestCase {
         XCTAssertEqual(output.lines, ["2"])
     }
 
+    func testFoundationTextCanMeasureAcrossRepeatedFrames() throws {
+        let project = try makeProject(
+            manifest: """
+            [package]
+            name = "RepeatedFoundationText"
+            version = "0.1.0"
+            kira = ">=1.0.0"
+            license = "Apache-2.0"
+
+            [targets]
+            macos = true
+
+            [dependencies]
+            "Kira.Foundation" = "0.1.0"
+            """,
+            sources: [
+                "Sources/main.kira": """
+                import Kira.Foundation
+
+                function main() {
+                    let text = Text(value: "Hello")
+                    text.layoutDescriptor()
+                    text.layoutDescriptor()
+                    print("ok")
+                    return
+                }
+                """
+            ],
+            packages: [
+                "Kira.Foundation": existingPackageSource(named: "Kira.Foundation")
+            ]
+        )
+
+        let bytecode = try compileProjectMain(at: project)
+        let module = try BytecodeLoader().load(data: bytecode)
+        let output = PackageImportOutputBuffer()
+        let vm = VirtualMachine(module: module, output: { output.lines.append($0) })
+        _ = try vm.run(function: "__kira_init_globals")
+        _ = try vm.run(function: "main")
+        XCTAssertEqual(output.lines, ["ok"])
+    }
+
     func testImportKiraGraphics() throws {
         let project = try makeProject(
             manifest: """

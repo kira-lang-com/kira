@@ -18,6 +18,12 @@ Foundation entry point used to measure widgets, dispatch input, and build draw l
 `DrawListRenderer`
 Renderer that translates Foundation draw commands into graphics draws.
 
+### root
+`Widget`
+Static widget tree reused across frames for the demo.
+    The sample UI is not stateful yet, so rebuilding it every frame only creates avoidable allocation churn.
+    Reusing one root keeps the demo representative without stressing the runtime.
+
 ### viewportWidth
 `Float`
 Current drawable width tracked in Foundation's `Float` coordinate space.

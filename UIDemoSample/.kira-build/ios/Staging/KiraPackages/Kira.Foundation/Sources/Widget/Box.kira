@@ -1,0 +1,44 @@
+import Kira.Graphics
+
+@Doc("Simple rectangular widget that draws a filled background.
+Use this for panels, debug surfaces, and other solid-color layout elements.
+The widget can also host children when a background container is needed.")
+type Box: Widget {
+    @Doc("Fill color used for the background rectangle.")
+    var color: Color = Color.clear
+    @Doc("Corner radius stored on the draw command for future rounded rendering.")
+    var cornerRadius: Float = 0.0
+    @Doc("Ordered child widgets hosted by the box.")
+    var items: [Widget] = []
+    @Doc("Layout descriptor controlling the box and its children.")
+    var descriptor: LayoutDescriptor = LayoutDescriptor()
+
+    @Doc("Return the current layout descriptor for the box.
+    The descriptor is returned exactly as stored on the widget.
+    Callers can configure sizing, arrangement, padding, and clipping directly on it.")
+    function layoutDescriptor() -> LayoutDescriptor {
+        return descriptor
+    }
+
+    @Doc("Emit a filled-rectangle background for the box bounds.
+    The background uses the resolved root-space bounds supplied by UIFoundation.
+    Child widgets are drawn separately during recursive traversal.")
+    function draw(bounds: Rect, builder: DrawListBuilder) {
+        builder.addRect(bounds: bounds, color: color, cornerRadius: cornerRadius)
+        return
+    }
+
+    @Doc("Return child widgets hosted by the box.
+    Boxes can act as both visual leaves and visual containers.
+    UIFoundation traverses the returned array in order.")
+    function children() -> [Widget] {
+        return items
+    }
+
+    @Doc("Handle one input event directed at the box.
+    The current default box does not consume input on its own.
+    It returns `false` so composition-specific widgets can decide interaction behavior.")
+    function handleInput(event: InputEvent, bounds: Rect) -> Bool {
+        return false
+    }
+}

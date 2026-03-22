@@ -8,6 +8,10 @@ type DrawListRenderer {
     var device: GraphicsDevice = GraphicsDevice()
     @Doc("Pipeline used for all colored-quad rendering in the current implementation.")
     var pipeline: RenderPipeline = RenderPipeline()
+    @Doc("Tracks whether the shared pipeline has already been created.
+    Using an explicit flag keeps the renderer independent from string-property lookups on cached pipeline state.
+    The flag flips to `true` after the first successful pipeline build.")
+    var pipelineReady: Bool = false
 
     @Doc("Render a Foundation draw list through a graphics encoder.
     Each supported command is translated into one or more transient triangle draws.
@@ -59,7 +63,7 @@ type DrawListRenderer {
     The pipeline is created lazily the first time rendering is requested.
     Reusing one pipeline keeps the initial Foundation renderer small and stable.")
     function ensurePipeline() {
-        if pipeline.label.count > 0 {
+        if pipelineReady {
             return
         }
         pipeline = device.makeRenderPipeline(desc: RenderPipelineDescriptor {
@@ -73,6 +77,7 @@ type DrawListRenderer {
             colorFormat = .bgra8Unorm
             label = "FoundationUI"
         })
+        pipelineReady = true
         return
     }
 

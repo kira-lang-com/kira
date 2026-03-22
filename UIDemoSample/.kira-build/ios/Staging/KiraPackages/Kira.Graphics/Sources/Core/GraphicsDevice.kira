@@ -1,0 +1,124 @@
+import Kira.Fondation
+
+@Doc("Backend constant for the Direct3D 11 renderer.
+Used internally to choose the correct shader source set on Windows.
+Matches the backend value returned by the native Sokol bridge.")
+let GRAPHICS_BACKEND_D3D11: sg_backend = 2
+@Doc("Backend constant for a two-component floating-point vertex attribute.
+Used when translating `VertexFormat.float2` into the native graphics descriptor.
+This format is common for texture coordinates and 2D positions.")
+let GRAPHICS_VERTEXFORMAT_FLOAT2: sg_vertex_format = 2
+@Doc("Backend constant for a three-component floating-point vertex attribute.
+Used when translating `VertexFormat.float3` into the native graphics descriptor.
+This format is common for positions and normals.")
+let GRAPHICS_VERTEXFORMAT_FLOAT3: sg_vertex_format = 3
+@Doc("Backend constant for a four-component floating-point vertex attribute.
+Used when translating `VertexFormat.float4` into the native graphics descriptor.
+This format is common for colors and generic packed vertex data.")
+let GRAPHICS_VERTEXFORMAT_FLOAT4: sg_vertex_format = 4
+@Doc("Backend constant for point-list rendering.
+Used when a render pipeline requests point primitives.
+Forwarded directly into the native pipeline descriptor.")
+let GRAPHICS_PRIMITIVE_POINTS: sg_primitive_type = 1
+@Doc("Backend constant for line-list rendering.
+Used when a render pipeline requests discrete line segments.
+Forwarded directly into the native pipeline descriptor.")
+let GRAPHICS_PRIMITIVE_LINES: sg_primitive_type = 2
+@Doc("Backend constant for line-strip rendering.
+Used when a render pipeline requests connected line segments.
+Forwarded directly into the native pipeline descriptor.")
+let GRAPHICS_PRIMITIVE_LINE_STRIP: sg_primitive_type = 3
+@Doc("Backend constant for triangle-list rendering.
+Used when a render pipeline requests independent triangles.
+Forwarded directly into the native pipeline descriptor.")
+let GRAPHICS_PRIMITIVE_TRIANGLES: sg_primitive_type = 4
+@Doc("Backend constant for triangle-strip rendering.
+Used when a render pipeline requests strip-based triangles.
+Forwarded directly into the native pipeline descriptor.")
+let GRAPHICS_PRIMITIVE_TRIANGLE_STRIP: sg_primitive_type = 5
+
+@Doc("Primary entry point for creating GPU resources and pipeline state.
+Scenes receive a `GraphicsDevice` once the graphics runtime finishes startup.
+Use it to allocate buffers and render pipelines that live across multiple frames.")
+type GraphicsDevice {
+    @Doc("Identifier of the active backend chosen by the runtime.
+    Used internally to select backend-specific shader sources and behavior.
+    Exposed so advanced code can branch on renderer capabilities when necessary.")
+    var backend: sg_backend = 0
+
+    @Doc("Create a GPU buffer from CPU-side memory.
+    The byte range pointed to by `data` is copied into a new native buffer object.
+    Use this for immutable vertex, index, or uniform data prepared on the CPU.")
+    function makeBuffer(data: CPointer<CVoid>, size: Int, label: String) -> Buffer {
+        let buffer = sg_make_buffer(desc: sg_buffer_desc(
+            size: size,
+            data: sg_range(ptr: data, size: size),
+            label: label))
+        return Buffer(handle: buffer, size: size, label: label)
+    }
+
+    @Doc("Create a render pipeline from a high-level descriptor.
+    Chooses the correct shader source pair for the active backend before compilation.
+    The returned pipeline can be bound on a render encoder and reused across frames.")
+    function makeRenderPipeline(desc: RenderPipelineDescriptor) -> RenderPipeline {
+        let is_d3d11 = backend == GRAPHICS_BACKEND_D3D11
+        let vs_source = is_d3d11 ? desc.d3d11VertexSource : desc.metalVertexSource
+        let fs_source = is_d3d11 ? desc.d3d11FragmentSource : desc.metalFragmentSource
+
+        let vs_func = sg_shader_function(source: vs_source, entry: "vs_main", d3d11_target: "vs_5_0")
+        let fs_func = sg_shader_function(source: fs_source, entry: "fs_main", d3d11_target: "ps_5_0")
+
+        let attr0 = sg_shader_vertex_attr(
+            base_type: SG_SHADERATTRBASETYPE_FLOAT,
+            hlsl_sem_name: "POSITION",
+            hlsl_sem_index: 0)
+        let attr1 = sg_shader_vertex_attr(
+            base_type: SG_SHADERATTRBASETYPE_FLOAT,
+            hlsl_sem_name: "COLOR",
+            hlsl_sem_index: 0)
+        let shader = sg_make_shader(desc: sg_shader_desc(
+            vertex_func: vs_func,
+            fragment_func: fs_func,
+            attrs: CArray16_sg_shader_vertex_attr(
+                _0: attr0,
+                _1: attr1),
+            label: desc.label))
+
+        let attr0Size = graphicsVertexFormatSize(desc.attribute0)
+        let attr1Size = graphicsVertexFormatSize(desc.attribute1)
+        let layout = sg_vertex_layout_state(
+            buffers: CArray8_sg_vertex_buffer_layout_state(
+                _0: sg_vertex_buffer_layout_state(stride: attr0Size + attr1Size)),
+            attrs: CArray16_sg_vertex_attr_state(
+                _0: sg_vertex_attr_state(buffer_index: 0, offset: 0, format: graphicsVertexFormat(desc.attribute0)),
+                _1: sg_vertex_attr_state(buffer_index: 0, offset: attr0Size, format: graphicsVertexFormat(desc.attribute1))))
+
+        let pipeline = sg_make_pipeline(desc: sg_pipeline_desc(
+            shader: shader,
+            layout: layout,
+            primitive_type: graphicsPrimitive(desc.primitive),
+            label: desc.label))
+        return RenderPipeline(handle: pipeline, primitive: desc.primitive, label: desc.label)
+    }
+}
+
+@Doc("Convert a Kira vertex-format enum into the native backend constant.
+This keeps pipeline descriptors backend-agnostic in user code.
+Unknown values currently fall back to the three-component float format.")
+function graphicsVertexFormat(format: VertexFormat) -> sg_vertex_format {
+    return format == .float2 ? GRAPHICS_VERTEXFORMAT_FLOAT2 : (format == .float4 ? GRAPHICS_VERTEXFORMAT_FLOAT4 : GRAPHICS_VERTEXFORMAT_FLOAT3)
+}
+
+@Doc("Return the byte size of one vertex attribute format.
+This is used to build a correct native vertex layout with explicit offsets and stride.
+Formats outside the current supported set fall back to zero bytes.")
+function graphicsVertexFormatSize(format: VertexFormat) -> Int {
+    return format == .float2 ? 8 : (format == .float3 ? 12 : (format == .float4 ? 16 : 0))
+}
+
+@Doc("Convert a Kira primitive enum into the native backend constant.
+This isolates backend-specific primitive values from the public API.
+Unknown values currently fall back to triangle-list rendering.")
+function graphicsPrimitive(primitive: Primitive) -> sg_primitive_type {
+    return primitive == .points ? GRAPHICS_PRIMITIVE_POINTS : (primitive == .lines ? GRAPHICS_PRIMITIVE_LINES : (primitive == .lineStrip ? GRAPHICS_PRIMITIVE_LINE_STRIP : (primitive == .triangleStrip ? GRAPHICS_PRIMITIVE_TRIANGLE_STRIP : GRAPHICS_PRIMITIVE_TRIANGLES)))
+}

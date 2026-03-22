@@ -7,12 +7,12 @@ It keeps layout simple and deterministic while still exercising real draw-list o
 function buildCard() -> Widget {
     let content = VStack(
         items: [
-            Text(value: "Kira Foundation", color: Color.white),
+            Text(value: "Kira Foundation LIVE 4", color: Color.white),
             Text(value: "Scene-driven UI rendered through Kira.Graphics.", color: Color(r: 0.82, g: 0.87, b: 0.94, a: 1.0)),
             Text(value: "This sample proves layout, draw-list generation, and GPU submission.", color: Color(r: 0.68, g: 0.76, b: 0.88, a: 1.0))
         ],
         spacing: 14.0,
-        alignment: CrossAlignment.Start,
+        alignment: CrossAlignment.Center,
         descriptor: LayoutDescriptor(
             width: SizeMode.Hug,
             height: SizeMode.Hug,
@@ -86,6 +86,10 @@ type UIDemoScene: Scene {
     var ui: UIFoundation = UIFoundation()
     @Doc("Renderer that translates Foundation draw commands into graphics draws.")
     var renderer: DrawListRenderer = DrawListRenderer()
+    @Doc("Static widget tree reused across frames for the demo.
+    The sample UI is not stateful yet, so rebuilding it every frame only creates avoidable allocation churn.
+    Reusing one root keeps the demo representative without stressing the runtime.")
+    var root: Widget = buildRoot()
     @Doc("Current drawable width tracked in Foundation's `Float` coordinate space.
     It starts at the sample window width and is refreshed from resize callbacks.
     The scene uses it to build layout and rendering bounds each frame.")
@@ -108,7 +112,7 @@ type UIDemoScene: Scene {
     A dark clear color is used so the card and placeholder text are easy to see.")
     function onFrame(frame: Frame) {
         let bounds = Rect(x: 0.0, y: 0.0, width: viewportWidth, height: viewportHeight)
-        let drawList = ui.update(root: buildRoot(), bounds: bounds, input: InputState.empty)
+        let drawList = ui.update(root: root, bounds: bounds, input: InputState.empty)
         let commandBuffer = frame.encode()
         let passDescriptor = frame.defaultPass.withClear(color: Color(r: 0.03, g: 0.04, b: 0.07, a: 1.0))
         let encoder = commandBuffer.render(descriptor: passDescriptor)

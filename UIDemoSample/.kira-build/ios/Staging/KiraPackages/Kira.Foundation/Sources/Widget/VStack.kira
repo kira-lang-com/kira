@@ -1,0 +1,42 @@
+@Doc("Vertical stack container widget.
+Children are arranged from top to bottom with a uniform spacing value.
+Use this as the primary column-style composition primitive in Foundation.")
+type VStack: Widget {
+    @Doc("Ordered child widgets contained by the stack.")
+    var items: [Widget] = []
+    @Doc("Spacing inserted between adjacent children in points.")
+    var spacing: Float = 0.0
+    @Doc("Cross-axis alignment used for the children.")
+    var alignment: CrossAlignment = .Start
+    @Doc("Base layout descriptor for the stack container.")
+    var descriptor: LayoutDescriptor = LayoutDescriptor()
+
+    @Doc("Return the current layout descriptor for the stack.
+    The descriptor is updated so its arrangement mode matches the stack's stored configuration.
+    Callers can still override other descriptor properties such as padding and width mode.")
+    function layoutDescriptor() -> LayoutDescriptor {
+        descriptor.arrange = ArrangeMode.Stack(axis: Axis.Vertical, spacing: spacing, alignment: alignment)
+        return descriptor
+    }
+
+    @Doc("Emit draw commands for the stack container itself.
+    The default stack has no intrinsic visual appearance and emits no commands.
+    Child widgets are drawn separately by UIFoundation traversal.")
+    function draw(bounds: Rect, builder: DrawListBuilder) {
+        return
+    }
+
+    @Doc("Return child widgets in stable visual order.
+    UIFoundation uses this order for both layout and drawing traversal.
+    The array is returned exactly as stored on the widget.")
+    function children() -> [Widget] {
+        return items
+    }
+
+    @Doc("Handle one input event directed at the stack container.
+    The default stack does not consume input itself.
+    It returns `false` so children or ancestors can respond instead.")
+    function handleInput(event: InputEvent, bounds: Rect) -> Bool {
+        return false
+    }
+}

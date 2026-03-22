@@ -12,6 +12,7 @@
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
 #import <QuartzCore/QuartzCore.h>
+#include <stdbool.h>
 
 #include "vendor/sokol/sokol_app.h"
 #include "vendor/sokol/sokol_gfx.h"
@@ -23,4 +24,20 @@ __attribute__((visibility("default"))) void kira_sg_setup(void) {
     desc.environment = sglue_environment();
     desc.logger.func = slog_func;
     sg_setup(&desc);
+}
+
+__attribute__((visibility("default"))) void kira_sg_begin_default_pass(bool clearEnabled, float r, float g, float b, float a, const char* label) {
+    sg_pass pass = {0};
+    pass.swapchain = sglue_swapchain();
+    pass.label = label;
+    pass.action.colors[0].load_action = clearEnabled ? SG_LOADACTION_CLEAR : SG_LOADACTION_LOAD;
+    pass.action.colors[0].store_action = SG_STOREACTION_STORE;
+    pass.action.colors[0].clear_value = (sg_color){ .r = r, .g = g, .b = b, .a = a };
+    sg_begin_pass(&pass);
+}
+
+__attribute__((visibility("default"))) void kira_sg_apply_vertex_buffer(sg_buffer buffer) {
+    sg_bindings bindings = {0};
+    bindings.vertex_buffers[0] = buffer;
+    sg_apply_bindings(&bindings);
 }

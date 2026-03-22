@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(CryptoKit)
+import CryptoKit
+#endif
 
 public enum AppleBuildPlatform: String, Sendable {
     case iOS
@@ -120,14 +123,23 @@ public struct AppMetadata: Sendable {
 }
 
 public enum NativeDependencyResolver {
+    private static let libffiVersion = "3.5.2"
+    private static let libffiSourceURL = URL(string: "https://github.com/libffi/libffi/releases/download/v3.5.2/libffi-3.5.2.tar.gz")!
+    private static let libffiSourceSHA256 = "f3a3082a23b37c293a4fcd1053147b371f2ff91fa7ea1b2a52e335676bac82dc"
+
     public static func prepareRuntimePackage(from kiraRoot: URL, into buildRoot: URL) throws -> URL {
         let fileManager = FileManager.default
         let packageRoot = buildRoot.appendingPathComponent("KiraRuntimePackage", isDirectory: true)
         let sourcesRoot = packageRoot.appendingPathComponent("Sources", isDirectory: true)
         let clibffiRoot = sourcesRoot.appendingPathComponent("Clibffi", isDirectory: true)
+        let kiraDebugRuntimeRoot = sourcesRoot.appendingPathComponent("KiraDebugRuntime", isDirectory: true)
         let kiraVMRoot = sourcesRoot.appendingPathComponent("KiraVM", isDirectory: true)
 
         try fileManager.createDirectory(at: clibffiRoot, withIntermediateDirectories: true, attributes: nil)
+        try fileManager.copyItem(
+            at: kiraRoot.appendingPathComponent("Sources/KiraDebugRuntime", isDirectory: true),
+            to: kiraDebugRuntimeRoot
+        )
         try fileManager.copyItem(
             at: kiraRoot.appendingPathComponent("Sources/KiraVM", isDirectory: true),
             to: kiraVMRoot
@@ -155,19 +167,20 @@ public enum NativeDependencyResolver {
     }
 
     public static func prepareIOSDeviceLibffi(into buildRoot: URL, minimumVersion: String) throws -> URL {
+        let fileManager = FileManager.default
         let destinationDirectory = buildRoot
             .appendingPathComponent("vendor", isDirectory: true)
             .appendingPathComponent("libffi", isDirectory: true)
             .appendingPathComponent("iphoneos", isDirectory: true)
-        let destinationStub = destinationDirectory.appendingPathComponent("libffi.tbd")
+        let destinationLibrary = destinationDirectory.appendingPathComponent("libffi.a")
 
-        if FileManager.default.fileExists(atPath: destinationStub.path) {
+        if fileManager.fileExists(atPath: destinationLibrary.path) {
             return destinationDirectory
         }
 
-        try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true, attributes: nil)
-        try makeIOSDeviceLibffiStub(minimumVersion: minimumVersion)
-            .write(to: destinationStub, atomically: true, encoding: .utf8)
+        let cachedLibrary = try ensureIOSDeviceLibffiBuilt(minimumVersion: minimumVersion)
+        try fileManager.createDirectory(at: destinationDirectory, withIntermediateDirectories: true, attributes: nil)
+        try fileManager.copyItem(at: cachedLibrary, to: destinationLibrary)
         return destinationDirectory
     }
 
@@ -218,6 +231,16 @@ public enum NativeDependencyResolver {
             )
             try generatedSwiftHeader().write(
                 to: directory.appendingPathComponent("KiraVM-Swift.h"),
+                atomically: true,
+                encoding: .utf8
+            )
+            try generatedDebugRuntimeModuleMap().write(
+                to: directory.appendingPathComponent("KiraDebugRuntime.modulemap"),
+                atomically: true,
+                encoding: .utf8
+            )
+            try generatedSwiftHeader().write(
+                to: directory.appendingPathComponent("KiraDebugRuntime-Swift.h"),
                 atomically: true,
                 encoding: .utf8
             )
@@ -324,8 +347,12 @@ public enum NativeDependencyResolver {
                     path: "Sources/Clibffi"
                 ),
                 .target(
+                    name: "KiraDebugRuntime",
+                    path: "Sources/KiraDebugRuntime"
+                ),
+                .target(
                     name: "KiraVM",
-                    dependencies: ["Clibffi"],
+                    dependencies: ["Clibffi", "KiraDebugRuntime"],
                     path: "Sources/KiraVM"
                 ),
             ]
@@ -380,37 +407,190 @@ public enum NativeDependencyResolver {
         try text.write(to: headerURL, atomically: true, encoding: .utf8)
     }
 
-    private static func makeIOSDeviceLibffiStub(minimumVersion: String) -> String {
-        """
-        --- !tapi-tbd
-        tbd-version:     4
-        targets:         [ arm64-ios, arm64e-ios ]
-        install-name:    '/usr/lib/libffi.dylib'
-        current-version: 40
-        compat-version:  1
-        swift-abi-version: 0
-        parent-umbrella: ''
-        exports:
-          - targets:         [ arm64-ios, arm64e-ios ]
-            symbols:         [ _ffi_call, _ffi_closure_alloc, _ffi_closure_free, _ffi_find_closure_for_code_np,
-                               _ffi_get_struct_offsets, _ffi_java_ptrarray_to_raw, _ffi_java_raw_call,
-                               _ffi_java_raw_size, _ffi_java_raw_to_ptrarray, _ffi_prep_cif,
-                               _ffi_prep_cif_var, _ffi_prep_closure_loc, _ffi_prep_java_raw_closure,
-                               _ffi_prep_java_raw_closure_loc, _ffi_prep_raw_closure, _ffi_prep_raw_closure_loc,
-                               _ffi_ptrarray_to_raw, _ffi_raw_call, _ffi_raw_size, _ffi_raw_to_ptrarray,
-                               _ffi_tramp_alloc, _ffi_tramp_free, _ffi_tramp_get_addr, _ffi_tramp_is_supported,
-                               _ffi_tramp_set_parms, _ffi_type_complex_double, _ffi_type_complex_float,
-                               _ffi_type_double, _ffi_type_float, _ffi_type_pointer, _ffi_type_sint16,
-                               _ffi_type_sint32, _ffi_type_sint64, _ffi_type_sint8, _ffi_type_uint16,
-                               _ffi_type_uint32, _ffi_type_uint64, _ffi_type_uint8, _ffi_type_void ]
-        ...
-        """
+    private static func ensureIOSDeviceLibffiBuilt(minimumVersion: String) throws -> URL {
+        let fileManager = FileManager.default
+        let cacheRoot = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("Caches", isDirectory: true)
+            .appendingPathComponent("kira", isDirectory: true)
+            .appendingPathComponent("libffi", isDirectory: true)
+        let installRoot = cacheRoot
+            .appendingPathComponent("ios-arm64-\(libffiVersion)-\(minimumVersion)", isDirectory: true)
+        let installLibrary = installRoot.appendingPathComponent("lib/libffi.a")
+
+        if fileManager.fileExists(atPath: installLibrary.path) {
+            return installLibrary
+        }
+
+        let archiveURL = try ensureLibffiSourceArchive(in: cacheRoot)
+        let buildRoot = cacheRoot.appendingPathComponent("build-\(libffiVersion)-\(minimumVersion)", isDirectory: true)
+        if fileManager.fileExists(atPath: buildRoot.path) {
+            try fileManager.removeItem(at: buildRoot)
+        }
+        if fileManager.fileExists(atPath: installRoot.path) {
+            try fileManager.removeItem(at: installRoot)
+        }
+
+        try fileManager.createDirectory(at: buildRoot, withIntermediateDirectories: true, attributes: nil)
+        try fileManager.createDirectory(at: installRoot, withIntermediateDirectories: true, attributes: nil)
+
+        try runProcess("/usr/bin/tar", args: ["-xf", archiveURL.path, "-C", buildRoot.path])
+
+        let sourceRoot = buildRoot.appendingPathComponent("libffi-\(libffiVersion)", isDirectory: true)
+        let sdkPath = try captureProcess(
+            "/usr/bin/xcrun",
+            args: ["--sdk", "iphoneos", "--show-sdk-path"]
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        let clangPath = try captureProcess(
+            "/usr/bin/xcrun",
+            args: ["--sdk", "iphoneos", "-f", "clang"]
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        let compiler = "\(clangPath) -arch arm64 -isysroot \(sdkPath) -miphoneos-version-min=\(minimumVersion)"
+        let buildTriplet = "aarch64-apple-darwin"
+
+        try runProcess(
+            "/bin/sh",
+            args: [
+                "-lc",
+                """
+                export CC='\(compiler)'
+                export CFLAGS='-O2'
+                export LDFLAGS='-arch arm64 -isysroot \(sdkPath) -miphoneos-version-min=\(minimumVersion)'
+                ./configure --host=\(buildTriplet) --disable-shared --enable-static --prefix='\(installRoot.path)'
+                """
+            ],
+            currentDirectoryURL: sourceRoot
+        )
+
+        let configuredBuildRoot = sourceRoot.appendingPathComponent(buildTriplet, isDirectory: true)
+        try runProcess("/usr/bin/make", args: ["-j\(ProcessInfo.processInfo.activeProcessorCount)"], currentDirectoryURL: configuredBuildRoot)
+        try runProcess("/usr/bin/make", args: ["install"], currentDirectoryURL: configuredBuildRoot)
+
+        guard fileManager.fileExists(atPath: installLibrary.path) else {
+            throw NSError(
+                domain: "KiraPlatform",
+                code: 7,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to build iPhoneOS libffi static library at \(installLibrary.path)"]
+            )
+        }
+        return installLibrary
+    }
+
+    private static func ensureLibffiSourceArchive(in cacheRoot: URL) throws -> URL {
+        let fileManager = FileManager.default
+        let archiveURL = cacheRoot.appendingPathComponent("libffi-\(libffiVersion).tar.gz")
+        if fileManager.fileExists(atPath: archiveURL.path) {
+            try verifyLibffiArchiveIfPossible(at: archiveURL)
+            return archiveURL
+        }
+
+        try fileManager.createDirectory(at: cacheRoot, withIntermediateDirectories: true, attributes: nil)
+        let data = try Data(contentsOf: libffiSourceURL)
+        try verifyLibffiArchiveDataIfPossible(data)
+        try data.write(to: archiveURL, options: .atomic)
+        return archiveURL
+    }
+
+    private static func verifyLibffiArchiveIfPossible(at archiveURL: URL) throws {
+        #if canImport(CryptoKit)
+        let data = try Data(contentsOf: archiveURL)
+        try verifyLibffiArchiveDataIfPossible(data)
+        #else
+        _ = archiveURL
+        #endif
+    }
+
+    private static func verifyLibffiArchiveDataIfPossible(_ data: Data) throws {
+        #if canImport(CryptoKit)
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        guard digest == libffiSourceSHA256 else {
+            throw NSError(
+                domain: "KiraPlatform",
+                code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "Downloaded libffi source archive failed SHA-256 verification"]
+            )
+        }
+        #else
+        _ = data
+        #endif
+    }
+
+    private static func runProcess(
+        _ executable: String,
+        args: [String],
+        currentDirectoryURL: URL? = nil
+    ) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = args
+        process.currentDirectoryURL = currentDirectoryURL
+
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+
+        try process.run()
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 0 else {
+            let output = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let errors = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            throw NSError(
+                domain: "KiraPlatform",
+                code: 9,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Command failed: \(executable) \(args.joined(separator: " "))\n\(output)\n\(errors)"
+                ]
+            )
+        }
+    }
+
+    private static func captureProcess(
+        _ executable: String,
+        args: [String]
+    ) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = args
+
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+
+        try process.run()
+        process.waitUntilExit()
+
+        let output = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        guard process.terminationStatus == 0 else {
+            let errors = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            throw NSError(
+                domain: "KiraPlatform",
+                code: 10,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Command failed: \(executable) \(args.joined(separator: " "))\n\(errors)"
+                ]
+            )
+        }
+        return output
     }
 
     private static func generatedModuleMap() -> String {
         """
         module KiraVM {
             header "KiraVM-Swift.h"
+            requires objc
+        }
+        """
+    }
+
+    private static func generatedDebugRuntimeModuleMap() -> String {
+        """
+        module KiraDebugRuntime {
+            header "KiraDebugRuntime-Swift.h"
             requires objc
         }
         """

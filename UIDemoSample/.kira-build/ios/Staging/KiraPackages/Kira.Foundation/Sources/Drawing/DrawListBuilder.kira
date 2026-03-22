@@ -1,0 +1,78 @@
+import Kira.Graphics
+
+@Doc("Mutable draw-list builder used internally by UIFoundation.
+Widgets append commands here during tree traversal.
+Call `build()` at the end of the frame to freeze the list into a `DrawList`.")
+type DrawListBuilder {
+    @Doc("Commands accumulated for the current frame.")
+    var commands: [DrawCommand] = []
+    @Doc("Textures referenced by image commands.")
+    var textures: [Texture] = []
+    @Doc("Current clip depth recorded for nested clip regions.
+    The builder stores this to keep clip push/pop usage balanced.
+    It does not need to expose the full stack to callers.")
+    var clipDepth: Int = 0
+    @Doc("Atlas texture metadata for text commands in the current frame.")
+    var atlasTexture: Texture = Texture()
+
+    @Doc("Append a filled-rectangle command.
+    Use this for simple background and decoration output from widgets.
+    The command is stored exactly as supplied.")
+    function addRect(bounds: Rect, color: Color, cornerRadius: Float) {
+        commands.append(DrawCommand.FilledRect(bounds: bounds, color: color, cornerRadius: cornerRadius))
+        return
+    }
+
+    @Doc("Append a stroked-rectangle command.
+    Use this for borders and simple separators around widget bounds.
+    The command is stored exactly as supplied.")
+    function addStroke(bounds: Rect, color: Color, cornerRadius: Float, lineWidth: Float) {
+        commands.append(DrawCommand.StrokedRect(bounds: bounds, color: color, cornerRadius: cornerRadius, lineWidth: lineWidth))
+        return
+    }
+
+    @Doc("Append a text command with resolved glyph instances.
+    UIFoundation uses this for text widgets after measurement has finished.
+    The glyph bounds are already expressed in root coordinates.")
+    function addText(origin: Point, glyphs: [GlyphInstance], color: Color) {
+        commands.append(DrawCommand.Text(origin: origin, glyphs: glyphs, color: color))
+        return
+    }
+
+    @Doc("Append an image command and register the referenced texture.
+    The texture is stored in the builder-local texture table and the command references its index.
+    This keeps the draw command itself compact and stable.")
+    function addImage(bounds: Rect, texture: Texture, uv: Rect, tint: Color) {
+        let index = textures.count
+        textures.append(texture)
+        commands.append(DrawCommand.Image(bounds: bounds, texture: index, uv: uv, tint: tint))
+        return
+    }
+
+    @Doc("Push a clip command into the command stream.
+    The clip depth is tracked so nested clips remain balanced.
+    Renderers can interpret the matching push and pop commands later.")
+    function pushClip(rect: Rect) {
+        clipDepth = clipDepth + 1
+        commands.append(DrawCommand.PushClip(rect: rect))
+        return
+    }
+
+    @Doc("Push a clip-pop command into the command stream.
+    The builder only decrements depth when a clip is currently active.
+    This keeps command output balanced for ordinary widget traversal.")
+    function popClip() {
+        if clipDepth > 0 {
+            clipDepth = clipDepth - 1
+            commands.append(DrawCommand.PopClip)
+        }
+        return
+    }
+
+    @Doc("Freeze the builder into an immutable draw list.
+    The resulting value contains the current commands, textures, and optional atlas texture.
+    Call this once after all widgets have been traversed for the frame.")
+    function build() -> DrawList {
+        return DrawList(commands: commands, textures: textures, atlasTexture: atlasTexture)
+    }
+}

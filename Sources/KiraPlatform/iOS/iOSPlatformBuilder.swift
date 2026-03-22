@@ -28,13 +28,22 @@ public struct iOSPlatformBuilder {
         try runBindgen(for: config)
 
         print("  Compiling Kira bytecode...")
-        let bytecode = try compileProject(at: stagingRoot, target: .iOS(arch: .arm64))
+        let artifacts = try compileProject(
+            at: stagingRoot,
+            target: .iOS(arch: .arm64),
+            projectName: config.appName,
+            targetAppIdentifier: config.bundleID
+        )
         let bytecodeURL = sourcesDir.appendingPathComponent("\(config.appName).kirbc")
-        try bytecode.write(to: bytecodeURL, options: .atomic)
+        let manifestURL = sourcesDir.appendingPathComponent("\(config.appName).kirpatch.json")
+        try artifacts.bytecode.write(to: bytecodeURL, options: .atomic)
+        try artifacts.manifest.write(to: manifestURL, options: .atomic)
 
         print("  Writing platform sources...")
         try AppDelegateTemplate.generate(
             appName: config.appName,
+            projectName: config.appName,
+            targetAppIdentifier: config.bundleID,
             title: config.title,
             width: config.width,
             height: config.height
@@ -63,6 +72,7 @@ public struct iOSPlatformBuilder {
             headerSearchPaths: config.headerSearchPaths,
             deviceOnlyLibrarySearchPaths: [deviceLibFFIDirectory.path],
             bytecodePath: bytecodeURL.path,
+            manifestPath: manifestURL.path,
             kiraPackagePath: runtimePackageRoot.path,
             outputPath: projectPath.path,
             targetedDeviceFamily: targetedFamily
@@ -101,6 +111,18 @@ public struct iOSPlatformBuilder {
         text = text.replacingOccurrences(of: #"// Library: FFI/libsokol.dylib"#, with: #"// Library: current process"#)
         if !text.contains("extern function kira_sg_setup() -> CVoid") {
             text.append("\n@ffi(lib: \"\")\nextern function kira_sg_setup() -> CVoid\n")
+        }
+        if !text.contains("extern function kira_sg_begin_default_pass(") {
+            text.append(
+                """
+
+                @ffi(lib: "")
+                extern function kira_sg_begin_default_pass(clearEnabled: CBool, r: CFloat, g: CFloat, b: CFloat, a: CFloat, label: CPointer<CInt8>) -> CVoid
+
+                @ffi(lib: "")
+                extern function kira_sg_apply_vertex_buffer(buffer: sg_buffer) -> CVoid
+                """
+            )
         }
         try text.write(to: sokolBindings, atomically: true, encoding: .utf8)
 
@@ -150,7 +172,105 @@ public struct iOSPlatformBuilder {
             of: "    sg_setup(desc: sg_desc(environment: sglue_environment()))",
             with: "    kira_sg_setup()"
         )
+        if !applicationText.contains("function graphics_on_reload() {") {
+            applicationText.append(
+                """
+
+                @Doc("Reload hook invoked after the hosted Kira VM has been recreated inside an already-running native app.
+                Rebinds the active scene to the live graphics backend without restarting the native shell.
+                This keeps hot reload deterministic while preserving host-owned graphics state.")
+                function graphics_on_reload() {
+                    graphicsDevice = GraphicsDevice(backend: sg_query_backend())
+                    graphicsScene.onLoad(device: graphicsDevice)
+                    return
+                }
+                """
+            )
+        }
         try applicationText.write(to: graphicsApplication, atomically: true, encoding: .utf8)
+
+        let commandBufferURL = stagedPackages
+            .appendingPathComponent("Kira.Graphics", isDirectory: true)
+            .appendingPathComponent("Sources", isDirectory: true)
+            .appendingPathComponent("Core", isDirectory: true)
+            .appendingPathComponent("CommandBuffer.kira")
+        var commandBufferText = try String(contentsOf: commandBufferURL, encoding: .utf8)
+        let hostedRender = [
+            "    function render(descriptor: RenderPassDescriptor) -> RenderEncoder {",
+            "        let load_action = descriptor.clearEnabled ? SG_LOADACTION_CLEAR : SG_LOADACTION_LOAD",
+            "        let clear = sg_color(",
+            "            r: descriptor.clearColor.r,",
+            "            g: descriptor.clearColor.g,",
+            "            b: descriptor.clearColor.b,",
+            "            a: descriptor.clearColor.a)",
+            "        let color_action = sg_color_attachment_action(",
+            "            load_action: load_action,",
+            "            store_action: SG_STOREACTION_STORE,",
+            "            clear_value: clear)",
+            "        let pass_action = sg_pass_action(",
+            "            colors: CArray8_sg_color_attachment_action(_0: color_action),",
+            "            depth: sg_depth_attachment_action(),",
+            "            stencil: sg_stencil_attachment_action())",
+            "        let pass = sg_pass(",
+            "            _start_canary: 0,",
+            "            compute: false,",
+            "            action: pass_action,",
+            "            attachments: sg_attachments(),",
+            "            swapchain: sglue_swapchain(),",
+            "            label: descriptor.label,",
+            "            _end_canary: 0)",
+            "        sg_begin_pass(pass: pass)",
+            "        return RenderEncoder()",
+            "    }",
+        ].joined(separator: "\n")
+        let nativeRender = [
+            "    function render(descriptor: RenderPassDescriptor) -> RenderEncoder {",
+            "        kira_sg_begin_default_pass(",
+            "            clearEnabled: descriptor.clearEnabled,",
+            "            r: descriptor.clearColor.r,",
+            "            g: descriptor.clearColor.g,",
+            "            b: descriptor.clearColor.b,",
+            "            a: descriptor.clearColor.a,",
+            "            label: descriptor.label)",
+            "        return RenderEncoder()",
+            "    }",
+        ].joined(separator: "\n")
+        commandBufferText = commandBufferText.replacingOccurrences(of: hostedRender, with: nativeRender)
+        try commandBufferText.write(to: commandBufferURL, atomically: true, encoding: .utf8)
+
+        let renderEncoderURL = stagedPackages
+            .appendingPathComponent("Kira.Graphics", isDirectory: true)
+            .appendingPathComponent("Sources", isDirectory: true)
+            .appendingPathComponent("Core", isDirectory: true)
+            .appendingPathComponent("RenderEncoder.kira")
+        var renderEncoderText = try String(contentsOf: renderEncoderURL, encoding: .utf8)
+        let hostedDraw = [
+            "    function draw(primitive: Primitive, count: Int) {",
+            "        sg_apply_pipeline(pip: pipeline.handle)",
+            "        let bindings = sg_bindings(",
+            "            _start_canary: 0,",
+            "            vertex_buffers: CArray8_sg_buffer(_0: vertex0.handle),",
+            "            vertex_buffer_offsets: CArray8_CInt32(),",
+            "            index_buffer: sg_buffer(),",
+            "            index_buffer_offset: 0,",
+            "            views: CArray32_sg_view(),",
+            "            samplers: CArray12_sg_sampler(),",
+            "            _end_canary: 0)",
+            "        sg_apply_bindings(bindings: bindings)",
+            "        sg_draw(base_element: 0, num_elements: count, num_instances: 1)",
+            "        return",
+            "    }",
+        ].joined(separator: "\n")
+        let nativeDraw = [
+            "    function draw(primitive: Primitive, count: Int) {",
+            "        sg_apply_pipeline(pip: pipeline.handle)",
+            "        kira_sg_apply_vertex_buffer(buffer: vertex0.handle)",
+            "        sg_draw(base_element: 0, num_elements: count, num_instances: 1)",
+            "        return",
+            "    }",
+        ].joined(separator: "\n")
+        renderEncoderText = renderEncoderText.replacingOccurrences(of: hostedDraw, with: nativeDraw)
+        try renderEncoderText.write(to: renderEncoderURL, atomically: true, encoding: .utf8)
     }
 
     private func runBindgen(for config: AppleBuildConfiguration) throws {
@@ -171,7 +291,12 @@ public struct iOSPlatformBuilder {
         }
     }
 
-    private func compileProject(at root: URL, target: PlatformTarget) throws -> Data {
+    private func compileProject(
+        at root: URL,
+        target: PlatformTarget,
+        projectName: String,
+        targetAppIdentifier: String
+    ) throws -> (bytecode: Data, manifest: Data) {
         let fileManager = FileManager.default
         let previousDirectory = fileManager.currentDirectoryPath
         guard fileManager.changeCurrentDirectoryPath(root.path) else {
@@ -189,11 +314,16 @@ public struct iOSPlatformBuilder {
         let sources = try sourceFiles.map { url in
             SourceText(file: url.path, text: try String(contentsOf: url, encoding: .utf8))
         }
-        let output = try CompilerDriver().compile(sources: sources, target: target)
-        guard let bytecode = output.bytecode else {
-            throw NSError(domain: "KiraPlatform", code: 1, userInfo: [NSLocalizedDescriptionKey: "Missing bytecode output"])
-        }
-        return bytecode
+        let patchCompiler = PatchCompiler(config: .init(
+            sessionID: "bootstrap",
+            sessionToken: "bootstrap",
+            projectName: projectName,
+            targetAppIdentifier: targetAppIdentifier,
+            target: target
+        ))
+        let bundle = try patchCompiler.buildPatch(from: sources, sourceFiles: sourceFiles, generation: 0)
+        let manifest = try JSONEncoder().encode(bundle.manifest)
+        return (bundle.bytecode, manifest)
     }
 
     private func collectKiraSources(in directory: URL) throws -> [URL] {
@@ -225,6 +355,7 @@ public struct iOSPlatformBuilder {
         #import <Metal/Metal.h>
         #import <MetalKit/MetalKit.h>
         #import <QuartzCore/QuartzCore.h>
+        #include <stdbool.h>
 
         #include "vendor/sokol/sokol_app.h"
         #include "vendor/sokol/sokol_gfx.h"
@@ -236,6 +367,22 @@ public struct iOSPlatformBuilder {
             desc.environment = sglue_environment();
             desc.logger.func = slog_func;
             sg_setup(&desc);
+        }
+
+        __attribute__((visibility("default"))) void kira_sg_begin_default_pass(bool clearEnabled, float r, float g, float b, float a, const char* label) {
+            sg_pass pass = {0};
+            pass.swapchain = sglue_swapchain();
+            pass.label = label;
+            pass.action.colors[0].load_action = clearEnabled ? SG_LOADACTION_CLEAR : SG_LOADACTION_LOAD;
+            pass.action.colors[0].store_action = SG_STOREACTION_STORE;
+            pass.action.colors[0].clear_value = (sg_color){ .r = r, .g = g, .b = b, .a = a };
+            sg_begin_pass(&pass);
+        }
+
+        __attribute__((visibility("default"))) void kira_sg_apply_vertex_buffer(sg_buffer buffer) {
+            sg_bindings bindings = {0};
+            bindings.vertex_buffers[0] = buffer;
+            sg_apply_bindings(&bindings);
         }
         """
     }

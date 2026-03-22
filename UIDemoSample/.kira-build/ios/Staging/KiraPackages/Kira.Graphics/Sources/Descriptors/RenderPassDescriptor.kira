@@ -1,0 +1,26 @@
+@Doc("Mutable description of how a render pass should start.
+Use this with command-buffer APIs to choose clear behavior and attach debug labels.
+The descriptor is copied into backend pass state when rendering begins.")
+type RenderPassDescriptor {
+    @Doc("Whether the pass clears its color attachment before drawing.
+    Defaults to `false`, which preserves the current contents.
+    Set this when the frame should begin from a known color value.")
+    var clearEnabled: Bool = false
+    @Doc("Clear color used when `clearEnabled` is true.
+    Ignored when the pass is configured to load previous contents instead of clearing.
+    Defaults to `Color.black` for predictable startup behavior.")
+    var clearColor: Color = Color.black
+    @Doc("Optional debug label forwarded to the backend pass object.
+    Stable labels make GPU capture and debugging tools easier to read.
+    Defaults to the empty string when no label is needed.")
+    var label: String = ""
+
+    @Doc("Enable clearing and set the clear color in one step.
+    Returns `self` so the descriptor can be used fluently in builder-style configuration.
+    This is the simplest way to create a fresh pass at the start of a frame.")
+    function withClear(color: Color) -> RenderPassDescriptor {
+        clearEnabled = true
+        clearColor = color
+        return self
+    }
+}

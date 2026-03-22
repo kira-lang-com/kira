@@ -13,6 +13,8 @@ public enum BytecodeEmitError: Error, CustomStringConvertible, Sendable {
 }
 
 public struct BytecodeEmitter: Sendable {
+    public static let bytecodeFormatVersion: UInt32 = 1
+
     public init() {}
 
     public func emit(module: KiraIRModule) throws -> Data {
@@ -270,7 +272,7 @@ public struct BytecodeEmitter: Sendable {
 
         // Header (32 bytes).
         appendU32(0x4B495242) // "KIRB"
-        appendU32(1) // version
+        appendU32(Self.bytecodeFormatVersion) // version
         appendU32(0) // flags
         appendU32(UInt32(encodedFunctions.count))
         data.append(contentsOf: Array(repeating: 0, count: 16))

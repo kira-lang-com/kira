@@ -19,6 +19,7 @@ public struct XcodeProjGenerator {
         public var headerSearchPaths: [String]
         public var deviceOnlyLibrarySearchPaths: [String]
         public var bytecodePath: String
+        public var manifestPath: String
         public var kiraPackagePath: String
         public var outputPath: String
         public var targetedDeviceFamily: String?
@@ -34,6 +35,7 @@ public struct XcodeProjGenerator {
             headerSearchPaths: [String],
             deviceOnlyLibrarySearchPaths: [String] = [],
             bytecodePath: String,
+            manifestPath: String,
             kiraPackagePath: String,
             outputPath: String,
             targetedDeviceFamily: String? = nil
@@ -48,6 +50,7 @@ public struct XcodeProjGenerator {
             self.headerSearchPaths = headerSearchPaths
             self.deviceOnlyLibrarySearchPaths = deviceOnlyLibrarySearchPaths
             self.bytecodePath = bytecodePath
+            self.manifestPath = manifestPath
             self.kiraPackagePath = kiraPackagePath
             self.outputPath = outputPath
             self.targetedDeviceFamily = targetedDeviceFamily
@@ -104,6 +107,12 @@ public struct XcodeProjGenerator {
             lastKnownFileType: "file",
             path: "\(config.appName).kirbc"
         )
+        let manifestRef = PBXFileReference(
+            sourceTree: .group,
+            name: "\(config.appName).kirpatch.json",
+            lastKnownFileType: "text.json",
+            path: "\(config.appName).kirpatch.json"
+        )
         let infoPlistRef = PBXFileReference(
             sourceTree: .group,
             name: "Info.plist",
@@ -118,7 +127,7 @@ public struct XcodeProjGenerator {
         )
 
         sourcesGroup.children.append(contentsOf: [
-            appDelegateRef, sokolImplRef, bridgingHeaderRef, bytecodeRef, infoPlistRef,
+            appDelegateRef, sokolImplRef, bridgingHeaderRef, bytecodeRef, manifestRef, infoPlistRef,
         ])
         productsGroup.children.append(productRef)
 
@@ -158,7 +167,8 @@ public struct XcodeProjGenerator {
             PBXBuildFile(file: sokolImplRef),
         ]
         let resourcesBuildFiles = [
-            PBXBuildFile(file: bytecodeRef)
+            PBXBuildFile(file: bytecodeRef),
+            PBXBuildFile(file: manifestRef),
         ]
         let frameworkBuildFiles = frameworkRefs.map { PBXBuildFile(file: $0) }
         let staticLibraryBuildFiles = staticLibRefs.map { PBXBuildFile(file: $0) }
@@ -223,7 +233,7 @@ public struct XcodeProjGenerator {
             mainGroup, sourcesGroup, frameworksGroup, productsGroup, vendorGroup, sokolGroup,
         ])
         objects.append(contentsOf: [
-            appDelegateRef, sokolImplRef, bridgingHeaderRef, bytecodeRef, infoPlistRef, productRef,
+            appDelegateRef, sokolImplRef, bridgingHeaderRef, bytecodeRef, manifestRef, infoPlistRef, productRef,
         ])
         objects.append(contentsOf: headerRefs)
         objects.append(contentsOf: frameworkRefs)
@@ -277,7 +287,7 @@ public struct XcodeProjGenerator {
         let librarySearchPaths = Set(
             config.staticLibs.map {
                 URL(fileURLWithPath: $0).deletingLastPathComponent().path
-            } + packageBuildPaths
+            }
         ).sorted()
 
         var settings: BuildSettings = [
@@ -290,7 +300,6 @@ public struct XcodeProjGenerator {
             "SWIFT_OBJC_BRIDGING_HEADER": "Sources/KiraBridging.h",
             "HEADER_SEARCH_PATHS": ["$(SRCROOT)/Sources/vendor/sokol"] + config.headerSearchPaths,
             "LIBRARY_SEARCH_PATHS": librarySearchPaths,
-            "FRAMEWORK_SEARCH_PATHS": packageBuildPaths,
             "SWIFT_INCLUDE_PATHS": packageBuildPaths,
             "ARCHS": "arm64",
             "ONLY_ACTIVE_ARCH": "YES",
@@ -303,6 +312,11 @@ public struct XcodeProjGenerator {
             "SWIFT_OPTIMIZATION_LEVEL": release ? "-O" : "-Onone",
             "GCC_OPTIMIZATION_LEVEL": release ? "s" : "0",
         ]
+
+        if !release {
+            settings["SWIFT_ACTIVE_COMPILATION_CONDITIONS"] = ["$(inherited)", "DEBUG"]
+            settings["GCC_PREPROCESSOR_DEFINITIONS"] = ["$(inherited)", "DEBUG=1"]
+        }
 
         if !config.teamID.isEmpty {
             settings["DEVELOPMENT_TEAM"] = config.teamID

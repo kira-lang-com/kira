@@ -20,10 +20,12 @@ type Text: Widget {
     This keeps leaf text measurement compatible with the current layout engine.")
     function layoutDescriptor() -> LayoutDescriptor {
         let measured = TextLayout().measure(text: value, font: font)
-        if descriptor.width == SizeMode.Hug {
+        let widthIsHug = isHug(mode: descriptor.width)
+        if widthIsHug {
             descriptor.width = SizeMode.Fixed(value: measured.width)
         }
-        if descriptor.height == SizeMode.Hug {
+        let heightIsHug = isHug(mode: descriptor.height)
+        if heightIsHug {
             descriptor.height = SizeMode.Fixed(value: measured.height)
         }
         return descriptor
@@ -50,5 +52,27 @@ type Text: Widget {
     It always returns `false` so events may continue bubbling.")
     function handleInput(event: InputEvent, bounds: Rect) -> Bool {
         return false
+    }
+
+    @Doc("Return whether a size mode is the hug variant.
+    This helper avoids direct equality on payload-bearing enums after the descriptor has been resolved once.
+    It keeps text widgets safe to measure across repeated frames and live resizes.")
+    function isHug(mode: SizeMode) -> Bool {
+        match mode {
+            Hug:
+                return true
+            Fixed(let _):
+                return false
+            Fill:
+                return false
+            Fraction(let _):
+                return false
+            Min(let _):
+                return false
+            Max(let _):
+                return false
+            Range(let _, let _):
+                return false
+        }
     }
 }

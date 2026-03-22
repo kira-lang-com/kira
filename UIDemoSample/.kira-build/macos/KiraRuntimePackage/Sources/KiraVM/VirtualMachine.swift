@@ -149,6 +149,8 @@ public struct BytecodeModule: Sendable {
 }
 
 public struct BytecodeLoader: Sendable {
+    public static let currentBytecodeFormatVersion: UInt32 = 1
+
     public init() {}
 
     public func load(data: Data) throws -> BytecodeModule {
@@ -188,7 +190,10 @@ public struct BytecodeLoader: Sendable {
 
         let magic = try readU32()
         guard magic == 0x4B495242 else { throw VMError.invalidBytecode("bad magic") }
-        _ = try readU32() // version
+        let version = try readU32()
+        guard version == Self.currentBytecodeFormatVersion else {
+            throw VMError.invalidBytecode("unsupported bytecode version \(version)")
+        }
         _ = try readU32() // flags
         let fnCount = Int(try readU32())
         _ = try readBytes(16) // reserved

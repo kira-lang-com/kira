@@ -55,8 +55,10 @@ enum KiraCLI {
           new <name>                                         Create a new Kira project.
           build [--target ios|android|macos|linux|windows|wasm] [--release]
                                                              Compile the current project.
-          run                                                Compile and run the current project in the VM.
-          watch                                              Rebuild on source changes.
+          run [path] [--target macos|linux|windows|wasm] [--rebuild]
+                                                             Run a Kira file, or launch a cached native macOS app when available. Debug patch sessions start automatically for native debug builds with hotReload enabled.
+          watch [--target macos|ios] [--localhost] [--port <number>]
+                                                             Start a debug patch server for a native host app without launching it.
           doc [--all|--only-documented] --out <dir> [--force] [--clean]
                                                              Generate API docs.
           package add <name> <version>                       Add a package dependency.

@@ -52,43 +52,61 @@ enum KiraAppLauncher {
 private final class KiraGeneratedBootstrap {
     static let shared = KiraGeneratedBootstrap()
 
-    private var vm: VirtualMachine?
+    private let controller = KiraEmbeddedAppController()
 
     func prepare() throws {
-        if vm != nil {
-            return
-        }
-
         guard let bytecodeURL = Bundle.main.url(forResource: "{{APP_NAME}}", withExtension: "kirbc") else {
             throw NSError(domain: "KiraApp", code: 1, userInfo: [NSLocalizedDescriptionKey: "Missing bundled bytecode for {{APP_NAME}}"])
         }
 
-        let data = try Data(contentsOf: bytecodeURL)
-        let module = try BytecodeLoader().load(data: data)
-        let loadedVM = VirtualMachine(module: module, output: { message in
-            print(message)
-        })
+        let manifestURL = Bundle.main.url(forResource: "{{APP_NAME}}.kirpatch", withExtension: "json")
+        let environment = ProcessInfo.processInfo.environment
+        #if DEBUG
+        let sessionID = environment["KIRA_PATCH_SESSION"]
+        let sessionToken = environment["KIRA_PATCH_TOKEN"]
+        let patchHost = environment["KIRA_PATCH_HOST"]
+        let patchPort = environment["KIRA_PATCH_PORT"].flatMap(UInt16.init)
+        let debugModeEnabled = sessionID != nil && sessionToken != nil
+        #else
+        let sessionID: String? = nil
+        let sessionToken: String? = nil
+        let patchHost: String? = nil
+        let patchPort: UInt16? = nil
+        let debugModeEnabled = false
+        #endif
 
-        if module.functions.contains(where: { $0.name == "__kira_init_globals" }) {
-            _ = try loadedVM.run(function: "__kira_init_globals")
-        }
-        _ = try loadedVM.run(function: "main")
-        vm = loadedVM
+        try controller.prepare(config: .init(
+            appName: "{{APP_NAME}}",
+            projectName: "{{PROJECT_NAME}}",
+            targetAppIdentifier: "{{APP_ID}}",
+            initialBytecodeURL: bytecodeURL,
+            initialManifestURL: manifestURL,
+            debugModeEnabled: debugModeEnabled,
+            sessionID: sessionID,
+            sessionToken: sessionToken,
+            patchHost: patchHost,
+            patchPort: patchPort
+        ))
     }
 
     func runCallback(named functionName: String) {
-        guard let vm else {
-            print("[KiraRuntime] runtime not prepared for \(functionName)")
-            return
-        }
-        do {
-            _ = try vm.run(function: functionName)
-        } catch {
-            print("[KiraRuntime] \(functionName) failed: \(error)")
-        }
+        controller.runCallback(named: functionName)
+    }
+
+    func runCallback(named functionName: String, args: [KiraValue]) {
+        controller.runCallback(named: functionName, args: args)
     }
 
     func handleEvent(_ event: UnsafePointer<sapp_event>?) {
-        _ = event
+        guard let event else {
+            return
+        }
+        // Foundation layout runs in window-point coordinates, not retina-scaled framebuffer pixels.
+        let width = Int(event.pointee.window_width)
+        let height = Int(event.pointee.window_height)
+        guard width > 0 && height > 0 else {
+            return
+        }
+        runCallback(named: "graphics_on_resize", args: [.int(Int64(width)), .int(Int64(height))])
     }
 }

@@ -1,0 +1,27 @@
+@Doc("Text measurement and simple glyph-instance generation for Foundation.
+The current implementation estimates width from string length and font size.
+This keeps text widgets measurable and drawable inside the current compiler/runtime surface.")
+type TextLayout {
+    @Doc("Measure a string using the supplied font description.
+    Width is estimated from character count and a weight-adjusted advance factor.
+    Height is derived from font size with a stable line-height multiplier.")
+    function measure(text: String, font: Font) -> Size {
+        let count = text.count
+        let weightScale = font.weight == .Bold || font.weight == .Heavy || font.weight == .Black ? 0.65 : 0.6
+        let width = Float(count) * font.size * weightScale
+        let height = font.size * 1.2
+        return Size(width: width, height: height)
+    }
+
+    @Doc("Produce draw-ready glyph instances for a string at a root-space origin.
+    The current implementation emits one placeholder glyph instance spanning the full text bounds.
+    This keeps the draw list stable even before per-character rasterization is introduced.")
+    function layout(text: String, font: Font, origin: Point) -> [GlyphInstance] {
+        if text.count == 0 {
+            return []
+        }
+        let size = measure(text: text, font: font)
+        let glyph = GlyphInstance(atlasUV: Rect(x: 0.0, y: 0.0, width: 1.0, height: 1.0), bounds: Rect(x: origin.x, y: origin.y, width: size.width, height: size.height))
+        return [glyph]
+    }
+}

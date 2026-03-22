@@ -1,0 +1,48 @@
+@Doc("Snapshot of frame timing, drawable size, and device access for one scene update.
+Scenes receive a fresh `Frame` value each tick from the runtime.
+Use it to begin command recording and inspect the current presentation state.")
+type Frame {
+    @Doc("Current drawable width reported for this frame.
+    Use it when sizing render targets or viewport-dependent content.
+    The value comes directly from the platform bridge at frame start.")
+    var width: CFloat = 0.0
+    @Doc("Current drawable height reported for this frame.
+    Use it when sizing render targets or viewport-dependent content.
+    The value comes directly from the platform bridge at frame start.")
+    var height: CFloat = 0.0
+    @Doc("Backend frame count reported by the platform layer.
+    Useful for diagnostics or deterministic resource rotation schemes.
+    The runtime supplies this value rather than user code.")
+    var time: CUInt64 = 0
+    @Doc("Elapsed time in seconds since the previous frame.
+    Use this for frame-rate independent animation and simulation updates.
+    The value is provided by the native platform timing callback.")
+    var delta: CDouble = 0.0
+    @Doc("Monotonic frame index tracked by the Kira runtime.
+    Starts at zero when the application begins running.
+    Useful for temporal resource indexing and debugging.")
+    var index: Int = 0
+    @Doc("Graphics device associated with the current frame.
+    Use it to create resources that should outlive the current frame.
+    Most rendering work still flows through a command buffer created from the frame.")
+    var device: GraphicsDevice = GraphicsDevice()
+    @Doc("Default render-pass descriptor targeting the application swapchain.
+    Scenes can use this as a starting point when beginning frame rendering.
+    Modify it before encoding if the frame should clear or change its debug label.")
+    var defaultPass: RenderPassDescriptor = RenderPassDescriptor()
+
+    @Doc("Create a fresh command buffer for this frame.
+    Record passes and draws on the returned buffer, then present it.
+    Call this from `Scene.onFrame(frame:)` to begin issuing rendering work.")
+    function encode() -> CommandBuffer {
+        return CommandBuffer()
+    }
+
+    @Doc("Request application shutdown from within the current frame.
+    The underlying platform receives a quit request after this call.
+    Use this for explicit exit flows rather than normal frame control.")
+    function quit() {
+        sapp_quit()
+        return
+    }
+}

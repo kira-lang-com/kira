@@ -1,0 +1,30 @@
+@Doc("Utility wrapper around a root widget.
+This is a small convenience type for code that wants an explicit tree object.
+It can flatten descendants into a stable array order for diagnostics or tooling.")
+type WidgetTree {
+    @Doc("Root widget for the tree.")
+    var root: Widget
+
+    @Doc("Return the root widget followed by all descendants in depth-first order.
+    The traversal preserves child order as returned by each container widget.
+    Use this for debugging, inspection, or simple widget-tree tooling.")
+    function flattened() -> [Widget] {
+        var result: [Widget] = []
+        append(widget: root, into: result)
+        return result
+    }
+
+    @Doc("Append one widget and all descendants into the supplied result array.
+    Traversal is depth-first and preserves child order.
+    This helper exists so tree flattening logic stays in one place.")
+    function append(widget: Widget, into: [Widget]) {
+        into.append(widget)
+        let kids = widget.children()
+        var i = 0
+        while i < kids.count {
+            append(widget: kids[i], into: into)
+            i = i + 1
+        }
+        return
+    }
+}

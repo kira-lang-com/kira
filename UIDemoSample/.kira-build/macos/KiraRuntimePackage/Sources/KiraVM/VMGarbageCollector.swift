@@ -7,6 +7,7 @@ public final class VMGarbageCollector: @unchecked Sendable {
     public var grayStack: [ObjectRef] = []
     public var allObjectIDs: [Int] = []
     public var sweepCursor: Int = 0
+    public var sweepWriteCursor: Int = 0
     public var lastGCCount: Int = 0
 
     public init() {}
@@ -34,10 +35,14 @@ public final class VMGarbageCollector: @unchecked Sendable {
             if grayStack.isEmpty {
                 phase = .sweeping
                 sweepCursor = 0
+                sweepWriteCursor = 0
             }
         case .sweeping:
             sweep(heap: heap, budget: max(1, budget / 2))
             if sweepCursor >= allObjectIDs.count {
+                if sweepWriteCursor < allObjectIDs.count {
+                    allObjectIDs.removeSubrange(sweepWriteCursor..<allObjectIDs.count)
+                }
                 phase = .idle
                 lastGCCount = heapCount(heap)
             }
@@ -53,8 +58,7 @@ public final class VMGarbageCollector: @unchecked Sendable {
     }
 
     private func heapCount(_ heap: VMHeap) -> Int {
-        // Approx: allObjectIDs contains IDs, but some may have been removed.
-        allObjectIDs.count
+        heap.liveObjectCount
     }
 
     private func mark(ref: ObjectRef, heap: VMHeap) {
@@ -95,8 +99,9 @@ public final class VMGarbageCollector: @unchecked Sendable {
                 heap.remove(ref)
             } else {
                 obj.gcColor = .white
+                allObjectIDs[sweepWriteCursor] = id
+                sweepWriteCursor += 1
             }
         }
     }
 }
-

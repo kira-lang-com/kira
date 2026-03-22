@@ -38,8 +38,9 @@ func makeTargets() -> [Target] {
 
     var compilerDeps: [Target.Dependency] = [
         "KiraStdlib",
+        "KiraDebugRuntime",
     ]
-    var vmDeps: [Target.Dependency] = []
+    var vmDeps: [Target.Dependency] = ["KiraDebugRuntime"]
 
     #if os(Windows)
     if enableWindowsLibffi {
@@ -95,6 +96,10 @@ func makeTargets() -> [Target] {
             ]
         ),
         .target(
+            name: "KiraDebugRuntime",
+            path: "Sources/KiraDebugRuntime"
+        ),
+        .target(
             name: "KiraCompiler",
             dependencies: compilerDeps,
             path: "Sources/KiraCompiler",
@@ -137,13 +142,13 @@ func makeTargets() -> [Target] {
         ),
         .testTarget(
             name: "KiraCompilerTests",
-            dependencies: ["KiraCompiler"],
+            dependencies: ["KiraCompiler", "KiraDebugRuntime"],
             path: "Tests/KiraCompilerTests",
             linkerSettings: windowsLibffiLinkerSettings
         ),
         .testTarget(
             name: "KiraVMTests",
-            dependencies: ["KiraVM", "KiraCompiler"],
+            dependencies: ["KiraVM", "KiraCompiler", "KiraDebugRuntime"],
             path: "Tests/KiraVMTests",
             linkerSettings: windowsLibffiLinkerSettings
         ),
