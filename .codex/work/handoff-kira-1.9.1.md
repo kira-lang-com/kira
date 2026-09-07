@@ -363,6 +363,37 @@ single-commit failure is not evidence that the platform or the commit is
 involved; this one was reproducible everywhere and had been latent for as long
 as the sessions feature has existed.
 
+### An HTTP/3 test fails about one Windows run in five, and the error says only "Io"
+
+`kira-network`'s `http3_client_server_multiplexes_requests` failed once on
+windows-latest with
+
+```
+panicked at crates\kira-network\src\http3_api.rs:733:17:
+one: Io
+```
+
+which is the GET half of the pair returning `NetworkError::Io`. It passed on
+the four windows-latest runs before it, at 0.083s to 0.118s; the failing run
+took 0.103s, so the connection and both requests took their usual time and one
+of them then reported a transport failure. 480 runs of the same test on Linux,
+eight at a time, are clean. `crates/kira-network/src/http3_api.rs` has not been
+touched since 1.8.1.
+
+`Io` on that path can only come from `stream.finish()`, and quinn's `finish`
+returns an error only for `ClosedStream` — a peer STOP_SENDING is explicitly
+folded into `Ok` — so the send stream was already finished or reset when the
+client finished it. What did that is not established.
+
+The reason nothing more can be read out of the log is deliberate and is the
+thing to fix first: `NetworkError` is a `Copy` enum of stable negative codes
+returned through the C ABI, so every h3 and quinn error reaching it is mapped
+with `map_err(|_| NetworkError::Io)` and its cause is dropped at that line. The
+public error cannot grow a payload without changing the ABI, but the cause could
+be reported beside it — at which point one more occurrence would name the reason
+instead of repeating "Io". Until then this cannot be diagnosed without a Windows
+host to reproduce it on.
+
 ### A property that has nothing to do with time should not be stated in terms of it
 
 Two tests in this repository have now been "fixed" more than once for the same
