@@ -333,6 +333,36 @@ runs on a machine where more than one person builds. Nothing writes there any
 more, and a run can be checked for regressions by deleting it and confirming
 nothing recreates it.
 
+### A per-process counter is not an identifier — FIXED
+
+The MCP server saves every run it produces under
+`<temp>/kira-mcp-runs/<kind>-<stamp>-<ordinal>.json` and answers with that name,
+so a summary can stay small and the detail stay one lookup away. The ordinal
+comes from a process-local `AtomicU64` that starts at zero, and the stamp is a
+millisecond. Nothing in the name says which process wrote it.
+
+The tests run one process per test. Two of them save a `validate` run, and when
+they land in the same millisecond both compute `validate-<stamp>-0000` and write
+the same file. The one that reads its identifier back gets the other test's run,
+or — because the write truncates before it fills — a partial file that will not
+parse. Both failures present as `"replayed": false`: the server correctly
+refuses to describe a run it cannot read, and the test sees a saved run vanish
+between saving it and asking for it.
+
+It surfaced on macOS only, on one commit, alongside an unrelated change to how
+temp sources are laid out, and read exactly like a consequence of that change.
+It is neither: 150 concurrent pairs of those two tests on Linux reproduce it 19
+times in 300 runs. The identifier now carries the process id, and the same
+reproduction is clean in 600.
+
+Two things worth carrying forward. First, under process-per-test any
+process-local counter is a counter and not an identifier, and a shared directory
+in the system temp directory is shared with every other process on the machine —
+including another copy of the same test binary. Second, a single-platform,
+single-commit failure is not evidence that the platform or the commit is
+involved; this one was reproducible everywhere and had been latent for as long
+as the sessions feature has existed.
+
 ### A property that has nothing to do with time should not be stated in terms of it
 
 Two tests in this repository have now been "fixed" more than once for the same
