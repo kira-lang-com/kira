@@ -33,6 +33,13 @@ Measured on the merged tree, each run watched to completion:
 The pins in `crates/kira-cli/tests/kik_harness.rs` are 1502, 20021 and 302, each
 matching what the run reports.
 
+CI is green on `d4b7d8c`, every check: `fmt + clippy + build + test` on
+ubuntu-24.04, ubuntu-24.04-arm, macos-latest and windows-latest, `native async
+networking` on all three hosts, and the toolchain metadata gate. The three
+skipped entries are the release workflow's two conditional jobs and a
+third-party autofix advertisement, none of them a gate. windows-11-arm is out of
+the matrix until its LLVM bundle is rebuilt; section 7 says why.
+
 The wasm end-to-end tests **are** runnable on the development host. Earlier
 notes in this file said otherwise; Emscripten installs there in one step
 (`git clone emscripten-core/emsdk && ./emsdk install latest && ./emsdk activate
