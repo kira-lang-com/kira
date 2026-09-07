@@ -80,6 +80,14 @@ fn main() {
     // `KIRA_LLVM_LINK_TRACE` is set, because it is a question with one asker.
     println!("cargo:rerun-if-env-changed=KIRA_LLVM_LINK_TRACE");
     if std::env::var_os("KIRA_LLVM_LINK_TRACE").is_some() {
+        // The raw answer as well as what was made of it. Which of the two is
+        // wrong is the whole question when a link fails for want of symbols
+        // these archives define, and a host nobody can log into answers it
+        // only if both are in the log.
+        println!(
+            "cargo:warning=llvm-config --link-static --libs answered: {}",
+            libs.trim()
+        );
         println!(
             "cargo:warning=linking {} LLVM librar{} from {}: {}",
             names.len(),
@@ -255,17 +263,27 @@ fn run(llvm_config: &Path, args: &[&str]) -> String {
 /// else on the line (search-path flags, verbatim paths) is not a library
 /// name and is dropped.
 fn link_names(line: &str) -> Vec<String> {
-    line.split_whitespace()
-        .filter_map(|token| {
-            if let Some(name) = token.strip_prefix("-l") {
-                Some(name.to_owned())
-            } else {
-                token
-                    .strip_suffix(".lib")
-                    .map(|name| name.rsplit(['/', '\\']).next().unwrap_or(name).to_owned())
-            }
-        })
-        .collect()
+    line.split_whitespace().filter_map(library_name).collect()
+}
+
+/// One token of an `llvm-config` link line as a bare library name, or `None`
+/// when the token names no library.
+///
+/// Every spelling is reduced the same way rather than by branch, because the
+/// branches were not equivalent and the difference was invisible on the
+/// platform they were written on. A `-l` prefix, a directory, and a `.lib`
+/// suffix are each removed if present, in that order — so `-lLLVMCore`,
+/// `LLVMCore.lib`, `C:\bundle\lib\LLVMCore.lib` and even `-lLLVMCore.lib`
+/// all answer `LLVMCore`.
+///
+/// The last of those is the one that mattered: it used to keep its suffix,
+/// because only the non-`-l` branch stripped it, and a name carrying `.lib`
+/// asks a linker that appends the extension itself for `LLVMCore.lib.lib`.
+fn library_name(token: &str) -> Option<String> {
+    let token = token.strip_prefix("-l").unwrap_or(token);
+    let token = token.rsplit(['/', '\\']).next().unwrap_or(token);
+    let name = token.strip_suffix(".lib").unwrap_or(token);
+    (!name.is_empty() && !name.starts_with('-')).then(|| name.to_owned())
 }
 
 /// Fails the build with a message cargo shows the user, without a backtrace.
