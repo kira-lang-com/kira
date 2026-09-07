@@ -370,36 +370,49 @@ single-commit failure is not evidence that the platform or the commit is
 involved; this one was reproducible everywhere and had been latent for as long
 as the sessions feature has existed.
 
-### An HTTP/3 test fails about one Windows run in five, and the error says only "Io"
+### A request whose body the server never reads was a coin toss — FIXED
 
-`kira-network`'s `http3_client_server_multiplexes_requests` failed once on
-windows-latest with
+`kira-network`'s `http3_client_server_multiplexes_requests` failed on
+windows-latest and then, two runs later, on macos-latest, both times identically:
 
 ```
-panicked at crates\kira-network\src\http3_api.rs:733:17:
+panicked at crates/kira-network/src/http3_api.rs:733:17:
 one: Io
 ```
 
-which is the GET half of the pair returning `NetworkError::Io`. It passed on
-the four windows-latest runs before it, at 0.083s to 0.118s; the failing run
-took 0.103s, so the connection and both requests took their usual time and one
-of them then reported a transport failure. 480 runs of the same test on Linux,
-eight at a time, are clean. `crates/kira-network/src/http3_api.rs` has not been
-touched since 1.8.1.
+Always the GET half of the pair, never the POST, and always at the normal
+duration — the connection and both requests took their usual tenth of a second
+and one of them then reported a transport failure. It looked platform-specific
+and was not; it is a race that this suite loses about one run in five.
 
-`Io` on that path can only come from `stream.finish()`, and quinn's `finish`
-returns an error only for `ClosedStream` — a peer STOP_SENDING is explicitly
-folded into `Ok` — so the send stream was already finished or reset when the
-client finished it. What did that is not established.
+The GET's handler answers from the request line and never reads the request
+body, so the body reader is dropped as the response is produced. Dropping it
+terminates the receiving side of that request stream, and the client's
+`finish()` — sent a moment later — fails, because h3 writes a GREASE frame there
+and the write goes to a stream the peer has stopped reading. The client's
+`send_request` mapped that to `NetworkError::Io` and failed the request, so
+whether the answer beat the last write decided whether the request succeeded.
+The POST never failed because its handler reads the body to the end.
 
-The reason nothing more can be read out of the log is deliberate and is the
-thing to fix first: `NetworkError` is a `Copy` enum of stable negative codes
-returned through the C ABI, so every h3 and quinn error reaching it is mapped
-with `map_err(|_| NetworkError::Io)` and its cause is dropped at that line. The
-public error cannot grow a payload without changing the ABI, but the cause could
-be reported beside it — at which point one more occurrence would name the reason
-instead of repeating "Io". Until then this cannot be diagnosed without a Windows
-host to reproduce it on.
+The client now treats `StreamError::RemoteTerminate` on the sending side as what
+it is — the peer saying it has what it needs — stops sending and reads the
+response, which is already on its way. Every other failure is still reported as
+`Io`. `recv_response` remains the judge of whether the request actually
+succeeded, so a connection that really is broken is still a failure.
+
+The regression test is `a_server_that_answers_without_reading_the_body_still_answers`:
+an 8 MiB body posted to a route that answers without reading it, so the answer
+arrives while the body is still going and the ordering is not left to chance. It
+fails on the old code with the same `Io` and passes on the new. 640 runs of both
+HTTP/3 tests, sixteen at a time, are clean.
+
+Two things this cost more than it should have. `NetworkError` is a `Copy` enum
+of stable negative codes for the C ABI, so every h3 and quinn error reaching it
+is mapped with `map_err(|_| NetworkError::Io)` and its cause is dropped at that
+line: the CI log could say only "Io", and neither run could be told from the
+other. And the first occurrence was on Windows alone, which made a platform
+difference look like the explanation; it was not one, and the second occurrence
+on macOS is what said so.
 
 ### A property that has nothing to do with time should not be stated in terms of it
 
