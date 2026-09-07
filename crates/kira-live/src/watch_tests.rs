@@ -204,13 +204,18 @@ fn build_output_never_triggers_a_rebuild() {
     ] {
         dir.write(output, "build output");
     }
+    // Ordered rather than timed, for the reason
+    // `a_single_file_root_does_not_watch_its_siblings` gives: a real edit is
+    // written last and waited for, so what this asserts is that the batch
+    // holding it holds nothing else — not that a notification service stayed
+    // quiet for a quarter of a second.
+    let source = dir.write("app.kira", "after!");
 
-    assert!(
-        watcher
-            .wait_for(Duration::from_millis(250))
-            .expect("output watcher")
-            .is_empty()
-    );
+    let reported: Vec<PathBuf> = changes(&mut watcher)
+        .into_iter()
+        .map(|change| change.path)
+        .collect();
+    assert_eq!(reported, vec![source]);
 }
 
 #[test]
@@ -228,13 +233,14 @@ fn editor_noise_never_triggers_a_rebuild() {
     ] {
         dir.write(noise, "noise");
     }
+    // Ordered rather than timed; see `build_output_never_triggers_a_rebuild`.
+    let source = dir.write("app.kira", "after!");
 
-    assert!(
-        watcher
-            .wait_for(Duration::from_millis(250))
-            .expect("noise watcher")
-            .is_empty()
-    );
+    let reported: Vec<PathBuf> = changes(&mut watcher)
+        .into_iter()
+        .map(|change| change.path)
+        .collect();
+    assert_eq!(reported, vec![source]);
 }
 
 #[test]
@@ -276,6 +282,20 @@ fn shaders_and_assets_are_watched() {
     assert_eq!(changed, expected);
 }
 
+/// A root that names one file reports that file and not the directory it sits
+/// in.
+///
+/// Ordered rather than timed. The sibling is written first and the root second,
+/// and the wait is for the root's own change — a signal that must arrive —
+/// rather than for a window in which the sibling's must not. A watcher that
+/// followed the whole directory would put the sibling in this batch, because
+/// the platform reports in the order the writes happened; one that watches the
+/// file alone reports only the file.
+///
+/// The earlier spelling asserted nothing arrived within 150ms, which is a claim
+/// about how promptly a file-system notification service delivers rather than
+/// about what this watcher watches. It failed on macOS, where FSEvents watches
+/// the directory and the filtering this test is about happens afterwards.
 #[test]
 fn a_single_file_root_does_not_watch_its_siblings() {
     let dir = TempDir::new("single");
@@ -284,14 +304,13 @@ fn a_single_file_root_does_not_watch_its_siblings() {
     let mut watcher = SourceWatcher::new(WatchSet::new().root(&source)).expect("watcher");
 
     fs::write(&sibling, "changed").expect("sibling edit");
-    assert!(
-        watcher
-            .wait_for(Duration::from_millis(150))
-            .expect("sibling watcher")
-            .is_empty()
-    );
     fs::write(&source, "after!").expect("source edit");
-    assert_eq!(changes(&mut watcher).len(), 1);
+
+    let reported: Vec<PathBuf> = changes(&mut watcher)
+        .into_iter()
+        .map(|change| change.path)
+        .collect();
+    assert_eq!(reported, vec![source], "sibling was {}", sibling.display());
 }
 
 #[test]

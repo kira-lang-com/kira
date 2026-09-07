@@ -37,9 +37,24 @@ jobs:
           - os: windows-latest
             host_key: x86_64-windows-msvc
             emscripten: true
-          - os: windows-11-arm
-            host_key: aarch64-windows-msvc
-            emscripten: false
+          # windows-11-arm is deliberately absent, not forgotten.
+          #
+          # The published `aarch64-windows-msvc` LLVM bundle is built for the
+          # wrong architecture: every member of its `LLVMCore.lib` is an AMD64
+          # object under an aarch64 name. It installs, it is the right size, and
+          # its archives hold every symbol a reader looks for — the only thing
+          # that ever objects is `link.exe` on that host, which skips the
+          # wrong-machine members and reports each symbol as merely unresolved.
+          #
+          # The cause is fixed: `release-llvm-toolchains.yml` now names the MSVC
+          # `arch` from the target key, where `ilammy/msvc-dev-cmd` defaulted to
+          # `x64` on every runner, and `check-bundle-architecture.ps1` fails a
+          # bundle whose machine type is not the one its name promises. What is
+          # missing is a rebuilt bundle: restoring this entry needs the LLVM
+          # toolchains workflow re-run with publish enabled for that target.
+          #
+          # Until then this runner cannot compile the workspace at all, so
+          # keeping it would report a broken artifact as a broken repository.
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

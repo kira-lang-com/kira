@@ -423,6 +423,34 @@ suffix was surviving into a `#[link]` name. The trace showed that host's
 `llvm-config` answers the plain form, so the branch handled it correctly all
 along. That change removed a real latent bug and was not this one.
 
+### The aarch64-windows-msvc LLVM bundle is built for the wrong architecture
+
+`windows-11-arm` is out of `ci.yml`'s matrix and restoring it needs one thing:
+a republished bundle.
+
+Every member of `LLVMCore.lib` in the published `aarch64-windows-msvc` bundle
+is an **AMD64** object. Read the COFF header of any member and it says
+`machine=0x8664`; the libffi archive from the same host says `ARM64`, which is
+the contrast that settles it. The bundle installs, is within 5MB of the x86_64
+one, and every symbol a reader looks for is defined in it — `llvm-nm` finds
+`LLVMBuildLoad2` without complaint. The only thing that ever objected was
+`link.exe` on the host it claims to serve, which skips wrong-machine members
+and reports each symbol as *unresolved* rather than as a mismatch. Three people
+concluded the Kira side was at fault, twice.
+
+The cause was one unset input. `ilammy/msvc-dev-cmd@v1` defaults to `x64`
+whatever it runs on, and `release-llvm-toolchains.yml` did not name an `arch`,
+so the arm64 job got an x64 developer environment. It now derives the arch from
+the target key, and `check-bundle-architecture.ps1` reads the PE header of the
+bundle's own `llvm-config.exe` and fails the build when the machine type is not
+the one the target key promises — because that is the assertion whose absence
+let this ship.
+
+**To restore the runner:** re-run the LLVM toolchains workflow with publish
+enabled for `aarch64-windows-msvc`, confirm the new bundle passes the
+architecture check, then put the matrix entry back. Nothing in Kira can link an
+x86_64 archive on ARM64, so there is no workaround on this side.
+
 ### libffi is installed without a published checksum
 
 `knvm install libffi` prints `no checksum is published for this artifact; it
