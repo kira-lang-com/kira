@@ -304,6 +304,71 @@ for file *access*, so opening is never the problem; the question is only whether
 the path is ever compared as a string or pasted into source, and being used to
 open a file as well does not exempt it.
 
+### Tests that share a build directory race each other
+
+`write_source` wrote its `.kira` file straight into the system temp directory,
+and a build puts its `.kira-build` beside the source it was given — so every
+test using it built into one shared `/tmp/.kira-build`. A `kira build` clears
+its output directory on the way in, so one test's build removed the directory
+another test's LLVM worker was moving an object into. It surfaced as
+
+```
+cannot move the emitted object into `/tmp/.kira-build/web/kira_e2e_34499_0.o`:
+No such file or directory
+```
+
+on one runner and not another, naming a path that looks like the failing test's
+own private business.
+
+The helper beside it, `write_isolated_source`, existed for exactly this and its
+doc comment says so — *"removing one test's `.kira-build` must not race an LLVM
+worker belonging to another test"* — but the tests that inspect build artifacts
+were not the ones using it. Fixing those call sites would have left the class:
+the racing *writer* can be any of the fourteen tests that build. `write_source`
+gives every source its own directory now, keeping the unique stem so a caller
+deriving an artifact name from it reads the same.
+
+Worth knowing: `/tmp/.kira-build` is also shared between users and between
+runs on a machine where more than one person builds. Nothing writes there any
+more, and a run can be checked for regressions by deleting it and confirming
+nothing recreates it.
+
+### A property that has nothing to do with time should not be stated in terms of it
+
+Two tests in this repository have now been "fixed" more than once for the same
+underlying reason, and the second one cost a passing platform.
+
+The timeline test took three attempts. An absolute millisecond bound, then a
+bound against its own gap, and both were assertions about how promptly a loaded
+machine wakes a thread. It settled only when the clock left the test entirely
+and the instants were injected — because what the recorder does with a repeated
+phase is arithmetic, and arithmetic has no timing.
+
+The watcher tests took two. They asserted *nothing arrived within 150ms* after
+writing a file the watcher should ignore, which failed on macOS where FSEvents
+watches the directory and the filtering happens afterwards. The replacement
+waited for a real edit and asserted the batch holding it held nothing else —
+which fixed macOS and **broke ubuntu-24.04-arm**, while x86_64 Linux kept
+passing. Same OS, same inotify, so it was never backend semantics: it was
+timing, and the rewrite had moved the dependence rather than removed it.
+
+What the property actually is: *no ignored path is ever reported, and the real
+edit is*. That references no batch, no grouping and no interval, so it cannot
+be traded from one platform to another — the helper reads events until the edit
+that must arrive has, and both claims are made against the union of everything
+seen.
+
+Two of those three tests — `build_output_never_triggers_a_rebuild` and
+`editor_noise_never_triggers_a_rebuild` — were rewritten pre-emptively, because
+they shared the shape of the one that failed rather than because they had. They
+turned out fine on every platform, so that gamble cost nothing this time; it is
+still a gamble, and the batch-free formulation is what makes all three safe
+rather than the ordering that preceded it.
+
+`a_change_is_reported_once` still asserts an absence within 150ms, and is the
+last of this shape. It is left alone deliberately: it has never failed, and the
+lesson above is exactly about not rewriting that.
+
 ### Output equality is the weakest thing a test can assert here
 
 Three defects this effort were each caught by a *stronger* assertion than the
