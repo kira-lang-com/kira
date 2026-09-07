@@ -381,7 +381,7 @@ was made wrongly against the builder. A reader should not assume that a
 verified module means the code which produced it was used correctly; that whole
 class is unguarded, and this one was caught only because it faulted.
 
-### A link requirement that only travelled by inheritance
+### A link requirement that only travelled by inheritance — twice
 
 `kira-llvm-backend` named the LLVM archives it needs with
 `cargo:rustc-link-lib` from its build script. That reaches the artifacts cargo
@@ -404,10 +404,24 @@ dependent. This is the same rule as a producer refusing rather than emitting
 nothing: **a link line that arrives half-formed is worse than one that does not
 arrive**, because the failure names something that is not at fault.
 
-Why only aarch64 Windows exposed it is not established. x86_64 Windows links
-the same graph and succeeds, so something about that target resolves what the
-other does not — and that difference is now moot rather than understood, which
-is worth saying plainly.
+`kira-libffi` had the identical shape one layer over, and only showed itself
+once the LLVM half resolved: same build-script executable, same search path
+present, `ffi_prep_cif` and five siblings unresolved. Both crates declare their
+archive in their own metadata now. The rule generalises — **a crate that must
+be linked against a native library says so in the crate, not only in a
+directive its build script emits** — and it is worth checking any other crate
+that emits `cargo:rustc-link-lib` against the same question.
+
+Why only aarch64 Windows exposed either of them is not established. x86_64
+Windows links the same graph and succeeds, so something about that target
+resolves what the other does not — and that difference is now moot rather than
+understood, which is worth saying plainly.
+
+One correction to keep the record straight: a fix that normalised every
+library-name spelling in `link_names` was pushed on the theory that a `.lib`
+suffix was surviving into a `#[link]` name. The trace showed that host's
+`llvm-config` answers the plain form, so the branch handled it correctly all
+along. That change removed a real latent bug and was not this one.
 
 ### libffi is installed without a published checksum
 
