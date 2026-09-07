@@ -381,6 +381,34 @@ was made wrongly against the builder. A reader should not assume that a
 verified module means the code which produced it was used correctly; that whole
 class is unguarded, and this one was caught only because it faulted.
 
+### A link requirement that only travelled by inheritance
+
+`kira-llvm-backend` named the LLVM archives it needs with
+`cargo:rustc-link-lib` from its build script. That reaches the artifacts cargo
+links the crate into *as a dependency*, and it does not reach a link that
+includes the rlib from somewhere else — another crate's **build-script
+executable**, which is what `kira-export-consumer` builds, because it
+build-depends on `kira-build` and `kira-build` depends on the backend
+unconditionally.
+
+There the search path arrived and the library names did not, so `link.exe`
+reported every LLVM symbol the crate references as unresolved, each one naming
+one of Kira's own functions. It read as a broken LLVM bundle, and three people
+looked there first. The bundle was complete: 194 archives, the same as x86_64,
+with the symbols defined.
+
+The names are now `#[link]` attributes generated into the crate from the
+bundle's own `llvm-config`, so the requirement is recorded in the rlib metadata
+and travels with it wherever it goes. The cargo directives stay for a direct
+dependent. This is the same rule as a producer refusing rather than emitting
+nothing: **a link line that arrives half-formed is worse than one that does not
+arrive**, because the failure names something that is not at fault.
+
+Why only aarch64 Windows exposed it is not established. x86_64 Windows links
+the same graph and succeeds, so something about that target resolves what the
+other does not — and that difference is now moot rather than understood, which
+is worth saying plainly.
+
 ### libffi is installed without a published checksum
 
 `knvm install libffi` prints `no checksum is published for this artifact; it

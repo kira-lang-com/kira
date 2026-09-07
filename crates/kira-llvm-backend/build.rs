@@ -88,6 +88,38 @@ fn main() {
             names.join(" "),
         );
     }
+    // Written into the crate rather than only emitted as cargo directives.
+    //
+    // `cargo:rustc-link-lib` names a library for the artifacts cargo links this
+    // crate into *as a dependency*. It does not reach a link that includes this
+    // rlib from somewhere else — another crate's build-script executable, which
+    // is what `kira-export-consumer` builds — and there the search path arrives
+    // while the library names do not, so the link fails naming Kira's own
+    // functions and not the list that never got there.
+    //
+    // A `#[link]` attribute is recorded in the crate's own metadata, so it
+    // travels with the rlib wherever it goes. The requirement stops depending
+    // on inheritance that is not guaranteed, which is the same rule as a
+    // producer refusing rather than emitting nothing: a link line that arrives
+    // half-formed is worse than one that does not arrive.
+    let declarations: String = names
+        .iter()
+        .map(|name| {
+            format!("#[link(name = \"{name}\", kind = \"static\")]\nunsafe extern \"C\" {{}}\n")
+        })
+        .collect();
+    let out_dir = std::env::var("OUT_DIR").unwrap_or_else(|error| {
+        fail(&format!("cargo set no OUT_DIR: {error}"));
+    });
+    let written = Path::new(&out_dir).join("llvm_link.rs");
+    if let Err(error) = std::fs::write(&written, declarations) {
+        fail(&format!(
+            "cannot write the LLVM link declarations to `{}`: {error}",
+            written.display()
+        ));
+    }
+    // Kept as well: they are what a plain dependent has always used, and the
+    // order `llvm-config` gives is a dependency order a static link needs.
     for name in names {
         println!("cargo:rustc-link-lib=static={name}");
     }
