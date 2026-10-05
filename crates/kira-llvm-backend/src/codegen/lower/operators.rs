@@ -15,6 +15,13 @@ use llvm_sys::{LLVMIntPredicate, LLVMRealPredicate};
 use super::FunctionLowering;
 use crate::LlvmError;
 
+/// One lazy branch of a select expression.
+pub(super) struct SelectArm<'a> {
+    pub(super) setup: &'a [kira_ir::IrStmt],
+    pub(super) value: IrExprId,
+    pub(super) cleanup: &'a [u32],
+}
+
 impl FunctionLowering<'_, '_> {
     /// Lowers a unary operator.
     pub(super) fn lower_unary(&mut self, op: IrUnOp, value: LLVMValueRef) -> LLVMValueRef {
@@ -191,6 +198,21 @@ impl FunctionLowering<'_, '_> {
                 IrBinOp::EqStr | IrBinOp::NeStr => {
                     return Ok(self.lower_string_compare(op, left, right));
                 }
+                // `==` / `!=` on a struct, an array, or a payload-carrying enum.
+                // The type checker settled that both operands share one
+                // `Equatable` type, so the walk is type-directed — the same one
+                // `EqAny` reaches once erasure recovers the type — rather than
+                // reading a runtime tag. The operand type is the operands', not
+                // `ty`, which is the `Bool` result.
+                IrBinOp::EqValue | IrBinOp::NeValue => {
+                    let operand_ty = self.type_of(lhs);
+                    return self.codegen.equal_values(
+                        left,
+                        right,
+                        operand_ty,
+                        op == IrBinOp::NeValue,
+                    );
+                }
                 // Both operands are erasure boxes, and the runtime reads the
                 // type each carries before it reads either payload. The two are
                 // dropped afterwards, as every comparison drops what it
@@ -230,6 +252,16 @@ impl FunctionLowering<'_, '_> {
                     right,
                     c"type.ne".as_ptr(),
                 ),
+                // Structural three-way ordering on a struct or an array (an enum
+                // is refused inside the walk until its native path exists). The
+                // walk answers an `i8` sign; `CmpValue` is a plain `Int`, so it
+                // is sign-extended to `i64` and the surrounding comparison
+                // against zero recovers `<`, `<=`, `>`, `>=`.
+                IrBinOp::CmpValue => {
+                    let operand_ty = self.type_of(lhs);
+                    let sign = self.codegen.compare_values(left, right, operand_ty)?;
+                    LLVMBuildSExt(builder, sign, self.codegen.types.i64, c"cmp.wide".as_ptr())
+                }
                 IrBinOp::BitAnd => LLVMBuildAnd(builder, left, right, c"and".as_ptr()),
                 IrBinOp::BitOr => LLVMBuildOr(builder, left, right, c"or".as_ptr()),
                 IrBinOp::BitXor => LLVMBuildXor(builder, left, right, c"xor".as_ptr()),
@@ -454,8 +486,8 @@ impl FunctionLowering<'_, '_> {
     pub(super) fn lower_select(
         &mut self,
         cond: IrExprId,
-        then: IrExprId,
-        otherwise: IrExprId,
+        then_arm: SelectArm<'_>,
+        otherwise_arm: SelectArm<'_>,
         ty: Type,
     ) -> Result<LLVMValueRef, LlvmError> {
         let condition = self.lower_expr(cond)?;
@@ -470,7 +502,9 @@ impl FunctionLowering<'_, '_> {
         unsafe { LLVMBuildCondBr(builder, condition, then_block, else_block) };
 
         self.position_at(then_block);
-        let then_value = self.lower_expr(then)?;
+        self.lower_block(then_arm.setup)?;
+        let then_value = self.lower_expr(then_arm.value)?;
+        self.lower_select_cleanup(then_arm.cleanup)?;
         // SAFETY: the then block is unterminated; join it to the end. The exit
         // block is re-read rather than assumed, because lowering the branch may
         // itself have created blocks (a nested conditional, or a division).
@@ -480,7 +514,9 @@ impl FunctionLowering<'_, '_> {
         };
 
         self.position_at(else_block);
-        let else_value = self.lower_expr(otherwise)?;
+        self.lower_block(otherwise_arm.setup)?;
+        let else_value = self.lower_expr(otherwise_arm.value)?;
+        self.lower_select_cleanup(otherwise_arm.cleanup)?;
         // SAFETY: as above, for the else branch.
         let else_exit = unsafe {
             LLVMBuildBr(builder, done_block);
@@ -499,6 +535,17 @@ impl FunctionLowering<'_, '_> {
             phi
         };
         Ok(result)
+    }
+
+    /// Releases locals whose lexical lifetime belongs to one select branch,
+    /// after the branch value has been materialized for the join.
+    fn lower_select_cleanup(&mut self, locals: &[u32]) -> Result<(), LlvmError> {
+        for &slot in locals {
+            let ty = self.local_type(slot)?;
+            let pointer = self.local_pointer(slot)?;
+            self.release_local_if_live(slot, pointer, ty)?;
+        }
+        Ok(())
     }
 
     /// Lowers `&&`/`||` as branches, evaluating the right operand only when the

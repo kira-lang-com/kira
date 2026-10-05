@@ -28,6 +28,7 @@ pub(in crate::codegen) fn declare_runtime(module: LLVMModuleRef, types: &Types) 
             print_float: declare(c"kira_rt_print_float", types.void, &mut [types.f64]),
             print_bool: declare(c"kira_rt_print_bool", types.void, &mut [types.i8]),
             print_str: declare(c"kira_rt_print_str", types.void, &mut [types.ptr]),
+            abort: declare(c"kira_rt_abort", types.void, &mut [types.ptr]),
             str_new: declare(
                 c"kira_rt_str_new",
                 types.ptr,
@@ -39,6 +40,7 @@ pub(in crate::codegen) fn declare_runtime(module: LLVMModuleRef, types: &Types) 
                 &mut [types.ptr, types.ptr],
             ),
             str_eq: declare(c"kira_rt_str_eq", types.i8, &mut [types.ptr, types.ptr]),
+            str_cmp: declare(c"kira_rt_str_cmp", types.i8, &mut [types.ptr, types.ptr]),
             str_free: declare(c"kira_rt_str_free", types.void, &mut [types.ptr]),
             // The array helpers are generic over the element type: a size and
             // a clone/free callback are all they need, so one declaration each
@@ -88,19 +90,42 @@ pub(in crate::codegen) fn declare_runtime(module: LLVMModuleRef, types: &Types) 
                 // (a, b, element size, element equality leaf)
                 &mut [types.ptr, types.ptr, types.i64, types.ptr],
             ),
-            enum_new_aggregate_eq: declare(
-                c"kira_rt_enum_new_aggregate_eq",
-                types.ptr,
-                // (tag, source, size, clone, free, eq)
-                &mut [
-                    types.i64, types.ptr, types.i64, types.ptr, types.ptr, types.ptr,
-                ],
+            array_cmp: declare(
+                c"kira_rt_array_cmp",
+                types.i8,
+                // (a, b, element size, element three-way-compare leaf)
+                &mut [types.ptr, types.ptr, types.i64, types.ptr],
+            ),
+            any_cmp: declare(c"kira_rt_any_cmp", types.i8, &mut [types.ptr, types.ptr]),
+            any_hash: declare(c"kira_rt_any_hash", types.i64, &mut [types.i64, types.ptr]),
+            hash_seed: declare(c"kira_rt_hash_seed", types.i64, &mut []),
+            hash_bytes: declare(
+                c"kira_rt_hash_bytes",
+                types.i64,
+                // (acc, ptr, len)
+                &mut [types.i64, types.ptr, types.i64],
+            ),
+            hash_str: declare(c"kira_rt_hash_str", types.i64, &mut [types.i64, types.ptr]),
+            hash_array: declare(
+                c"kira_rt_hash_array",
+                types.i64,
+                // (acc, array, element size, element hash leaf)
+                &mut [types.i64, types.ptr, types.i64, types.ptr],
             ),
             enum_new_aggregate: declare(
                 c"kira_rt_enum_new_aggregate",
                 types.ptr,
                 // (tag, source, size, clone, free)
                 &mut [types.i64, types.ptr, types.i64, types.ptr, types.ptr],
+            ),
+            enum_new_aggregate_ord: declare(
+                c"kira_rt_enum_new_aggregate_ord",
+                types.ptr,
+                // (tag, source, size, clone, free, eq, cmp, hash)
+                &mut [
+                    types.i64, types.ptr, types.i64, types.ptr, types.ptr, types.ptr, types.ptr,
+                    types.ptr,
+                ],
             ),
             enum_tag: declare(c"kira_rt_enum_tag", types.i64, &mut [types.ptr]),
             enum_payload: declare(c"kira_rt_enum_payload", types.i64, &mut [types.ptr]),
@@ -308,7 +333,33 @@ pub(in crate::codegen) fn declare_runtime(module: LLVMModuleRef, types: &Types) 
                 ),
                 declare(c"kira_rt_string_is_int", types.i1, &mut [types.ptr]),
                 declare(c"kira_rt_string_to_int", types.i64, &mut [types.ptr]),
+                declare(c"kira_rt_string_bytes", types.ptr, &mut [types.ptr]),
             ],
+            // One per `NumberOp`, in wire order. The conversions in and out have
+            // scalar shapes; the arithmetic answers a handle; the comparisons
+            // answer `i1`. Every handle argument and result is one pointer.
+            number_ops: kira_runtime_abi::NumberOp::ALL.map(|op| {
+                use kira_runtime_abi::NumberOp as N;
+                let name = c_string(op.runtime_symbol());
+                // A `Number` is `i128` here; only the conversions in and out take
+                // or answer a scalar or a string handle.
+                let (ret, mut params) = match op {
+                    N::FromInt => (types.i128, vec![types.i64]),
+                    N::FromString => (types.i128, vec![types.ptr]),
+                    N::FromFloat => (types.i128, vec![types.f64]),
+                    N::ToString => (types.ptr, vec![types.i128]),
+                    N::ToInt => (types.i64, vec![types.i128]),
+                    N::ToFloat => (types.f64, vec![types.i128]),
+                    N::Negate => (types.i128, vec![types.i128]),
+                    N::Add | N::Subtract | N::Multiply | N::Divide => {
+                        (types.i128, vec![types.i128, types.i128])
+                    }
+                    N::Equal | N::Less | N::LessOrEqual | N::Greater | N::GreaterOrEqual => {
+                        (types.i1, vec![types.i128, types.i128])
+                    }
+                };
+                declare(&name, ret, &mut params)
+            }),
             scalar_text: declare(c"kira_rt_scalar_text", types.ptr, &mut [types.i64]),
             array_elements: declare(
                 c"kira_rt_array_elements",
@@ -325,6 +376,16 @@ pub(in crate::codegen) fn declare_runtime(module: LLVMModuleRef, types: &Types) 
                 &mut [types.i32, types.ptr, types.i32, types.ptr],
             ),
             native_value_int: declare(c"kira_rt_native_value_int", types.ptr, &mut [types.i64]),
+            native_value_number: declare(
+                c"kira_rt_native_value_number",
+                types.ptr,
+                &mut [types.i128],
+            ),
+            native_value_read_number: declare(
+                c"kira_rt_native_value_read_number",
+                types.i128,
+                &mut [types.ptr],
+            ),
             native_value_any: declare(
                 c"kira_rt_native_value_any",
                 types.ptr,
@@ -339,6 +400,16 @@ pub(in crate::codegen) fn declare_runtime(module: LLVMModuleRef, types: &Types) 
                 c"kira_rt_native_value_raw_ptr",
                 types.ptr,
                 &mut [types.i64],
+            ),
+            native_value_native_state: declare(
+                c"kira_rt_native_value_native_state",
+                types.ptr,
+                &mut [types.i64],
+            ),
+            native_value_read_native_state: declare(
+                c"kira_rt_native_value_read_native_state",
+                types.i64,
+                &mut [types.ptr],
             ),
             native_value_cell: declare(c"kira_rt_native_value_cell", types.ptr, &mut [types.ptr]),
             native_value_read_cell: declare(
@@ -427,6 +498,11 @@ pub(in crate::codegen) fn declare_runtime(module: LLVMModuleRef, types: &Types) 
                 types.i32,
                 &mut [types.i64, types.ptr, types.ptr],
             ),
+            native_state_new_dropping: declare(
+                c"kira_rt_native_state_new_dropping",
+                types.i32,
+                &mut [types.i64, types.ptr, types.i32, types.ptr],
+            ),
             native_state_recover: declare(
                 c"kira_rt_native_state_recover",
                 types.i32,
@@ -435,7 +511,28 @@ pub(in crate::codegen) fn declare_runtime(module: LLVMModuleRef, types: &Types) 
             native_state_replace: declare(
                 c"kira_rt_native_state_replace",
                 types.i32,
-                &mut [types.i64, types.i64, types.ptr],
+                &mut [types.i64, types.i64, types.ptr, types.ptr],
+            ),
+            native_state_read_path: declare(
+                c"kira_rt_native_state_read_path",
+                types.i32,
+                &mut [
+                    types.i64, types.i64, types.ptr, types.ptr, types.i64, types.ptr,
+                ],
+            ),
+            native_state_write_path: declare(
+                c"kira_rt_native_state_write_path",
+                types.i32,
+                &mut [
+                    types.i64, types.i64, types.ptr, types.ptr, types.i64, types.ptr, types.ptr,
+                ],
+            ),
+            native_state_append_path: declare(
+                c"kira_rt_native_state_append_path",
+                types.i32,
+                &mut [
+                    types.i64, types.i64, types.ptr, types.ptr, types.i64, types.ptr,
+                ],
             ),
             native_state_retain: declare(
                 c"kira_rt_native_state_retain",
@@ -446,6 +543,11 @@ pub(in crate::codegen) fn declare_runtime(module: LLVMModuleRef, types: &Types) 
                 c"kira_rt_native_state_release",
                 types.i32,
                 &mut [types.i64],
+            ),
+            native_state_release_dropping: declare(
+                c"kira_rt_native_state_release_dropping",
+                types.i32,
+                &mut [types.i64, types.ptr],
             ),
             native_state_box_new: declare(
                 c"kira_rt_native_state_box_new",

@@ -59,8 +59,12 @@ pub enum TokenKind {
     True,
     /// `false`
     False,
+    /// `infinity`
+    Infinity,
     /// `import`
     Import,
+    /// `namespace`
+    Namespace,
     /// `as`
     As,
     /// `is`
@@ -79,6 +83,10 @@ pub enum TokenKind {
     Extends,
     /// `override`
     Override,
+    /// `public` — the visibility modifier that exports a declaration from its
+    /// module. Declarations are private to their module by default; `public`
+    /// opts one into cross-module visibility.
+    Public,
     /// `match`
     Match,
     /// `attempt`
@@ -127,6 +135,26 @@ pub enum TokenKind {
     Arrow,
     /// `=`
     Equals,
+    /// `+=`
+    PlusEq,
+    /// `-=`
+    MinusEq,
+    /// `*=`
+    StarEq,
+    /// `/=`
+    SlashEq,
+    /// `%=`
+    PercentEq,
+    /// `&=`
+    AmpEq,
+    /// `|=`
+    PipeEq,
+    /// `^=`
+    CaretEq,
+    /// `<<=`
+    LtLtEq,
+    /// `>>=`
+    GtGtEq,
     /// `+`
     Plus,
     /// `-`
@@ -188,7 +216,9 @@ impl TokenKind {
             "while" => TokenKind::While,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
+            "infinity" => TokenKind::Infinity,
             "import" => TokenKind::Import,
+            "namespace" => TokenKind::Namespace,
             "as" => TokenKind::As,
             "is" => TokenKind::Is,
             "struct" => TokenKind::Struct,
@@ -198,6 +228,7 @@ impl TokenKind {
             "trait" => TokenKind::Trait,
             "extends" => TokenKind::Extends,
             "override" => TokenKind::Override,
+            "public" => TokenKind::Public,
             "match" => TokenKind::Match,
             // `handle` is deliberately absent: the reference lexes it as an
             // identifier, so it is recognized contextually after an `attempt`
@@ -230,7 +261,9 @@ impl TokenKind {
             TokenKind::While => "`while`",
             TokenKind::True => "`true`",
             TokenKind::False => "`false`",
+            TokenKind::Infinity => "`infinity`",
             TokenKind::Import => "`import`",
+            TokenKind::Namespace => "`namespace`",
             TokenKind::As => "`as`",
             TokenKind::Is => "`is`",
             TokenKind::Struct => "`struct`",
@@ -240,6 +273,7 @@ impl TokenKind {
             TokenKind::Trait => "`trait`",
             TokenKind::Extends => "`extends`",
             TokenKind::Override => "`override`",
+            TokenKind::Public => "`public`",
             TokenKind::Match => "`match`",
             TokenKind::Attempt => "`attempt`",
             TokenKind::Try => "`try`",
@@ -263,6 +297,16 @@ impl TokenKind {
             TokenKind::Question => "`?`",
             TokenKind::Arrow => "`->`",
             TokenKind::Equals => "`=`",
+            TokenKind::PlusEq => "`+=`",
+            TokenKind::MinusEq => "`-=`",
+            TokenKind::StarEq => "`*=`",
+            TokenKind::SlashEq => "`/=`",
+            TokenKind::PercentEq => "`%=`",
+            TokenKind::AmpEq => "`&=`",
+            TokenKind::PipeEq => "`|=`",
+            TokenKind::CaretEq => "`^=`",
+            TokenKind::LtLtEq => "`<<=`",
+            TokenKind::GtGtEq => "`>>=`",
             TokenKind::Plus => "`+`",
             TokenKind::Minus => "`-`",
             TokenKind::Star => "`*`",

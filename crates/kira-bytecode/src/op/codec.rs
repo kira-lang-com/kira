@@ -12,7 +12,7 @@
 
 use super::{
     ChannelPrim, CompilerOp, EnvOp, FieldPath, FileSystemOp, Instruction, MainThreadOp, MathOp,
-    PathStep, PlacePath, StringOp, TaskPrim, WritebackTarget, opcode as o, step_tag,
+    NumberOp, PathStep, PlacePath, StringOp, TaskPrim, WritebackTarget, opcode as o, step_tag,
 };
 
 /// An error decoding a byte stream back into instructions.
@@ -300,6 +300,10 @@ pub fn encode_one(instruction: &Instruction, out: &mut Vec<u8>) {
             out.push(o::STRING_OP);
             out.push(op.as_byte());
         }
+        Instruction::NumberOp(op) => {
+            out.push(o::NUMBER_OP);
+            out.push(op.as_byte());
+        }
         Instruction::ScalarText => out.push(o::SCALAR_TEXT),
         Instruction::ArrayElements(ty) => {
             out.push(o::ARRAY_ELEMENTS);
@@ -319,6 +323,8 @@ pub fn encode_one(instruction: &Instruction, out: &mut Vec<u8>) {
         }
         Instruction::NewCell => out.push(o::NEW_CELL),
         Instruction::EnumTag => out.push(o::ENUM_TAG),
+        Instruction::EnumFromCode => out.push(o::ENUM_FROM_CODE),
+        Instruction::HashValue => out.push(o::HASH_VALUE),
         Instruction::EnumPayload => out.push(o::ENUM_PAYLOAD),
         Instruction::ConvertIntToFloat => out.push(o::CONVERT_INT_TO_FLOAT),
         Instruction::ConvertFloatToInt => out.push(o::CONVERT_FLOAT_TO_INT),
@@ -388,12 +394,16 @@ pub fn encode_one(instruction: &Instruction, out: &mut Vec<u8>) {
             out.extend_from_slice(&type_id.to_le_bytes());
         }
         Instruction::EqAny => out.push(o::EQ_ANY),
+        Instruction::EqValue => out.push(o::EQ_VALUE),
+        Instruction::NeValue => out.push(o::NE_VALUE),
+        Instruction::CmpValue => out.push(o::CMP_VALUE),
         Instruction::EqType => out.push(o::EQ_TYPE),
         Instruction::NeType => out.push(o::NE_TYPE),
         Instruction::NeAny => out.push(o::NE_ANY),
         Instruction::EqStr => out.push(o::EQ_STR),
         Instruction::NeStr => out.push(o::NE_STR),
         Instruction::Print => out.push(o::PRINT),
+        Instruction::Abort => out.push(o::ABORT),
         Instruction::Return => out.push(o::RETURN),
         Instruction::ReturnVoid => out.push(o::RETURN_VOID),
     }
@@ -666,6 +676,15 @@ impl Cursor<'_> {
                 })?;
                 Instruction::StringOp(op)
             }
+            o::NUMBER_OP => {
+                let tag_offset = self.offset;
+                let [tag] = self.take::<1>()?;
+                let op = NumberOp::from_byte(tag).ok_or(DecodeError::UnknownOpcode {
+                    opcode: tag,
+                    offset: tag_offset,
+                })?;
+                Instruction::NumberOp(op)
+            }
             o::SCALAR_TEXT => Instruction::ScalarText,
             o::ARRAY_ELEMENTS => {
                 let at = self.offset;
@@ -822,6 +841,9 @@ fn nullary_from_opcode(op: u8) -> Option<Instruction> {
         o::EQ_BOOL => Instruction::EqBool,
         o::NE_BOOL => Instruction::NeBool,
         o::EQ_ANY => Instruction::EqAny,
+        o::EQ_VALUE => Instruction::EqValue,
+        o::NE_VALUE => Instruction::NeValue,
+        o::CMP_VALUE => Instruction::CmpValue,
         o::EQ_TYPE => Instruction::EqType,
         o::NE_TYPE => Instruction::NeType,
         o::NE_ANY => Instruction::NeAny,
@@ -841,6 +863,8 @@ fn nullary_from_opcode(op: u8) -> Option<Instruction> {
 
         o::CSTRING_NEW => Instruction::CStringNew,
         o::ENUM_TAG => Instruction::EnumTag,
+        o::ENUM_FROM_CODE => Instruction::EnumFromCode,
+        o::HASH_VALUE => Instruction::HashValue,
         o::ENUM_PAYLOAD => Instruction::EnumPayload,
         o::CONVERT_INT_TO_FLOAT => Instruction::ConvertIntToFloat,
         o::CONVERT_FLOAT_TO_INT => Instruction::ConvertFloatToInt,
@@ -851,6 +875,7 @@ fn nullary_from_opcode(op: u8) -> Option<Instruction> {
         o::NATIVE_STATE_RELEASE => Instruction::NativeStateRelease,
         o::RAW_PTR_NULL => Instruction::ConstRawPtrNull,
         o::PRINT => Instruction::Print,
+        o::ABORT => Instruction::Abort,
         o::RETURN => Instruction::Return,
         o::RETURN_VOID => Instruction::ReturnVoid,
         o::MAIN_THREAD_LIFECYCLE => Instruction::MainThreadLifecycle,

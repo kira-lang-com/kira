@@ -268,7 +268,7 @@ impl FunctionLowering<'_, '_> {
             }
         };
 
-        if self.codegen.calls_foreign_directly() {
+        if self.codegen.calls_import_directly(import.signature()) {
             self.emit_direct_foreign_call(
                 import.symbol(),
                 &params,
@@ -356,6 +356,15 @@ impl FunctionLowering<'_, '_> {
         ty: Type,
         retained: bool,
     ) -> Result<(), LlvmError> {
+        // A retained NativeState crosses as its opaque token word and transfers
+        // the one affine reference represented by this argument to C. The
+        // successful call therefore consumes the Kira owner: dropping it here
+        // would release the very reference the callee was promised it keeps.
+        // A failed call reaches this helper with `retained = false` and releases
+        // the owner normally.
+        if retained && matches!(ty, Type::NativeState(_)) {
+            return Ok(());
+        }
         if retained && self.codegen.contains_c_storage(ty) {
             return self.keep_c_storage(value, ty);
         }
@@ -537,8 +546,12 @@ impl FunctionLowering<'_, '_> {
                 // import colliding with a maths declaration — would build a
                 // call whose type disagrees with the definition. Name the
                 // collision rather than fail verification far from the cause.
+                //
+                // A native image calls one symbol at several prototypes the way
+                // C casts `objc_msgSend`, so only wasm, whose call checks the
+                // callee's type, refuses the mismatch.
                 let found = LLVMGlobalGetValueType(existing);
-                if found != function_type {
+                if found != function_type && self.codegen.calls_foreign_directly() {
                     return Err(LlvmError::SymbolCollision {
                         symbol: symbol.to_owned(),
                     });

@@ -103,6 +103,11 @@ module.exports = grammar({
     [$._callable, $._ownership_operand],
     // `Any` alone is the top type; `Any Family` is the existential.
     [$.existential_type, $._type_name],
+    // `(A, B)` is a tuple type until a following `->` turns the same prefix
+    // into a function type.
+    [$.tuple_type, $.function_type],
+    [$.match_statement, $.match_expression],
+    [$.match_arm, $.match_value_arm],
   ],
 
   rules: {
@@ -113,7 +118,9 @@ module.exports = grammar({
     _item: ($) =>
       choice(
         $.import_declaration,
+        $.namespace_declaration,
         $.function_definition,
+        $.extern_library_declaration,
         $.constant_declaration,
         $.struct_declaration,
         $.class_declaration,
@@ -135,6 +142,7 @@ module.exports = grammar({
     // the program. There is no module-scope `var`.
     constant_declaration: ($) =>
       seq(
+        optional('public'),
         'let',
         field('name', $.identifier),
         optional(seq(':', field('type', $._type))),
@@ -151,6 +159,32 @@ module.exports = grammar({
       ),
 
     module_path: ($) => seq($.identifier, repeat(seq('.', $.identifier))),
+
+    // `namespace A.B.C { let X = … }` — a nested named scope whose members are
+    // reached by their dotted path. A segment is an identifier or a numeric
+    // token (`GPT.5.6`), and a member is a `let` constant or a nested namespace.
+    namespace_declaration: ($) =>
+      seq(
+        'namespace',
+        field('path', $.namespace_path),
+        field('body', $.namespace_body),
+      ),
+
+    namespace_path: ($) =>
+      seq(
+        $._namespace_segment,
+        repeat(seq('.', $._namespace_segment)),
+      ),
+
+    _namespace_segment: ($) =>
+      choice($.identifier, $.integer_literal, $.float_literal),
+
+    namespace_body: ($) =>
+      seq(
+        '{',
+        repeat(choice($.constant_declaration, $.namespace_declaration)),
+        '}',
+      ),
 
     // ----- annotations ---------------------------------------------------
 
@@ -226,7 +260,9 @@ module.exports = grammar({
     function_definition: ($) =>
       prec.right(
         seq(
+          optional('public'),
           repeat($.attribute),
+          optional('public'),
           optional('async'),
           'function',
           field('name', $.identifier),
@@ -235,6 +271,25 @@ module.exports = grammar({
           optional(field('return_type', $.return_type)),
           optional(field('body', $.block)),
         ),
+      ),
+
+    extern_library_declaration: ($) =>
+      seq(
+        'extern',
+        'library',
+        field('library', $.identifier),
+        '{',
+        repeat($.extern_function_declaration),
+        '}',
+      ),
+
+    extern_function_declaration: ($) =>
+      seq(
+        'function',
+        field('name', $.identifier),
+        optional(field('type_parameters', $.type_parameters)),
+        field('parameters', $.parameters),
+        optional(field('return_type', $.return_type)),
       ),
 
     parameters: ($) =>
@@ -275,6 +330,8 @@ module.exports = grammar({
     _type: ($) =>
       choice(
         $.array_type,
+        $.parenthesized_type,
+        $.tuple_type,
         $.function_type,
         $.existential_type,
         $.generic_type,
@@ -310,6 +367,20 @@ module.exports = grammar({
 
     array_type: ($) => seq('[', $._type, ']'),
 
+    parenthesized_type: ($) => seq('(', $._type, ')'),
+
+    tuple_type: ($) =>
+      seq(
+        '(',
+        field('element', $._type),
+        ',',
+        field('element', $._type),
+        optional(seq(',', field('element', $._type))),
+        optional(seq(',', field('element', $._type))),
+        optional(','),
+        ')',
+      ),
+
     function_type: ($) =>
       seq(
         '(',
@@ -326,7 +397,9 @@ module.exports = grammar({
     // `struct Name[: Trait, …] { <member>* }`. `:` is always conformance.
     struct_declaration: ($) =>
       seq(
+        optional('public'),
         repeat($.attribute),
+        optional('public'),
         'struct',
         field('name', $.identifier),
         optional(field('type_parameters', $.type_parameters)),
@@ -340,7 +413,9 @@ module.exports = grammar({
     // parents second.
     class_declaration: ($) =>
       seq(
+        optional('public'),
         repeat($.attribute),
+        optional('public'),
         'class',
         field('name', $.identifier),
         optional(field('type_parameters', $.type_parameters)),
@@ -410,7 +485,9 @@ module.exports = grammar({
     // `+`.
     enum_declaration: ($) =>
       seq(
+        optional('public'),
         repeat($.attribute),
+        optional('public'),
         'enum',
         field('name', $.identifier),
         optional(field('type_parameters', $.type_parameters)),
@@ -452,14 +529,16 @@ module.exports = grammar({
 
     // `type Name = Target`.
     type_alias_declaration: ($) =>
-      seq('type', field('name', $.identifier), '=', field('target', $._type)),
+      seq(optional('public'), 'type', field('name', $.identifier), '=', field('target', $._type)),
 
     // `distinct Name = Representation`. The same shape as an alias and the
     // opposite meaning: an alias is a second spelling for one type, while this
     // is a second type over one representation.
     distinct_declaration: ($) =>
       seq(
+        optional('public'),
         repeat($.attribute),
+        optional('public'),
         'distinct',
         field('name', $.identifier),
         '=',
@@ -472,6 +551,7 @@ module.exports = grammar({
     // body is a default.
     trait_declaration: ($) =>
       seq(
+        optional('public'),
         'trait',
         field('name', $.identifier),
         optional(field('type_parameters', $.type_parameters)),
@@ -501,7 +581,9 @@ module.exports = grammar({
     // is the family template.
     construct_declaration: ($) =>
       seq(
+        optional('public'),
         repeat($.attribute),
+        optional('public'),
         'construct',
         field('name', $.identifier),
         optional(field('parameters', $.parameters)),
@@ -734,11 +816,27 @@ module.exports = grammar({
       ),
 
     // The target is written with expression syntax (`p`, `p.x`, `xs[i]`);
-    // whether it names a place is a question for semantics.
+    // whether it names a place is a question for semantics. A compound operator
+    // (`+=` and its kin) stores `target op value`.
     assignment_statement: ($) =>
       seq(
         field('left', $._assignment_target),
-        '=',
+        field(
+          'operator',
+          choice(
+            '=',
+            '+=',
+            '-=',
+            '*=',
+            '/=',
+            '%=',
+            '&=',
+            '|=',
+            '^=',
+            '<<=',
+            '>>=',
+          ),
+        ),
         field('right', $._expression),
       ),
 
@@ -798,11 +896,45 @@ module.exports = grammar({
         ),
       ),
 
+    match_expression: ($) =>
+      prec.dynamic(
+        1,
+        prec(
+          1,
+          seq(
+            'match',
+            field('subject', $._expression),
+            '{',
+            repeat($.match_value_arm),
+            '}',
+          ),
+        ),
+      ),
+
+    match_value_arm: ($) =>
+      seq(
+        field('pattern', $._match_pattern),
+        repeat(seq(',', field('pattern', $._match_pattern))),
+        '->',
+        field('body', choice($.block, $._expression)),
+      ),
+
+    // An arm head is one or more patterns separated by `,` (an alternation),
+    // then `->` and the body.
     match_arm: ($) =>
       seq(
-        field('pattern', $.variant_pattern),
+        field('pattern', $._match_pattern),
+        repeat(seq(',', field('pattern', $._match_pattern))),
         '->',
         field('body', choice($.block, $._statement)),
+      ),
+
+    _match_pattern: ($) =>
+      choice(
+        $.variant_pattern,
+        $.range_pattern,
+        $.wildcard_pattern,
+        $._pattern_literal,
       ),
 
     variant_pattern: ($) =>
@@ -811,8 +943,30 @@ module.exports = grammar({
         optional(seq('(', field('binding', $.identifier), ')')),
       ),
 
-    // `attempt { … } handle { Variant[(binding)] { … } … }` — a handler arm
-    // takes no arrow, and its body is always a block.
+    // `0..10` — a half-open integer range, its bounds literals.
+    range_pattern: ($) =>
+      seq(
+        field('start', $._pattern_literal),
+        '..',
+        field('end', $._pattern_literal),
+      ),
+
+    // `else` — the catch-all.
+    wildcard_pattern: ($) => 'else',
+
+    _pattern_literal: ($) =>
+      choice(
+        $.integer_literal,
+        $.negative_integer_literal,
+        $.float_literal,
+        $.string_literal,
+        $.boolean_literal,
+      ),
+
+    negative_integer_literal: ($) => seq('-', $.integer_literal),
+
+    // `attempt { … } handle { Variant[(binding)] { … } … else { … } }` — a
+    // handler arm takes no arrow, and its body is always a block.
     attempt_statement: ($) =>
       seq(
         'attempt',
@@ -824,7 +978,10 @@ module.exports = grammar({
       ),
 
     handler_arm: ($) =>
-      seq(field('pattern', $.variant_pattern), field('body', $.block)),
+      seq(
+        field('pattern', choice($.variant_pattern, $.wildcard_pattern)),
+        field('body', $.block),
+      ),
 
     expression_statement: ($) => prec(-1, $._expression),
 
@@ -832,6 +989,7 @@ module.exports = grammar({
 
     _expression: ($) =>
       choice(
+        $.match_expression,
         $.conditional_expression,
         $.binary_expression,
         $.type_test_expression,
@@ -849,6 +1007,7 @@ module.exports = grammar({
         $.field_expression,
         $.index_expression,
         $.closure_expression,
+        $.tuple_expression,
         $.parenthesized_expression,
         $.array_literal,
         $.dot_member_expression,
@@ -1033,13 +1192,19 @@ module.exports = grammar({
     // one too: `type` starts a declaration and is a keyword there, and after a
     // `.` there is no declaration to start, so it names the runtime type
     // descriptor and nothing else.
+    // A field name is usually an identifier, but a namespace access carries
+    // version-like numeric segments — `AI.Providers.OpenAI.GPT.5.6.Sol`, where
+    // `5.6` is one float token the parser reads as a path segment.
     field_expression: ($) =>
       prec(
         PREC.postfix,
         seq(
           field('receiver', $._expression),
           '.',
-          field('field', choice($.identifier, 'type')),
+          field(
+            'field',
+            choice($.identifier, 'type', $.integer_literal, $.float_literal),
+          ),
         ),
       ),
 
@@ -1172,6 +1337,18 @@ module.exports = grammar({
     array_literal: ($) =>
       seq('[', commaSepTrailing($._expression), ']'),
 
+    tuple_expression: ($) =>
+      seq(
+        '(',
+        field('element', $._expression),
+        ',',
+        field('element', $._expression),
+        optional(seq(',', field('element', $._expression))),
+        optional(seq(',', field('element', $._expression))),
+        optional(','),
+        ')',
+      ),
+
     parenthesized_expression: ($) => seq('(', $._expression, ')'),
 
     // ----- tokens --------------------------------------------------------
@@ -1187,8 +1364,10 @@ module.exports = grammar({
     integer_literal: (_$) => token(choice(/0[xX][0-9a-fA-F]+/, /[0-9]+/)),
 
     // Digits DOT digits, both sides required: `1.` is an integer plus a stray
-    // dot, and `1e5` is an integer plus the identifier `e5`.
-    float_literal: (_$) => token(seq(/[0-9]+/, '.', /[0-9]+/)),
+    // dot, and `1e5` is an integer plus the identifier `e5`. `infinity` is the
+    // one named IEEE float literal and belongs to this same syntax node.
+    float_literal: (_$) =>
+      token(prec(1, choice(seq(/[0-9]+/, '.', /[0-9]+/), 'infinity'))),
 
     // An unescaped newline ends the literal (unterminated, KLEX002); an
     // escaped newline continues it onto the next line.

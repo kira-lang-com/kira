@@ -207,6 +207,7 @@ impl IrProgram {
             | IrExpr::CellNull { ty }
             | IrExpr::CellGet { ty, .. }
             | IrExpr::StringOperation { ty, .. }
+            | IrExpr::NumberOperation { ty, .. }
             | IrExpr::Index { ty, .. } => *ty,
             IrExpr::Select { ty, .. } => *ty,
             IrExpr::TypeTest { .. } => Type::Bool,
@@ -219,7 +220,7 @@ impl IrProgram {
             | IrExpr::EnumTag { .. } => Type::INT,
             IrExpr::StringSubstring { .. } | IrExpr::StringOf { .. } => Type::String,
             IrExpr::CStringNew { .. } | IrExpr::CLayoutAddress { .. } => Type::CBlock,
-            IrExpr::NativeUserData { .. } => Type::RawPtr,
+            IrExpr::NativeUserData { ty, .. } => *ty,
             IrExpr::IntoAny { .. } => Type::Any,
             IrExpr::TypeConst { .. } | IrExpr::TypeOf { .. } => Type::RuntimeType,
             IrExpr::TypeField { ty, .. } => *ty,
@@ -283,7 +284,12 @@ fn binop_result(op: IrBinOp) -> Type {
         | IrBinOp::BitXor
         | IrBinOp::Shl
         | IrBinOp::ShrInt
-        | IrBinOp::ShrUInt => Type::INT,
+        | IrBinOp::ShrUInt
+        // A three-way structural compare answers a plain `Int` sign: negative,
+        // zero, or positive. The four orderings are recovered by comparing it
+        // against zero, so the walk itself is width-free like the arithmetic
+        // above.
+        | IrBinOp::CmpValue => Type::INT,
         IrBinOp::AddFloat
         | IrBinOp::SubFloat
         | IrBinOp::MulFloat
@@ -312,6 +318,8 @@ fn binop_result(op: IrBinOp) -> Type {
         | IrBinOp::NeStr
         | IrBinOp::EqAny
         | IrBinOp::NeAny
+        | IrBinOp::EqValue
+        | IrBinOp::NeValue
         | IrBinOp::EqType
         | IrBinOp::NeType
         | IrBinOp::And

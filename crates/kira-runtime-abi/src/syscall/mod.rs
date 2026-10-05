@@ -33,6 +33,7 @@
 //! file already owns, so it reads them here rather than carrying a second copy.
 
 pub mod host;
+mod interpreter;
 
 use thiserror::Error;
 
@@ -208,6 +209,81 @@ pub enum LinuxSyscall {
     /// can signal whatever started next. A descriptor refers to one process for
     /// as long as it is open, and to nothing at all afterwards.
     PidfdSendSignal = 50,
+    /// `socket(domain, type, protocol)` — an endpoint, before it has a name.
+    ///
+    /// The head of the family that lets two processes on this machine talk at
+    /// all. A pipe carries bytes and only bytes; a socket carries a message
+    /// with descriptors beside it, which is the whole reason the family is
+    /// here — see `sendmsg`.
+    Socket = 51,
+    /// `socketpair(domain, type, protocol, fds)` — two connected endpoints, and no name.
+    ///
+    /// What a parent hands a child it just spawned: a connected pair that
+    /// exists in nobody's filesystem, so there is no path to agree on, no
+    /// permission to get right, and no window in which the child is running and
+    /// the socket is not there yet.
+    Socketpair = 52,
+    /// `bind(fd, address, length)` — give an endpoint a name.
+    Bind = 53,
+    /// `listen(fd, backlog)` — take connections on a named endpoint.
+    Listen = 54,
+    /// `accept4(fd, address, length, flags)` — the next connection, as a descriptor.
+    ///
+    /// `accept4` rather than `accept`, for the same reason as `pipe2` and
+    /// `dup3`: the flags argument is where `SOCK_CLOEXEC` goes, and without it
+    /// a server that spawns anything leaks every client's connection into the
+    /// child. AArch64's table has no `accept` to fall back to in any case.
+    Accept4 = 55,
+    /// `connect(fd, address, length)` — reach a named endpoint.
+    Connect = 56,
+    /// `sendmsg(fd, message, flags)` — a message, and descriptors beside it.
+    ///
+    /// The call the rest of the family exists to reach. A `struct msghdr` can
+    /// carry ancillary data, and `SCM_RIGHTS` ancillary data carries open file
+    /// descriptors from one process to another. On Linux there is no other way
+    /// to hand a program a buffer somebody else allocated — which is what a
+    /// client handing a compositor a rendered frame is.
+    Sendmsg = 57,
+    /// `recvmsg(fd, message, flags)` — a message, and whatever descriptors came with it.
+    ///
+    /// The receiving half, and the one with the sharp edge: the descriptors
+    /// arrive inside a `struct cmsghdr` whose alignment is stricter than it
+    /// looks, and getting it wrong produces a descriptor that reads as -1 with
+    /// no error reported anywhere.
+    Recvmsg = 58,
+    /// `shutdown(fd, how)` — stop one direction without closing the descriptor.
+    Shutdown = 59,
+    /// `getsockname(fd, address, length)` — the name this endpoint answers to.
+    Getsockname = 60,
+    /// `setsockopt(fd, level, option, value, length)` — change how an endpoint behaves.
+    Setsockopt = 61,
+    /// `getsockopt(fd, level, option, value, length)` — read one of those back.
+    Getsockopt = 62,
+    /// `memfd_create(name, flags)` — an anonymous file that lives in memory.
+    ///
+    /// The descriptor a shared buffer is passed over: a client fills a `memfd`,
+    /// hands the display server the descriptor, and the two map the same pages.
+    MemfdCreate = 63,
+    /// `clock_settime(clockid, time)` — move a system clock.
+    ///
+    /// The write half of the pair with `clock_gettime`. Setting the wall clock
+    /// is a machine-wide act, so a userland reserves it to the one service that
+    /// owns time and refuses every application the number.
+    ClockSettime = 64,
+    /// `timerfd_create(clockid, flags)` — a descriptor that becomes readable
+    /// when a timer expires.
+    ///
+    /// How an event loop waits on time in the same `epoll` set as its
+    /// descriptors, rather than blocking in `nanosleep` and answering nothing
+    /// else meanwhile.
+    TimerfdCreate = 65,
+    /// `timerfd_settime(fd, flags, new, old)` — arm or disarm a timer
+    /// descriptor.
+    TimerfdSettime = 66,
+    /// `timerfd_gettime(fd, current)` — how long a timer descriptor has left.
+    TimerfdGettime = 67,
+    /// `uname(buffer)` — the kernel's name, release, version, and machine.
+    Uname = 68,
 }
 
 /// Every system call this table knows, in tag order.
@@ -215,7 +291,7 @@ pub enum LinuxSyscall {
 /// A total list rather than a search: the frontend prints it when it refuses an
 /// unknown name, and a name that is in the enum but missing from here would be
 /// a call the author cannot discover.
-pub const LINUX_SYSCALLS: [LinuxSyscall; 51] = [
+pub const LINUX_SYSCALLS: [LinuxSyscall; 69] = [
     LinuxSyscall::Read,
     LinuxSyscall::Write,
     LinuxSyscall::Mount,
@@ -267,6 +343,24 @@ pub const LINUX_SYSCALLS: [LinuxSyscall; 51] = [
     LinuxSyscall::Clone3,
     LinuxSyscall::Waitid,
     LinuxSyscall::PidfdSendSignal,
+    LinuxSyscall::Socket,
+    LinuxSyscall::Socketpair,
+    LinuxSyscall::Bind,
+    LinuxSyscall::Listen,
+    LinuxSyscall::Accept4,
+    LinuxSyscall::Connect,
+    LinuxSyscall::Sendmsg,
+    LinuxSyscall::Recvmsg,
+    LinuxSyscall::Shutdown,
+    LinuxSyscall::Getsockname,
+    LinuxSyscall::Setsockopt,
+    LinuxSyscall::Getsockopt,
+    LinuxSyscall::MemfdCreate,
+    LinuxSyscall::ClockSettime,
+    LinuxSyscall::TimerfdCreate,
+    LinuxSyscall::TimerfdSettime,
+    LinuxSyscall::TimerfdGettime,
+    LinuxSyscall::Uname,
 ];
 
 /// How many arguments a Linux system call can take.
@@ -337,6 +431,24 @@ impl LinuxSyscall {
             48 => Some(Self::Clone3),
             49 => Some(Self::Waitid),
             50 => Some(Self::PidfdSendSignal),
+            51 => Some(Self::Socket),
+            52 => Some(Self::Socketpair),
+            53 => Some(Self::Bind),
+            54 => Some(Self::Listen),
+            55 => Some(Self::Accept4),
+            56 => Some(Self::Connect),
+            57 => Some(Self::Sendmsg),
+            58 => Some(Self::Recvmsg),
+            59 => Some(Self::Shutdown),
+            60 => Some(Self::Getsockname),
+            61 => Some(Self::Setsockopt),
+            62 => Some(Self::Getsockopt),
+            63 => Some(Self::MemfdCreate),
+            64 => Some(Self::ClockSettime),
+            65 => Some(Self::TimerfdCreate),
+            66 => Some(Self::TimerfdSettime),
+            67 => Some(Self::TimerfdGettime),
+            68 => Some(Self::Uname),
             _ => None,
         }
     }
@@ -400,6 +512,24 @@ impl LinuxSyscall {
             Self::Clone3 => "clone3",
             Self::Waitid => "waitid",
             Self::PidfdSendSignal => "pidfd_send_signal",
+            Self::Socket => "socket",
+            Self::Socketpair => "socketpair",
+            Self::Bind => "bind",
+            Self::Listen => "listen",
+            Self::Accept4 => "accept4",
+            Self::Connect => "connect",
+            Self::Sendmsg => "sendmsg",
+            Self::Recvmsg => "recvmsg",
+            Self::Shutdown => "shutdown",
+            Self::Getsockname => "getsockname",
+            Self::Setsockopt => "setsockopt",
+            Self::Getsockopt => "getsockopt",
+            Self::MemfdCreate => "memfd_create",
+            Self::ClockSettime => "clock_settime",
+            Self::TimerfdCreate => "timerfd_create",
+            Self::TimerfdSettime => "timerfd_settime",
+            Self::TimerfdGettime => "timerfd_gettime",
+            Self::Uname => "uname",
         }
     }
 
@@ -474,6 +604,24 @@ impl LinuxSyscall {
                 Self::Clone3 => 435,
                 Self::Waitid => 95,
                 Self::PidfdSendSignal => 424,
+                Self::Socket => 198,
+                Self::Socketpair => 199,
+                Self::Bind => 200,
+                Self::Listen => 201,
+                Self::Accept4 => 242,
+                Self::Connect => 203,
+                Self::Sendmsg => 211,
+                Self::Recvmsg => 212,
+                Self::Shutdown => 210,
+                Self::Getsockname => 204,
+                Self::Setsockopt => 208,
+                Self::Getsockopt => 209,
+                Self::MemfdCreate => 279,
+                Self::ClockSettime => 112,
+                Self::TimerfdCreate => 85,
+                Self::TimerfdSettime => 86,
+                Self::TimerfdGettime => 87,
+                Self::Uname => 160,
             },
             SyscallArch::X86_64 => match self {
                 Self::Read => 0,
@@ -527,6 +675,24 @@ impl LinuxSyscall {
                 Self::Clone3 => 435,
                 Self::Waitid => 247,
                 Self::PidfdSendSignal => 424,
+                Self::Socket => 41,
+                Self::Socketpair => 53,
+                Self::Bind => 49,
+                Self::Listen => 50,
+                Self::Accept4 => 288,
+                Self::Connect => 42,
+                Self::Sendmsg => 46,
+                Self::Recvmsg => 47,
+                Self::Shutdown => 48,
+                Self::Getsockname => 51,
+                Self::Setsockopt => 54,
+                Self::Getsockopt => 55,
+                Self::MemfdCreate => 319,
+                Self::ClockSettime => 227,
+                Self::TimerfdCreate => 283,
+                Self::TimerfdSettime => 286,
+                Self::TimerfdGettime => 287,
+                Self::Uname => 63,
             },
         }
     }
@@ -542,203 +708,6 @@ impl LinuxSyscall {
     /// never reach.
     pub const fn returns(self) -> bool {
         !matches!(self, Self::ExitGroup)
-    }
-
-    /// Whether an interpreter can serve this call on the program's behalf.
-    ///
-    /// A property of what the call *does*, which is why it lives on the call
-    /// rather than on the host that serves it: no host is in a position to
-    /// answer it differently, because the fact underneath is the same for all
-    /// of them — **under the interpreter the process is the interpreter, not
-    /// the program.**
-    ///
-    /// The three that answer yes take a descriptor and say what they did.
-    /// Serving one is indistinguishable from the program having made it, so a
-    /// `--backend vm` run of a program that only reads, writes, or waits on
-    /// descriptors can be compared byte for byte against a native run — which is
-    /// the oracle a `@FFI.Syscall` otherwise has none of.
-    ///
-    /// Taking a descriptor is the whole of the test, and it is a narrower test
-    /// than "acts on files". A call the program hands one of its own open
-    /// descriptors to cannot reach past what the program already had; a call
-    /// that takes none is bounded by nothing smaller than the machine.
-    ///
-    /// The rest act on the process itself or on the machine, and there the
-    /// difference between the interpreter and the program is the whole failure:
-    ///
-    /// - `wait4` reaps the *interpreter's* children, so a program waiting for
-    ///   one it started sees a process it never spawned, or blocks forever.
-    /// - `exit_group` ends the interpreter in the middle of the program it is
-    ///   running — under `kira test` that is the runner, and the rest of the
-    ///   suite never reports.
-    /// - `execve` replaces the interpreter's image, so the VM ceases to exist
-    ///   and there is nothing left to hand the program's result back to.
-    /// - `mount`, `umount2` and `reboot` act on the developer's real machine.
-    ///   `kira run --backend vm` on an init would mount over their filesystem
-    ///   and power the machine off.
-    /// - `sync` is that same argument, and sat on the wrong side of it until it
-    ///   flushed a real machine. It takes no descriptor: it writes back every
-    ///   filesystem mounted on the box, so what it acts on is the developer's
-    ///   machine rather than the program's open files. `fsync(fd)` is the call
-    ///   that would belong here. Overreach is not the worst of it — over a 9p
-    ///   `/mnt/c` the flush parks in the kernel uninterruptibly, so a run that
-    ///   reaches it cannot be killed and `timeout` does not end it.
-    ///
-    /// None of that applies to the code generator's lowering, where the process
-    /// really is the program — so this narrows one engine and changes nothing
-    /// about `--backend llvm` or the native half of `--backend hybrid`.
-    pub const fn servable_by_an_interpreter(self) -> bool {
-        match self {
-            Self::Read
-            | Self::Write
-            | Self::Ppoll
-            | Self::Openat
-            | Self::Close
-            | Self::Ioctl
-            | Self::Lseek
-            | Self::Pread64
-            | Self::Pwrite64
-            | Self::Fstat
-            | Self::Statx
-            | Self::ClockGettime
-            | Self::Nanosleep
-            | Self::EpollCreate1
-            | Self::EpollCtl
-            | Self::EpollPwait
-            | Self::Pipe2
-            | Self::Fcntl
-            | Self::Ftruncate
-            | Self::Fdatasync
-            | Self::Getdents64
-            | Self::Syncfs => true,
-            Self::Sync
-            | Self::Mount
-            | Self::Umount2
-            | Self::Reboot
-            | Self::Execve
-            | Self::Wait4
-            | Self::Chdir
-            | Self::Chroot
-            | Self::Mmap
-            | Self::Munmap
-            | Self::Mprotect
-            | Self::Clone
-            | Self::Clone3
-            | Self::Waitid
-            | Self::PidfdSendSignal
-            | Self::Getpid
-            | Self::Kill
-            | Self::Setsid
-            | Self::Dup3
-            | Self::RtSigaction
-            | Self::RtSigprocmask
-            | Self::RtSigreturn
-            | Self::Signalfd4
-            | Self::Mkdirat
-            | Self::Unlinkat
-            | Self::Renameat2
-            | Self::Fchmodat
-            | Self::Statfs
-            | Self::ExitGroup => false,
-        }
-    }
-
-    /// Why an interpreter refuses this call, as one clause naming the effect.
-    ///
-    /// Written once here rather than at each place that reports a refusal, so
-    /// the compile-time message and the runtime one cannot come to say different
-    /// things about the same call. Empty for a call that is served, which no
-    /// caller has a reason to ask about.
-    pub const fn interpreter_refusal(self) -> &'static str {
-        match self {
-            Self::Read
-            | Self::Write
-            | Self::Ppoll
-            | Self::Openat
-            | Self::Close
-            | Self::Ioctl
-            | Self::Lseek
-            | Self::Pread64
-            | Self::Pwrite64
-            | Self::Fstat
-            | Self::Statx
-            | Self::ClockGettime
-            | Self::Nanosleep
-            | Self::EpollCreate1
-            | Self::EpollCtl
-            | Self::EpollPwait
-            | Self::Pipe2
-            | Self::Fcntl
-            | Self::Ftruncate
-            | Self::Fdatasync
-            | Self::Getdents64
-            | Self::Syncfs => "",
-            Self::Sync => {
-                "would flush every filesystem mounted on the machine running the interpreter, \
-                 taking no descriptor that could bound it to the program's own files"
-            }
-            Self::Mount => "would mount a filesystem on the machine running the interpreter",
-            Self::Umount2 => "would unmount a filesystem of the machine running the interpreter",
-            Self::Reboot => "would restart, halt, or power off the machine running the interpreter",
-            Self::Execve => {
-                "would replace the interpreter's own image, so the VM would cease to exist \
-                 mid-program"
-            }
-            Self::Wait4 => "would reap the interpreter's children rather than the program's",
-            Self::ExitGroup => {
-                "would end the interpreter itself, in the middle of the program it is running"
-            }
-            Self::Chdir => {
-                "would move the interpreter's own working directory, so every relative path \
-                 the interpreter resolves afterwards would resolve somewhere else"
-            }
-            Self::Chroot => {
-                "would confine the interpreter itself to the program's new root, leaving it \
-                 unable to reach the rest of the developer's machine"
-            }
-            Self::Mmap => {
-                "would map into the interpreter's own address space, where the program has no way to reach it and the interpreter did not ask for it"
-            }
-            Self::Munmap => "would unmap part of the interpreter's own address space",
-            Self::Mprotect => "would change the permissions of the interpreter's own memory",
-            Self::Clone => {
-                "would fork the interpreter, leaving two of them running the same program"
-            }
-            Self::Clone3 => {
-                "would fork the interpreter, leaving two of them running the same program"
-            }
-            Self::Waitid => {
-                "would reap a child of the interpreter, which is not the program's to reap"
-            }
-            Self::PidfdSendSignal => {
-                "would signal a process of the developer's machine through a descriptor the interpreter owns"
-            }
-            Self::Getpid => {
-                "would answer with the interpreter's identifier, which is not the program's"
-            }
-            Self::Kill => {
-                "would signal a process of the developer's machine, chosen by a number the program made up"
-            }
-            Self::Setsid => "would detach the interpreter from its own terminal",
-            Self::Dup3 => {
-                "would rewrite the interpreter's own descriptor table, where a number the program picked may be the interpreter's output"
-            }
-            Self::RtSigaction => {
-                "would install a handler in the interpreter, which is the process the signal would reach"
-            }
-            Self::RtSigprocmask => {
-                "would block signals for the interpreter rather than for the program"
-            }
-            Self::RtSigreturn => "would return from a handler the interpreter never entered",
-            Self::Signalfd4 => {
-                "would take delivery of the interpreter's signals, which are not the program's to consume"
-            }
-            Self::Mkdirat => "would create a directory on the developer's machine",
-            Self::Unlinkat => "would remove a file from the developer's machine",
-            Self::Renameat2 => "would move a file on the developer's machine",
-            Self::Fchmodat => "would change permissions on the developer's machine",
-            Self::Statfs => "would answer about a filesystem of the developer's machine",
-        }
     }
 }
 
@@ -794,7 +763,7 @@ pub enum SyscallError {
 /// no `SyscallArch` for a machine whose registers are unknown, so no caller has
 /// an unsupported case to handle.
 ///
-/// macOS is deliberately absent even on the same processors. Its system-call
+/// macOS is absent even on the same processors, and for a reason. Its system-call
 /// numbers are not a stable interface — Apple's supported entry is libSystem,
 /// the numbers move between releases, and a program that called them directly
 /// would break on an OS update with no diagnostic. Kira refuses the target
@@ -892,179 +861,4 @@ impl SyscallArch {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Pinned bytes: an import table carrying these travels into a `.kbc`
-    /// module, so a renumbering would make an old module name a different call.
-    #[test]
-    fn the_serialized_tags_are_the_ones_already_written() {
-        assert_eq!(LinuxSyscall::Read.tag(), 0);
-        assert_eq!(LinuxSyscall::Write.tag(), 1);
-        assert_eq!(LinuxSyscall::Mount.tag(), 2);
-        assert_eq!(LinuxSyscall::Umount2.tag(), 3);
-        assert_eq!(LinuxSyscall::Reboot.tag(), 4);
-        assert_eq!(LinuxSyscall::Execve.tag(), 5);
-        assert_eq!(LinuxSyscall::Wait4.tag(), 6);
-        assert_eq!(LinuxSyscall::ExitGroup.tag(), 7);
-        assert_eq!(LinuxSyscall::Sync.tag(), 8);
-        assert_eq!(LinuxSyscall::Ppoll.tag(), 9);
-        assert_eq!(LinuxSyscall::Chdir.tag(), 10);
-        assert_eq!(LinuxSyscall::Chroot.tag(), 11);
-        assert_eq!(LinuxSyscall::Openat.tag(), 12);
-        assert_eq!(LinuxSyscall::Close.tag(), 13);
-    }
-
-    #[test]
-    fn every_call_round_trips_through_its_tag_and_its_name() {
-        for syscall in LINUX_SYSCALLS {
-            assert_eq!(LinuxSyscall::from_tag(syscall.tag()), Some(syscall));
-            assert_eq!(LinuxSyscall::parse(syscall.label()), Some(syscall));
-        }
-        // One past the last tag, derived rather than written: tags are assigned
-        // densely from zero, so the table's length *is* the first unassigned
-        // one. A literal here was 48, which stopped meaning "unassigned" the
-        // day the table grew past it and turned this into a test that the
-        // newest call does not exist.
-        let first_unassigned =
-            u8::try_from(LINUX_SYSCALLS.len()).expect("the table is far below the tag width");
-        assert_eq!(LinuxSyscall::from_tag(first_unassigned), None);
-    }
-
-    /// A name this table does not carry resolves to nothing at all. The near
-    /// miss is the case that matters: `exitGroup` is what a Kira author would
-    /// write by habit, and resolving it to `exit_group` would mean the spelling
-    /// in source stops being the spelling in `man 2`.
-    #[test]
-    fn a_name_this_table_does_not_carry_resolves_to_nothing() {
-        assert_eq!(LinuxSyscall::parse("exitGroup"), None);
-        assert_eq!(LinuxSyscall::parse("bpf"), None);
-        assert_eq!(LinuxSyscall::parse(""), None);
-        assert_eq!(LinuxSyscall::parse("WRITE"), None);
-    }
-
-    /// The measured numbers, both architectures. These are the whole reason the
-    /// compiler owns the table: `write` is 64 on one machine and 1 on the other,
-    /// so one number written in Kira source would be wrong on one of them.
-    #[test]
-    fn the_numbers_are_the_kernels_own_on_each_architecture() {
-        let aarch64 = SyscallArch::Aarch64;
-        let x86_64 = SyscallArch::X86_64;
-        assert_eq!(LinuxSyscall::Write.number(aarch64), 64);
-        assert_eq!(LinuxSyscall::Write.number(x86_64), 1);
-        assert_eq!(LinuxSyscall::Read.number(aarch64), 63);
-        assert_eq!(LinuxSyscall::Read.number(x86_64), 0);
-        assert_eq!(LinuxSyscall::Mount.number(aarch64), 40);
-        assert_eq!(LinuxSyscall::Mount.number(x86_64), 165);
-        assert_eq!(LinuxSyscall::Umount2.number(aarch64), 39);
-        assert_eq!(LinuxSyscall::Umount2.number(x86_64), 166);
-        assert_eq!(LinuxSyscall::Reboot.number(aarch64), 142);
-        assert_eq!(LinuxSyscall::Reboot.number(x86_64), 169);
-        assert_eq!(LinuxSyscall::Execve.number(aarch64), 221);
-        assert_eq!(LinuxSyscall::Execve.number(x86_64), 59);
-        assert_eq!(LinuxSyscall::Wait4.number(aarch64), 260);
-        assert_eq!(LinuxSyscall::Wait4.number(x86_64), 61);
-        assert_eq!(LinuxSyscall::ExitGroup.number(aarch64), 94);
-        assert_eq!(LinuxSyscall::ExitGroup.number(x86_64), 231);
-        assert_eq!(LinuxSyscall::Sync.number(aarch64), 81);
-        assert_eq!(LinuxSyscall::Sync.number(x86_64), 162);
-    }
-
-    /// Two architectures answer and everything else is turned away here, which
-    /// is what makes [`LinuxSyscall::number`] total.
-    #[test]
-    fn only_the_architectures_with_a_lowering_answer() {
-        assert_eq!(SyscallArch::for_arch("aarch64"), Some(SyscallArch::Aarch64));
-        assert_eq!(SyscallArch::for_arch("x86_64"), Some(SyscallArch::X86_64));
-        assert_eq!(SyscallArch::for_arch("x86"), None);
-        assert_eq!(SyscallArch::for_arch("arm"), None);
-        assert_eq!(SyscallArch::for_arch("riscv64"), None);
-        assert_eq!(SyscallArch::for_arch("wasm32"), None);
-    }
-
-    /// Six argument registers on both, because six is what the kernel entry
-    /// reserves — the constant the frontend refuses a seventh parameter against
-    /// is the length of these lists and not a number written twice.
-    #[test]
-    fn each_architecture_names_exactly_the_arguments_the_kernel_reads() {
-        for arch in [SyscallArch::Aarch64, SyscallArch::X86_64] {
-            assert_eq!(arch.argument_registers().len(), MAX_SYSCALL_ARGUMENTS);
-        }
-    }
-
-    /// x86-64 must not pass an argument in `rcx`: the `syscall` instruction
-    /// writes the return address there, so an argument placed in it is destroyed
-    /// by the instruction meant to deliver it.
-    #[test]
-    fn x86_64_keeps_its_arguments_out_of_the_registers_the_instruction_destroys() {
-        let arch = SyscallArch::X86_64;
-        for clobbered in arch.clobbered_registers() {
-            assert!(
-                !arch.argument_registers().contains(clobbered),
-                "`{clobbered}` is both an argument register and destroyed by `syscall`"
-            );
-        }
-        assert_eq!(arch.clobbered_registers(), &["rcx", "r11"]);
-        assert!(arch.argument_registers().contains(&"r10"));
-        assert!(!arch.argument_registers().contains(&"rcx"));
-    }
-
-    /// `exit_group` is the one call with no return, and the table says so rather
-    /// than every caller special-casing the name.
-    #[test]
-    fn exit_group_is_the_one_call_that_does_not_come_back() {
-        for syscall in LINUX_SYSCALLS {
-            assert_eq!(syscall.returns(), syscall != LinuxSyscall::ExitGroup);
-        }
-    }
-
-    /// The split, pinned. Three calls take a descriptor the program already
-    /// holds and are therefore the same call whoever's process makes them; the
-    /// other seven act on the process or the machine, which under the
-    /// interpreter is not the program's.
-    ///
-    /// `sync` is among the seven deliberately. It is the one that reads as
-    /// file-shaped and is not: no descriptor bounds it, so it reaches every
-    /// mount on the machine. Pinning it here is what keeps a later reading of
-    /// "acts on files" from putting it back.
-    #[test]
-    fn an_interpreter_serves_the_calls_that_act_only_on_descriptors() {
-        for syscall in [LinuxSyscall::Read, LinuxSyscall::Write, LinuxSyscall::Ppoll] {
-            assert!(syscall.servable_by_an_interpreter(), "{}", syscall.label());
-        }
-        for syscall in [
-            LinuxSyscall::Sync,
-            LinuxSyscall::Mount,
-            LinuxSyscall::Umount2,
-            LinuxSyscall::Reboot,
-            LinuxSyscall::Execve,
-            LinuxSyscall::Wait4,
-            LinuxSyscall::ExitGroup,
-        ] {
-            assert!(!syscall.servable_by_an_interpreter(), "{}", syscall.label());
-        }
-    }
-
-    /// Every refused call says what it would do, and no served one carries a
-    /// reason it will never be asked for. A refusal naming nothing is what sends
-    /// a reader looking for a flag to pass instead of an engine to change.
-    #[test]
-    fn every_refused_call_carries_the_effect_that_refuses_it() {
-        for syscall in LINUX_SYSCALLS {
-            assert_eq!(
-                syscall.interpreter_refusal().is_empty(),
-                syscall.servable_by_an_interpreter(),
-                "{}",
-                syscall.label()
-            );
-        }
-        assert_eq!(
-            SyscallError::Unservable {
-                call: LinuxSyscall::Reboot
-            }
-            .to_string(),
-            "`reboot` cannot be served by an interpreter: it would restart, halt, or power off \
-             the machine running the interpreter"
-        );
-    }
-}
+mod tests;

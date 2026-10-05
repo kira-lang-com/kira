@@ -14,14 +14,15 @@ use kira_ir::IrProgram;
 use kira_llvm_backend::NativeLinkInputs;
 use kira_manifest::RunnerId;
 
+use super::artifacts::stage_bundled_assets;
 use super::execute::{
     build_native, refuse_syscalls_on_the_vm, run_hybrid, run_native, run_on_vm, run_vm_module_file,
     run_web,
 };
 use super::{
-    EXIT_FAILURE, EXIT_OK, EXIT_USAGE, apply_manifest_defaults, compile, emit_diagnostics,
+    EXIT_FAILURE, EXIT_OK, EXIT_USAGE, apply_manifest_defaults, compile_in, emit_diagnostics,
     foreign_link, options_target, parse_options, refuse_unsupported_sanitizer, resolve_foreign,
-    resolve_path, runnable_ir, verified, verified_as,
+    resolve_path, runnable_ir, verified_as_in, verified_in,
 };
 use crate::debugger;
 use crate::hybrid;
@@ -54,7 +55,7 @@ pub fn check(args: &[String]) -> i32 {
     crate::diagnostics::show_notes(options.show_notes);
     let _timings = crate::timings::Timings::install(options.timings);
     let path = options.path.as_str();
-    match compile(path, &options_target(&options)) {
+    match compile_in(path, &options_target(&options), options.sysroot.as_deref()) {
         Ok(compiled) => {
             emit_diagnostics(&compiled.diagnostics, &compiled.sources);
             if compiled.has_errors() {
@@ -86,7 +87,11 @@ pub fn run(args: &[String]) -> i32 {
         Ok(path) => path,
         Err(code) => return code,
     };
-    let compiled = match verified(&options.path, &options_target(&options)) {
+    let compiled = match verified_in(
+        &options.path,
+        &options_target(&options),
+        options.sysroot.as_deref(),
+    ) {
         Ok(compiled) => compiled,
         Err(code) => return code,
     };
@@ -96,6 +101,10 @@ pub fn run(args: &[String]) -> i32 {
     if let Err(code) = refuse_unsupported_sanitizer("run", &options) {
         return code;
     }
+    // The program about to run reads its dependencies' assets out of the
+    // bundles `kira build` lays down; a run is a build too, and a dependency's
+    // catalog that only `build` staged is a file `run` silently goes without.
+    stage_bundled_assets(Path::new(&options.path), &compiled);
     let ir = match runnable_ir("run", compiled) {
         Ok(ir) => ir,
         Err(code) => return code,
@@ -187,9 +196,10 @@ pub fn debug(args: &[String]) -> i32 {
         Ok(path) => path,
         Err(code) => return code,
     };
-    let compiled = match verified(
+    let compiled = match verified_in(
         &debug_options.compile.path,
         &options_target(&debug_options.compile),
+        debug_options.compile.sysroot.as_deref(),
     ) {
         Ok(compiled) => compiled,
         Err(code) => return code,
@@ -271,11 +281,12 @@ pub fn test(args: &[String]) -> i32 {
     // Compiled as a test run, which neither requires an `@Main` nor refuses
     // one: a suite is entered through the generated runner, and a package that
     // is both an application and a suite keeps both entrypoints.
-    let compiled = match verified_as(
+    let compiled = match verified_as_in(
         "test",
         &options.path,
         kira_semantics::BuildKind::Test,
         &options_target(&options),
+        options.sysroot.as_deref(),
     ) {
         Ok(compiled) => compiled,
         Err(code) => return code,

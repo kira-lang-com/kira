@@ -13,9 +13,13 @@ pub(in crate::codegen) struct Runtime {
     pub(in crate::codegen) print_float: Callable,
     pub(in crate::codegen) print_bool: Callable,
     pub(in crate::codegen) print_str: Callable,
+    /// `kira_rt_abort`: emit a message and hard-trap; does not return.
+    pub(in crate::codegen) abort: Callable,
     pub(in crate::codegen) str_new: Callable,
     pub(in crate::codegen) str_concat: Callable,
     pub(in crate::codegen) str_eq: Callable,
+    /// Three-way byte-lexicographic order of two strings, as an `i8` sign.
+    pub(in crate::codegen) str_cmp: Callable,
     pub(in crate::codegen) str_free: Callable,
     pub(in crate::codegen) array_new: Callable,
     pub(in crate::codegen) array_len: Callable,
@@ -32,10 +36,24 @@ pub(in crate::codegen) struct Runtime {
     pub(in crate::codegen) any_eq: Callable,
     /// Structural equality of two arrays, given the element's equality leaf.
     pub(in crate::codegen) array_eq: Callable,
-    /// Boxes a moved aggregate payload with clone/free **and** equality leaves.
-    pub(in crate::codegen) enum_new_aggregate_eq: Callable,
+    /// Structural three-way order of two arrays, given the element's cmp leaf.
+    pub(in crate::codegen) array_cmp: Callable,
+    /// Structural three-way order of two enum boxes (non-aggregate payloads).
+    pub(in crate::codegen) any_cmp: Callable,
+    /// Structural hash fold of an enum box (non-aggregate payloads).
+    pub(in crate::codegen) any_hash: Callable,
+    /// The FNV-1a seed a `hash(v)` fold starts from.
+    pub(in crate::codegen) hash_seed: Callable,
+    /// Folds raw bytes into a running hash accumulator.
+    pub(in crate::codegen) hash_bytes: Callable,
+    /// Folds a string's bytes into a running hash accumulator.
+    pub(in crate::codegen) hash_str: Callable,
+    /// Folds an array's length and elements into a hash, given the element leaf.
+    pub(in crate::codegen) hash_array: Callable,
     /// Boxes a moved aggregate payload with type-specific clone/free leaves.
     pub(in crate::codegen) enum_new_aggregate: Callable,
+    /// Boxes a moved aggregate payload with equality, ordering, and hash leaves.
+    pub(in crate::codegen) enum_new_aggregate_ord: Callable,
     pub(in crate::codegen) enum_tag: Callable,
     /// Reads an enum's payload as an owned word (`match` arm bindings).
     pub(in crate::codegen) enum_payload: Callable,
@@ -151,6 +169,10 @@ pub(in crate::codegen) struct Runtime {
     /// byte rather than matched by name, so a new operation is a row here and
     /// nothing in the lowering.
     pub(in crate::codegen) string_ops: [Callable; kira_runtime_abi::StringOp::ALL.len()],
+    /// The `Number` operations, one callable each, in
+    /// [`NumberOp`](kira_runtime_abi::NumberOp) order — the same shape
+    /// `string_ops` has, indexed by the operand byte.
+    pub(in crate::codegen) number_ops: [Callable; kira_runtime_abi::NumberOp::ALL.len()],
     /// `kira_rt_scalar_text`: one Unicode scalar's text, from its code point.
     pub(in crate::codegen) scalar_text: Callable,
     /// `kira_rt_array_elements`: an array's elements written out in C's widths.
@@ -190,9 +212,17 @@ pub(in crate::codegen) struct Runtime {
     /// `kira_hybrid_call_runtime`: how native code reaches the VM half.
     pub(in crate::codegen) call_runtime: Callable,
     pub(in crate::codegen) native_value_int: Callable,
+    /// `kira_rt_native_value_number`: a `Number` as a state-value node.
+    pub(in crate::codegen) native_value_number: Callable,
+    /// `kira_rt_native_value_read_number`: a `Number` back out of a node.
+    pub(in crate::codegen) native_value_read_number: Callable,
     pub(in crate::codegen) native_value_any: Callable,
     pub(in crate::codegen) native_value_read_any_type: Callable,
     pub(in crate::codegen) native_value_raw_ptr: Callable,
+    /// Moves one affine NativeState owner into a portable state node.
+    pub(in crate::codegen) native_value_native_state: Callable,
+    /// Retains one affine NativeState owner out of a portable state node.
+    pub(in crate::codegen) native_value_read_native_state: Callable,
     /// A capture cell into a state node, and the box back out of one.
     pub(in crate::codegen) native_value_cell: Callable,
     pub(in crate::codegen) native_value_read_cell: Callable,
@@ -216,12 +246,22 @@ pub(in crate::codegen) struct Runtime {
     pub(in crate::codegen) native_value_array_from: Callable,
     pub(in crate::codegen) native_value_array_to: Callable,
     pub(in crate::codegen) native_state_new: Callable,
+    pub(in crate::codegen) native_state_new_dropping: Callable,
     pub(in crate::codegen) native_state_recover: Callable,
     pub(in crate::codegen) native_state_replace: Callable,
+    /// Reads exactly one path-addressed value into a generic state node.
+    pub(in crate::codegen) native_state_read_path: Callable,
+    /// Replaces exactly one path-addressed value and returns the displaced owner.
+    pub(in crate::codegen) native_state_write_path: Callable,
+    /// Appends one element to a path-addressed array.
+    pub(in crate::codegen) native_state_append_path: Callable,
     /// Adds one owner to a callback state, boxed or stored.
     pub(in crate::codegen) native_state_retain: Callable,
     /// Removes one owner from a callback state; the last release destroys it.
     pub(in crate::codegen) native_state_release: Callable,
+    /// Removes one owner and hands a final Drop-bearing value-tree state back
+    /// to generated code so its Kira body can run exactly once.
+    pub(in crate::codegen) native_state_release_dropping: Callable,
     /// Allocates a box holding one state value in this backend's own layout.
     pub(in crate::codegen) native_state_box_new: Callable,
     /// The address of the value inside a box, type-checked.

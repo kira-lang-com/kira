@@ -23,7 +23,7 @@ pub use kira_runtime_abi::ChannelPrim;
 /// The deferred-task primitives, re-exported so an instruction names them from
 /// the one place the executor defines them.
 pub use kira_runtime_abi::TaskPrim;
-pub use kira_runtime_abi::{CompilerOp, EnvOp, FileSystemOp, MathOp, StringOp};
+pub use kira_runtime_abi::{CompilerOp, EnvOp, FileSystemOp, MathOp, NumberOp, StringOp};
 use kira_runtime_abi::{ForeignType, MainThreadOp};
 /// Which property a [`Instruction::TypeField`] reads, re-exported so an engine
 /// decoding an instruction names it without reaching past the module format.
@@ -169,6 +169,27 @@ pub enum Instruction {
     EqAny,
     /// Pop two erased values; push whether they are structurally unequal.
     NeAny,
+    /// Pop two values of one statically known type; push whether they are
+    /// structurally equal.
+    ///
+    /// The typed twin of [`EqAny`]. The compiler emits this only where the type
+    /// checker has proven both operands share one `Equatable` type, so the walk
+    /// needs no runtime kind tag — the VM's values are tagged anyway, so the
+    /// comparison is the same structural walk `EqAny` runs. Both operands are
+    /// dropped, as every comparison drops what it consumed.
+    EqValue,
+    /// Pop two values of one statically known type; push whether they are
+    /// structurally unequal.
+    NeValue,
+    /// Pop two values of one statically known type; push a plain `Int` sign of
+    /// their structural three-way order: negative, zero, or positive.
+    ///
+    /// The typed ordering twin of [`EqValue`], sharing its structural walk but
+    /// answering an ordering rather than a bool. The compiler emits it only
+    /// where the type checker proved both operands share one `Ordered` type, and
+    /// wraps the result in an integer comparison against zero to recover `<`,
+    /// `<=`, `>`, `>=`. Both operands are dropped, as every comparison does.
+    CmpValue,
     /// Pop two runtime type descriptors; push whether they name one type.
     EqType,
     /// Pop two runtime type descriptors; push whether they name two types.
@@ -275,6 +296,9 @@ pub enum Instruction {
     ForeignCallback(u32),
     /// Pop a value, format it, emit one output line, and push unit.
     Print,
+    /// Pop a message string, emit it, and hard-trap. Does not return, so no
+    /// value is pushed; execution of the program ends here with a trap.
+    Abort,
     /// Return the stack top from the current function.
     Return,
     /// Return unit from the current function.
@@ -560,6 +584,13 @@ pub enum Instruction {
     /// keep paying that. See [`StringOp`] for the numbering, which is
     /// append-only.
     StringOp(StringOp),
+    /// Perform one `Number` operation, its [`NumberOp`] in the operand byte.
+    ///
+    /// The operands are already on the stack — one for a conversion or negation,
+    /// two for arithmetic and the comparisons — and this replaces them with the
+    /// result, exactly as `StringOp` does. One opcode for the whole decimal
+    /// surface, for the reason `StringOp` gives.
+    NumberOp(NumberOp),
     /// Pop an array, push the address of a C buffer holding its elements as
     /// `ty`.
     ///
@@ -631,6 +662,24 @@ pub enum Instruction {
     },
     /// Pop an enum, push its discriminant `tag` as an `Int`, and drop the enum.
     EnumTag,
+    /// Pop the variant count, then a code (both `Int`), and push the payload-less
+    /// enum whose discriminant is that code — clamped to the first variant when
+    /// the code is outside `0..count`.
+    ///
+    /// The inverse of [`Instruction::EnumTag`], behind `fromCode`. The count
+    /// rides on the stack rather than as an operand so the instruction stays
+    /// nullary like the other enum ops; the analyzer put it there from the type
+    /// argument. Builds a payload-less variant, so nothing else is consumed.
+    EnumFromCode,
+    /// Pop one value of a statically known `Hashable` type; push its structural
+    /// hash as an `Int`, and drop the value.
+    ///
+    /// The fold twin of [`Instruction::EqValue`], sharing its structural nesting:
+    /// a struct folds its fields, an array its length then elements, an enum its
+    /// tag then payload, each leaf an integer, a boolean, a string's bytes, or a
+    /// decimal's value. Floats never reach it — the type checker refused them —
+    /// so the hash agrees with `==`.
+    HashValue,
     /// Pop an enum, push an owned copy of its payload, and drop the enum.
     ///
     /// Emitted only inside a `match` arm whose tag test already selected the

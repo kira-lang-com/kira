@@ -375,6 +375,9 @@ impl<'a> Codegen<'a> {
             Type::String | Type::Array(_) | Type::Enum(_) | Type::Any | Type::Cell(_) => {
                 self.types.ptr
             }
+            // A `Number` is a two-word value held inline — a mantissa and a
+            // scale packed into a register pair — not a handle.
+            Type::Number => self.types.i128,
             // A `RawPtr` is an opaque target-width word Kira only stores and
             // passes back; it is represented as an `i64` payload and never
             // dereferenced, exactly as the VM keeps it in a `Value::RawPtr`.

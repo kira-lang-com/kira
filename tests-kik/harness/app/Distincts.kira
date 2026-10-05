@@ -12,8 +12,9 @@ distinct DistinctTabId = U32
 distinct DistinctBookmarkId = U32
 distinct DistinctMillis = U64
 distinct DistinctTicks = DistinctMillis
+distinct DistinctStream = Int
 
-@Derive(Equatable, Clone, Hashable, Serializable, Ordered)
+@Derive(Serializable)
 distinct DistinctPort = U32
 
 struct DistinctTab {
@@ -75,28 +76,70 @@ function distinctsSection() -> Int {
     return score
 }
 
-// The derives, folded the same way: each answer is a number so a backend that
-// generated a different function shows up as a different total.
-function distinctDerivesSection() -> Int {
-    let port = DistinctPort(U32(41))
-    let copied = clone_DistinctPort(port)
+// A distinct type carries its representation's whole operator surface:
+// arithmetic and shifts yield the distinct type again, comparisons yield
+// `Bool`, a bare literal adapts into it, and a distinct-over-`Int` indexes an
+// array. Folded so a backend that lowered any operator differently answers a
+// different total. Compound assignment (`+=`, `<<=`, …) is exercised here too,
+// against both a sibling distinct value and a bare literal.
+function distinctOperatorSection() -> Int {
+    var s = DistinctStream(1)
+    s = s + DistinctStream(2)
+    s += DistinctStream(1)
+    s -= 1
     var score = 0
-    if eq_DistinctPort(port, copied) {
+    if s == 3 {
         score = score + 1
     }
-    if eq_DistinctPort(port, DistinctPort(U32(42))) {
+    if s < DistinctStream(5) {
         score = score + 10
     }
-    if hash_DistinctPort(port) == hash_DistinctPort(copied) {
+    if s >= 3 {
         score = score + 100
     }
-    if hash_DistinctPort(port) == hash_DistinctPort(DistinctPort(U32(42))) {
+    let xs: [Int] = [10, 20, 30, 40]
+    score = score + xs[s]
+    let neg = -s
+    score = score + neg.raw
+    s *= DistinctStream(2)
+    score = score + s.raw
+
+    var flags = DistinctStream(6)
+    flags &= DistinctStream(3)
+    flags |= 8
+    flags ^= DistinctStream(1)
+    flags <<= 1
+    flags >>= 1
+    score = score + flags.raw
+    return score
+}
+
+// A distinct type's whole value surface, folded the same way. A distinct over a
+// scalar word is `Copy`, so a plain binding copies it — no `clone` needed — and
+// equality, hashing, and ordering are the compiler's own — `==`, `hash(...)`,
+// and `<` — walking the representation with no derive. Each answer is a number
+// so a backend that lowered any of them differently shows up as a different
+// total.
+function distinctDerivesSection() -> Int {
+    let port = DistinctPort(U32(41))
+    let copied = port
+    var score = 0
+    if port == copied {
+        score = score + 1
+    }
+    if port == DistinctPort(U32(42)) {
+        score = score + 10
+    }
+    if hash(port) == hash(copied) {
+        score = score + 100
+    }
+    if hash(port) == hash(DistinctPort(U32(42))) {
         score = score + 1000
     }
-    if lt_DistinctPort(port, DistinctPort(U32(42))) {
+    if port < DistinctPort(U32(42)) {
         score = score + 10000
     }
-    if lt_DistinctPort(DistinctPort(U32(42)), port) {
+    if DistinctPort(U32(42)) < port {
         score = score + 100000
     }
     return score
@@ -111,7 +154,7 @@ function distinctSerdeSection() -> Int {
     if wire == "DistinctPort(U32(8080))" {
         score = score + 10
     }
-    if eq_DistinctPort(deserialize_DistinctPort(wire), port) {
+    if deserialize_DistinctPort(wire) == port {
         score = score + 100
     }
     return score

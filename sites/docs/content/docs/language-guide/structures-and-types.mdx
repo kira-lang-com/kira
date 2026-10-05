@@ -33,11 +33,52 @@ Assigning to a place requires `var` at *every* step, not just the last. Writing 
 
 A struct is also constructed by naming it. `Vec3(1, 2, 3)` fills the fields in declaration order and `Vec3(x: 1, y: 2, z: 3)` binds each by name, the two spellings the literal already had. A field the call does not reach takes its declared default, so a struct whose fields all default is built by `Type()`. The constructor lowers to the same struct value a literal produces.
 
+### Copy Updates
+
+A stored-value local may be copied while replacing selected fields:
+
+```kira
+let original = Box {
+    origin = Vec3 { x = 1, y = 2, z = 3 },
+    label = "old",
+}
+
+let changed = original {
+    let origin.x = 9
+    let label = "new"
+}
+```
+
+Fields not named by an update are copied from the base value. A dotted update rebuilds only the nested value path needed for that field. The base local is read once before any replacement expression is evaluated, so replacements cannot cause it to be evaluated repeatedly.
+
+The same syntax applies to ordinary stored-value structs and classes and to concrete construct-backed values. A closure value is not a user-visible stored-value shape and cannot be updated this way.
+
 ### Field Order and Cycles
 
 **Field type order does not matter.** Struct collection declares every name before resolving any field, so a field may name a struct declared later in the file or in another file of the same package. A by-value cycle still has no finite size: analysis detects it, reports `KSEM052`, and breaks the closing field to `Error` so recursive layout, copy, and drop walks stay total.
 
 Defaults that recursively construct each other have no finite value and are refused with `KSEM213` rather than recursing during analysis.
+
+### Equality
+
+`==` and `!=` compare two structs **structurally**: field by field, each field by its own equality, recursing through nested structs, arrays, and enums down to the scalars, strings, and pointer words at the leaves. A type earns this the moment its every leaf is comparable — there is no `@Derive` to write and no annotation to opt in. A struct holding a leaf with no equality — a task handle, a runtime type descriptor, C storage — is refused with `KSEM390`, naming the leaf, rather than compared by identity behind your back. Arrays follow the same rule, comparing length then element by element, and both hold on the VM, the native backend, and the hybrid split.
+
+### Ordering
+
+`<`, `<=`, `>`, and `>=` compare two values of one aggregate type **structurally** too, and lexicographically: a struct field by field in declaration order, an array element by element and then by length (a prefix orders before what extends it), an enum by its variant's declaration order and then by payload. The first pair of leaves that differ decides; equal pairs walk on. Like equality this is earned by shape, with no `@Derive` — and `<T: Ordered>` accepts exactly the types that earn it.
+
+Ordering is stricter than equality about its leaves. Equality accepts anything it can answer *same or not* for, so it compares a pointer word or an opaque handle by identity; ordering has no such fallback — an order read off an address means nothing across runs — so it admits only leaves that carry a **total order** of their own: signed integers, floats, booleans, strings, and the aggregates built from them. A type reaching a leaf with no order is refused with `KSEM391`, naming the leaf.
+
+An **unsigned** integer leaf (`U8`…`U64`) is refused too, for a subtler reason than a pointer: the value the walk compares is width-erased, so the walk cannot tell a `U64` from an `Int` to know whether to compare it signed or unsigned. A bare `u64Value < other` gets this right because the *operator* it compiles to carries the signedness; the structural walk has no such carrier. Order the field as a signed `Int`, or compare it directly.
+
+```kira
+struct Point { let x: Int let y: Int }
+
+Point { x: 1, y: 2 } < Point { x: 1, y: 9 }   // true, the y fields decide
+[1, 2] < [1, 2, 0]                            // true, the prefix is smaller
+```
+
+Ordering runs identically on every backend, whatever the shape — a struct, an array, a string, a number, or an enum, down to an enum whose payload is itself a struct or array (its box carries the compare leaf its payload needs).
 
 ### Defaults Are a Frontend Concern
 
@@ -95,7 +136,7 @@ enum Message {
 
 A variant is written with a **leading dot**, and what it resolves against is the type *expected* at that position: a `let` annotation, a parameter, a return type, a struct field, or the other side of a comparison. So `.Red` alone is not a value; `let c: Color = .Red` is. A dot against a non-enum type, or in a position with no expected type, is refused (`KSEM119`).
 
-`==` and `!=` compare **discriminants**, so `c == .Red` asks which variant `c` is. Reading a payload back out is [`match`](/docs/language-guide/control-flow#match).
+`==` and `!=` compare an enum **structurally**: two values are equal when they hold the same variant *and* equal payloads. `c == .Red` still asks only which variant `c` is — comparing against a payload-less variant is a bare tag check, and an enum whose variants all carry no payload never compares more than its tag — but `.Text("a") == .Text("b")` is `false`, because the payloads differ. The payloads must themselves be comparable; an enum carrying a leaf with no equality is refused (`KSEM390`), the same rule structs and arrays follow. Reading a payload back out is [`match`](/docs/language-guide/control-flow#match).
 
 Like an array, an enum is a heap value that **moves on binding** and is not trivially copyable: a named enum needs `move` into an owned parameter, while a fresh `.Variant` needs nothing.
 
@@ -246,14 +287,25 @@ The type **costs nothing**. It has the size, the alignment, and the ABI of its r
 
 The representation is an integer width, a float width, `Bool`, `RawPtr`, or another distinct type. Anything that owns storage is refused (`KSEM345`): a name for a shape with fields is a `struct`.
 
-`==` and `!=` between two values of one distinct type are its whole operator surface. Arithmetic, ordering, and `print` are refused, which is the point — adding two ids or printing one as a number is treating an identity as a quantity. Fold, compare, and render one through the derives, or take `.raw` and say so.
+A distinct type carries the **whole operator surface of its representation**. Arithmetic, bitwise, and shift operators yield the distinct type again — a value stays inside the type it was minted in — while comparisons and equality yield `Bool`, and a distinct type over an integer indexes an array as the position it is. A bare literal adapts into a distinct type the way it adapts into a written integer width, so a position reads as itself:
 
 ```kira
-@Derive(Equatable, Clone, Hashable, Serializable, Ordered)
+distinct StreamId = Int
+
+var stream = StreamId(1)
+stream += 2                       // StreamId(3)
+if stream <= 0 { return }         // a bare literal adapts
+let group = layers[stream - 1]    // indexes as the Int it is
+```
+
+The nominal boundary still holds. Two **different** distinct types share no operator (`streamId + tabId` is `KSEM071`), and a distinct type does not mix with a *written* representation value — `tabId == U32(1)` is refused, because that is comparing an identity to the machine word underneath it; only a bare literal pairs. `print` is refused for the same reason, so render one through `@Derive(Serializable)` or take `.raw` and say so.
+
+```kira
+@Derive(Serializable)
 distinct Port = U32
 ```
 
-Each derive delegates to the representation, so `serialize_Port(Port(U32(8080)))` writes `8080` rather than a struct envelope around it. `@Derive(Tagged)` does not apply — it answers which number a *variant* is — and `@Derive(Copy)` is refused, because one scalar word is copyable already.
+Equality, hashing, and ordering are native — `Port(U32(41)) == Port(U32(41))`, `hash(port)`, and `Port(U32(41)) < Port(U32(42))` all work with no derive — and a distinct over a scalar word is `Copy`, so a plain binding copies it. `@Derive(Serializable)` supplies the wire form the compiler does not own; it delegates to the representation, so `serialize_Port(Port(U32(8080)))` writes `Port(U32(8080))` rather than a struct envelope around it. `@Derive(Copy)` is refused, because one scalar word is copyable already.
 
 At an `@FFI.Extern` signature a distinct type crosses as its representation, so the C prototype is the scalar's and no unwrapping is written at the call. The Kira side stays nominal: a parameter declared `TabId` still refuses the `U32` underneath it.
 
