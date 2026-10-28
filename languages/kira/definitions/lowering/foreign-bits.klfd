@@ -2,7 +2,10 @@
 // `@FFI.Struct`. The image is laid out by the target's C rules, which KIR
 // records do not spell, so a struct with bit-fields gets its offsets here:
 // a bit-field takes the next bits unless that would cross a unit of its
-// type, and any other member the next offset its alignment allows. The
+// type, and any other member the next offset its alignment allows. On
+// Windows a bit-field instead shares the open unit only when the unit's
+// type has its size and room for it, and otherwise opens a unit of its own
+// type, which it holds whole. The
 // record holds a zero-length array of the struct's alignment first, then
 // each run of bit-fields as the bytes it spans and every other member as
 // itself, which puts each where C does. A bit-field is read and written
@@ -64,18 +67,36 @@ extend KirTypes {
         var bytes: [Int] = []
         var bit = 0
         var alignment = 1
+        // The open Microsoft unit: its first bit, its size and the bits used.
+        var unitStart = 0
+        var unitSize = 0
+        var unitUsed = 0
         for at in 0..structure.fields.count {
             let held = imageType(program, structure.fields[at].valueType)
             let size = kir_type_size(builder, held)
             let align = kir_type_align(builder, held)
             if align > alignment { alignment = align }
-            if widths[at] > 0 {
+            if widths[at] > 0 && program.microsoftBitFields {
+                let unit = size * 8
+                if unitSize == size && unitUsed + widths[at] <= unit {
+                    offsets.append(unitStart + unitUsed)
+                    unitUsed += widths[at]
+                } else {
+                    unitStart = roundedUp(roundedUp(bit, 8) / 8, align) * 8
+                    unitSize = size
+                    unitUsed = widths[at]
+                    offsets.append(unitStart)
+                    bit = unitStart + unit
+                }
+                bytes.append(0 - 1)
+            } else if widths[at] > 0 {
                 let unit = size * 8
                 if bit % unit + widths[at] > unit { bit = roundedUp(bit, unit) }
                 offsets.append(bit)
                 bytes.append(0 - 1)
                 bit += widths[at]
             } else {
+                unitSize = 0
                 let byte = roundedUp(roundedUp(bit, 8) / 8, align)
                 offsets.append(0 - 1)
                 bytes.append(byte)

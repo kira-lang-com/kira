@@ -88,11 +88,12 @@ public function lastComponentOfPath(path: borrow String) -> String {
     return trimmed.substring(separator + 1, trimmed.count)
 }
 
-// Where the last `/` in `text` is, or -1 when it has none.
+// Where the last `/`, or `\` as Windows writes one, is in `text`, or -1
+// when it has neither.
 public function lastSeparatorIn(text: borrow String) -> Number {
     var index = text.count - 1
     while index >= 0 {
-        if text.charAt(index) == asSlash { return index }
+        if isPathSeparator(text.charAt(index)) { return index }
         index = index - 1
     }
     return -1
@@ -101,10 +102,15 @@ public function lastSeparatorIn(text: borrow String) -> Number {
 // A path without the separators a listing or an argument may leave on its end.
 public function trimTrailingSeparators(path: borrow String) -> String {
     var end = path.count
-    while end > 1 && path.charAt(end - 1) == asSlash {
+    while end > 1 && isPathSeparator(path.charAt(end - 1)) {
         end = end - 1
     }
     return path.substring(0, end)
 }
 
 public let asSlash: Number = 47
+public let asBackslash: Number = 92
+
+public function isPathSeparator(character: Number) -> Bool {
+    return character == asSlash || character == asBackslash
+}

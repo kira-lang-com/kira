@@ -72,7 +72,7 @@ public function installNewest(compiler: borrow Compiler) -> InstallOutcome {
 // What knvm's own release is published as: an archive of `bin/`, holding
 // `knvm` and the launcher under every compiler's name.
 public function toolsRelease() -> Compiler {
-    let parts: [String] = [joinPath(binaryDirectoryName, managerToolName)]
+    let parts: [String] = [joinPath(binaryDirectoryName, executableName(managerToolName))]
     return Compiler {
         name: toolsArchiveName,
         binary: managerToolName,
@@ -122,9 +122,9 @@ public function landTools(unpacked: borrow String, shellHome: borrow String, she
     sweepDisplaced(binDirectory)
     var tools: [String] = []
     for name in installedToolNames() {
-        let built = joinPath(unpacked, name)
+        let built = joinPath(unpacked, executableName(name))
         if !fileExists(built) { continue }
-        let destination = joinPath(binDirectory, name)
+        let destination = joinPath(binDirectory, executableName(name))
         if !displace(destination) { return .Failed(.Tools(destination)) }
         if !succeeded(renamePath(built, destination)) { return .Failed(.Tools(destination)) }
         tools.append(name)

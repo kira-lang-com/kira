@@ -24,9 +24,10 @@ struct seam_tagged {
 };
 long long seam_tagged_sum(struct seam_tagged tagged);
 
-/* `unsigned long` and `long` are the widths `@FFI.Alias` names. */
-unsigned long seam_ulong_twice(unsigned long value);
-long seam_long_negate(long value);
+/* `unsigned long long` and `long long` are the widths `@FFI.Alias` names;
+ * plain `long` is 32 bits on Windows. */
+unsigned long long seam_ulong_twice(unsigned long long value);
+long long seam_long_negate(long long value);
 
 /* A handle C allocates and the importer frees: `seam_box_free` counts the
  * frees, so a handle freed twice or never shows in the count. */
@@ -41,9 +42,9 @@ int seam_box_frees(void);
 int seam_box_live(void);
 
 /* A variadic function: `kinds` names each argument after it, `i` an int,
- * `l` a long, `d` a double (counted in tenths), `s` a string (its length)
+ * `l` a long long, `d` a double (counted in tenths), `s` a string (its length)
  * and `p` a pointer (1 when not null). */
-long seam_tally(const char *kinds, ...);
+long long seam_tally(const char *kinds, ...);
 
 /* Callbacks: `seam_each` calls `visit` with each value and the `data` it was
  * handed, and sums what it returns; `seam_apply` calls `unary` once. */

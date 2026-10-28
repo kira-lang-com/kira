@@ -20,11 +20,11 @@ long long seam_tagged_sum(struct seam_tagged tagged) {
     return (long long)tagged.tag + (long long)tagged.word.bits;
 }
 
-unsigned long seam_ulong_twice(unsigned long value) {
+unsigned long long seam_ulong_twice(unsigned long long value) {
     return value * 2;
 }
 
-long seam_long_negate(long value) {
+long long seam_long_negate(long long value) {
     return -value;
 }
 
@@ -61,16 +61,16 @@ int seam_box_live(void) {
     return live;
 }
 
-long seam_tally(const char *kinds, ...) {
+long long seam_tally(const char *kinds, ...) {
     va_list arguments;
-    long total = 0;
+    long long total = 0;
     va_start(arguments, kinds);
     for (const char *kind = kinds; *kind != 0; kind += 1) {
         switch (*kind) {
         case 'i': total += va_arg(arguments, int); break;
-        case 'l': total += va_arg(arguments, long); break;
-        case 'd': total += (long)(va_arg(arguments, double) * 10.0); break;
-        case 's': total += (long)strlen(va_arg(arguments, const char *)); break;
+        case 'l': total += va_arg(arguments, long long); break;
+        case 'd': total += (long long)(va_arg(arguments, double) * 10.0); break;
+        case 's': total += (long long)strlen(va_arg(arguments, const char *)); break;
         case 'p': total += va_arg(arguments, void *) != 0; break;
         default: total -= 1000; break;
         }

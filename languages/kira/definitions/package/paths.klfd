@@ -1,35 +1,54 @@
-// Paths as the driver spells them: `/`-separated, absolute or relative to the
-// directory the driver runs in.
+// Paths as the driver spells them, absolute or relative to the directory the
+// driver runs in. `/` separates their parts, and so does `\` as Windows
+// writes them; a path made here uses `/`. An absolute path starts with `/` or
+// with a drive, `C:/` or `C:\`.
 
-// The directory holding `path`: `.` for a bare name, `/` for a top-level one.
+// Whether `byte` separates a path's parts.
+function isSeparator(byte: Int) -> Bool {
+    return byte == 47 || byte == 92
+}
+
+// How long the root of `path` is: 1 for `/`, 3 for a drive, 0 for a relative
+// path.
+function rootLength(path: String) -> Int {
+    let count = utf8Count(path)
+    if count > 0 && isSeparator(utf8Byte(path, 0)) { return 1 }
+    if count > 2 && utf8Byte(path, 1) == 58 && isSeparator(utf8Byte(path, 2)) { return 3 }
+    return 0
+}
+
+// The directory holding `path`: `.` for a bare name, its root for a
+// top-level one.
 function directoryOf(path: String) -> String {
     var slash = -1
     for index in 0..utf8Count(path) {
-        if utf8Byte(path, index) == 47 { slash = index }
+        if isSeparator(utf8Byte(path, index)) { slash = index }
     }
     if slash < 0 { return "." }
+    let root = rootLength(path)
+    if slash < root { return utf8Slice(path, 0, root) }
     if slash == 0 { return "/" }
     return utf8Slice(path, 0, slash)
 }
 
 // `relative` read from `directory`. An absolute `relative` stands alone.
 function joinPath(directory: String, relative: String) -> String {
-    if utf8Count(relative) > 0 && utf8Byte(relative, 0) == 47 { return relative }
-    match directory {
-        "." -> return relative
-        "/" -> return joinText(["/", relative])
-        else -> return joinText([directory, "/", relative])
-    }
+    if rootLength(relative) > 0 { return relative }
+    if directory == "." { return relative }
+    let count = utf8Count(directory)
+    if count > 0 && isSeparator(utf8Byte(directory, count - 1)) { return joinText([directory, relative]) }
+    return joinText([directory, "/", relative])
 }
 
-// `path` with its `.` segments and each `name/..` pair removed, so two
-// spellings of one directory compare equal.
+// `path` with its `.` segments and each `name/..` pair removed, and every
+// separator a `/`, so two spellings of one directory compare equal.
 function normalizedPath(path: String) -> String {
-    let absolute = utf8Count(path) > 0 && utf8Byte(path, 0) == 47
+    let root = rootLength(path)
+    let absolute = root > 0
     var segments: [String] = []
-    var start = 0
-    for index in 0..(utf8Count(path) + 1) {
-        if index < utf8Count(path) && utf8Byte(path, index) != 47 { continue }
+    var start = root
+    for index in root..(utf8Count(path) + 1) {
+        if index < utf8Count(path) && !isSeparator(utf8Byte(path, index)) { continue }
         let segment = utf8Slice(path, start, index)
         start = index + 1
         match segment {
@@ -48,7 +67,8 @@ function normalizedPath(path: String) -> String {
         segments.append(segment)
     }
     var parts: [String] = []
-    if absolute { parts.append("/") }
+    if root == 1 { parts.append("/") }
+    if root == 3 { parts.append(joinText([utf8Slice(path, 0, 2), "/"])) }
     for index in 0..segments.count {
         if index > 0 { parts.append("/") }
         parts.append(segments[index])

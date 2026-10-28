@@ -124,7 +124,7 @@ public function installTools(
 
     let names = installedToolNames()
     for name in names {
-        let built = joinPath(staging, name)
+        let built = joinPath(staging, executableName(name))
         if !buildPackage(compiler, joinPath(toolDirectory(checkout), toolPackageOf(name)), built) {
             removeTree(staging)
             return .Failed(.BuildFailed(toolPackageOf(name)))
@@ -138,12 +138,12 @@ public function installTools(
     }
     sweepDisplaced(binDirectory)
     for name in names {
-        let destination = joinPath(binDirectory, name)
+        let destination = joinPath(binDirectory, executableName(name))
         if !displace(destination) {
             removeTree(staging)
             return .Failed(.Staging(destination))
         }
-        if !succeeded(renamePath(joinPath(staging, name), destination)) {
+        if !succeeded(renamePath(joinPath(staging, executableName(name)), destination)) {
             removeTree(staging)
             return .Failed(.Staging(destination))
         }

@@ -164,7 +164,15 @@ public function binaryPath(root: borrow String, compiler: borrow Compiler) -> St
 
 // `bin/<binary>` under `root`, as one path.
 public function binaryPathIn(root: borrow String, binary: borrow String) -> String {
-    return joinPath(joinPath(root, binaryDirectoryName), binary)
+    return joinPath(joinPath(root, binaryDirectoryName), executableName(binary))
+}
+
+// `binary` as a file on this host: `kira.exe` on Windows.
+public function executableName(binary: borrow String) -> String {
+    return match targetPlatform!() {
+        Windows -> binary + ".exe"
+        Linux, Tessera, Android, MacOS, Ios, Wasm, Unknown -> copy binary
+    }
 }
 
 // The file a directory tree pins one compiler's toolchain in.
@@ -430,7 +438,7 @@ public function migrateLegacyLayout() -> Bool {
 // The one compiler there was before languages were registered: the driver with
 // its definitions and standard library beside it.
 public function legacyCompiler() -> Compiler {
-    let parts: [String] = [joinPath(binaryDirectoryName, "kira"), definitionsDirectoryName, "std"]
+    let parts: [String] = [joinPath(binaryDirectoryName, executableName("kira")), definitionsDirectoryName, "std"]
     return Compiler {
         name: "kira",
         binary: "kira",
