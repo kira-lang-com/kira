@@ -1,0 +1,223 @@
+// One UDP socket's worth of QUIC connections (DESIGN.md section 6),
+// sans-I/O like the connections it holds: datagrams in with the peer's
+// address, datagrams out with the address they go to. It routes by
+// destination connection ID, answers unknown versions, resets connections it
+// no longer has, and validates new clients with Retry when asked to.
+
+distinct QuicConnectionHandle = Number
+
+struct QuicEndpointSettings {
+    // Present when this endpoint accepts connections.
+    let server: QuicServerSettings? = .None
+    // Every new client proves its address with a Retry first (RFC 9000
+    // section 8.1.2), at the cost of a round trip.
+    let validateAddresses: Bool = false
+}
+
+namespace QuicEndpointLimit {
+    let secretBytes: Number = 32
+    let tokenNonceBytes: Number = 12
+    // A Retry token is only good for the client's next flight.
+    let tokenLifetime: Number = 10000000
+    // A stateless reset never grows past this, and stays smaller than the
+    // packet that caused it so two endpoints cannot loop (RFC 9000 section
+    // 10.3.3).
+    let largestReset: Number = 43
+    // The version that asks for version negotiation, and what it answers.
+    let negotiationVersion: Number = 0
+}
+
+struct QuicEndpointConnection {
+    let handle: QuicConnectionHandle
+    let peer: String
+    var connection: QuicConnection
+}
+
+struct QuicEndpoint {
+    let settings: QuicEndpointSettings
+    // Keys Retry tokens and derives stateless reset tokens; it never leaves
+    // the endpoint.
+    let secret: [UN8]
+    var connections: [QuicEndpointConnection] = []
+    var nextHandle: Number = 1
+    var outgoing: [Datagram] = []
+    var sentOut: Number = 0
+    var incoming: [QuicConnectionHandle] = []
+    var acceptedCount: Number = 0
+    // Where `transmit` starts, so every connection gets its turn.
+    var turn: Number = 0
+
+    function index(borrow self, handle: QuicConnectionHandle) -> Number? {
+        for (position, entry) in connections.enumerated() {
+            if entry.handle == handle { return .Some(Number(position)) }
+        }
+        return .None
+    }
+
+    // A connection a client opened to this endpoint since the last call.
+    function accept(borrow mut self) -> QuicConnectionHandle? {
+        if acceptedCount == incoming.count {
+            incoming = []
+            acceptedCount = 0
+            return .None
+        }
+        let next = incoming[acceptedCount]
+        acceptedCount += 1
+        return .Some(next)
+    }
+
+    function connect(
+        borrow mut self,
+        settings: QuicClientSettings,
+        peer: borrow String,
+        now: QuicInstant
+    ) -> Result<QuicConnectionHandle, QuicTransportError> {
+        let connection = try quicClient(move settings, now)
+        return .Ok(adopt(move connection, peer))
+    }
+
+    function adopt(
+        borrow mut self,
+        connection: QuicConnection,
+        peer: borrow String
+    ) -> QuicConnectionHandle {
+        let handle = QuicConnectionHandle(nextHandle)
+        nextHandle += 1
+        connections.append(
+            QuicEndpointConnection { handle: handle, peer: copy peer, connection: move connection }
+        )
+        return handle
+    }
+
+    function receive(borrow mut self, datagram: borrow Datagram, now: QuicInstant) {
+        let raw = match quicReadHeader(datagram.bytes, 0, Quic.connectionIdBytes) {
+            Ok(value) -> value
+            Error(drop) -> {
+                if drop == .UnknownVersion { negotiate(datagram) }
+                return
+            }
+        }
+        match route(raw, datagram.peer) {
+            Some(position) -> connections[position].connection.receive(datagram.bytes, now)
+            None -> {
+                if raw.level == .Application {
+                    if !takeReset(datagram, now) { sendReset(datagram, raw) }
+                } else if raw.level == .Initial && !raw.retry {
+                    welcome(datagram, raw, now)
+                }
+            }
+        }
+    }
+
+    // The connection a packet is for: its ID, or for a client still on
+    // its first ID, the ID and its address together.
+    function route(borrow self, raw: borrow QuicRawHeader, peer: borrow String) -> Number? {
+        for (position, entry) in connections.enumerated() {
+            let connection = entry.connection
+            if connection.localId == raw.destination { return .Some(Number(position)) }
+            let early = connection.role == .Server && connection.originalDestination == raw.destination
+            if early && entry.peer == peer { return .Some(Number(position)) }
+        }
+        return .None
+    }
+
+    // A stateless reset names no connection ID this endpoint knows; its
+    // tail is the token of the connection it ends (RFC 9000 section
+    // 10.3.1).
+    function takeReset(borrow mut self, datagram: borrow Datagram, now: QuicInstant) -> Bool {
+        for position in 0..connections.count {
+            if connections[position].peer != datagram.peer { continue }
+            if connections[position].connection.takeStatelessReset(datagram.bytes, now) {
+                return true
+            }
+        }
+        return false
+    }
+
+    // A new client's first Initial: a connection, or a Retry first.
+    function welcome(
+        borrow mut self,
+        datagram: borrow Datagram,
+        raw: borrow QuicRawHeader,
+        now: QuicInstant
+    ) {
+        let server = match settings.server {
+            Some(value) -> value
+            None -> return
+        }
+        // An Initial in a datagram under 1200 bytes is dropped (RFC 9000
+        // section 14.1).
+        if datagram.bytes.count < Quic.minimumDatagram { return }
+        var retried: [UN8]? = .None
+        if raw.token.count > 0 {
+            retried = openToken(raw.token, datagram.peer, now)
+            // A token that does not open is one this endpoint never gave.
+            if retried.isNone() && settings.validateAddresses { return }
+        }
+        if retried.isNone() && settings.validateAddresses { return sendRetry(datagram, raw, now) }
+        let local = try quicFreshConnectionId() otherwise return
+        let resetToken = try resetTokenFor(local) otherwise return
+        let start = QuicServerStart {
+            first: copy raw,
+            retried: move retried,
+            local: local,
+            resetToken: resetToken
+        }
+        var connection = try quicServer(copy server, start, now) otherwise return
+        connection.receive(datagram.bytes, now)
+        let handle = adopt(move connection, datagram.peer)
+        incoming.append(handle)
+    }
+
+    function transmit(borrow mut self, now: QuicInstant) -> Datagram? {
+        if sentOut < outgoing.count {
+            let next = copy outgoing[sentOut]
+            sentOut += 1
+            return .Some(next)
+        }
+        outgoing = []
+        sentOut = 0
+        let count = connections.count
+        for step in 0..count {
+            let position = (turn + step) % count
+            match connections[position].connection.transmit(now) {
+                Some(bytes) -> {
+                    turn = (position + 1) % count
+                    return .Some(Datagram { peer: copy connections[position].peer, bytes: bytes })
+                }
+                None -> {}
+            }
+        }
+        return .None
+    }
+
+    function deadline(borrow self) -> QuicInstant? {
+        var next: QuicInstant? = .None
+        for entry in connections { next = quicEarliest(next, entry.connection.deadline()) }
+        return next
+    }
+
+    // Timers that are due, then connections that have ended leave.
+    function expire(borrow mut self, now: QuicInstant) {
+        for position in 0..connections.count {
+            match connections[position].connection.deadline() {
+                Some(at) -> if now.raw >= at.raw { connections[position].connection.expire(now) }
+                None -> {}
+            }
+        }
+        var kept: [QuicEndpointConnection] = []
+        for entry in connections {
+            if !entry.connection.isClosed() || entry.connection.delivered < entry.connection.events.count {
+                kept.append(entry)
+            }
+        }
+        connections = kept
+    }
+}
+
+function quicEndpoint(settings: QuicEndpointSettings) -> Result<QuicEndpoint, QuicTransportError> {
+    let secret = try randomBytes(UNumber(QuicEndpointLimit.secretBytes)) otherwise return .Error(
+        .InternalError
+    )
+    return .Ok(QuicEndpoint { settings: move settings, secret: secret })
+}

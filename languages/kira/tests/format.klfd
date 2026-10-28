@@ -1,0 +1,69 @@
+import Testing
+
+@Test
+function formatsLiteralsInlineBlocksGenericsAndQuotes() {
+    expect!(formats("""
+        comptime function splice(target:String,tag:String)->Syntax {
+        return quote {#{target} = #{target} + #{tag}(1) }
+        }
+
+        function area(p:Point)->Int {
+        var total=0
+        total+=p.x*p.y // trailing
+
+
+        if total>10 { return total }
+        let q = Point {x=1,y=2}
+        let r: Result<Int, Failure> = .Ok(-1)
+        match r {
+        Ok(v) -> return v
+        Error(e) -> {}
+        }
+        return area(p)
+        }
+
+        """, """
+        comptime function splice(target: String, tag: String) -> Syntax {
+            return quote { #{target} = #{target} + #{tag}(1) }
+        }
+
+        function area(p: Point) -> Int {
+            var total = 0
+            total += p.x * p.y // trailing
+
+            if total > 10 { return total }
+            let q = Point { x = 1, y = 2 }
+            let r: Result<Int, Failure> = .Ok(-1)
+            match r {
+                Ok(v) -> return v
+                Error(e) -> {}
+            }
+            return area(p)
+        }
+
+        """))
+}
+@Test
+function keepsLiteralsOpenAcrossClosureFields() {
+    expect!(formats("""
+        function actions() -> Actions {
+        return Actions {
+        open: { in self.open() },
+        save: { path in
+        self.save(path)
+        }
+        }
+        }
+
+        """, """
+        function actions() -> Actions {
+            return Actions {
+                open: { in self.open() },
+                save: { path in
+                    self.save(path)
+                }
+            }
+        }
+
+        """))
+}

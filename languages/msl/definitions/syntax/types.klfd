@@ -1,0 +1,288 @@
+// Written types: qualifiers, a possibly qualified name, template arguments
+// for the library templates, and a trailing `const`, `*` or `&`. A
+// declarator adds a name and array extents.
+//
+// `metal::` and `simd::` qualify the library's names and are dropped, as
+// are `fast::` and `precise::` after them: fast math is the host's setting
+// (section 15.3). Other qualifiers join their segments with `_`, the
+// spelling namespaces flatten to.
+
+struct Declarator {
+    let name: String
+    let typeSyntax: Int
+}
+
+// The names the library writes with template arguments.
+function isTemplateType(word: String) -> Bool {
+    if word == "array" || word == "vec" || word == "matrix" || word == "atomic" || word == "packed_vec" {
+        return true
+    }
+    return isImageWord(word)
+}
+
+function isImageWord(word: String) -> Bool {
+    match word {
+        "texture1d" -> return true
+        "texture1d_array" -> return true
+        "texture2d" -> return true
+        "texture2d_array" -> return true
+        "texture3d" -> return true
+        "texturecube" -> return true
+        "texturecube_array" -> return true
+        "texture2d_ms" -> return true
+        "texture2d_ms_array" -> return true
+        "texture_buffer" -> return true
+        "depth2d" -> return true
+        "depth2d_array" -> return true
+        "depthcube" -> return true
+        "depthcube_array" -> return true
+        "depth2d_ms" -> return true
+        "depth2d_ms_array" -> return true
+        else -> return false
+    }
+}
+
+function isScalarWord(word: String) -> Bool {
+    match word {
+        "bool" -> return true
+        "char" -> return true
+        "uchar" -> return true
+        "short" -> return true
+        "ushort" -> return true
+        "int" -> return true
+        "uint" -> return true
+        "long" -> return true
+        "ulong" -> return true
+        "half" -> return true
+        "float" -> return true
+        "double" -> return true
+        "bfloat" -> return true
+        else -> return false
+    }
+}
+
+// Whether `word` spells a library type: a scalar, a vector `float3`, a
+// matrix `float4x4`, a packed vector, or one of the opaque types.
+function isBuiltinTypeWord(word: String) -> Bool {
+    if isScalarWord(word) || isTemplateType(word) { return true }
+    match word {
+        "void" -> return true
+        "auto" -> return true
+        "sampler" -> return true
+        "atomic_int" -> return true
+        "atomic_uint" -> return true
+        "atomic_bool" -> return true
+        "atomic_float" -> return true
+        "size_t" -> return true
+        "ptrdiff_t" -> return true
+        "imageblock" -> return true
+        "visible_function_table" -> return true
+        "intersection_function_table" -> return true
+        "acceleration_structure" -> return true
+        "simdgroup_float8x8" -> return true
+        "simdgroup_half8x8" -> return true
+        else -> {}
+    }
+    var base = word
+    if startsWith(base, "packed_") { base = utf8Slice(base, 7, utf8Count(base)) }
+    if startsWith(base, "simd_") { base = utf8Slice(base, 5, utf8Count(base)) }
+    let length = utf8Count(base)
+    if length < 2 { return false }
+    if isVectorSize(utf8Byte(base, length - 1)) && isScalarWord(utf8Slice(base, 0, length - 1)) { return true }
+    if length < 4 || utf8Byte(base, length - 2) != asciiLowerX { return false }
+    return isVectorSize(utf8Byte(base, length - 1)) && isVectorSize(utf8Byte(base, length - 3))
+        && isScalarWord(utf8Slice(base, 0, length - 3))
+}
+
+function isVectorSize(byte: Int) -> Bool {
+    return byte >= 50 && byte <= 52
+}
+
+function isQualifierWord(word: String) -> Bool {
+    match word {
+        "const" -> return true
+        "constant" -> return true
+        "device" -> return true
+        "thread" -> return true
+        "threadgroup" -> return true
+        "threadgroup_imageblock" -> return true
+        "ray_data" -> return true
+        "object_data" -> return true
+        "volatile" -> return true
+        "typename" -> return true
+        "unsigned" -> return true
+        "signed" -> return true
+        else -> return false
+    }
+}
+
+function isDroppedQualifier(segment: String) -> Bool {
+    return segment == "metal" || segment == "simd" || segment == "fast" || segment == "precise"
+}
+
+extend Parser {
+    // `a::b::c` as `a_b_c`, without the library's qualifiers.
+    function namePath(borrow mut self) -> Result<String, Failure> {
+        eat(.ColonColon)
+        var segments: [String] = []
+        segments.append((try expect(.Word)).text)
+        while at(.ColonColon) && peek(1).kind == .Word {
+            advance()
+            segments.append(advance().text)
+        }
+        var kept: [String] = []
+        for segment in segments {
+            if kept.count == 0 && segments.count > 1 && isDroppedQualifier(segment) { continue }
+            if kept.count > 0 { kept.append("_") }
+            kept.append(segment)
+        }
+        return .Ok(joinText(kept))
+    }
+
+    // The path written at the cursor, read without moving.
+    function pathAhead(borrow self) -> String {
+        var ahead = 0
+        if peek(0).kind == .ColonColon { ahead = 1 }
+        var segments: [String] = []
+        while peek(ahead).kind == .Word {
+            segments.append(peek(ahead).text)
+            if peek(ahead + 1).kind != .ColonColon { break }
+            ahead += 2
+        }
+        var kept: [String] = []
+        for segment in segments {
+            if kept.count == 0 && segments.count > 1 && isDroppedQualifier(segment) { continue }
+            if kept.count > 0 { kept.append("_") }
+            kept.append(segment)
+        }
+        return joinText(kept)
+    }
+
+    function knowsType(borrow self, written: String) -> Bool {
+        if isBuiltinTypeWord(written) || contains(templateNames, written) { return true }
+        if contains(typeNames, written) || contains(typeNames, qualified(written)) { return true }
+        for opened in tree.usings {
+            if contains(typeNames, joinText([opened, "_", written])) { return true }
+        }
+        return false
+    }
+
+    // Whether a type starts at the cursor.
+    function atType(borrow self) -> Bool {
+        if !at(.Word) && !at(.ColonColon) { return false }
+        if at(.Word) && (isQualifierWord(token().text) || token().text == "struct") { return true }
+        return knowsType(pathAhead())
+    }
+
+    function typeName(borrow mut self) -> Result<Int, Failure> {
+        let start = token().span
+        var space: SpaceWord = .NoSpace
+        var constant = false
+        var unsigned = false
+        while at(.Word) {
+            let word = token().text
+            if word == "threadgroup_imageblock" { return .Error(fail(.TileFunction, token().span)) }
+            if word == "ray_data" { return .Error(fail(.FunctionTable, token().span)) }
+            if word == "object_data" { return .Error(fail(.MeshShader, token().span)) }
+            if word == "volatile" { return .Error(fail(.UnsupportedConstruct, token().span)) }
+            if word == "const" {
+                constant = true
+            } else if word == "constant" {
+                space = .ConstantSpace
+            } else if word == "device" {
+                space = .DeviceSpace
+            } else if word == "thread" {
+                space = .ThreadSpace
+            } else if word == "threadgroup" {
+                space = .ThreadgroupSpace
+            } else if word == "unsigned" {
+                unsigned = true
+            } else if word != "typename" && word != "struct" && word != "signed" {
+                break
+            }
+            advance()
+        }
+        var name = "uint"
+        if unsigned {
+            if atWord("short") {
+                name = "ushort"
+            } else if atWord("char") {
+                name = "uchar"
+            } else if atWord("long") {
+                name = "ulong"
+            }
+            if atWord("int") || name != "uint" { advance() }
+        } else {
+            if !at(.Word) && !at(.ColonColon) { return .Error(unexpected()) }
+            name = try namePath()
+        }
+        var typeArguments: [Int] = []
+        var valueArguments: [Int] = []
+        if isTemplateType(name) && eat(.Less) {
+            while !at(.Greater) && !at(.GreaterGreater) && !at(.End) {
+                if atType() {
+                    typeArguments.append(try typeName())
+                    valueArguments.append(-1)
+                } else {
+                    valueArguments.append(try binary(shiftPrecedence))
+                    typeArguments.append(-1)
+                }
+                if !eat(.Comma) { break }
+            }
+            try closeAngle()
+        }
+        var pointer = false
+        var reference = false
+        while true {
+            if eatWord("const") {
+                constant = true
+            } else if eat(.Star) {
+                pointer = true
+            } else if eat(.Ampersand) {
+                reference = true
+            } else if at(.AmpersandAmpersand) {
+                return .Error(fail(.UnsupportedConstruct, token().span))
+            } else {
+                break
+            }
+        }
+        tree.types.append(TypeSyntax {
+            name = name, typeArguments = typeArguments, valueArguments = valueArguments, space = space,
+            constant = constant, pointer = pointer, reference = reference, extents = [], span = since(start)
+        })
+        return .Ok(tree.types.count - 1)
+    }
+
+    // `>` closing template arguments; a `>>` closes two.
+    function closeAngle(borrow mut self) -> Result<Bool, Failure> {
+        if eat(.Greater) { return .Ok(true) }
+        if at(.GreaterGreater) {
+            let taken = token()
+            let rest = Span { file = taken.span.file, start = taken.span.start + 1, end = taken.span.end }
+            tokens[position] = Token { kind = .Greater, text = ">", span = rest, lineStart = false }
+            return .Ok(true)
+        }
+        return .Error(unexpected())
+    }
+
+    // A declared name and its array extents, on `base`.
+    function declarator(borrow mut self, base: Int) -> Result<Declarator, Failure> {
+        let declared = try name()
+        var extents: [Int] = []
+        while at(.LeftBracket) && peek(1).kind != .LeftBracket {
+            advance()
+            extents.append(try expression())
+            try expect(.RightBracket)
+        }
+        if extents.count == 0 { return .Ok(Declarator { name = declared.text, typeSyntax = base }) }
+        var written = tree.types[base]
+        written.extents = extents
+        tree.types.append(written)
+        return .Ok(Declarator { name = declared.text, typeSyntax = tree.types.count - 1 })
+    }
+}
+
+function startsWith(text: String, start: String) -> Bool {
+    let length = utf8Count(start)
+    return utf8Count(text) >= length && utf8Slice(text, 0, length) == start
+}

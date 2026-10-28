@@ -1,0 +1,59 @@
+struct PayloadDescription {
+    let payloadType: KirType
+    let boxType: KirType
+    let boxSize: Int
+    let size: Int
+    let alignment: Int
+    let global: KirGlobal
+    let destructor: KirFunctionBuilder
+    let copier: KirFunctionBuilder
+}
+
+extend KirTypes {
+    function declarePayloadDescription(borrow self, builder: KirModuleBuilder, program: CheckedProgram, span: Span, payload: KirType, key: String) -> PayloadDescription {
+        let name = program.named(span)
+        let box = builder.declareRecordSpecialization(name.start, name.end, ridlLayout, generatedSuffix(builder, "payload box", key))
+        builder.addRecordField(box, name.start, name.end, pointer)
+        builder.addRecordField(box, name.start, name.end, pointer)
+        builder.addRecordField(box, name.start, name.end, payload)
+        let drop = kir_signature_new_named(builder, name.start, name.end, unit, generatedSuffix(builder, "payload drop", key))
+        kir_signature_parameter(drop, pointer)
+        kir_signature_parameter(drop, pointer)
+        let copier = kir_signature_new_named(builder, name.start, name.end, unit, generatedSuffix(builder, "payload copy", key))
+        kir_signature_parameter(copier, pointer)
+        kir_signature_parameter(copier, pointer)
+        kir_signature_parameter(copier, pointer)
+        let global = kir_global_new_named(builder, name.start, name.end, descriptorTypes[0], 1, generatedSuffix(builder, "payload descriptor", key))
+        for byte in 0..kir_type_size(builder, descriptorTypes[0]) { kir_global_byte(global, 0) }
+        return PayloadDescription {
+            payloadType = payload, boxType = box, boxSize = kir_type_size(builder, box),
+            size = kir_type_size(builder, payload), alignment = kir_type_align(builder, payload), global = global,
+            destructor = kir_signature_declare(drop), copier = kir_signature_declare(copier)
+        }
+    }
+
+    function initializePayloadDescription(borrow self, initializer: KirFunctionBuilder, description: PayloadDescription) {
+        let address = kir_value_global_address(initializer, description.global)
+        initializer.store(initializer.integer(integer32, 1), initializer.field(address, 0, integer32))
+        initializer.store(initializer.integer(integer32, 3), initializer.field(address, 1, integer32))
+        initializer.store(initializer.integer(integer64, description.size), initializer.field(address, 2, integer64))
+        initializer.store(initializer.integer(integer64, description.alignment), initializer.field(address, 3, integer64))
+        let copier = kir_value_function_reference(initializer, description.copier)
+        initializer.store(initializer.convert(convertBitcast, copier, pointer), initializer.field(address, 4, pointer))
+        initializer.store(kir_value_null(initializer, pointer), initializer.field(address, 5, pointer))
+        let drop = kir_value_function_reference(initializer, description.destructor)
+        initializer.store(initializer.convert(convertBitcast, drop, pointer), initializer.field(address, 6, pointer))
+    }
+}
+
+extend FunctionLowering {
+    function allocatePayloadBox(borrow mut self, description: PayloadDescription) -> KirValue {
+        let context = arrayRuntimePointer(0, [kir.integer(types.integer64, description.boxSize)])
+        let box = kir.typedMemory(context, description.boxType)
+        let descriptor = kir_value_global_address(kir, description.global)
+        kir.store(kir.convert(convertBitcast, kir.pointer(descriptor), types.pointer), kir.field(box, 0, types.pointer))
+        let free = kir_value_function_reference(kir, functions[program.arrayFunctions[9]])
+        kir.store(kir.convert(convertBitcast, free, types.pointer), kir.field(box, 1, types.pointer))
+        return context
+    }
+}

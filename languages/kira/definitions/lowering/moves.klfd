@@ -1,0 +1,11 @@
+extend FunctionLowering {
+    // A move hands the value over as its bytes: what it owns, a recursive
+    // case's cell included, now belongs to the destination.
+    function moveValue(borrow mut self, from: KirAddress, to: KirAddress, valueType: Type) {
+        if (valueType.kind == .Structure && !isClassType(program, valueType)) || valueType.kind == .Enumeration {
+            kir.copyBytes(from, to, kir.integer(types.integer64, types.byteSize(valueType)), types.pointer)
+            return
+        }
+        kir.store(kir.load(from), to)
+    }
+}

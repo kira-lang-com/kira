@@ -1,0 +1,519 @@
+import Foundation
+
+// EnxGenericTests.kira — Deep Result<T, E> test suite.
+// Covers: Result<Int,E>, Result<struct,E>, Result<enum,E>, Result<[Int],E>;
+// both Ok and Error paths; chained matching; pipeline combinator; Results in
+// struct fields; Results in array elements matched via borrow-param helper;
+// error-code helpers; combined patterns; trap tests.
+// All top-level names use prefix enxG / EnxG.
+
+// ---------------------------------------------------------------------------
+// Error enum and value types
+// ---------------------------------------------------------------------------
+
+enum EnxGErr {
+    DivByZero
+    Overflow
+    NotFound
+    Empty
+    BadInput
+}
+
+enum EnxGTone {
+    Warm
+    Cool
+    Neutral
+    Vivid
+}
+
+struct EnxGRect {
+    var w: Int
+    var h: Int
+
+    function area() -> Int {
+        return self.w * self.h
+    }
+}
+
+// Stores a Result in a struct field for later matching.
+struct EnxGSlot {
+    var tag: Int
+    var r: Result<Int, EnxGErr>
+}
+
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+// Error-code helper: all negative so they fold distinctly from success values.
+function enxGErrCode(e: borrow EnxGErr) -> Int {
+    match e {
+        DivByZero -> { return 0 - 1 }
+        Overflow -> { return 0 - 2 }
+        NotFound -> { return 0 - 3 }
+        Empty -> { return 0 - 4 }
+        BadInput -> { return 0 - 5 }
+    }
+}
+
+function enxGToneVal(t: borrow EnxGTone) -> Int {
+    match t {
+        Warm -> { return 100 }
+        Cool -> { return 200 }
+        Neutral -> { return 300 }
+        Vivid -> { return 400 }
+    }
+}
+
+// --- Result<Int, EnxGErr> ---------------------------------------------------
+
+// Safe integer division: Error(DivByZero) if b==0, Error(BadInput) if a<0.
+function enxGSafeDiv(a: Int, b: Int) -> Result<Int, EnxGErr> {
+    if b == 0 {
+        return .Error(.DivByZero)
+    }
+    if a < 0 {
+        return .Error(.BadInput)
+    }
+    return .Ok(a / b)
+}
+
+// Fold a borrowed Result<Int, EnxGErr> to Int. Using a borrow-param function
+// is the required pattern for matching array elements (KSEM104 forbids direct
+// `match arr[i]`).
+function enxGResultIntVal(r: borrow Result<Int, EnxGErr>) -> Int {
+    match r {
+        Ok(x) -> { return x }
+        Error(e) -> { return enxGErrCode(e) }
+    }
+}
+
+// Returns 1 if r is an Error, 0 if Ok. Used to avoid matching arr[i] directly.
+function enxGIsError(r: borrow Result<Int, EnxGErr>) -> Int {
+    match r {
+        Ok(x) -> { return 0 }
+        Error(e) -> { return 1 }
+    }
+}
+
+// --- Result<EnxGRect, EnxGErr> ----------------------------------------------
+
+// Makes a rect: errors if w or h <= 0, or if area > 10000.
+function enxGMakeRect(w: Int, h: Int) -> Result<EnxGRect, EnxGErr> {
+    if w <= 0 || h <= 0 {
+        return .Error(.BadInput)
+    }
+    if w * h > 10000 {
+        return .Error(.Overflow)
+    }
+    return .Ok(EnxGRect { w: w, h: h })
+}
+
+function enxGRectResultArea(r: borrow Result<EnxGRect, EnxGErr>) -> Int {
+    match r {
+        Ok(rect) -> { return rect.area() }
+        Error(e) -> { return enxGErrCode(e) }
+    }
+}
+
+// --- Result<EnxGTone, EnxGErr> ---------------------------------------------
+
+// Maps 0->Warm, 1->Cool, 2->Neutral, 3->Vivid, else Error(BadInput).
+function enxGColorResult(i: Int) -> Result<EnxGTone, EnxGErr> {
+    match i {
+        0 -> {
+            return .Ok(.Warm)
+        }
+        1 -> {
+            return .Ok(.Cool)
+        }
+        2 -> {
+            return .Ok(.Neutral)
+        }
+        3 -> {
+            return .Ok(.Vivid)
+        }
+        else -> {
+            return .Error(.BadInput)
+        }
+    }
+}
+
+function enxGToneResultVal(r: borrow Result<EnxGTone, EnxGErr>) -> Int {
+    match r {
+        Ok(t) -> { return enxGToneVal(t) }
+        Error(e) -> { return enxGErrCode(e) }
+    }
+}
+
+// --- Result<[Int], EnxGErr> ------------------------------------------------
+
+// Builds [0, 3, 6, ..., (n-1)*3]. Error(Empty) if n<=0, Error(Overflow) if n>100.
+function enxGBuildRange(n: Int) -> Result<[Int], EnxGErr> {
+    if n <= 0 {
+        return .Error(.Empty)
+    }
+    if n > 100 {
+        return .Error(.Overflow)
+    }
+    var xs: [Int] = []
+    for i in 0..n {
+        xs.append(i * 3)
+    }
+    return .Ok(move xs)
+}
+
+// --- Result in struct fields ------------------------------------------------
+
+function enxGSlotVal(slot: borrow EnxGSlot) -> Int {
+    match slot.r {
+        Ok(x) -> { return x + slot.tag }
+        Error(e) -> { return slot.tag + enxGErrCode(e) }
+    }
+}
+
+// --- Chained Result matching -----------------------------------------------
+
+// Three-level chain: each Ok feeds the next fallible call.
+function enxGChain3(a: Int, b: Int, c: Int) -> Int {
+    let r1 = enxGSafeDiv(a, b)
+    match r1 {
+        Ok(x) -> {
+            let r2 = enxGSafeDiv(x + 10, c)
+            match r2 {
+                Ok(y) -> {
+                    let r3 = enxGSafeDiv(y + 5, 2)
+                    match r3 {
+                        Ok(z) -> { return x + y + z }
+                        Error(e) -> { return enxGErrCode(e) }
+                    }
+                }
+                Error(e) -> { return enxGErrCode(e) }
+            }
+        }
+        Error(e) -> { return enxGErrCode(e) }
+    }
+}
+
+// --- Pipeline combinator ---------------------------------------------------
+
+// Ok advances, Error propagates unchanged.
+function enxGStep(r: Result<Int, EnxGErr>, k: Int) -> Result<Int, EnxGErr> {
+    match r {
+        Ok(x) -> { return enxGSafeDiv(x + k, k) }
+        Error(e) -> { return .Error(e) }
+    }
+}
+
+function enxGPipeline(seed: Int, k1: Int, k2: Int, k3: Int) -> Int {
+    let r0 = enxGSafeDiv(seed, 1)
+    let r1 = enxGStep(move r0, k1)
+    let r2 = enxGStep(move r1, k2)
+    let r3 = enxGStep(move r2, k3)
+    match r3 {
+        Ok(v) -> { return v }
+        Error(e) -> { return enxGErrCode(e) }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T = Int tests
+// ---------------------------------------------------------------------------
+
+// enxGSafeDiv(90, 9) -> Ok(10)
+// enxGSafeDiv(90, 9) -> Ok(10)
+@Test
+function enxGDivOkBasic() {
+    let r = enxGSafeDiv(90, 9)
+    var out = 0
+    match r {
+        Ok(x) -> { out = x }
+        Error(e) -> { out = enxGErrCode(e) }
+    }
+    expect!(out == 10)
+}
+
+// enxGSafeDiv(100, 7) -> Ok(14) (truncated)
+@Test
+function enxGDivOkTruncated() {
+    let r = enxGSafeDiv(100, 7)
+    var out = 0
+    match r {
+        Ok(x) -> { out = x }
+        Error(e) -> { out = enxGErrCode(e) }
+    }
+    expect!(out == 14)
+}
+
+// enxGSafeDiv(50, 0) -> Error(DivByZero) -> -1
+@Test
+function enxGDivErrDivByZero() {
+    let r = enxGSafeDiv(50, 0)
+    var out = 0
+    match r {
+        Ok(x) -> { out = x }
+        Error(e) -> { out = enxGErrCode(e) }
+    }
+    expect!(out == 0 - 1)
+}
+
+// enxGSafeDiv(-10, 2) -> Error(BadInput) -> -5
+@Test
+function enxGDivErrBadInput() {
+    let r = enxGSafeDiv(0 - 10, 2)
+    var out = 0
+    match r {
+        Ok(x) -> { out = x }
+        Error(e) -> { out = enxGErrCode(e) }
+    }
+    expect!(out == 0 - 5)
+}
+
+// enxGSafeDiv(0, 5) -> Ok(0)
+@Test
+function enxGDivZeroNumerator() {
+    let r = enxGSafeDiv(0, 5)
+    var out = 999
+    match r {
+        Ok(x) -> { out = x }
+        Error(e) -> { out = enxGErrCode(e) }
+    }
+    expect!(out == 0)
+}
+
+// enxGSafeDiv(42, 1) -> Ok(42)
+@Test
+function enxGDivUnitDivisor() {
+    expect!(enxGResultIntVal(enxGSafeDiv(42, 1)) == 42)
+}
+
+// enxGSafeDiv(999, 9) -> Ok(111)
+@Test
+function enxGDivLargeOk() {
+    expect!(enxGResultIntVal(enxGSafeDiv(999, 9)) == 111)
+}
+
+// sum enxGSafeDiv(120, i+1) for i=0..11 (all Ok):
+// 120/1+120/2+120/3+120/4+120/5+120/6+120/7+120/8+120/9+120/10+120/11+120/12
+// =120+60+40+30+24+20+17+15+13+12+10+10=371
+@Test
+function enxGDivLoopFold12() {
+    var acc = 0
+    for i in 0..12 {
+        acc = acc + enxGResultIntVal(enxGSafeDiv(120, i + 1))
+    }
+    expect!(acc == 371)
+}
+
+// Count Error results in enxGSafeDiv(i-3, 2) for i=0..5:
+// i=0:a=-3<0->Error, i=1:a=-2->Error, i=2:a=-1->Error, i=3..5:Ok -> count=3
+@Test
+function enxGDivErrorCount() {
+    var count = 0
+    for i in 0..6 {
+        let r = enxGSafeDiv(i - 3, 2)
+        var isErr = 0
+        match r {
+            Ok(x) -> { isErr = 0 }
+            Error(e) -> { isErr = 1 }
+        }
+        count = count + isErr
+    }
+    expect!(count == 3)
+}
+
+// Sum of all 5 error codes: -1-2-3-4-5 = -15
+@Test
+function enxGAllErrCodeSum() {
+    let a = enxGErrCode(.DivByZero)
+    let b = enxGErrCode(.Overflow)
+    let c = enxGErrCode(.NotFound)
+    let d = enxGErrCode(.Empty)
+    let f = enxGErrCode(.BadInput)
+    expect!(a + b + c + d + f == 0 - 15)
+}
+
+// Inline match with both paths covered: Ok path
+@Test
+function enxGInlineMatchOk() {
+    let r = enxGSafeDiv(56, 8)
+    var out = 0
+    match r {
+        Ok(x) -> { out = x }
+        Error(e) -> { out = enxGErrCode(e) }
+    }
+    expect!(out == 7)
+}
+
+// Inline match with both paths covered: Error path
+@Test
+function enxGInlineMatchErr() {
+    let r = enxGSafeDiv(0 - 1, 5)
+    var out = 0
+    match r {
+        Ok(x) -> { out = x }
+        Error(e) -> { out = enxGErrCode(e) }
+    }
+    expect!(out == 0 - 5)
+}
+
+// ---------------------------------------------------------------------------
+// T = struct (EnxGRect) tests
+// ---------------------------------------------------------------------------
+
+// makeRect(5,3) -> Ok -> area=15
+@Test
+function enxGRectOkArea() {
+    expect!(enxGRectResultArea(enxGMakeRect(5, 3)) == 15)
+}
+
+// makeRect(10,10) -> Ok -> area=100
+@Test
+function enxGRectOkAreaSquare() {
+    expect!(enxGRectResultArea(enxGMakeRect(10, 10)) == 100)
+}
+
+// makeRect(-1, 5) -> Error(BadInput) -> -5
+@Test
+function enxGRectErrNegW() {
+    expect!(enxGRectResultArea(enxGMakeRect(0 - 1, 5)) == 0 - 5)
+}
+
+// makeRect(5, -1) -> Error(BadInput) -> -5
+@Test
+function enxGRectErrNegH() {
+    expect!(enxGRectResultArea(enxGMakeRect(5, 0 - 1)) == 0 - 5)
+}
+
+// makeRect(0, 5) -> Error(BadInput) -> -5
+@Test
+function enxGRectErrZeroW() {
+    expect!(enxGRectResultArea(enxGMakeRect(0, 5)) == 0 - 5)
+}
+
+// makeRect(200, 200) -> area=40000 > 10000 -> Error(Overflow) -> -2
+@Test
+function enxGRectErrOverflow() {
+    expect!(enxGRectResultArea(enxGMakeRect(200, 200)) == 0 - 2)
+}
+
+// Fold makeRect(i+1, i+2) for i=0..5: areas 1*2+2*3+3*4+4*5+5*6+6*7=2+6+12+20+30+42=112
+@Test
+function enxGRectFoldLoop() {
+    var acc = 0
+    for i in 0..6 {
+        acc = acc + enxGRectResultArea(enxGMakeRect(i + 1, i + 2))
+    }
+    expect!(acc == 112)
+}
+
+// Fold makeRect(i, 10-i) for i=0..10:
+// i=0: BadInput(-5); i=1..9: (1,9)=9,(2,8)=16,(3,7)=21,(4,6)=24,(5,5)=25,
+//   (6,4)=24,(7,3)=21,(8,2)=16,(9,1)=9; i=10: BadInput(-5)
+// sum=-5+9+16+21+24+25+24+21+16+9-5=155
+@Test
+function enxGRectFoldMixed() {
+    var acc = 0
+    for i in 0..11 {
+        acc = acc + enxGRectResultArea(enxGMakeRect(i, 10 - i))
+    }
+    expect!(acc == 155)
+}
+
+// Rect field access from Ok: makeRect(4,6) -> Ok -> read w+h=10
+@Test
+function enxGRectFieldAccessOk() {
+    let r = enxGMakeRect(4, 6)
+    var out = 0
+    match r {
+        Ok(rect) -> { out = rect.w + rect.h }
+        Error(e) -> { out = enxGErrCode(e) }
+    }
+    expect!(out == 10)
+}
+
+// ---------------------------------------------------------------------------
+// T = enum (Result<EnxGTone, EnxGErr>) tests
+// ---------------------------------------------------------------------------
+
+// colorResult(0) -> Ok(Warm) -> 100
+@Test
+function enxGToneWarm() {
+    expect!(enxGToneResultVal(enxGColorResult(0)) == 100)
+}
+
+// colorResult(1) -> Ok(Cool) -> 200
+@Test
+function enxGToneCool() {
+    expect!(enxGToneResultVal(enxGColorResult(1)) == 200)
+}
+
+// colorResult(2) -> Ok(Neutral) -> 300
+@Test
+function enxGToneNeutral() {
+    expect!(enxGToneResultVal(enxGColorResult(2)) == 300)
+}
+
+// colorResult(3) -> Ok(Vivid) -> 400
+@Test
+function enxGToneVivid() {
+    expect!(enxGToneResultVal(enxGColorResult(3)) == 400)
+}
+
+// colorResult(4) -> Error(BadInput) -> -5
+@Test
+function enxGToneBadInput() {
+    expect!(enxGToneResultVal(enxGColorResult(4)) == 0 - 5)
+}
+
+// Fold colorResult(i%5) for i=0..15 (16 values):
+// Cycle 0..4: 100+200+300+400-5=995; 3 full (0..14)=2985; i=15:15%5=0->Warm->100
+// total=3085
+@Test
+function enxGToneFold16() {
+    var acc = 0
+    for i in 0..16 {
+        acc = acc + enxGToneResultVal(enxGColorResult(i % 5))
+    }
+    expect!(acc == 3085)
+}
+
+// Count non-error tones in i=0..19: i%5 in {0,1,2,3} -> 4 per 5-cycle -> 16
+@Test
+function enxGToneNonErrorCount() {
+    var count = 0
+    for i in 0..20 {
+        let r = enxGColorResult(i % 5)
+        var ok = 0
+        match r {
+            Ok(t) -> { ok = 1 }
+            Error(e) -> { ok = 0 }
+        }
+        count = count + ok
+    }
+    expect!(count == 16)
+}
+
+// Fold colorResult(i%5) for i=0..11:
+// cycle 0..4: 995; cycle 5..9: 995; i=10:0->100; i=11:1->200
+// total=995+995+100+200=2290
+@Test
+function enxGToneFold12() {
+    var acc = 0
+    for i in 0..12 {
+        acc = acc + enxGToneResultVal(enxGColorResult(i % 5))
+    }
+    expect!(acc == 2290)
+}
+
+// Inline double-match: Ok(Vivid) inner tone value
+@Test
+function enxGToneInlineDouble() {
+    let r = enxGColorResult(3)
+    var out = 0
+    match r {
+        Ok(t) -> { out = enxGToneVal(t) }
+        Error(e) -> { out = enxGErrCode(e) }
+    }
+    expect!(out == 400)
+}

@@ -1,0 +1,22 @@
+import Foundation
+import Build
+
+function compilerProbe() -> Number {
+    var graph = Graph {
+        project: "compiler relocation",
+        root: environmentValue("FIXTURE_ROOT"),
+        request: BuildRequest { arguments: ["all"], jobs: 1 }
+    }
+    let compiler = graph.kira()
+    let settings = KiraSettings { sourceRoot: ".", excluding: [".git", ".kira-build"] }
+    let library = compiler.library(graph, "library", settings)
+    // Host packages consume path dependencies directly. The compiler's
+    // depfile records this sibling input for the variant cache.
+    let consumer = compiler.program(graph, "consumer", settings)
+    let unrelated = compiler.program(graph, "unrelated", settings)
+    graph.step(Step {
+        name: "all", summary: "real compiler relocation probe",
+        produces: [library.binary, consumer, unrelated]
+    })
+    return graph.run()
+}

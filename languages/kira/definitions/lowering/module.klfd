@@ -1,0 +1,239 @@
+// Lowering: a checked program to a KIR module.
+//
+// Every function is declared before any body is lowered, so a call may reach
+// a function declared later. A struct or enum result is written through an
+// out-pointer the caller passes first; a struct or enum parameter, and any
+// `borrow mut` one, arrives as the address of the caller's storage.
+
+function lowerProgram(session: Session, unit: Unit, carried: Program) -> KirModule {
+    let program: CheckedProgram = artifactValue(definition_program_payload(session, carried))
+    let builder = kir_module_new(session, unit, carried)
+    lowerCheckedProgram(builder, program, programRoots(program), true)
+    return kir_module_finish(builder)
+}
+
+// What a program is built for: its entry, its globals' initialization and its
+// public functions; for a library, everything it declares. A compile-time function the program
+// calls is reached through that call, so the ones only macros use stay out.
+// What another unit defines is that unit's to build, and the unit of a
+// package the program depends on leaves the globals to the program's.
+function programRoots(program: CheckedProgram) -> [Int] {
+    var roots: [Int] = []
+    for index in 0..program.functions.count {
+        if program.builtElsewhere(index) || program.neverChecked(index) { continue }
+        let declared = program.functions[index]
+        if program.library || program.dependencyRoot(index) || declared.entry || declared.exported || witnessExported(declared) { roots.append(index) }
+    }
+    if program.dependencyUnit { return roots }
+    match program.globalInitializer {
+        Some(initializer) -> roots.append(initializer)
+        None -> {}
+    }
+    for root in lazyGlobalInitializers(program) { roots.append(root) }
+    if !program.library {
+        for exit in program.exitFunctions { roots.append(exit) }
+    }
+    for root in dispatchRoots(program) { roots.append(root) }
+    // A unit built apart may read a descriptor, and only this unit defines
+    // the table answering it.
+    for root in program.typeTableFunctions { roots.append(root) }
+    // A failed cast names the type the `Any` held through the type table.
+    match program.typeNames {
+        Some(table) -> roots.append(table)
+        None -> {}
+    }
+    for root in classDispatchRoots(program) { roots.append(root) }
+    return roots
+}
+
+// Every function is declared, so indices stay those of the checked program,
+// but only the bodies `roots` reach are lowered. One nothing reaches may not
+// have been checked, so it gets an empty body, unless another unit may reach
+// it: one a package built apart declares, or any of a dependency unit's own,
+// is then declared by name alone, and its body is the reaching unit's. One
+// another unit defines is declared with its signature when reached.
+function lowerCheckedProgram(builder: KirModuleBuilder, program: CheckedProgram, roots: [Int], markComptime: Bool) -> [KirFunctionBuilder] {
+    let reached = reachableFunctions(program, roots)
+    var types = KirTypes.declare(builder, program)
+    types.declareForeignImages(builder, program)
+    types.declareNativeLibraries(builder, program)
+    types.declareGlobals(builder, program)
+    var functions: [KirFunctionBuilder] = []
+    for index in 0..program.functions.count {
+        let checked = program.functions[index]
+        match checked.foreign {
+            Some(foreign) -> {
+                if !reached[index] || excludedForeign(program, program.foreignFunctions[foreign]) || runtimeForeign(program, program.foreignFunctions[foreign]) {
+                    functions.append(declareKirFunction(builder, types, program, checked, false, false))
+                    continue
+                }
+                functions.append(types.declareForeign(builder, program, checked, program.foreignFunctions[foreign], .None))
+            }
+            None -> {
+                if reached[index] {
+                    functions.append(declareKirFunction(builder, types, program, checked, true, bufferOperation(program, index)))
+                } else if program.dependencyUnit || program.declaredApart(index) {
+                    functions.append(declareKirFunction(builder, types, program, checked, false, false))
+                } else {
+                    functions.append(declareUnreachedFunction(builder, types, program, checked))
+                }
+            }
+        }
+    }
+    types.declareClassDispatchers(builder, program, reached)
+    types.declareForeignEntries(builder, program, reached)
+    types.declareVariadicCalls(builder, program, reached)
+    if markComptime {
+        for index in program.comptimeFunctions {
+            let result = program.functions[index].result
+            match result.kind {
+                Structure -> markComptimeStructure(types, program, functions[index], functions[program.arrayFunctions[0]], result)
+                Integer -> kir_function_comptime(functions[index])
+                Decimal -> kir_function_comptime(functions[index])
+                Floating -> kir_function_comptime(functions[index])
+                Boolean -> kir_function_comptime(functions[index])
+                Pointer -> kir_function_comptime(functions[index])
+                Void -> kir_function_comptime(functions[index])
+                Enumeration -> kir_function_comptime(functions[index])
+                Invalid -> kir_function_comptime(functions[index])
+            }
+        }
+    }
+    types.declareCaptureTypes(builder, program)
+    types.declareClassDescriptions(builder, program)
+    types.declareArrayBufferOps(builder, program, functions)
+    types.declareCaptureDescriptors(builder, program)
+    types.declareValueHelpers(builder, program)
+    types.declareAnyCases(builder, program)
+    let buffersDefined = declareRidlSurface(builder, program, types, functions)
+    let importsDefined = declareRidlImports(builder, program, types, functions, buffersDefined)
+    let witnessed = types.declareRidlWitnesses(builder, program, functions, reached)
+    if witnessed.types.count > 0 {
+        // The surface's `ridl.type` rows name its own destroy functions; a
+        // trait's spelling of the same type adds an equal one under its own
+        // name, which the engine reads in place of it.
+        if !importsDefined { defineRidlBuffers(builder, program, types, functions) }
+        declareRidlTypes(builder, program, types, witnessed.types, witnessed.spellings, "__klf_witness_destroy_")
+    }
+    types.declareTracers(builder, program)
+    types.declareOutputService(builder, program)
+    types.declareTrapOperands(builder, program)
+    types.declareClosureThunks(builder, program, reached)
+    types.declareExitRegistration(builder, program, functions, !markComptime)
+    declareGlobalBootstrap(builder, program, types, functions)
+    // Resume functions first: the async functions that start them need
+    // their frames' sizes.
+    for index in 0..program.functions.count {
+        if !reached[index] || program.functions[index].asyncResume.isNone() { continue }
+        var resume = FunctionLowering.start(program, types, functions, index)
+        types.asyncFrames.append(resume.lowerAsyncResume(index))
+    }
+    for index in 0..program.functions.count {
+        if program.functions[index].service || !reached[index] || program.builtElsewhere(index) { continue }
+        if program.functions[index].asyncResume.isSome() { continue }
+        var lowering = FunctionLowering.start(program, types, functions, index)
+        if boxesWitness(program.functions[index].witness) {
+            lowering.lowerWitnessBox()
+            continue
+        }
+        if unboxesWitness(program.functions[index].witness) {
+            lowering.lowerWitnessUnbox()
+            continue
+        }
+        lowering.lowerBody()
+    }
+    lowerClosureThunks(program, types, functions, reached)
+    lowerCaptureFrameHelpers(program, types, functions)
+    lowerClassPayloadHelpers(program, types, functions)
+    lowerWitnessHelpers(program, types, functions)
+    lowerFamilyDispatches(program, types, functions)
+    lowerClassDispatchers(program, types, functions)
+    lowerGlobalTeardown(program, types, functions)
+    lowerTracers(program, types, functions)
+    lowerAnyCases(program, types, functions)
+    lowerValueHelpers(program, types, functions)
+    lowerForeignEntries(program, types, functions)
+    lowerRuntimeHooks(builder, program, types, functions)
+    return functions
+}
+
+function declareKirFunction(builder: KirModuleBuilder, types: KirTypes, program: CheckedProgram, checked: CheckedFunction, reached: Bool, calledFromC: Bool) -> KirFunctionBuilder {
+    var result = types.of(checked.result)
+    if checked.result.isAggregate() || !reached { result = types.unit }
+    let name = program.named(checked.name)
+    let signature = kir_signature_new(builder, name.start, name.end, result)
+    for index in 0..utf8Count(checked.symbol) {
+        kir_signature_name_byte(signature, utf8Byte(checked.symbol, index))
+    }
+    if !reached { return kir_signature_declare(signature) }
+    if checked.lambda { kir_signature_parameter(signature, types.pointer) }
+    if checked.result.isAggregate() {
+        kir_signature_parameter(signature, types.address(checked.result))
+    }
+    for index in checked.captures.count..checked.parameterCount {
+        kir_signature_parameter(signature, parameterType(types, checked.locals[index]))
+        if calledFromC { types.cParameter(signature, program, checked.locals[index].valueType) }
+    }
+    if calledFromC { types.cResult(signature, program, checked.result) }
+    // A `public` declaration is in its module's surface, so the engine emits a
+    // second entry under its mangled RIDL symbol for a caller reaching it
+    // through the RIDL ABI (sections 20 and 24). Anything without `public` is
+    // the module's own business.
+    // A function a witness table names is reached from another module's
+    // entry, so it is exported too, though it is in no surface.
+    if checked.exported || witnessExported(checked) { kir_signature_export(signature) }
+    return kir_signature_declare(signature)
+}
+
+// Whether function `index` is one a buffer's ops point at. Code of any
+// language frees and grows a Kira buffer it holds through them (KLF section
+// 21.4), so they take the C convention, and on the VM C calls them through
+// a native entry.
+function bufferOperation(program: CheckedProgram, index: Int) -> Bool {
+    if program.arrayFunctions.count < 9 { return false }
+    return index == program.arrayFunctions[7] || index == program.arrayFunctions[8]
+}
+
+// A Kira function nothing reaches, given an empty body: one declared without
+// a body would read as a C import of its bare name, and could clash with
+// another, or with the platform's `main`.
+function declareUnreachedFunction(builder: KirModuleBuilder, types: KirTypes, program: CheckedProgram, checked: CheckedFunction) -> KirFunctionBuilder {
+    let name = program.named(checked.name)
+    let signature = kir_signature_new(builder, name.start, name.end, types.unit)
+    for index in 0..utf8Count(checked.symbol) {
+        kir_signature_name_byte(signature, utf8Byte(checked.symbol, index))
+    }
+    let stub = kir_signature_define(signature)
+    stub.switchTo(stub.entryBlock())
+    stub.returnVoid()
+    return stub
+}
+
+function parameterType(types: KirTypes, local: Local) -> KirType {
+    if local.byReference || local.valueType.isAggregate() {
+        return types.address(local.valueType)
+    }
+    return types.of(local.valueType)
+}
+
+// A compile-time function returning a struct writes it through its result
+// parameter: text and pointer-free arrays bring their buffer's bytes along,
+// and any other struct is rebuilt field by field.
+function markComptimeStructure(types: KirTypes, program: CheckedProgram, marked: KirFunctionBuilder, allocator: KirFunctionBuilder, result: Type) {
+    if isStringType(program, result) {
+        kir_function_comptime_buffer(marked, allocator, 0, 1)
+        return
+    }
+    if !isArrayType(program, result) {
+        kir_function_comptime_record(marked)
+        return
+    }
+    // An instantiated array is named for its element; its generic base is
+    // `Array`.
+    let element = program.structs[result.declaration].typeArguments[0]
+    if needsArrayCleanup(program, element) {
+        kir_function_comptime(marked)
+        return
+    }
+    kir_function_comptime_array(marked, allocator, 0, 1, types.byteSize(element))
+}

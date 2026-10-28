@@ -1,0 +1,22 @@
+import Heap
+
+@Main
+function main() -> Int {
+    let pointer: RawPtr = Heap.allocateRaw(16, 8)
+    Heap.writeHeapWord(pointer, 40)
+    let tail: RawPtr = Heap.offsetHeapBytes(pointer, 8)
+    Heap.writeHeapByte(tail, U8(2))
+    let answer = Heap.readHeapWord(pointer) + Int(Heap.readHeapByte(tail))
+    Heap.freeRaw(pointer)
+    var original = Heap.makeHeapBuffer(8)
+    Heap.writeHeapWord(Heap.heapBufferData(original), 11)
+    var shared = Heap.retainHeapBuffer(original)
+    Heap.ensureUniqueHeapBuffer(shared)
+    Heap.writeHeapWord(Heap.heapBufferData(shared), 22)
+    Heap.resizeHeapBuffer(shared, 16)
+    let preserved = Heap.readHeapWord(Heap.heapBufferData(original))
+    let changed = Heap.readHeapWord(Heap.heapBufferData(shared))
+    Heap.releaseHeapBuffer(shared)
+    Heap.releaseHeapBuffer(original)
+    return answer + preserved + changed
+}

@@ -1,0 +1,27 @@
+// A `NativeState` runs `drop`, but it is counted, not owned once: a copy
+// retains it and each drop releases one count. Copying one is fine, through
+// an array's elements (`reversed`, `sorted`) and out of a named value by a
+// `match` arm, and neither is refused as a value dropped twice.
+
+import Foundation
+
+struct Holder {
+    var state: NativeState<Int>
+    var rank: Int
+}
+
+@Main
+function main() -> Int {
+    var holders: [Holder] = []
+    holders.append(Holder { state = nativeState(Int(40)), rank = 2 })
+    holders.append(Holder { state = nativeState(Int(2)), rank = 1 })
+    let reversed = holders.reversed()
+    let sorted = holders.sorted({ a, b in return a.rank < b.rank })
+    let named: Optional<NativeState<Int>> = .Some(nativeState(Int(0)))
+    var extra = 0
+    match named {
+        Some(state) -> extra = nativeRecover<Int>(state)
+        None -> {}
+    }
+    return nativeRecover<Int>(reversed[1].state) + nativeRecover<Int>(sorted[0].state) + extra
+}

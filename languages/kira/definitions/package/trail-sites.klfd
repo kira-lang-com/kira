@@ -1,0 +1,116 @@
+// What the parser could not know about a `log` statement: its trail, named
+// after the package and the file's path inside `app/`, the path a report
+// prints, and Foundation, whose trail the statement calls into whether or not
+// the file imports it.
+
+extend Loader {
+    function placeTrailSites(borrow mut self) -> Result<Int, Failure> {
+        let count = tree.trailSites.count
+        if count == 0 { return .Ok(0) }
+        let foundation = try trailFoundation(tree.trailSites[0].span)
+        for index in 0..count {
+            let site = tree.trailSites[index]
+            let position = sourcePositionOf(tree, site.span.file)
+            if position < 0 {
+                numberSite(site, index)
+                continue
+            }
+            let module = tree.modules[tree.sources[position].module]
+            let relative = relativeSourcePath(module.root, fileName(session, site.span.file as SourceFile))
+            let trail = trailName(module.name, relative)
+            numberSite(site, siteKey(trail, site.span.start))
+            tree.expressions[site.trail].kind = .StringLiteral(.Some(trail))
+            if site.categoryPath >= 0 {
+                tree.expressions[site.categoryPath].kind = .StringLiteral(.Some(joinText([module.name, ".", site.categoryName])))
+            }
+            var shown = relative
+            if module.library {
+                shown = joinText([module.name, "/", relative])
+                tree.expressions[site.library].kind = .IntegerLiteral(1, false)
+            }
+            tree.expressions[site.path].kind = .StringLiteral(.Some(shown))
+            importFoundation(position, foundation, site.span)
+        }
+        return .Ok(count)
+    }
+
+    // Gives every literal naming `site` the number `key`.
+    function numberSite(borrow mut self, site: TrailSiteSyntax, key: Int) {
+        for number in site.numbers { tree.expressions[number].kind = .IntegerLiteral(key, false) }
+    }
+
+    // The Foundation module, loaded now when nothing imported it.
+    function trailFoundation(borrow mut self, span: Span) -> Result<Int, Failure> {
+        for index in 0..tree.modules.count {
+            if tree.modules[index].library && tree.modules[index].name == "Foundation" { return .Ok(index) }
+        }
+        let name = Identifier { text = "Foundation", span = span }
+        return resolveImport(Import { name = name, alias = name, module = .None }, [])
+    }
+
+    function importFoundation(borrow mut self, position: Int, foundation: Int, span: Span) {
+        for imported in tree.sources[position].imports {
+            match imported.module {
+                Some(module) -> { if module == foundation { return } }
+                None -> {}
+            }
+        }
+        let name = Identifier { text = "Foundation", span = span }
+        tree.sources[position].imports.append(Import { name = name, alias = name, module = .Some(foundation) })
+    }
+}
+
+// The number of the site at byte `start` of the file whose trail is
+// `trail`: the same in every unit that parses the file, so a function two
+// units lower comes out alike from both, and the sites of different files
+// do not share one. The trail's hash is from 1 up, so a key is never one of
+// the small numbers a site outside any source file gets.
+function siteKey(trail: String, start: Int) -> Int {
+    let modulus = 2147483629
+    var hash = 0
+    for index in 0..utf8Count(trail) { hash = (hash * 131 + utf8Byte(trail, index)) % modulus }
+    return (hash + 1) * 2147483648 + start
+}
+
+function sourcePositionOf(tree: SyntaxTree, file: Int) -> Int {
+    for index in 0..tree.sources.count {
+        if tree.sources[index].file == file { return index }
+    }
+    return 0 - 1
+}
+
+// `file` past the package root `written` and the separator after it, or the
+// whole path when it lies elsewhere. Both are read with `.` and `..`
+// resolved, so a package reached along two dependency paths names its files
+// alike in every unit.
+function relativeSourcePath(written: String, file: String) -> String {
+    let root = normalizedPath(written)
+    let path = normalizedPath(file)
+    let rootCount = utf8Count(root)
+    let pathCount = utf8Count(path)
+    if rootCount == 0 || pathCount <= rootCount + 1 || utf8Slice(path, 0, rootCount) != root { return path }
+    return utf8Slice(path, rootCount + 1, pathCount)
+}
+
+// `Shop` and `app/net/Http.kira` make `Shop.net.Http`: the package, then the
+// file's path inside `app/` without its extension.
+function trailName(package: String, relative: String) -> String {
+    var start = 0
+    let count = utf8Count(relative)
+    if count > 4 && utf8Slice(relative, 0, 4) == "app/" { start = 4 }
+    var end = count
+    if end - start > 5 && utf8Slice(relative, end - 5, end) == ".kira" { end = end - 5 }
+    var parts: [String] = []
+    if utf8Count(package) > 0 { parts.append(package) }
+    var segment = start
+    for index in start..end {
+        if utf8Byte(relative, index) == 47 {
+            parts.append(utf8Slice(relative, segment, index))
+            segment = index + 1
+        }
+    }
+    parts.append(utf8Slice(relative, segment, end))
+    var name = parts[0]
+    for index in 1..parts.count { name = joinText([name, ".", parts[index]]) }
+    return name
+}

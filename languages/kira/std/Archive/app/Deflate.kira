@@ -1,0 +1,462 @@
+import Foundation
+
+// A DEFLATE compressor (RFC 1951), and the gzip (RFC 1952) and zlib
+// (RFC 1950) wrappers around it: matches over a 32 KiB window, each block of
+// at most 65535 input bytes coded with Huffman codes of its own, or stored
+// when that is shorter.
+
+namespace DeflateShape {
+    let window: Number = 32768
+    let longestMatch: Number = 258
+    let shortestMatch: Number = 3
+    // The farthest a match of 3 bytes is taken, as zlib does.
+    let farthestShortest: Number = 4096
+    // The shortest match of the levels that never look one byte further:
+    // at their few candidates, matches of 3 bytes cost more than they save.
+    let shortestFastMatch: Number = 4
+    // The most input bytes one block covers: what a stored block holds.
+    let blockInput: Number = 65535
+    let longestCode: Number = 15
+    let longestLengthCode: Number = 7
+    let endOfBlock: Number = 256
+}
+
+// The order the code length code's own lengths are written in.
+function codeLengthOrder() -> [Number] {
+    return [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+}
+
+// One block's tokens: a literal byte, with a length of 0, or a match.
+struct DeflateTokens {
+    var lengths: [Number] = []
+    var values: [Number] = []
+}
+
+// A Huffman code as DEFLATE writes it: each symbol's length and its code
+// with the bits reversed, since codes go out from their highest bit.
+struct DeflateCode {
+    let lengths: [Number]
+    let reversed: [Number]
+}
+
+// What turns lengths and distances into symbols and extra bits.
+struct DeflateTables {
+    // For each match length from 3 to 258, its symbol less 257.
+    let lengthSymbols: [Number]
+    let lengthBases: [Number]
+    let lengthExtras: [Number]
+    let distanceBases: [Number]
+    let distanceExtras: [Number]
+    // The symbol of each distance less 1 below 256, then of each distance
+    // less 1 shifted down 7 bits: symbols from 16 up cover whole multiples
+    // of 128.
+    let distanceSymbols: [Number]
+
+    function distanceSymbol(borrow self, distance: Number) -> Number {
+        let less = distance - 1
+        if less < 256 { return distanceSymbols[less] }
+        return distanceSymbols[256 + (less >> 7)]
+    }
+}
+
+// The symbol of the distance `distance`, from its highest bits.
+function slowDistanceSymbol(distance: Number) -> Number {
+    if distance <= 4 { return distance - 1 }
+    let bit = highBit(distance - 1)
+    return bit * 2 + (((distance - 1) >> (bit - 1)) & 1)
+}
+
+function deflateTables() -> DeflateTables {
+    var lengthBases: [Number] = []
+    var lengthExtras: [Number] = []
+    for (base, extra) in deflateLengths() {
+        lengthBases.append(base)
+        lengthExtras.append(extra)
+    }
+    var distanceBases: [Number] = []
+    var distanceExtras: [Number] = []
+    for (base, extra) in deflateDistances() {
+        distanceBases.append(base)
+        distanceExtras.append(extra)
+    }
+    var distanceSymbols: [Number] = []
+    for less in 0..256 { distanceSymbols.append(slowDistanceSymbol(less + 1)) }
+    for high in 0..256 { distanceSymbols.append(slowDistanceSymbol((high << 7) + 1)) }
+    var lengthSymbols: [Number] = []
+    var symbol: Number = 0
+    for length in 0..259 {
+        while symbol + 1 < lengthBases.count && lengthBases[symbol + 1] <= length { symbol += 1 }
+        lengthSymbols.append(symbol)
+    }
+    return DeflateTables {
+        lengthSymbols: lengthSymbols,
+        lengthBases: lengthBases,
+        lengthExtras: lengthExtras,
+        distanceBases: distanceBases,
+        distanceExtras: distanceExtras,
+        distanceSymbols: distanceSymbols
+    }
+}
+
+// How hard each level, from 1 to 9, looks for matches: how many candidates
+// it tries, the length it stops looking at, and the length below which it
+// looks one byte further for a longer match, 0 for never. The same as zlib's
+// from level 4.
+function deflateEffort(level: Number) -> (Number, Number, Number) {
+    let depths: [Number] = [2, 2, 4, 16, 32, 128, 256, 1024, 4096]
+    let nices: [Number] = [258, 258, 258, 16, 32, 128, 128, 258, 258]
+    let lazies: [Number] = [0, 0, 0, 4, 16, 16, 32, 128, 258]
+    return (depths[level - 1], nices[level - 1], lazies[level - 1])
+}
+
+/// `bytes` as a raw DEFLATE stream. `level`, from 1 to 9, is how hard it looks for matches.
+public function deflateCompress(bytes: borrow [UN8], level: Number) -> [UN8] {
+    let clamped = max(1, min(9, level))
+    let window = DeflateShape.window
+    let (depth, nice, lazy) = deflateEffort(clamped)
+    let width = lazy == 0 ? DeflateShape.shortestFastMatch : DeflateShape.shortestMatch
+    var matcher = matchFinder(width, depth, 15, 15, window, lazy == 0)
+    matcher.nice = nice
+    matcher.farthestShortest = DeflateShape.farthestShortest
+    let tables = deflateTables()
+    var writer = LowBitWriter {}
+    let blockInput = DeflateShape.blockInput
+    let longest = DeflateShape.longestMatch
+    let shortest = matcher.shortest
+    var start: Number = 0
+    while true {
+        let end = min(start + blockInput, bytes.count)
+        let last = end == bytes.count
+        var tokens = DeflateTokens {}
+        var at = start
+        // A match already found at `at`, whose positions are in the chains:
+        // its length, 0 for none.
+        var heldLength: Number = 0
+        var heldDistance: Number = 0
+        while at < end {
+            var length = heldLength
+            var distance = heldDistance
+            heldLength = 0
+            if length == 0 && at + shortest <= end {
+                let (found, foundDistance) = matcher.find(bytes, at, min(end, at + longest))
+                length = found
+                distance = foundDistance
+            }
+            if length == 0 {
+                tokens.lengths.append(0)
+                tokens.values.append(Number(bytes[at]))
+                at += 1
+                continue
+            }
+            // A longer match one byte on leaves this byte a literal.
+            var from = at
+            if length < lazy && at + 1 + shortest <= end {
+                let (next, nextDistance) = matcher.find(bytes, at + 1, min(end, at + 1 + longest))
+                if next > length {
+                    tokens.lengths.append(0)
+                    tokens.values.append(Number(bytes[at]))
+                    at += 1
+                    heldLength = next
+                    heldDistance = nextDistance
+                    continue
+                }
+                from = at + 1
+            }
+            tokens.lengths.append(length)
+            tokens.values.append(distance)
+            matcher.insertMatched(bytes, from, at + length)
+            at += length
+        }
+        writeDeflateBlock(writer, bytes, start, end, tokens, tables, last)
+        start = end
+        if last { break }
+    }
+    if writer.heldCount > 0 { writer.bytes.append(UN8(writer.held & 255)) }
+    return copy writer.bytes
+}
+
+// Writes the block of `tokens` covering `start` to `end`: Huffman-coded, or
+// stored when that is shorter.
+function writeDeflateBlock(
+    writer: borrow mut LowBitWriter,
+    bytes: borrow [UN8],
+    start: Number,
+    end: Number,
+    tokens: borrow DeflateTokens,
+    tables: borrow DeflateTables,
+    last: Bool
+) {
+    var literalCounts: [Number] = []
+    for symbol in 0..286 { literalCounts.append(0) }
+    var distanceCounts: [Number] = []
+    for symbol in 0..30 { distanceCounts.append(0) }
+    for index in 0..tokens.lengths.count {
+        let length = tokens.lengths[index]
+        if length == 0 {
+            literalCounts[tokens.values[index]] += 1
+        } else {
+            literalCounts[257 + tables.lengthSymbols[length]] += 1
+            distanceCounts[tables.distanceSymbol(tokens.values[index])] += 1
+        }
+    }
+    literalCounts[DeflateShape.endOfBlock] += 1
+    let literals = deflateCode(literalCounts, DeflateShape.longestCode)
+    // A block without matches still describes one distance.
+    var anyDistance = false
+    for count in distanceCounts {
+        if count > 0 { anyDistance = true }
+    }
+    if !anyDistance { distanceCounts[0] = 1 }
+    let distances = deflateCode(distanceCounts, DeflateShape.longestCode)
+    var literalCount: Number = 286
+    while literalCount > 257 && literals.lengths[literalCount - 1] == 0 { literalCount -= 1 }
+    var distanceCount: Number = 30
+    while distanceCount > 1 && distances.lengths[distanceCount - 1] == 0 { distanceCount -= 1 }
+    var all: [Number] = []
+    for symbol in 0..literalCount { all.append(literals.lengths[symbol]) }
+    for symbol in 0..distanceCount { all.append(distances.lengths[symbol]) }
+    let (runSymbols, runExtras) = lengthRuns(all)
+    var runCounts: [Number] = []
+    for symbol in 0..19 { runCounts.append(0) }
+    for symbol in runSymbols { runCounts[symbol] += 1 }
+    let runs = deflateCode(runCounts, DeflateShape.longestLengthCode)
+    let order = codeLengthOrder()
+    var orderCount: Number = 19
+    while orderCount > 4 && runs.lengths[order[orderCount - 1]] == 0 { orderCount -= 1 }
+    // What the coded block costs in bits, against a stored one.
+    var cost: Number = 17 + 3 * orderCount
+    for index in 0..runSymbols.count {
+        cost += runs.lengths[runSymbols[index]] + runExtraBits(runSymbols[index])
+    }
+    for symbol in 0..286 { cost += literalCounts[symbol] * literals.lengths[symbol] }
+    for symbol in 0..29 {
+        cost += literalCounts[257 + symbol] * tables.lengthExtras[symbol]
+    }
+    for symbol in 0..30 {
+        cost += distanceCounts[symbol] * (distances.lengths[symbol] + tables.distanceExtras[symbol])
+    }
+    let stored = 32 + 8 * (end - start) + 10
+    let final = last ? 1 : 0
+    if cost >= stored {
+        writer.add(final, 1)
+        writer.add(0, 2)
+        if writer.heldCount > 0 { writer.add(0, 8 - writer.heldCount) }
+        let size = end - start
+        appendLittle(writer.bytes, size, 2)
+        appendLittle(writer.bytes, size ^ 65535, 2)
+        writer.bytes.appendAll(byteRun(bytes, start, end))
+        return
+    }
+    writer.add(final, 1)
+    writer.add(2, 2)
+    writer.add(literalCount - 257, 5)
+    writer.add(distanceCount - 1, 5)
+    writer.add(orderCount - 4, 4)
+    for index in 0..orderCount { writer.add(runs.lengths[order[index]], 3) }
+    for index in 0..runSymbols.count {
+        let symbol = runSymbols[index]
+        writer.add(runs.reversed[symbol], runs.lengths[symbol])
+        writer.add(runExtras[index], runExtraBits(symbol))
+    }
+    // Each length's code and extra bits as one value, written at once with
+    // its distance's: at most 15 + 5 + 15 + 13 bits.
+    var lengthValues: [Number] = []
+    var lengthBits: [Number] = []
+    for length in 0..259 {
+        let symbol = tables.lengthSymbols[length]
+        let codeBits = literals.lengths[257 + symbol]
+        lengthValues.append(
+            literals.reversed[257 + symbol] | ((length - tables.lengthBases[symbol]) << codeBits)
+        )
+        lengthBits.append(codeBits + tables.lengthExtras[symbol])
+    }
+    for index in 0..tokens.lengths.count {
+        let length = tokens.lengths[index]
+        if length == 0 {
+            let byte = tokens.values[index]
+            writer.add(literals.reversed[byte], literals.lengths[byte])
+            continue
+        }
+        let distance = tokens.values[index]
+        let symbol = tables.distanceSymbol(distance)
+        let codeBits = distances.lengths[symbol]
+        let distanceValue = distances.reversed[symbol]
+            | ((distance - tables.distanceBases[symbol]) << codeBits)
+        let bits = lengthBits[length]
+        writer.add(
+            lengthValues[length] | (distanceValue << bits),
+            bits + codeBits + tables.distanceExtras[symbol]
+        )
+    }
+    let stop = DeflateShape.endOfBlock
+    writer.add(literals.reversed[stop], literals.lengths[stop])
+}
+
+// The code of `counts`, none longer than `limit`: canonical, shorter codes
+// first and each length's symbols in order (RFC 1951 section 3.2.2).
+function deflateCode(counts: borrow [Number], limit: Number) -> DeflateCode {
+    var lengths = huffmanLengths(counts, limit)
+    var used: Number = 0
+    var only: Number = 0
+    for symbol in 0..counts.count {
+        if counts[symbol] > 0 {
+            used += 1
+            only = symbol
+        }
+    }
+    if used == 1 { lengths[only] = 1 }
+    var perLength: [Number] = []
+    for length in 0..(limit + 1) { perLength.append(0) }
+    for length in lengths {
+        if length > 0 { perLength[length] += 1 }
+    }
+    var next: [Number] = [0]
+    var code: Number = 0
+    for length in 1..(limit + 1) {
+        code = (code + perLength[length - 1]) << 1
+        next.append(code)
+    }
+    var reversed: [Number] = []
+    for symbol in 0..lengths.count {
+        let length = lengths[symbol]
+        if length == 0 {
+            reversed.append(0)
+            continue
+        }
+        reversed.append(reverseBits(next[length], length))
+        next[length] += 1
+    }
+    return DeflateCode { lengths: lengths, reversed: reversed }
+}
+
+// The code lengths `lengths` as code length symbols and their extra bits:
+// 16 repeats the previous length 3 to 6 times, 17 and 18 write 3 to 10 and
+// 11 to 138 zeros.
+function lengthRuns(lengths: borrow [Number]) -> ([Number], [Number]) {
+    var symbols: [Number] = []
+    var extras: [Number] = []
+    var at: Number = 0
+    while at < lengths.count {
+        let length = lengths[at]
+        var run: Number = 1
+        while at + run < lengths.count && lengths[at + run] == length { run += 1 }
+        at += run
+        if length == 0 {
+            while run >= 11 {
+                let taken = min(run, 138)
+                symbols.append(18)
+                extras.append(taken - 11)
+                run -= taken
+            }
+            if run >= 3 {
+                symbols.append(17)
+                extras.append(run - 3)
+                run = 0
+            }
+        } else {
+            symbols.append(length)
+            extras.append(0)
+            run -= 1
+            while run >= 3 {
+                let taken = min(run, 6)
+                symbols.append(16)
+                extras.append(taken - 3)
+                run -= taken
+            }
+        }
+        for each in 0..run {
+            symbols.append(length)
+            extras.append(0)
+        }
+    }
+    return (symbols, extras)
+}
+
+function runExtraBits(symbol: Number) -> Number {
+    return match symbol {
+        16 -> 2
+        17 -> 3
+        18 -> 7
+        else -> 0
+    }
+}
+
+// The low `count` bits of `value` in the opposite order.
+function reverseBits(value: Number, count: Number) -> Number {
+    var reversed: Number = 0
+    for bit in 0..count { reversed = (reversed << 1) | ((value >> bit) & 1) }
+    return reversed
+}
+
+/// `bytes` as a gzip member with no name and time 0, as `gzip -n` writes.
+public function gzipCompress(bytes: borrow [UN8], level: Number) -> [UN8] {
+    var member: [UN8] = [31, 139, 8, 0, 0, 0, 0, 0, 0, 3]
+    member.appendAll(deflateCompress(bytes, level))
+    appendLittle(member, crc32(bytes), 4)
+    appendLittle(member, bytes.count & 4294967295, 4)
+    return member
+}
+
+/// `bytes` as a zlib stream, as squashfs keeps a gzip-compressed block.
+public function zlibCompress(bytes: borrow [UN8], level: Number) -> [UN8] {
+    var stream: [UN8] = [120, 156]
+    stream.appendAll(deflateCompress(bytes, level))
+    let sum = adler32(bytes)
+    for index in 0..4 { stream.append(UN8((sum >> ((3 - index) * 8)) & 255)) }
+    return stream
+}
+
+/// The file `from` gzip-compressed into the new file `to`, answering its length.
+public function gzipCompressFile(
+    from: borrow String,
+    to: borrow String,
+    level: Number
+) -> Result<UNumber, ArchiveFailure> {
+    let bytes = match readArchiveFile(from) {
+        Ok(read) -> read
+        Error(failure) -> return .Error(failure)
+    }
+    var sink = match createArchiveSink(to) {
+        Ok(created) -> created
+        Error(failure) -> return .Error(failure)
+    }
+    sink.append(gzipCompress(bytes, level))
+    return sink.finish()
+}
+
+/// The CRC-32 of `bytes`, as gzip and zip check them.
+public function crc32(bytes: borrow [UN8]) -> Number {
+    let table = crcTable()
+    var crc: Number = 4294967295
+    for byte in bytes { crc = table[(crc ^ Number(byte)) & 255] ^ (crc >> 8) }
+    return crc ^ 4294967295
+}
+
+function crcTable() -> [Number] {
+    var table: [Number] = []
+    for index in 0..256 {
+        var value: Number = index
+        for bit in 0..8 { value = (value & 1) == 1 ? 3988292384 ^ (value >> 1) : value >> 1 }
+        table.append(value)
+    }
+    return table
+}
+
+/// The Adler-32 of `bytes`, as zlib checks them.
+public function adler32(bytes: borrow [UN8]) -> Number {
+    var low: Number = 1
+    var high: Number = 0
+    var pending: Number = 0
+    for byte in bytes {
+        low += Number(byte)
+        high += low
+        pending += 1
+        // Below 2^63 for far longer, but kept small as zlib keeps it.
+        if pending == 5552 {
+            low = low % 65521
+            high = high % 65521
+            pending = 0
+        }
+    }
+    return ((high % 65521) << 16) | (low % 65521)
+}

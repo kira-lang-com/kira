@@ -1,0 +1,475 @@
+import Foundation
+
+// StxOwnershipTests: deep ownership tests — move into consuming functions,
+// owned aggregates, borrow (shared and mut) writeback, pipeline of moves,
+// copy vs. move semantics, and runtime traps.
+//
+// All top-level names use the Stxo/stxo prefix to avoid harness namespace
+// collisions. This file imports Foundation explicitly (imports are file-scoped).
+
+// ---------------------------------------------------------------------------
+// Struct definitions
+// ---------------------------------------------------------------------------
+
+struct StxoVec {
+    var x: Int
+    var y: Int
+    var z: Int
+}
+
+struct StxoBox {
+    var min: StxoVec
+    var max: StxoVec
+    var id: Int
+}
+
+struct StxoBag {
+    var items: [Int]
+    var label: Int
+}
+
+struct StxoWrap {
+    var inner: StxoVec
+    var weight: Int
+}
+
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+function stxoVecSum(v: borrow StxoVec) -> Int { return v.x + v.y + v.z }
+
+function stxoConsumeVec(v: StxoVec) -> Int { return v.x + v.y + v.z }
+
+function stxoConsumeBox(b: StxoBox) -> Int { return b.min.x + b.max.x + b.id }
+
+function stxoConsumeBag(b: StxoBag) -> Int {
+    var s = b.label
+    for i in 0..b.items.count {
+        s = s + b.items[i]
+    }
+    return s
+}
+
+function stxoConsumeArr(xs: [Int]) -> Int {
+    var s = 0
+    for i in 0..xs.count {
+        s = s + xs[i]
+    }
+    return s
+}
+
+function stxoBumpVec(v: borrow mut StxoVec) {
+    v.x = v.x + 1
+    v.y = v.y + 1
+    v.z = v.z + 1
+}
+
+function stxoDoubleVec(v: borrow mut StxoVec) {
+    v.x = v.x * 2
+    v.y = v.y * 2
+    v.z = v.z * 2
+}
+
+function stxoScaleVec(v: borrow mut StxoVec, k: Int) {
+    v.x = v.x * k
+    v.y = v.y * k
+    v.z = v.z * k
+}
+
+function stxoPipeAdd(v: StxoVec, n: Int) -> StxoVec {
+    return StxoVec { x: v.x + n, y: v.y + n, z: v.z + n }
+}
+
+function stxoPipeMul(v: StxoVec, k: Int) -> StxoVec {
+    return StxoVec { x: v.x * k, y: v.y * k, z: v.z * k }
+}
+
+function stxoPipeNeg(v: StxoVec) -> StxoVec {
+    return StxoVec { x: 0 - v.x, y: 0 - v.y, z: 0 - v.z }
+}
+
+function stxoWrap(v: StxoVec, w: Int) -> StxoWrap {
+    return StxoWrap { inner: move v, weight: w }
+}
+
+function stxoUnwrap(c: StxoWrap) -> Int {
+    return c.inner.x + c.inner.y + c.inner.z + c.weight
+}
+
+function stxoBuildBag(n: Int) -> StxoBag {
+    var xs: [Int] = []
+    for i in 1..(n + 1) {
+        xs.append(i)
+    }
+    return StxoBag { items: move xs, label: n }
+}
+
+// ---------------------------------------------------------------------------
+// Group 1: Move into consuming functions
+// ---------------------------------------------------------------------------
+@Test
+function stxoMoveVec() {
+    // consume {1,2,3} → 6
+    let v = StxoVec { x: 1, y: 2, z: 3 }
+    expect!(stxoConsumeVec(move v) == 6)
+}
+
+@Test
+function stxoMoveVecVar() {
+    // consume from var binding
+    var v = StxoVec { x: 10, y: 20, z: 30 }
+    expect!(stxoConsumeVec(move v) == 60)
+}
+
+@Test
+function stxoMoveBox() {
+    // consume box: min.x + max.x + id = 1 + 2 + 3 = 6
+    let b = StxoBox { min: StxoVec { x: 1, y: 0, z: 0 }, max: StxoVec { x: 2, y: 0, z: 0 }, id: 3 }
+    expect!(stxoConsumeBox(move b) == 6)
+}
+
+@Test
+function stxoMoveBoxLarge() {
+    // min.x=10, max.x=100, id=5 → 115
+    let b = StxoBox {
+        min: StxoVec { x: 10, y: 20, z: 30 },
+        max: StxoVec { x: 100, y: 200, z: 300 },
+        id: 5
+    }
+    expect!(stxoConsumeBox(move b) == 115)
+}
+
+@Test
+function stxoMoveBag0() {
+    // stxoBuildBag(0): label=0, items=[], consume→0
+    let b = stxoBuildBag(0)
+    expect!(stxoConsumeBag(move b) == 0)
+}
+
+@Test
+function stxoMoveBag5() {
+    // stxoBuildBag(5): label=5, items=[1..5], consume=5+15=20
+    let b = stxoBuildBag(5)
+    expect!(stxoConsumeBag(move b) == 20)
+}
+
+@Test
+function stxoMoveArr3() {
+    // xs=[10,20,30], consume→60
+    var xs: [Int] = []
+    xs.append(10)
+    xs.append(20)
+    xs.append(30)
+    expect!(stxoConsumeArr(move xs) == 60)
+}
+
+@Test
+function stxoMovePipeAdd() {
+    // v={1,2,3}, pipeAdd(5)={6,7,8}, consume→21
+    let v = StxoVec { x: 1, y: 2, z: 3 }
+    let w = stxoPipeAdd(move v, 5)
+    expect!(stxoConsumeVec(move w) == 21)
+}
+
+@Test
+function stxoMovePipeMul() {
+    // v={2,3,4}, pipeMul(10)={20,30,40}, consume→90
+    let v = StxoVec { x: 2, y: 3, z: 4 }
+    let w = stxoPipeMul(move v, 10)
+    expect!(stxoConsumeVec(move w) == 90)
+}
+
+@Test
+function stxoMoveVecLoop() {
+    // i=0..9: v={i,i,i}, consume→3i; total=3*(0+1+..+9)=135
+    var acc = 0
+    for i in 0..10 {
+        let v = StxoVec { x: i, y: i, z: i }
+        acc = acc + stxoConsumeVec(move v)
+    }
+    expect!(acc == 135)
+}
+
+@Test
+function stxoMoveBagLoop() {
+    // n=1..5: consumeBag(n)=n+n*(n+1)/2 → 2+5+9+14+20=50
+    var acc = 0
+    for n in 1..6 {
+        let b = stxoBuildBag(n)
+        acc = acc + stxoConsumeBag(move b)
+    }
+    expect!(acc == 50)
+}
+
+@Test
+function stxoMoveArrLoop() {
+    // i=0..9: xs=[i], consume→i; total=0+1+..+9=45
+    var acc = 0
+    for i in 0..10 {
+        var xs: [Int] = []
+        xs.append(i)
+        acc = acc + stxoConsumeArr(move xs)
+    }
+    expect!(acc == 45)
+}
+
+@Test
+function stxoMoveBoxLoop() {
+    // i=1..3: box={min.x:i, max.x:i*2, id:i*3}, consume=6i; total=6+12+18=36
+    var acc = 0
+    for i in 1..4 {
+        let b = StxoBox {
+            min: StxoVec { x: i, y: 0, z: 0 },
+            max: StxoVec { x: i * 2, y: 0, z: 0 },
+            id: i * 3
+        }
+        acc = acc + stxoConsumeBox(move b)
+    }
+    expect!(acc == 36)
+}
+
+@Test
+function stxoMovePipeline() {
+    // v={2,3,4}, pipeAdd(10)={12,13,14}, pipeMul(2)={24,26,28}, consume→78
+    let v = StxoVec { x: 2, y: 3, z: 4 }
+    let w = stxoPipeAdd(move v, 10)
+    let x = stxoPipeMul(move w, 2)
+    expect!(stxoConsumeVec(move x) == 78)
+}
+
+@Test
+function stxoMoveWrapUnwrap() {
+    // v={3,4,5}, wrap weight=10, unwrap=3+4+5+10=22
+    let v = StxoVec { x: 3, y: 4, z: 5 }
+    let c = stxoWrap(move v, 10)
+    expect!(stxoUnwrap(move c) == 22)
+}
+
+@Test
+function stxoMoveBag10() {
+    // stxoBuildBag(10): label=10, items=[1..10], consume=10+55=65
+    let b = stxoBuildBag(10)
+    expect!(stxoConsumeBag(move b) == 65)
+}
+
+// ---------------------------------------------------------------------------
+// Group 2: Borrow (non-consuming) then keep using
+// ---------------------------------------------------------------------------
+
+@Test
+function stxoBorrowSum() {
+    // borrow v, get sum=18
+    let v = StxoVec { x: 5, y: 6, z: 7 }
+    expect!(stxoVecSum(v) == 18)
+}
+
+@Test
+function stxoBorrowOrigX() {
+    // borrow to get sum, then access original field
+    let v = StxoVec { x: 5, y: 6, z: 7 }
+    let s = stxoVecSum(v)
+    expect!(v.x == 5)
+}
+
+@Test
+function stxoBorrowTwice() {
+    // borrow twice, both return same value; sum=2*12=24
+    let v = StxoVec { x: 3, y: 4, z: 5 }
+    let s1 = stxoVecSum(v)
+    let s2 = stxoVecSum(v)
+    expect!(s1 + s2 == 24)
+}
+
+@Test
+function stxoBorrowInLoop() {
+    // borrow same v 5x in loop; acc=5*6=30
+    let v = StxoVec { x: 1, y: 2, z: 3 }
+    var acc = 0
+    for i in 0..5 {
+        acc = acc + stxoVecSum(v)
+    }
+    expect!(acc == 30)
+}
+
+@Test
+function stxoBorrowThenField() {
+    // borrow, get sum=60, then access original v.z=30; total=90
+    let v = StxoVec { x: 10, y: 20, z: 30 }
+    let s = stxoVecSum(v)
+    expect!(s + v.z == 90)
+}
+
+@Test
+function stxoBorrowThenModify() {
+    // borrow v to get s=6, then mutate v.x=10; v.x + s = 16
+    var v = StxoVec { x: 1, y: 2, z: 3 }
+    let s = stxoVecSum(v)
+    v.x = 10
+    expect!(v.x + s == 16)
+}
+
+@Test
+function stxoBorrowBoxField() {
+    // b.min.x + b.max.z + b.id = 1 + 6 + 7 = 14
+    let b = StxoBox { min: StxoVec { x: 1, y: 2, z: 3 }, max: StxoVec { x: 4, y: 5, z: 6 }, id: 7 }
+    expect!(b.min.x + b.max.z + b.id == 14)
+}
+
+@Test
+function stxoBorrowBeforeAfterMut() {
+    // v={5,5,5}, borrow→s1=15; bumpVec→{6,6,6}; borrow→s2=18; s2-s1=3
+    var v = StxoVec { x: 5, y: 5, z: 5 }
+    let s1 = stxoVecSum(v)
+    stxoBumpVec(v)
+    let s2 = stxoVecSum(v)
+    expect!(s2 - s1 == 3)
+}
+
+@Test
+function stxoBorrowLoopSum() {
+    // v starts {0,0,0}; each iteration: bump (v→{i,i,i}), add stxoVecSum=3i
+    // acc = sum 3i for i=1..10 = 3*55=165
+    var v = StxoVec { x: 0, y: 0, z: 0 }
+    var acc = 0
+    for i in 0..10 {
+        stxoBumpVec(v)
+        acc = acc + stxoVecSum(v)
+    }
+    expect!(acc == 165)
+}
+
+@Test
+function stxoBorrowConsistency() {
+    // stxoVecSum(v) == v.x + v.y + v.z
+    let v = StxoVec { x: 7, y: 8, z: 9 }
+    expect!(stxoVecSum(v) == v.x + v.y + v.z)
+}
+
+@Test
+function stxoBorrowSumField() {
+    // v={4,6,8}, sum=18; sum + v.y = 24
+    let v = StxoVec { x: 4, y: 6, z: 8 }
+    let s = stxoVecSum(v)
+    expect!(s + v.y == 24)
+}
+
+@Test
+function stxoBorrowBagItems() {
+    // stxoBuildBag(5): items=[1,2,3,4,5]; items[0]+items[4]=1+5=6
+    var b = stxoBuildBag(5)
+    expect!(b.items[0] + b.items[4] == 6)
+}
+
+// ---------------------------------------------------------------------------
+// Group 3: Borrow mut writeback
+// ---------------------------------------------------------------------------
+
+@Test
+function stxoBumpOnce() {
+    // v={5,5,5}, bump→{6,6,6}, v.x=6
+    var v = StxoVec { x: 5, y: 5, z: 5 }
+    stxoBumpVec(v)
+    expect!(v.x == 6)
+}
+
+@Test
+function stxoBumpSum() {
+    // v={1,2,3}, bump→{2,3,4}, sum=9
+    var v = StxoVec { x: 1, y: 2, z: 3 }
+    stxoBumpVec(v)
+    expect!(v.x + v.y + v.z == 9)
+}
+
+@Test
+function stxoBumpLoop10() {
+    // v={0,0,0}, 10x bump → v.x=10
+    var v = StxoVec { x: 0, y: 0, z: 0 }
+    for i in 0..10 {
+        stxoBumpVec(v)
+    }
+    expect!(v.x == 10)
+}
+
+@Test
+function stxoDoubleOnce() {
+    // v={3,4,5}, double→{6,8,10}, v.x=6
+    var v = StxoVec { x: 3, y: 4, z: 5 }
+    stxoDoubleVec(v)
+    expect!(v.x == 6)
+}
+
+@Test
+function stxoDoubleLoop5() {
+    // v={1,1,1}, 5x double → v.x=2^5=32
+    var v = StxoVec { x: 1, y: 1, z: 1 }
+    for i in 0..5 {
+        stxoDoubleVec(v)
+    }
+    expect!(v.x == 32)
+}
+
+@Test
+function stxoScaleK() {
+    // v={3,4,5}, scale(7): {21,28,35}, sum=84
+    var v = StxoVec { x: 3, y: 4, z: 5 }
+    stxoScaleVec(v, 7)
+    expect!(v.x + v.y + v.z == 84)
+}
+
+@Test
+function stxoBumpThenDouble() {
+    // v={2,3,4}, bump→{3,4,5}, bump→{4,5,6}, double→{8,10,12}, v.x=8
+    var v = StxoVec { x: 2, y: 3, z: 4 }
+    stxoBumpVec(v)
+    stxoBumpVec(v)
+    stxoDoubleVec(v)
+    expect!(v.x == 8)
+}
+
+@Test
+function stxoBumpThenBorrow() {
+    // v={5,5,5}, bump→{6,6,6}, stxoVecSum=18
+    var v = StxoVec { x: 5, y: 5, z: 5 }
+    stxoBumpVec(v)
+    expect!(stxoVecSum(v) == 18)
+}
+
+@Test
+function stxoScaleLoop3() {
+    // v={1,2,3}, 3x scale(2): v.x = 1*2*2*2=8
+    var v = StxoVec { x: 1, y: 2, z: 3 }
+    for i in 0..3 {
+        stxoScaleVec(v, 2)
+    }
+    expect!(v.x == 8)
+}
+
+@Test
+function stxoBumpSum20() {
+    // v={0,0,0}, 20x bump → v.x=v.y=v.z=20, sum=60
+    var v = StxoVec { x: 0, y: 0, z: 0 }
+    for i in 0..20 {
+        stxoBumpVec(v)
+    }
+    expect!(v.x + v.y + v.z == 60)
+}
+
+@Test
+function stxoScaleThenBump() {
+    // v={2,2,2}, scale(5)→{10,10,10}, bump→{11,11,11}, v.x=11
+    var v = StxoVec { x: 2, y: 2, z: 2 }
+    stxoScaleVec(v, 5)
+    stxoBumpVec(v)
+    expect!(v.x == 11)
+}
+
+@Test
+function stxoBumpZ20() {
+    // v={0,0,0}, 20x bump → v.z=20
+    var v = StxoVec { x: 0, y: 0, z: 0 }
+    for i in 0..20 {
+        stxoBumpVec(v)
+    }
+    expect!(v.z == 20)
+}

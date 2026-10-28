@@ -1,0 +1,184 @@
+import Foundation
+
+// Kira Test coverage for the deferred async task spine: `async function`
+// entry points (started only as tasks), `Task { call }` deferred spawn, `handle.await` join, cooperative
+// `requestCancel()` (cancel-before-drive prevents the call; awaiting a
+// cancelled task traps), `detach()` (drives and discards; a later await is a
+// double-join trap).
+
+@Test
+function asxAsyncFunctionRunsAsATask() {
+    let handle = Task { asyncSum(19, 23) }
+    expect!(handle.await == 42)
+}
+
+@Test
+function asxAsyncCallsOrdinaryFunctions() {
+    let handle = Task { asyncDouble(21) }
+    expect!(handle.await == 42)
+}
+
+@Test
+function asxAsyncWrapsRecursion() {
+    let handle = Task { asyncFactorial(5) }
+    expect!(handle.await == 120)
+}
+
+@Test
+function asxTaskSpawnAwait() {
+    let handle = Task { asyncFactorial(5) }
+    expect!(handle.await == 120)
+}
+
+@Test
+function asxAwaitYieldsDeferredResult() {
+    let handle = Task { asyncSum(40, 2) }
+    expect!(handle.await == 42)
+}
+
+@Test
+function asxAwaitCancelledTaskTraps() {
+    expectTrap!("")
+        let handle = Task { asyncSum(40, 2) }
+        handle.requestCancel()
+        let _ = handle.await
+}
+
+@Test
+function asxDoubleAwaitTraps() {
+    expectTrap!("")
+        let handle = Task { asyncSum(40, 2) }
+        let first = handle.await
+        let _ = first + handle.await
+}
+
+@Test
+function asxAwaitAfterDetachTraps() {
+    expectTrap!("")
+        let handle = Task { asyncSum(40, 2) }
+        handle.detach()
+        let _ = handle.await
+}
+
+@Test
+function asxCancelledSiblingLeavesJoinIntact() {
+    expect!(asyncCancelDetachSiblings() == 142)
+}
+
+@Test
+function asxReadySpawnAwait() {
+    let handle = Task { 41 }
+    expect!(handle.await + 1 == 42)
+}
+
+@Test
+function asxVoidTaskJoinsAsZero() {
+    let handle = Task { asyncNoop(5) }
+    expect!(handle.await == 0)
+}
+
+@Test
+function asxVoidTaskDetach() {
+    let handle = Task { asyncNoop(5) }
+    handle.detach()
+    let got = 1
+    expect!(got == 1)
+}
+
+@Test
+function asxYieldWithEmptyQueueIsNoop() {
+    taskYield()
+    let got = 1
+    expect!(got == 1)
+}
+
+@Test
+function asxYieldInsideTaskBody() {
+    let sibling = Task { asyncSum(1, 2) }
+    let phased = Task { asyncPhased(4, 2) }
+    let joined = phased.await
+    expect!(joined + sibling.await == 243)
+}
+
+@Test
+function asxSuspendableFrameSurvivesYields() {
+    let handle = Task { asyncStepper(100, 1) }
+    expect!(handle.await == 102)
+}
+
+@Test
+function asxSuspendableTasksInterleave() {
+    let a = Task { asyncStepper(100, 1) }
+    let b = Task { asyncStepper(200, 2) }
+    let c = Task { asyncStepper(300, 3) }
+    expect!(a.await + b.await + c.await == 612)
+}
+
+@Test
+function asxCancelledSuspendableNeverRuns() {
+    expectTrap!("")
+        let handle = Task { asyncStepper(100, 1) }
+        handle.requestCancel()
+        let _ = handle.await
+}
+
+@Test
+function asxJoinSuspensionParksUntilComplete() {
+    let c = Task { asyncCoordinator(100) }
+    let bystander = Task { asyncSum(1, 2) }
+    expect!(c.await + bystander.await == 114)
+}
+
+@Test
+function asxSleepParksAndResumes() {
+    let a = Task { asyncNapper(3, 40) }
+    let b = Task { asyncNapper(1, 2) }
+    expect!(a.await * 10 + b.await == 424)
+}
+
+@Test
+function asxSpineSectionChecksum() {
+    expect!(asyncSpineSection() == 304)
+}
+
+// A task takes and returns a String: the argument is boxed at the spawn site
+// and the result recovered at the join, both as the native-state token a
+// channel payload crosses as.
+// A task takes and returns a String: the argument is boxed at the spawn site
+// and the result recovered at the join, both as the native-state token a
+// channel payload crosses as.
+@Test
+function asxTaskCrossesAString() {
+    let handle = Task { asyncGreet("kira") }
+    expect!(handle.await == "hi kira")
+}
+
+// A task takes and returns a struct: the whole aggregate round-trips across
+// spawn -> drive -> join, field for field.
+// A task takes and returns a struct: the whole aggregate round-trips across
+// spawn -> drive -> join, field for field.
+@Test
+function asxTaskCrossesAStruct() {
+    let handle = Task { asyncShiftPoint(AsyncPoint(x: 3, y: 4), 10) }
+    let shifted = handle.await
+    expect!(shifted.x * 100 + shifted.y == 1314)
+}
+
+// A task takes an array argument and folds it.
+// A task takes an array argument and folds it.
+@Test
+function asxTaskTakesAnArray() {
+    let handle = Task { asyncSumValues([4, 5, 6]) }
+    expect!(handle.await == 15)
+}
+
+// A task returns an array, recovered whole at the join.
+// A task returns an array, recovered whole at the join.
+@Test
+function asxTaskReturnsAnArray() {
+    let handle = Task { asyncCountUp(4) }
+    let built = handle.await
+    expect!(
+        built.count * 1000 + built[0] + built[1] * 10 + built[2] * 100 + built[3] * 1000 == 7210
+    )
+}

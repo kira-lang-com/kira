@@ -1,0 +1,199 @@
+import Foundation
+
+// Discovered inputs (DESIGN.md section 5.3): what a command read besides its
+// declared inputs, as the make-style depfile it writes names it. The record
+// under the action's key lists each such path with its digest, and is a hit
+// only while every one still has it.
+
+// A path a command read besides its declared inputs, and what it was then.
+struct Discovered {
+    let path: String
+    // A file's SHA-256, a directory's names under `names:`, or `absent`.
+    let digest: String
+    let relative: Bool = false
+}
+
+namespace DiscoveredDigest {
+    let absent: String = "absent"
+    let names: String = "names:"
+}
+
+extend Engine {
+    // What the depfile of the command `action` names, besides what is under
+    // its working directory and the sources it reads in place, which its key
+    // covers already.
+    function discover(
+        borrow mut self,
+        graph: borrow Graph,
+        action: Number,
+        place: borrow WorkPlace
+    ) -> Result<[Discovered], BuildFailure> {
+        let depfile = match graph.actions[action] {
+            Run(command) -> copy command.depfile
+            Native(native) -> ""
+        }
+        if depfile.count == 0 { return .Ok([]) }
+        let path = joinPath(place.directory, depfile)
+        let text = match readFile(path) {
+            Ok(contents) -> contents.text
+            Error(failure) -> return .Error(
+                .Failed("\(actionLabel(graph.actions[action])) wrote no depfile \(depfile)")
+            )
+        }
+        let sourceRoot = try actionSourceRoot(graph, action)
+        var known: [String] = [try physicalPath(place.directory)]
+        // What the command keeps in its workspace is its own.
+        if place.workspace.count > 0 { known.append(try physicalPath(place.workspace)) }
+        for read in graph.readsOf(action) { known.append(try physicalPath(graph.sourcePath(read))) }
+        var discovered: [Discovered] = []
+        for written in depfilePaths(text) {
+            // A path the depfile names from the working directory is the
+            // command's own.
+            let found = try physicalPath(joinPath(place.directory, written))
+            var covered = false
+            for prefix in known {
+                if pathUnder(found, prefix) { covered = true }
+            }
+            if covered { continue }
+            let digest = match pathDigest(found) {
+                Ok(hex) -> hex
+                Error(failure) -> return .Error(failure)
+            }
+            let relative = relativeSourcePath(found, sourceRoot)
+            discovered.append(Discovered {
+                path: relative.or(found),
+                digest: digest,
+                relative: relative.isSome()
+            })
+        }
+        return .Ok(discovered)
+    }
+
+    // Whether every path `record` discovered still has its digest.
+    function discoveredHold(
+        borrow mut self,
+        graph: borrow Graph,
+        action: Number,
+        record: borrow ActionRecord
+    ) -> Bool {
+        let sourceRoot = match actionSourceRoot(graph, action) {
+            Ok(root) -> root
+            Error(failure) -> return false
+        }
+        for found in record.discovered {
+            if found.relative && sourceRoot.count == 0 { return false }
+            let path = found.relative ? joinPath(sourceRoot, found.path) : copy found.path
+            match pathDigest(path) {
+                Ok(digest) -> {
+                    if digest != found.digest { return false }
+                }
+                Error(failure) -> {
+                    absorb failure
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
+    // What `path` is now: a file's SHA-256, a directory's names, or absent.
+    function pathDigest(borrow mut self, path: borrow String) -> Result<String, BuildFailure> {
+        if !pathExists(path) { return .Ok(DiscoveredDigest.absent) }
+        if !isDirectory(path) { return cache.fileHex(path) }
+        var names: [String] = []
+        match listNames(path, "", names) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        let sorted = names.sorted({ left, right in return orderStrings(left, right) < 0 })
+        let text = joined(sorted, "\n")
+        return match sha256Hex(text.utf8()) {
+            Ok(hex) -> .Ok(DiscoveredDigest.names + hex)
+            Error(failure) -> .Error(failure)
+        }
+    }
+}
+
+// Every name under `directory`, from it, a directory's ending in `/`.
+function listNames(
+    root: borrow String,
+    relative: borrow String,
+    names: borrow mut [String]
+) -> Result<Void, BuildFailure> {
+    let directory = joinPath(root, relative)
+    let entries = match listDirectory(directory) {
+        Ok(listing) -> listing.entries
+        Error(failure) -> return .Error(.Files("cannot list \(directory): \(traceText(failure))"))
+    }
+    for name in entries {
+        let path = relative.count == 0 ? copy name : relative + "/" + name
+        let full = joinPath(root, path)
+        let status = match linkStatus(full) {
+            Ok(found) -> found
+            Error(failure) -> return .Error(.Files("cannot read \(full): \(traceText(failure))"))
+        }
+        if status.kind == .Directory {
+            names.append(path + "/")
+            match listNames(root, path, names) {
+                Ok -> {}
+                Error(failure) -> return .Error(failure)
+            }
+        } else {
+            names.append(path)
+        }
+    }
+    return .Ok
+}
+
+// The prerequisites of a make-style depfile: every path after the first
+// target's `:`. `\` escapes a space, `#` or `\`, `$$` is `$`, and `\` at a
+// line's end continues it.
+function depfilePaths(text: borrow String) -> [String] {
+    var paths: [String] = []
+    var current: [UN8] = []
+    var target = true
+    var index = 0
+    let space = UN8(32)
+    let newline = UN8(10)
+    let feed = UN8(13)
+    let tab = UN8(9)
+    let backslash = UN8(92)
+    let dollar = UN8(36)
+    let colon = UN8(58)
+    while index < text.count {
+        let byte = UN8(text.byteAt(index))
+        let next = index + 1 < text.count ? UN8(text.byteAt(index + 1)) : UN8(0)
+        let blank = byte == space || byte == newline || byte == feed || byte == tab
+        if byte == backslash && (next == space || next == UN8(35) || next == backslash) {
+            current.append(UN8(next))
+            index += 2
+            continue
+        }
+        if byte == backslash && (next == newline || next == feed) {
+            index += 1
+            continue
+        }
+        if byte == dollar && next == dollar {
+            current.append(UN8(dollar))
+            index += 2
+            continue
+        }
+        let ending = next == space || next == newline || next == feed || next == tab || next == UN8(
+            0
+        )
+        if target && byte == colon && ending {
+            target = false
+            current = []
+        } else if blank {
+            if !target && current.count > 0 {
+                paths.append(textFromBytes(current).or(""))
+            }
+            current = []
+        } else {
+            current.append(UN8(byte))
+        }
+        index += 1
+    }
+    if !target && current.count > 0 { paths.append(textFromBytes(current).or("")) }
+    return paths
+}

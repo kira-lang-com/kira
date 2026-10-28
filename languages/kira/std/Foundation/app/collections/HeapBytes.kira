@@ -1,0 +1,19 @@
+import Heap
+
+// The bridges between heap memory and arrays, which `Heap` itself, beneath
+// the arrays, cannot name.
+
+// A block holding a copy of the array's bytes, in one copy.
+function blockFromBytes(bytes: borrow [UN8]) -> Heap.ByteBlock {
+    let block = Heap.uninitializedBlock(bytes.count, 1)
+    heapCopyBytes(block.pointer(), bytes.data, bytes.count)
+    return move block
+}
+
+// The view's bytes, copied out into an array in one copy.
+function viewBytes(view: borrow Heap.MemoryView) -> [UN8] {
+    let data = makeArrayData(max(view.count, 1))
+    heapCopyBytes(data, view.start, view.count)
+    let empty: [UN8] = []
+    return Array { data = data, count = view.count, capacity = max(view.count, 1), ops = empty.ops }
+}

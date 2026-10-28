@@ -1,0 +1,142 @@
+import Heap
+
+struct Identifier {
+    let text: String
+
+    function asString(borrow self) -> String { return text }
+}
+
+struct Syntax {
+    let text: String
+
+    function asString(borrow self) -> String { return text }
+
+    function identifiers(borrow self) -> [Identifier] {
+        var identifiers: [Identifier] = []
+        var start: Int = -1
+        for index in 0..text.count {
+            let byte = heapReadByte(heapOffset(text.data, index))
+            let letter = (byte >= U8(65) && byte <= U8(90)) || (
+                byte >= U8(97) && byte <= U8(122)
+            ) || byte == U8(95) || byte == U8(36)
+            let digit = byte >= U8(48) && byte <= U8(57)
+            if start < 0 {
+                if letter { start = index }
+            } else if !letter && !digit {
+                identifiers.append(Identifier { text = syntaxTextSlice(text, start, index) })
+                start = -1
+            }
+        }
+        if start >= 0 {
+            identifiers.append(Identifier { text = syntaxTextSlice(text, start, text.count) })
+        }
+        return identifiers
+    }
+
+    function replaceIdentifier(borrow self, from: borrow String, to: borrow String) -> Syntax {
+        return replacedIdentifier(text, from, to)
+    }
+
+    function replaceIdentifier(borrow self, from: borrow String, to: borrow Syntax) -> Syntax {
+        return replacedIdentifier(text, from, to.text)
+    }
+
+    function join(parts: borrow [Syntax], separator: borrow String) -> Syntax {
+        return Syntax { text = joinedSyntaxText(parts, separator) }
+    }
+
+    // The text without the declaration of the field `name`, the line it
+    // stands on included. A macro rewriting a struct's fields has only the
+    // text, not the byte ranges the compiler recorded for a `Declaration`, so
+    // the line is found by reading it.
+    function dropField(borrow self, name: borrow Identifier) -> Syntax {
+        return droppedField(text, name.text)
+    }
+
+    // Every use of the property `name` on `self`, rewritten: a read becomes
+    // `getter`, a write `self.name = value` becomes `setter(value)`. The
+    // field itself is `dropField`'s to remove; this reads the rest of the
+    // text.
+    function rewriteProperty(
+        borrow self,
+        name: borrow Identifier,
+        getter: borrow Syntax,
+        setter: borrow Syntax
+    ) -> Syntax {
+        return rewrittenProperty(text, name.text, getter.text, setter.text)
+    }
+}
+
+function joinQuotedSyntax(parts: borrow [Syntax]) -> String {
+    return joinedSyntaxText(parts, "\n")
+}
+
+// The texts of `parts` with `separator` between each two, copied once into
+// a string of their total length: joining a program's worth of generated
+// declarations one concatenation at a time would copy it over and over.
+function joinedSyntaxText(parts: borrow [Syntax], separator: borrow String) -> String {
+    let empty: String = ""
+    var count: Int = 0
+    for index in 0..parts.count {
+        if index > 0 { count = count + separator.count }
+        count = count + parts[index].text.count
+    }
+    let data = makeArrayData(count)
+    var offset: Int = 0
+    for index in 0..parts.count {
+        if index > 0 {
+            heapCopyBytes(heapOffset(data, offset), separator.data, separator.count)
+            offset = offset + separator.count
+        }
+        heapCopyBytes(heapOffset(data, offset), parts[index].text.data, parts[index].text.count)
+        offset = offset + parts[index].text.count
+    }
+    return String { data = data, count = count, capacity = count, ops = empty.ops }
+}
+
+function quoteString(value: borrow String) -> String {
+    let empty = ""
+    var count: Int = 2
+    for index in 0..value.count {
+        let byte = heapReadByte(heapOffset(value.data, index))
+        count = count + (
+            byte == U8(34) || byte == U8(92) || byte == U8(10) || byte == U8(13) || byte == U8(
+                9
+            ) || byte == U8(0) ? 2 : 1
+        )
+    }
+    let data = makeArrayData(count)
+    heapWriteByte(data, U8(34))
+    var offset: Int = 1
+    for index in 0..value.count {
+        let byte = heapReadByte(heapOffset(value.data, index))
+        if byte == U8(34) || byte == U8(92) {
+            heapWriteByte(heapOffset(data, offset), U8(92))
+            offset = offset + 1
+            heapWriteByte(heapOffset(data, offset), byte)
+        } else if byte == U8(10) || byte == U8(13) || byte == U8(9) || byte == U8(0) {
+            heapWriteByte(heapOffset(data, offset), U8(92))
+            offset = offset + 1
+            let escaped = byte == U8(10) ? U8(110) : (
+                byte == U8(13) ? U8(114) : (byte == U8(9) ? U8(116) : U8(48))
+            )
+            heapWriteByte(heapOffset(data, offset), escaped)
+        } else {
+            heapWriteByte(heapOffset(data, offset), byte)
+        }
+        offset = offset + 1
+    }
+    heapWriteByte(heapOffset(data, offset), U8(34))
+    return String { data = data, count = count, capacity = count, ops = empty.ops }
+}
+
+function syntaxTextSlice(text: borrow String, start: Int, end: Int) -> String {
+    let count = end - start
+    let data = makeArrayData(count)
+    heapCopyBytes(data, heapOffset(text.data, start), count)
+    return String { data = data, count = count, capacity = count, ops = text.ops }
+}
+
+function joinSyntax(parts: borrow [Syntax], separator: borrow String) -> Syntax {
+    return Syntax { text = joinedSyntaxText(parts, separator) }
+}

@@ -1,0 +1,18 @@
+// Key paths: `\Root.member.member`, or `\.member` where the root is known
+// from the type expected, name the value a member path reaches from a value
+// of `Root`. A key path is the function reading it, as Swift's are where a
+// function is expected (SE-0249): Foundation's `KeyPath<Root, Value>` is
+// `(Root) -> Value` (`checkKeyPath`).
+
+extend Parser {
+    function keyPath(borrow mut self) -> Result<Int, Failure> {
+        let start = try expect(.Backslash)
+        var root: Optional<TypeReference> = .None
+        if at(.Identifier) { root = .Some(namedReference(try identifier(.ExpectedTypeName))) }
+        if !at(.Dot) { return .Error(failure(.ExpectedMemberName)) }
+        var members: [Identifier] = []
+        while eat(.Dot) { members.append(try identifier(.ExpectedMemberName)) }
+        let span = spanFrom(start.span)
+        return .Ok(tree.addExpression(.KeyPath(KeyPathDeclaration { root = root, members = members, span = span }), span))
+    }
+}

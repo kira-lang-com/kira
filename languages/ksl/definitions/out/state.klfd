@@ -1,0 +1,170 @@
+// The KSL out (KLF-KSL section 22.9): one unit, read through the reader
+// services, written back as one `.ksl` file.
+//
+// A unit is KSIR after the passes; KSL is smaller. What KSL cannot spell is
+// refused with a message naming it, and the out goes on so that every
+// refusal of the unit is reported at once.
+
+// A loop or a switch being written, and the flags that stand in for its
+// `break` and `continue`: KSL has neither statement.
+struct Breakable {
+    let isLoop: Bool
+    let id: Int
+    // Whether a flag variable records that the construct was left.
+    let flagged: Bool
+    // Whether a loop's body may `continue`.
+    let skips: Bool
+}
+
+struct KslOut {
+    let unit: ShaderUnit
+    var failed: Bool
+    var typeNames: [String]
+    var functionNames: [String]
+    var globalNames: [String]
+    // The function being written, by its number (section 6.7).
+    var current: Int
+    var argumentNames: [String]
+    var localNames: [String]
+    // Per expression of the current function: whether a temporary holds
+    // it, and whether it is written in place even when it would bake.
+    var bound: [Bool]
+    var inPlace: [Bool]
+    var indent: Int
+    // The loops and switches being written, innermost last. Only the
+    // first `depth` are open: a list cannot shrink.
+    var constructs: [Breakable]
+    var depth: Int
+    var nextId: Int
+}
+
+function writeKsl(unit: ShaderUnit) -> Bool {
+    var out = KslOut {
+        unit = unit, failed = false, typeNames = [], functionNames = [], globalNames = [], current = -1,
+        argumentNames = [], localNames = [], bound = [], inPlace = [], indent = 0, constructs = [], depth = 0, nextId = 0
+    }
+    out.writeModule()
+    return !out.failed
+}
+
+extend KslOut {
+    function count(borrow self, table: String, owner: Int) -> Int {
+        return shader_read_count(unit, table, owner)
+    }
+
+    function kind(borrow self, table: String, owner: Int, index: Int) -> String {
+        return shaderText(unit, shader_read_kind(unit, table, owner, index))
+    }
+
+    function field(borrow self, table: String, owner: Int, index: Int, name: String) -> Int {
+        return shader_read_int(unit, table, owner, index, name, 0)
+    }
+
+    function fieldItem(borrow self, table: String, owner: Int, index: Int, name: String, item: Int) -> Int {
+        return shader_read_int(unit, table, owner, index, name, item)
+    }
+
+    // How many items a list field holds.
+    function fieldCount(borrow self, table: String, owner: Int, index: Int, name: String) -> Int {
+        return shader_read_int(unit, table, owner, index, name, -1)
+    }
+
+    function text(borrow self, table: String, owner: Int, index: Int, name: String) -> String {
+        return shaderText(unit, shader_read_text(unit, table, owner, index, name, 0))
+    }
+
+    function textItem(borrow self, table: String, owner: Int, index: Int, name: String, item: Int) -> String {
+        return shaderText(unit, shader_read_text(unit, table, owner, index, name, item))
+    }
+
+    // Records that KSL cannot spell `what`, at `expression` of the current
+    // function (-1 for the function itself).
+    function refuse(borrow mut self, what: String, expression: Int) {
+        shader_out_refuse(unit, joinText(["KSL has no ", what]), current, expression)
+        failed = true
+    }
+
+    function write(borrow self, piece: String) {
+        shader_out_write(unit, piece)
+    }
+
+    // One line at the current indentation.
+    function line(borrow self, content: String) {
+        var pieces: [String] = []
+        for level in 0..indent {
+            pieces.append("    ")
+        }
+        pieces.append(content)
+        pieces.append("\n")
+        shader_out_write(unit, joinText(pieces))
+    }
+
+    // An expression's operand, or -1 when it has none.
+    function operand(borrow self, expression: Int, name: String) -> Int {
+        return field("expressions", current, expression, name)
+    }
+
+    function expressionKind(borrow self, expression: Int) -> String {
+        return kind("expressions", current, expression)
+    }
+
+    function typeOf(borrow self, expression: Int) -> Int {
+        return field("expressions", current, expression, "type")
+    }
+
+    // The type a pointer points to; any other type is itself.
+    function pointee(borrow self, typeIndex: Int) -> Int {
+        if kind("types", -1, typeIndex) == "pointer" { return field("types", -1, typeIndex, "base") }
+        return typeIndex
+    }
+}
+
+// KSL's words, which no name the out writes may be.
+function kslKeyword(name: String) -> Bool {
+    for word in ["import", "as", "type", "const", "enum", "function", "shader", "group", "option", "let",
+        "if", "else", "while", "return", "true", "false"] {
+        if name == word { return true }
+    }
+    return false
+}
+
+// A KSIR name as a KSL name. The out's own names start with `_`, so a
+// source name that does is moved out of their way.
+function kslName(given: String) -> String {
+    if utf8Count(given) == 0 { return "_unnamed" }
+    let name = identifierText(given)
+    if utf8Byte(name, 0) == 95 { return joinText(["v", name]) }
+    if kslKeyword(name) { return joinText([name, "_"]) }
+    return name
+}
+
+function identifierByte(byte: Int) -> Bool {
+    return (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+}
+
+// `name` with each byte an identifier cannot hold as `_`, as a shader named
+// for a file `basic-triangle` has, and an `n` before a leading digit.
+function identifierText(name: String) -> String {
+    var pieces: [String] = []
+    if utf8Byte(name, 0) >= 48 && utf8Byte(name, 0) <= 57 { pieces.append("n") }
+    var start = 0
+    let length = utf8Count(name)
+    for at in 0..length {
+        if !identifierByte(utf8Byte(name, at)) {
+            pieces.append(utf8Slice(name, start, at))
+            pieces.append("_")
+            start = at + 1
+        }
+    }
+    pieces.append(utf8Slice(name, start, length))
+    return joinText(pieces)
+}
+
+function temporaryName(expression: Int) -> String {
+    return joinText(["_t", decimalText(expression)])
+}
+
+function startsWithText(value: String, prefix: String) -> Bool {
+    if utf8Count(prefix) > utf8Count(value) { return false }
+    return utf8Slice(value, 0, utf8Count(prefix)) == prefix
+}

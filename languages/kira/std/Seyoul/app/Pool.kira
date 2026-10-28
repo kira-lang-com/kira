@@ -1,0 +1,108 @@
+import Foundation
+
+// Threads each running a Seyoul runtime of its own, sharing nothing:
+//
+//     let pool = workerPool(threadParallelism())
+//     let totals = Conduit<Number>()
+//     for part in 0..8 { pool.spawn(sumPart(part, copy totals)) }
+//     ...
+//     pool.join()
+//
+// `spawn` hands a task to the next worker in turn; it runs there to its end,
+// with its sockets and timers on that worker's runtime. A task answers what
+// it worked out through a `Conduit`. `join` lets every worker finish what it
+// was handed and waits for the threads.
+
+// A task handed to a worker, its output's type erased: the worker starts it
+// on its own runtime.
+class PoolJob {
+    function start() {}
+}
+
+class PoolJobOf<Output> extends PoolJob {
+    var future: Async<Output>?
+
+    override function start() {
+        let taken: Async<Output>? = move self.future
+        self.future = .None
+        match move taken {
+            Some(running) -> {
+                let task = spawn(move running)
+            }
+            None -> {}
+        }
+    }
+}
+
+// A worker's thread, held where an array can share it; emptying it joins
+// the thread.
+class WorkerThread {
+    var thread: Thread? = .None
+}
+
+class WorkerPool: Drop {
+    var queues: [Conduit<PoolJob>] = []
+    var threads: [WorkerThread] = []
+    var next: Number = 0
+
+    // Starts `threads` workers, at least one.
+    function start(threads: Number) {
+        var count = threads
+        if count < 1 { count = 1 }
+        for index in 0..count {
+            let queue = Conduit<PoolJob>()
+            self.queues.append(copy queue)
+            let worker = WorkerThread()
+            worker.thread = .Some(
+                spawnThread(
+                    { in
+                        let served = runAll(serveWorker(copy queue))
+                    }
+                )
+            )
+            self.threads.append(worker)
+        }
+    }
+
+    // Runs `future` on one of the workers; its output is dropped.
+    function spawn<Output>(future: Async<Output>) {
+        let job = PoolJobOf<Output> { future = .Some(move future) }
+        let sent = self.queues[self.next].send(move job)
+        self.next = (self.next + 1) % self.queues.count
+    }
+
+    // Lets every worker finish the tasks it was handed, then waits for the
+    // threads to end.
+    function join() {
+        for queue in self.queues { queue.close() }
+        for worker in self.threads { worker.thread = .None }
+        self.queues = []
+        self.threads = []
+    }
+
+    function drop(borrow mut self) {
+        self.join()
+    }
+}
+
+// A pool of `threads` workers, started.
+function workerPool(threads: Number) -> WorkerPool {
+    let pool = WorkerPool()
+    pool.start(threads)
+    return pool
+}
+
+// A worker's own task: spawns what it is handed until its queue is closed.
+async function serveWorker(queue: Conduit<PoolJob>) -> Number {
+    var served: Number = 0
+    while true {
+        match queue.receive().await {
+            Some(job) -> {
+                job.start()
+                served += 1
+            }
+            None -> return served
+        }
+    }
+    return served
+}

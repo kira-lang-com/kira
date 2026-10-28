@@ -1,0 +1,428 @@
+// Trait objects of crossing families (KLF-RIDL sections 21.6, 21.7, 22.6
+// and 23.2, and 27.7 for the mapping).
+//
+// A family whose values cross RIDL is the struct `Any Family`, two words: a
+// RIDL box holding the value and the witness table of the value's type. A
+// declaration seen through it boxes its values with `__witness_box_Family`,
+// whose body lowering writes here: a Kira box with the declaration's
+// descriptor, and the table the declaration's module exports. The engine
+// builds the tables, their witness entries and the adapters through which a
+// member is called, from the attributes this file writes:
+//
+// - `ridl.witness.trait`, per module whose traits the program uses: the
+//   module and the `.ridl` text declaring them.
+// - `ridl.witness.table`, per declaration of the program boxed: the trait's
+//   module, the declaration's, the declaration, the trait, the function
+//   answering its descriptor, the symbol the program calls for the table,
+//   and one `member=function` per member the declaration answers.
+// - `ridl.witness.import`, per declaration of another module boxed: the
+//   trait's module, the declaration's, the declaration, the trait and the
+//   symbol the program calls for the table.
+// - `ridl.witness.call`, per member the program calls: the trait's module,
+//   the trait, the member and the symbol the program calls.
+// - `ridl.witness.default`, per default of a family the program declares:
+//   the trait's module, the trait, the member and the function taking the
+//   trait object that implements it.
+//
+// Copying a trait object shares its box, which counts its holders as every
+// Kira box does, rather than copying the value through the descriptor: a
+// view tree passes values down far more often than it changes one. A member
+// that changes or takes over its receiver first makes the box its own
+// (`__klf_ridl_box_unique`), so no other holder sees the change.
+
+let ridlWitnessTraitAttribute = 11
+let ridlWitnessTableAttribute = 12
+let ridlWitnessImportAttribute = 13
+let ridlWitnessCallAttribute = 14
+let ridlWitnessDefaultAttribute = 15
+
+// The function a witness call makes the receiver's box its own with.
+let boxUniqueName = "__klf_ridl_box_unique"
+
+// The trait members of the crossing family `structure`: the functions
+// called through its table, ordered by name.
+function witnessMembers(program: CheckedProgram, structure: Int) -> [Int] {
+    var members: [Int] = []
+    for index in 0..program.functions.count {
+        let checked = program.functions[index]
+        if !isWitnessMember(checked) || !ownedBy(checked, structure) { continue }
+        var place = members.count
+        for position in 0..members.count {
+            if place == members.count && textBefore(checked.memberName, program.functions[members[position]].memberName) { place = position }
+        }
+        var ordered: [Int] = []
+        for position in 0..members.count {
+            if position == place { ordered.append(index) }
+            ordered.append(members[position])
+        }
+        if place == members.count { ordered.append(index) }
+        members = ordered
+    }
+    return members
+}
+
+// Whether `checked` is a member of a crossing family, which the family's
+// struct declares for the trait's method, rather than a method an `extend`
+// of the family adds or the default the program keeps for a member.
+function isWitnessMember(checked: CheckedFunction) -> Bool {
+    return utf8Count(checked.ridlImport) > 0 && (checked.witness == "member" || checked.witness == "default")
+}
+
+// Whether a call of `checked` goes through the witness table of the trait
+// object it is called on.
+function callsWitness(program: CheckedProgram, checked: CheckedFunction) -> Bool {
+    return witnessedOwner(program, checked.owner) && isWitnessMember(checked)
+}
+
+function ownedBy(checked: CheckedFunction, structure: Int) -> Bool {
+    match checked.owner {
+        Some(owner) -> return owner.kind == .Structure && owner.declaration == structure
+        None -> return false
+    }
+}
+
+// The crossing family `Any Family` named `name`.
+function witnessedNamed(program: CheckedProgram, name: String) -> Optional<Type> {
+    for index in 0..program.structs.count {
+        if program.structs[index].genericBase == "Witnessed" && program.structs[index].name.text == name { return .Some(Type.structure(index)) }
+    }
+    return .None
+}
+
+// The module whose trait the crossing family `structure` is.
+function witnessTraitModule(program: CheckedProgram, structure: Int) -> String {
+    for checked in program.functions {
+        if utf8Count(checked.ridlImport) > 0 && ownedBy(checked, structure) { return checked.ridlImport }
+    }
+    return ""
+}
+
+// The family's name, `Family` of `Any Family`.
+function witnessFamilyName(program: CheckedProgram, structure: Int) -> String {
+    let name = program.structs[structure].name.text
+    return ridlName(utf8Slice(name, 4, utf8Count(name)))
+}
+
+// Whether `owner` is a crossing family's trait object.
+function witnessedOwner(program: CheckedProgram, owner: Optional<Type>) -> Bool {
+    match owner {
+        Some(ownerType) -> return isWitnessedType(program, ownerType)
+        None -> return false
+    }
+}
+
+// Whether lowering keeps function `index` for a witness table, as an export
+// the table's entry calls.
+function witnessExported(checked: CheckedFunction) -> Bool {
+    return utf8Count(checked.ridlImport) == 0 && (checked.witness == "export" || checked.witness == "default")
+}
+
+// Every type the traits of the witness tables spell, once each, with its
+// spelling: the engine's entries and adapters destroy a value of one through
+// its `ridl.type` function.
+struct WitnessSpelled {
+    var types: [Type]
+    var spellings: [String]
+
+    function add(borrow mut self, valueType: Type, spelling: String) {
+        for known in spellings { if known == spelling { return } }
+        types.append(valueType)
+        spellings.append(spelling)
+    }
+}
+
+extend KirTypes {
+    // The structs a value of which is boxed as a trait object, which carry a
+    // payload description as a class does: those the unit boxes, and those
+    // the members it dispatches tell apart.
+    function markWitnessMembers(borrow mut self, program: CheckedProgram) {
+        for index in 0..program.structs.count { witnessMembers.append(false) }
+        for checked in program.functions {
+            if !boxesWitness(checked.witness) { continue }
+            match checked.owner {
+                Some(owner) -> witnessMembers[owner.declaration] = true
+                None -> {}
+            }
+        }
+        for dispatch in program.familyDispatches {
+            for member in dispatch.members { witnessMembers[member] = true }
+        }
+    }
+
+    // The attributes of every trait object the program makes or calls, and
+    // the functions they name: per boxing function the program reaches, the
+    // table's accessor and, for a declaration of its own, the descriptor
+    // function; and the function a witness call makes a box its own with.
+    function declareRidlWitnesses(borrow mut self, builder: KirModuleBuilder, program: CheckedProgram, functions: [KirFunctionBuilder], reached: [Bool]) -> WitnessSpelled {
+        var spelled = WitnessSpelled { types = [], spellings = [] }
+        var modules: [String] = []
+        var traits: [Type] = []
+        // The module each of `traits` is declared in: a family with no
+        // members has no import to tell it by.
+        var traitModules: [String] = []
+        for index in 0..program.functions.count {
+            let absent: Optional<KirFunctionBuilder> = .None
+            witnessAccessors.append(absent)
+        }
+        for index in 0..program.functions.count {
+            let checked = program.functions[index]
+            if !reached[index] { continue }
+            if boxesWitness(checked.witness) {
+                let fields = splitText(checked.witness, 9)
+                let traitModule = fields[1]
+                let declarationModule = fields[2]
+                var declaration = fields[4]
+                let family = witnessedNamed(program, familyTypeName(fields[3])).unwrap()
+                // A family a package built apart declares has no table: the
+                // program's own unit defines its members.
+                if program.dispatchedFamily(family.declaration) { continue }
+                let traitName = witnessFamilyName(program, family.declaration)
+                addWitnessTrait(modules, traits, traitModules, traitModule, family)
+                let accessor = joinText(["__klf_witness_table_", symbolText(program.moduleName), "_", symbolText(checked.symbol)])
+                witnessAccessors[index] = .Some(declareWitnessAccessor(builder, program, checked, accessor))
+                let member = checked.owner.unwrap()
+                // An instance of a generic declaration has a table of its
+                // own, under the instance's name made a RIDL identifier
+                // (section 23.5): `Square_Number_` for `Square<Number>`.
+                if program.structs[member.declaration].specialized {
+                    declaration = symbolText(ridlName(program.structs[member.declaration].name.text))
+                }
+                if fields[5] == "1" {
+                    moduleAttribute(builder, joinText([traitModule, "\t", declarationModule, "\t", declaration, "\t", traitName, "\t", accessor]), ridlWitnessImportAttribute)
+                    continue
+                }
+                let descriptor = joinText(["__klf_witness_descriptor_", symbolText(checked.symbol)])
+                defineWitnessDescriptor(builder, program, checked, member, descriptor)
+                var row: [String] = [traitModule, "\t", declarationModule, "\t", declaration, "\t", traitName, "\t", descriptor, "\t", accessor]
+                for method in witnessMembers(program, family.declaration) {
+                    let name = program.functions[method].memberName
+                    for candidate in program.functions {
+                        if candidate.witness != "export" || !ownedBy(candidate, member.declaration) { continue }
+                        if candidate.memberName == name || candidate.memberName == witnessReaderName(name) {
+                            row.append(joinText(["\t", name, "=", candidate.symbol]))
+                            break
+                        }
+                    }
+                }
+                moduleAttribute(builder, joinText(row), ridlWitnessTableAttribute)
+                continue
+            }
+            if !witnessedOwner(program, checked.owner) { continue }
+            let owner = checked.owner.unwrap()
+            if program.dispatchedFamily(owner.declaration) { continue }
+            let traitName = witnessFamilyName(program, owner.declaration)
+            if isWitnessMember(checked) {
+                addWitnessTrait(modules, traits, traitModules, checked.ridlImport, owner)
+                moduleAttribute(builder, joinText([checked.ridlImport, "\t", traitName, "\t", checked.memberName, "\t", checked.symbol]), ridlWitnessCallAttribute)
+                if boxUnique.isNone() { boxUnique = .Some(declareBoxUnique(builder, program, checked)) }
+                continue
+            }
+            if checked.witness == "default" {
+                let module = witnessTraitModule(program, owner.declaration)
+                let member = utf8Slice(checked.memberName, utf8Count(witnessDefaultName("")), utf8Count(checked.memberName))
+                addWitnessTrait(modules, traits, traitModules, module, owner)
+                moduleAttribute(builder, joinText([module, "\t", traitName, "\t", member, "\t", checked.symbol]), ridlWitnessDefaultAttribute)
+            }
+        }
+        for module in modules {
+            var surface = RidlSurface {
+                program = program, nominals = [], functions = [], methods = [], methodOwners = [], skipped = [], aliases = [], entries = [], paths = [],
+                spelled = [], spellings = []
+            }
+            for index in 0..traits.count {
+                if traitModules[index] == module {
+                    match surface.typeText(traits[index]) {
+                        Some(text) -> {}
+                        None -> {}
+                    }
+                }
+            }
+            moduleAttribute(builder, joinText([module, "\t", surface.text(false)]), ridlWitnessTraitAttribute)
+            for index in 0..surface.spelled.count { spelled.add(surface.spelled[index], surface.spellings[index]) }
+        }
+        if program.familyDispatches.count > 0 && boxUnique.isNone() {
+            boxUnique = .Some(declareBoxUnique(builder, program, program.functions[program.familyDispatches[0].dispatcher]))
+        }
+        return spelled
+    }
+
+    function addWitnessTrait(
+        borrow self,
+        modules: borrow mut [String],
+        traits: borrow mut [Type],
+        traitModules: borrow mut [String],
+        module: String,
+        witnessed: Type
+    ) {
+        var seen = false
+        for known in modules { if known == module { seen = true } }
+        if !seen { modules.append(module) }
+        for known in traits {
+            if known.declaration == witnessed.declaration { return }
+        }
+        traits.append(witnessed)
+        traitModules.append(module)
+    }
+
+    // `accessor() -> RawPtr`, the table's address: the engine defines it,
+    // for a table the program defines and one it imports alike.
+    function declareWitnessAccessor(borrow self, builder: KirModuleBuilder, program: CheckedProgram, checked: CheckedFunction, accessor: String) -> KirFunctionBuilder {
+        let span = program.named(checked.name)
+        let signature = kir_signature_new(builder, span.start, span.end, pointer)
+        for index in 0..utf8Count(accessor) { kir_signature_name_byte(signature, utf8Byte(accessor, index)) }
+        return kir_signature_declare(signature)
+    }
+
+    // `descriptor() -> RawPtr`, the descriptor of the declaration's values
+    // (section 23.1), which the engine writes into the table.
+    function defineWitnessDescriptor(borrow self, builder: KirModuleBuilder, program: CheckedProgram, checked: CheckedFunction, member: Type, name: String) {
+        let span = program.named(checked.name)
+        let signature = kir_signature_new(builder, span.start, span.end, pointer)
+        for index in 0..utf8Count(name) { kir_signature_name_byte(signature, utf8Byte(name, index)) }
+        kir_signature_export(signature)
+        let reading = kir_signature_define(signature)
+        reading.switchTo(reading.entryBlock())
+        let address = kir_value_global_address(reading, classDescription(member.declaration).global)
+        reading.returnValue(reading.convert(convertBitcast, reading.pointer(address), pointer))
+    }
+
+    // `__klf_ridl_box_unique(box) -> RawPtr`, declared here and lowered by
+    // `lowerWitnessHelpers`.
+    function declareBoxUnique(borrow self, builder: KirModuleBuilder, program: CheckedProgram, checked: CheckedFunction) -> KirFunctionBuilder {
+        let span = program.named(checked.name)
+        let signature = kir_signature_new(builder, span.start, span.end, pointer)
+        for index in 0..utf8Count(boxUniqueName) { kir_signature_name_byte(signature, utf8Byte(boxUniqueName, index)) }
+        kir_signature_parameter(signature, pointer)
+        kir_signature_export(signature)
+        return kir_signature_declare(signature)
+    }
+}
+
+function lowerWitnessHelpers(program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder]) {
+    match types.boxUnique {
+        Some(unique) -> {
+            var lowering = FunctionLowering.startChecked(program, types, functions, helperChecked(program.structs[0].baseNameSpan, Type.void()), unique)
+            lowering.lowerBoxUnique()
+        }
+        None -> {}
+    }
+}
+
+extend FunctionLowering {
+    // `__witness_box_Family(value) -> Any Family`: the value moved into a
+    // fresh box carrying its descriptor, and the table its module exports.
+    function lowerWitnessBox(borrow mut self) {
+        let body = kir.block()
+        enter(body)
+        let member = checked.owner.unwrap()
+        let description = types.classDescription(member.declaration)
+        let object = allocatePayloadBox(description)
+        let box = kir.typedMemory(object, description.boxType)
+        let payload = kir.field(box, 2, description.payloadType)
+        let out = kir.memory(kir.parameter(0), types.of(checked.result))
+        let value = kir.memory(kir.parameter(1), types.of(member))
+        kir.copyBytes(value, payload, kir.integer(types.integer64, description.size), types.pointer)
+        kir.store(object, kir.field(out, 0, types.pointer))
+        // A value of a family the program's own unit dispatches carries no
+        // table.
+        match types.witnessAccessors[functionIndex.unwrap()] {
+            Some(accessor) -> kir.store(kir.call(accessor, types.pointer), kir.field(out, 1, types.pointer))
+            None -> kir.store(kir_value_null(kir, types.pointer), kir.field(out, 1, types.pointer))
+        }
+        kir.returnVoid()
+        kir.switchTo(entry)
+        kir.branch(body)
+    }
+
+    // `__witness_unbox_Family(object) -> Declaration`: the value a forwarded
+    // default boxed (`forwardedDefault`), moved back out of the box, which
+    // is made the object's own first and then freed without dropping it.
+    function lowerWitnessUnbox(borrow mut self) {
+        let body = kir.block()
+        enter(body)
+        let member = checked.owner.unwrap()
+        let description = types.classDescription(member.declaration)
+        let out = kir.memory(kir.parameter(0), types.of(member))
+        let object = kir.memory(kir.parameter(1), types.of(checked.locals[0].valueType))
+        var boxed = kir.load(kir.field(object, 0, types.pointer))
+        match types.boxUnique {
+            Some(unique) -> {
+                kir.argument(boxed)
+                boxed = kir.call(unique, types.pointer)
+            }
+            None -> {}
+        }
+        let box = kir.typedMemory(boxed, description.boxType)
+        let payload = kir.field(box, 2, description.payloadType)
+        kir.copyBytes(payload, out, kir.integer(types.integer64, description.size), types.pointer)
+        arrayRuntimeVoid(3, [boxed])
+        kir.returnVoid()
+        kir.switchTo(entry)
+        kir.branch(body)
+    }
+
+    // The box itself when nothing else holds it; otherwise a copy of its
+    // value through its descriptor (section 23.1) in a fresh Kira box, the
+    // shared one released.
+    function lowerBoxUnique(borrow mut self) {
+        let body = kir.block()
+        enter(body)
+        let boxed = kir.parameter(0)
+        kir.argument(boxed)
+        let unique = kir.call(functions[program.arrayFunctions[6]], types.boolean)
+        let shared = kir.block()
+        let own = kir.block()
+        kir.branchIf(unique, own, shared)
+        enter(shared)
+        let header = kir.typedMemory(boxed, kir_type_array(0, types.pointer))
+        let descriptor = kir.load(kir.element(header, kir.integer(types.integer64, 0), types.pointer))
+        let typed = kir.typedMemory(descriptor, types.descriptorTypes[0])
+        let size = kir.load(kir.field(typed, 2, types.integer64))
+        let alignment = kir.load(kir.field(typed, 3, types.integer64))
+        let padded = kir.binary(kirOperator(.Add, true), false, true, kir.integer(types.integer64, 15), alignment)
+        let units = kir.binary(kirOperator(.Divide, false), false, false, padded, alignment)
+        let offset = kir.binary(kirOperator(.Multiply, true), false, true, units, alignment)
+        let total = kir.binary(kirOperator(.Add, true), false, true, offset, size)
+        let fresh = arrayRuntimePointer(0, [total])
+        let freshHeader = kir.typedMemory(fresh, kir_type_array(0, types.pointer))
+        kir.store(descriptor, kir.element(freshHeader, kir.integer(types.integer64, 0), types.pointer))
+        let free = kir_value_function_reference(kir, functions[program.arrayFunctions[9]])
+        kir.store(kir.convert(convertBitcast, free, types.pointer), kir.element(freshHeader, kir.integer(types.integer64, 1), types.pointer))
+        let source = kir.offsetBytes(boxed, offset)
+        let destination = kir.offsetBytes(fresh, offset)
+        let copier = kir.load(kir.field(typed, 4, types.pointer))
+        let bits = kir.convert(convertBitcast, copier, types.integer64)
+        let invoke = kir.block()
+        let bytes = kir.block()
+        let copied = kir.block()
+        kir.branchIf(kir.compare(kirPredicate(.NotEqual, false), bits, kir.integer(types.integer64, 0)), invoke, bytes)
+        enter(invoke)
+        rawCallbackVoid(copier, [destination, source, descriptor])
+        flowInto(copied)
+        // A copyable type with no `copy` copies as its bytes.
+        enter(bytes)
+        let raw = kir_type_array(0, types.integer8)
+        kir.copyBytes(kir.typedMemory(source, raw), kir.typedMemory(destination, raw), size, types.pointer)
+        flowInto(copied)
+        enter(copied)
+        destroyContext(boxed)
+        kir.returnValue(fresh)
+        open = false
+        enter(own)
+        kir.returnValue(boxed)
+        open = false
+        kir.switchTo(entry)
+        kir.branch(body)
+    }
+
+    // A trait object shares its box: the copy holds it once more.
+    function copyWitnessed(borrow mut self, from: KirAddress, to: KirAddress) {
+        let boxed = kir.load(kir.field(from, 0, types.pointer))
+        kir.store(arrayRuntimePointer(2, [boxed]), kir.field(to, 0, types.pointer))
+        kir.store(kir.load(kir.field(from, 1, types.pointer)), kir.field(to, 1, types.pointer))
+    }
+
+    function destroyWitnessed(borrow mut self, address: KirAddress) {
+        destroyContext(kir.load(kir.field(address, 0, types.pointer)))
+    }
+}

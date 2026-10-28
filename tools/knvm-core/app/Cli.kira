@@ -1,0 +1,619 @@
+import Foundation
+
+// Which version of a toolchain an invocation names.
+public struct VersionSpec {
+    // Whether the newest published version is meant, or `version` is.
+    var latest: Bool = false
+    var version: String = ""
+}
+
+// Reads a version argument: the literal `latest`, or a version.
+public function parseVersionSpec(argument: borrow String) -> VersionSpec {
+    if argument == "latest" { return VersionSpec { latest: true, version: "" } }
+    return VersionSpec { latest: false, version: argument }
+}
+
+// The version a spec names, once a source has resolved `latest`.
+public function specifiedVersion(spec: borrow VersionSpec) -> String {
+    if spec.latest { return "latest" }
+    return spec.version
+}
+
+// An install of one version from one channel.
+public struct InstallRequest {
+    // Which compiler's tree this installs into.
+    var compiler: Compiler = Compiler {}
+    var spec: VersionSpec = VersionSpec {}
+    var channel: Channel = .Release
+}
+
+// `list` reports every channel at once, so the only things it can be asked are
+// which compiler it is about and whether the question is of the disk or the feed.
+public struct ListRequest {
+    var compiler: Compiler = Compiler {}
+    var remote: Bool = false
+}
+
+// A verb that acts on one installed version: `use`, `uninstall`, `pin`, `unpin`.
+public struct SelectionRequest {
+    var compiler: Compiler = Compiler {}
+    var version: String = ""
+    var channel: Channel = .Release
+}
+
+// `binstall`, which builds a checkout.
+public struct BuildRequest {
+    var scope: BuildScope = .Manifest
+}
+
+// What one `binstall` builds.
+public enum BuildScope {
+    // Every language the enclosing `toolchain.klfd` lists: `binstall` with no
+    // compiler named.
+    Manifest
+    // One compiler.
+    One(Compiler)
+}
+
+// A parsed `knvm` invocation.
+//
+// A verb this enum accepts is a verb that runs: nothing here is a placeholder.
+public enum Command {
+    Install(InstallRequest)
+    List(ListRequest)
+    Use(SelectionRequest)
+    Uninstall(SelectionRequest)
+    Pin(SelectionRequest)
+    Unpin(SelectionRequest)
+    Binstall(BuildRequest)
+    Sinstall
+    // `valgrind install`: Valgrind for a target, which knvm builds and keeps.
+    Valgrind(ValgrindRequest)
+    // `sdk list`: the SDKs the launcher finds by name under the SDK roots.
+    SdkList
+    // `setup`: klf, every published language and the tools, from releases.
+    Setup
+    Help
+    // Bare `knvm`: greet, report what is installed and selected, hint the next
+    // step. Not an error, and the tool introducing itself is the front door.
+    Overview
+}
+
+// Why an invocation could not be parsed.
+public enum UsageFailure {
+    UnknownCommand(String)
+    InstallMissingVersion
+    MissingVersion(String)
+    ChannelMissingValue
+    UnknownChannel(String)
+    UnexpectedArgument(String)
+    UnknownOption(String)
+    // A compiler named and no verb after it: `knvm klf` is a namespace, not a
+    // verb, and saying so is more use than guessing which verb was meant.
+    MissingVerb(String)
+    // A verb named no compiler, and no registered language is the default.
+    NoDefault(String)
+    // A tool named and no verb after it.
+    ToolMissingVerb(String)
+    // An option that takes a value was given none.
+    OptionMissingValue(String)
+    // `valgrind install` without the option it cannot do without.
+    ValgrindNeeds(String)
+}
+
+// What parsing an invocation produced.
+public enum ParsedCommand {
+    Accepted(Command)
+    Refused(UsageFailure)
+}
+
+// The default channel, when `--channel` is not given. `release`, per the rustup
+// and nvm norm.
+public let defaultChannel: Channel = .Release
+
+// Parses an argument list, the program's own name excluded.
+//
+// A first word naming a compiler of `compilers` selects that compiler, and the
+// rest is read as one of its verbs: so `knvm klf list` and `knvm list` are one
+// parser on two targets. A first word naming no compiler is a verb acting on the
+// default one, except `binstall`, which then builds every language of the
+// enclosing manifest, and `sinstall`, which installs every launcher whichever
+// compiler was named.
+//
+// The registry is handed in rather than read here, so what a command means is a
+// question of its words and the registry alone.
+public function parseCommand(arguments: borrow [String], compilers: borrow [Compiler]) -> ParsedCommand {
+    if arguments.count == 0 { return .Accepted(.Overview) }
+    let first = arguments[0]
+    if first == "help" || first == "--help" || first == "-h" {
+        return rejectOrAccept(tailFrom(arguments, 1), .Help)
+    }
+    if first == valgrindName { return parseValgrind(tailFrom(arguments, 1)) }
+    if first == "sdk" { return parseSdk(tailFrom(arguments, 1)) }
+    if first == "setup" { return rejectOrAccept(tailFrom(arguments, 1), .Setup) }
+    match compilerNamed(compilers, first) {
+        Some(compiler) -> {
+            if arguments.count == 1 { return .Refused(.MissingVerb(compiler.name)) }
+            return parseVerb(.Some(compiler), tailFrom(arguments, 1), false)
+        }
+        None -> { return parseVerb(defaultCompiler(compilers), arguments, true) }
+    }
+    return .Refused(.UnknownCommand(first))
+}
+
+// One verb, acting on `named` or, for a verb that needs one and was given none,
+// refused for want of a default.
+public function parseVerb(
+    target: Optional<Compiler>,
+    arguments: borrow [String],
+    unnamed: Bool
+) -> ParsedCommand {
+    let rest = tailFrom(arguments, 1)
+    match verbNamed(arguments[0]) {
+        None -> { return .Refused(.UnknownCommand(arguments[0])) }
+        Some(verb) -> {
+            if verb == .Sinstall { return rejectOrAccept(rest, .Sinstall) }
+            if verb == .Binstall && unnamed { return parseManifestBinstall(rest) }
+            match target {
+                None -> { return .Refused(.NoDefault(arguments[0])) }
+                Some(compiler) -> { return parseCompilerVerb(verb, compiler, rest) }
+            }
+        }
+    }
+}
+
+// One compiler's verbs, read the same way whatever compiler they were named
+// with: which is what "the same verbs" has to mean for a registry that is not
+// fixed.
+public function parseCompilerVerb(
+    verb: borrow Verb,
+    compiler: borrow Compiler,
+    rest: borrow [String]
+) -> ParsedCommand {
+    match verb {
+        Install -> { return parseInstall(compiler, rest) }
+        List -> { return parseList(compiler, rest) }
+        Use -> { return parseSelectionVerb(compiler, rest, .Use) }
+        Uninstall -> { return parseSelectionVerb(compiler, rest, .Uninstall) }
+        Pin -> { return parseSelectionVerb(compiler, rest, .Pin) }
+        Unpin -> { return parseUnpin(compiler, rest) }
+        Binstall -> { return parseBinstall(compiler, rest) }
+        Sinstall -> { return rejectOrAccept(rest, .Sinstall) }
+    }
+    return .Refused(.UnknownCommand(""))
+}
+
+// `binstall` with no compiler named: every language of the enclosing manifest.
+// They are definition packages, built at the one profile `klf build` has.
+public function parseManifestBinstall(rest: borrow [String]) -> ParsedCommand {
+    match extraRefusal(rest) {
+        Some(failure) -> { return .Refused(failure) }
+        None -> { return .Accepted(.Binstall(BuildRequest { scope: .Manifest })) }
+    }
+    return .Accepted(.Binstall(BuildRequest { scope: .Manifest }))
+}
+
+// `valgrind install --target <triple> --sysroot <directory>`, the options in
+// either order. Install is its one verb, so naming it is still asked for:
+// `knvm valgrind` alone reads as a namespace, as `knvm klf` does.
+// `sdk list`, and nothing else for now.
+public function parseSdk(rest: borrow [String]) -> ParsedCommand {
+    if rest.count == 0 { return .Refused(.ToolMissingVerb("sdk")) }
+    if rest[0] != "list" { return .Refused(.UnknownCommand(rest[0])) }
+    if rest.count > 1 { return .Refused(.UnexpectedArgument(rest[1])) }
+    return .Accepted(.SdkList)
+}
+
+public function parseValgrind(rest: borrow [String]) -> ParsedCommand {
+    if rest.count == 0 { return .Refused(.ToolMissingVerb(valgrindName)) }
+    if rest[0] != "install" { return .Refused(.UnknownCommand(rest[0])) }
+    var request = ValgrindRequest {}
+    var index = 1
+    while index < rest.count {
+        let option = rest[index]
+        if option != "--target" && option != "--sysroot" {
+            if option.startsWith("-") { return .Refused(.UnknownOption(option)) }
+            return .Refused(.UnexpectedArgument(option))
+        }
+        if index + 1 >= rest.count { return .Refused(.OptionMissingValue(option)) }
+        if option == "--target" { request.target = rest[index + 1] } else {
+            request.sysroot = rest[index + 1]
+        }
+        index = index + 2
+    }
+    if request.target.isEmpty() { return .Refused(.ValgrindNeeds("--target")) }
+    if request.sysroot.isEmpty() { return .Refused(.ValgrindNeeds("--sysroot")) }
+    return .Accepted(.Valgrind(request))
+}
+
+// The verbs a compiler answers to.
+public enum Verb {
+    Install
+    List
+    Use
+    Uninstall
+    Pin
+    Unpin
+    Binstall
+    Sinstall
+}
+
+// The verb `word` spells, or nothing. `switch` is the nvm user's word for
+// `use`.
+public function verbNamed(word: borrow String) -> Optional<Verb> {
+    return match word {
+        "install" -> .Some(.Install)
+        "list" -> .Some(.List)
+        "use", "switch" -> .Some(.Use)
+        "uninstall" -> .Some(.Uninstall)
+        "pin" -> .Some(.Pin)
+        "unpin" -> .Some(.Unpin)
+        "binstall" -> .Some(.Binstall)
+        "sinstall" -> .Some(.Sinstall)
+        else -> .None
+    }
+}
+
+// `install <version|latest> [--channel <channel>]`, in either order.
+public function parseInstall(compiler: borrow Compiler, rest: borrow [String]) -> ParsedCommand {
+    let parsed = parseVersionAndChannel(rest)
+    match parsed {
+        Refused(failure) -> { return .Refused(failure) }
+        Accepted(pair) -> {
+            if pair.version.isEmpty() { return .Refused(.InstallMissingVersion) }
+            let request = InstallRequest {
+                compiler: compiler,
+                spec: parseVersionSpec(pair.version),
+                channel: pair.channel
+            }
+            return .Accepted(.Install(request))
+        }
+    }
+    return .Refused(.InstallMissingVersion)
+}
+
+// Which of the three verbs that take a version this is, and what each is called
+// when it complains about a missing one.
+public enum SelectionVerb {
+    Use
+    Uninstall
+    Pin
+
+    function canonicalName(borrow self) -> String {
+        match self {
+            Use -> { return "use" }
+            Uninstall -> { return "uninstall" }
+            Pin -> { return "pin" }
+        }
+        return "use"
+    }
+
+    function command(borrow self, request: borrow SelectionRequest) -> Command {
+        match self {
+            Use -> { return .Use(request) }
+            Uninstall -> { return .Uninstall(request) }
+            Pin -> { return .Pin(request) }
+        }
+        return .Unpin(request)
+    }
+}
+
+// `use`/`uninstall`/`pin <version> [--channel <channel>]`, in either order.
+//
+// None of them takes `latest`: they act on what is installed, and resolving
+// `latest` is a question for a release feed, not for a local directory. A
+// version named `latest` is therefore taken as a version name, which is then
+// refused downstream as not installed.
+public function parseSelectionVerb(
+    compiler: borrow Compiler,
+    rest: borrow [String],
+    verb: borrow SelectionVerb
+) -> ParsedCommand {
+    let parsed = parseVersionAndChannel(rest)
+    match parsed {
+        Refused(failure) -> { return .Refused(failure) }
+        Accepted(pair) -> {
+            if pair.version.isEmpty() { return .Refused(.MissingVersion(verb.canonicalName())) }
+            let request = SelectionRequest {
+                compiler: compiler,
+                version: pair.version,
+                channel: pair.channel
+            }
+            return .Accepted(verb.command(request))
+        }
+    }
+    return .Refused(.MissingVersion(verb.canonicalName()))
+}
+
+// `unpin`, which names no version: it removes whatever this tree pins.
+public function parseUnpin(compiler: borrow Compiler, rest: borrow [String]) -> ParsedCommand {
+    match extraRefusal(rest) {
+        Some(failure) -> { return .Refused(failure) }
+        None -> { return .Accepted(.Unpin(SelectionRequest { compiler: compiler })) }
+    }
+    return .Refused(.UnknownCommand("unpin"))
+}
+
+// `list`, which reports every channel at once and so takes no `--channel`:
+// refusing one is how a user learns that the listing cannot be filtered.
+public function parseList(compiler: borrow Compiler, rest: borrow [String]) -> ParsedCommand {
+    if rest.count == 0 {
+        return .Accepted(.List(ListRequest { compiler: compiler, remote: false }))
+    }
+    if rest[0] == "--remote" {
+        if rest.count > 1 { return .Refused(.UnexpectedArgument(rest[1])) }
+        return .Accepted(.List(ListRequest { compiler: compiler, remote: true }))
+    }
+    match extraRefusal(rest) {
+        Some(failure) -> { return .Refused(failure) }
+        None -> { return .Accepted(.List(ListRequest { compiler: compiler, remote: false })) }
+    }
+    return .Accepted(.List(ListRequest { compiler: compiler, remote: false }))
+}
+
+// `binstall`, which takes nothing: the checkout is found from the working
+// directory and the channel is always `dev`.
+public function parseBinstall(compiler: borrow Compiler, rest: borrow [String]) -> ParsedCommand {
+    if rest.count > 0 { return .Refused(.UnknownOption(rest[0])) }
+    return .Accepted(.Binstall(BuildRequest { scope: .One(compiler) }))
+}
+
+// A verb that takes no arguments at all.
+public function rejectOrAccept(rest: borrow [String], command: Command) -> ParsedCommand {
+    match extraRefusal(rest) {
+        Some(failure) -> { return .Refused(failure) }
+        None -> { return .Accepted(command) }
+    }
+    return .Accepted(command)
+}
+
+// Why `rest` cannot be given to a verb that takes nothing, or nothing when it
+// is empty.
+public function extraRefusal(rest: borrow [String]) -> Optional<UsageFailure> {
+    if rest.count == 0 { return .None }
+    if rest[0].startsWith("-") { return .Some(.UnknownOption(rest[0])) }
+    return .Some(.UnexpectedArgument(rest[0]))
+}
+
+// The argument shape every versioned verb shares.
+public struct VersionAndChannel {
+    var version: String = ""
+    var channel: Channel = .Release
+}
+
+// The outcome of reading one verb's arguments.
+public enum PairResult {
+    Accepted(VersionAndChannel)
+    Refused(UsageFailure)
+}
+
+// Parses `<version> [--channel <channel>]`, in either order.
+public function parseVersionAndChannel(arguments: borrow [String]) -> PairResult {
+    var version = ""
+    var channel = defaultChannel
+    var index = 0
+    while index < arguments.count {
+        let argument = arguments[index]
+        if argument == "--channel" {
+            if index + 1 >= arguments.count { return .Refused(.ChannelMissingValue) }
+            let named = parseChannel(arguments[index + 1])
+            match named {
+                None -> { return .Refused(.UnknownChannel(arguments[index + 1])) }
+                Some(found) -> { channel = found }
+            }
+            index = index + 2
+            continue
+        }
+        if argument.startsWith("-") { return .Refused(.UnknownOption(argument)) }
+        if version.isEmpty() {
+            version = argument
+            index = index + 1
+            continue
+        }
+        return .Refused(.UnexpectedArgument(argument))
+    }
+    return .Accepted(VersionAndChannel { version: version, channel: channel })
+}
+
+// `arguments` from `start` onwards.
+public function tailFrom(arguments: borrow [String], start: Number) -> [String] {
+    var tail: [String] = []
+    if start >= arguments.count { return tail }
+    for index in start..arguments.count {
+        tail.append(arguments[index])
+    }
+    return tail
+}
+
+// The usage text, as one block.
+//
+// The note column is aligned by the *visible* width of the invocation, because
+// ANSI escapes inflate a rendered string's length and would stagger it.
+public function usageText(output: borrow Output, compilers: borrow [Compiler]) -> String {
+    var text = output.bold(toolName) + " — the Kira version manager\n\n"
+    text = text + output.bold("Usage:") + "\n"
+    for entry in verbSummaries() {
+        text = text + verbLine(output, entry) + "\n"
+    }
+    text = text + "\n" + output.bold("Compilers:") + "\n"
+    text = text + compilerLines(output, compilers)
+    text = text + "\n" + output.bold("Tools:") + "\n"
+    text = text + "  " + output.cyan(toolName + " setup") + "   " + output.dim(
+        "klf, every language and knvm, newest release each, onto PATH"
+    ) + "\n"
+    text = text + "  " + output.cyan(toolName + " " + valgrindName + " install")
+        + " --target <triple> --sysroot <dir>   " + output.dim(
+            "Valgrind for a target, built with the selected klf"
+        ) + "\n"
+    text = text + "  " + output.cyan(toolName + " sdk list") + "   " + output.dim(
+        "the SDKs found by name under KIRA_SDK_PATH or ~/.klf/sdks"
+    ) + "\n"
+    text = text + "\n" + output.bold("Options:") + "\n"
+    text = text + "  --channel <release|dev>   " + output.dim(
+        "which channel to act on (default: release)"
+    ) + "\n"
+    text = text + "  --remote                  " + output.dim(
+        "list what is published rather than installed"
+    ) + "\n"
+    text = text + "  -h, --help                " + output.dim("print this message") + "\n"
+    return text
+}
+
+// One row of the usage text: the invocation, its arguments, and what it does.
+public struct VerbSummary {
+    var name: String = ""
+    var arguments: String = ""
+    var note: String = ""
+}
+
+public function verbSummaries() -> [VerbSummary] {
+    var summaries: [VerbSummary] = []
+    summaries.append(
+        VerbSummary {
+            name: "install",
+            arguments: " <version|latest> [--channel]",
+            note: "fetch a release and select it"
+        }
+    )
+    summaries.append(
+        VerbSummary {
+            name: "list",
+            arguments: " [--remote]",
+            note: "what is installed, or published"
+        }
+    )
+    summaries.append(
+        VerbSummary {
+            name: "use",
+            arguments: " <version> [--channel]",
+            note: "select an installed version"
+        }
+    )
+    summaries.append(
+        VerbSummary {
+            name: "pin",
+            arguments: " <version> [--channel]",
+            note: "pin this directory tree to a version"
+        }
+    )
+    summaries.append(
+        VerbSummary { name: "unpin", arguments: "", note: "remove this directory tree's pin" }
+    )
+    summaries.append(
+        VerbSummary {
+            name: "uninstall",
+            arguments: " <version> [--channel]",
+            note: "remove an installed version"
+        }
+    )
+    summaries.append(
+        VerbSummary {
+            name: "binstall",
+            arguments: "",
+            note: "this checkout's languages as dev toolchains"
+        }
+    )
+    summaries.append(
+        VerbSummary {
+            name: "sinstall",
+            arguments: "",
+            note: "knvm and the launchers themselves, onto PATH"
+        }
+    )
+    return summaries
+}
+
+public function verbLine(output: borrow Output, summary: borrow VerbSummary) -> String {
+    let invocation = toolName + " " + summary.name
+    let padding = verbColumnWidth() - (invocation.count + summary.arguments.count)
+    var spaces = ""
+    for index in 0..padding {
+        spaces = spaces + " "
+    }
+    return "  " + output.cyan(invocation) + summary.arguments + spaces + "   " + output.dim(
+        summary.note
+    )
+}
+
+// How wide the widest invocation in the usage text is.
+public function verbColumnWidth() -> Number {
+    var width = 0
+    for entry in verbSummaries() {
+        let visible = toolName.count + 1 + entry.name.count + entry.arguments.count
+        if visible > width { width = visible }
+    }
+    return width
+}
+
+// The compilers a verb can be pointed at, one row each.
+//
+// Written from the registry rather than from a list, so a compiler added to it
+// is offered here without anyone remembering this file: the namespace, the
+// layout, the launcher and this text all read the same table.
+public function compilerLines(output: borrow Output, compilers: borrow [Compiler]) -> String {
+    var text = ""
+    let width = compilerColumnWidth(compilers)
+    for compiler in compilers {
+        let spelling = compiler.isDefault ? " (default)" : ""
+        text = text + "  " + output.cyan(toolName + " " + compiler.name) + spelling
+        for index in 0..(width - toolName.count - 1 - compiler.name.count - spelling.count) {
+            text = text + " "
+        }
+        text = text + "   " + output.dim(compilerNote(compiler)) + "\n"
+    }
+    return text
+}
+
+public function compilerColumnWidth(compilers: borrow [Compiler]) -> Number {
+    var width = 0
+    for compiler in compilers {
+        let spelling = compiler.isDefault ? " (default)" : ""
+        let visible = toolName.count + 1 + compiler.name.count + spelling.count
+        if visible > width { width = visible }
+    }
+    return width
+}
+
+// What a compiler is, in one line, from what it is and how it is built.
+public function compilerNote(compiler: borrow Compiler) -> String {
+    return match compiler.route {
+        Published -> "the framework, installed from its releases"
+        Definition(
+            language
+        ) -> "a language definition, built from its repository's " + manifestFileName
+        Registered -> "a language definition, built from its repository's " + manifestFileName
+    }
+}
+
+// Why a usage failure reads the way it does, in one line.
+public function usageFailureText(failure: borrow UsageFailure) -> String {
+    match failure {
+        UnknownCommand(verb) -> { return "unknown command `" + verb + "`" }
+        InstallMissingVersion -> { return "`install` expects a version, or `latest`" }
+        MissingVersion(verb) -> { return "`" + verb + "` expects an installed version" }
+        ChannelMissingValue -> { return "`--channel` expects one of: release, dev" }
+        UnknownChannel(name) -> {
+            return "unknown channel `" + name + "`; expected one of: release, dev"
+        }
+        UnexpectedArgument(extra) -> { return "unexpected argument `" + extra + "`" }
+        UnknownOption(option) -> { return "unknown option `" + option + "`" }
+        NoDefault(verb) -> {
+            return "`" + verb + "` names no language and none is the default; run `" + toolName
+                + " binstall` in a repository with a " + manifestFileName + ", or name one: `"
+                + toolName + " <language> " + verb + "`"
+        }
+        ToolMissingVerb(tool) -> {
+            return "`" + toolName + " " + tool + "` names a tool, not a verb; try `" + toolName
+                + " " + tool + " install --target <triple> --sysroot <dir>`"
+        }
+        OptionMissingValue(option) -> { return "`" + option + "` expects a value" }
+        ValgrindNeeds(option) -> {
+            return "`" + valgrindName + " install` expects `" + option + "`"
+        }
+        MissingVerb(compiler) -> {
+            return "`" + toolName + " " + compiler + "` names a compiler, not a verb; try `"
+                + toolName + " " + compiler + " list`"
+        }
+    }
+    return ""
+}

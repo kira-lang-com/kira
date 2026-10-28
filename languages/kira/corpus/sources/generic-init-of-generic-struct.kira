@@ -1,0 +1,29 @@
+// A generic struct's `init` may take type parameters of its own, bound by the
+// arguments of each construction, written with the struct's type arguments
+// or with them inferred; a parameter left out takes its default.
+
+import Foundation
+
+struct Tally<Item> {
+    let items: [Item]
+    let weight: Int
+
+    function init<Source>(from: [Source], read: (borrow Source) -> Item, weight: Int = 2) -> Tally<Item> {
+        var items: [Item] = []
+        for source in from { items.append(read(source)) }
+        return Tally<Item> { items: items, weight: weight }
+    }
+
+    function total(borrow self, measure: (borrow Item) -> Int) -> Int {
+        var sum = 0
+        for item in items { sum = sum + measure(item) * weight }
+        return sum
+    }
+}
+
+@Main
+function main() -> Int {
+    let typed = Tally<String>(from: [1, 22, 333], read: { number in return String(number) })
+    let inferred = Tally(from: ["a", "bb"], read: { text in return text.count }, weight: 3)
+    return typed.total(measure: { text in return text.count }) + inferred.total(measure: { count in return count })
+}

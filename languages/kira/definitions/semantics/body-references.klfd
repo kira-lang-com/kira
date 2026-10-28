@@ -1,0 +1,130 @@
+function appendBodyReferences(tree: SyntaxTree, references: borrow mut [TypeReference], body: [Int]) {
+    for index in body {
+        match tree.statements[index].kind {
+            Binding(binding) -> {
+                match binding.annotation { Some(target) -> appendTypeReferences(references, tree.typeReferences[target]) None -> {} }
+                appendExpressionReferences(tree, references, binding.value)
+            }
+            Assignment(target, value) -> {
+                appendExpressionReferences(tree, references, target)
+                appendExpressionReferences(tree, references, value)
+            }
+            CompoundAssignment(operator, target, value) -> {
+                appendExpressionReferences(tree, references, target)
+                appendExpressionReferences(tree, references, value)
+            }
+            Evaluation(value) -> appendExpressionReferences(tree, references, value)
+            If(condition, first, second) -> {
+                appendExpressionReferences(tree, references, condition)
+                appendBodyReferences(tree, references, first)
+                appendBodyReferences(tree, references, second)
+            }
+            While(condition, body) -> {
+                appendExpressionReferences(tree, references, condition)
+                appendBodyReferences(tree, references, body)
+            }
+            For(name, low, high, body) -> {
+                appendExpressionReferences(tree, references, low)
+                appendExpressionReferences(tree, references, high)
+                appendBodyReferences(tree, references, body)
+            }
+            ForEach(name, array, body) -> {
+                appendExpressionReferences(tree, references, array)
+                appendBodyReferences(tree, references, body)
+            }
+            Match(subject, arms) -> {
+                appendExpressionReferences(tree, references, subject)
+                for arm in arms { appendBodyReferences(tree, references, arm.body) }
+            }
+            Attempt(body, arms) -> {
+                appendBodyReferences(tree, references, body)
+                for arm in arms { appendBodyReferences(tree, references, arm.body) }
+            }
+            Return(value) -> { match value { Some(expression) -> appendExpressionReferences(tree, references, expression) None -> {} } }
+            Break -> {}
+            Continue -> {}
+        }
+    }
+}
+
+function appendExpressionReferences(tree: SyntaxTree, references: borrow mut [TypeReference], index: Int) {
+    let kind = tree.expressions[index].kind
+    match kind.queriedType() { Some(target) -> appendTypeReferences(references, tree.typeReferences[target]) None -> {} }
+    match kind.constructedType() { Some(target) -> appendTypeReferences(references, target) None -> {} }
+    match kind {
+        IntegerLiteral -> {}
+        FloatLiteral -> {}
+        BooleanLiteral -> {}
+        StringLiteral -> {}
+        Name -> {}
+        Quote(parts) -> { for part in parts { match part { Text -> {} Splice(value) -> appendExpressionReferences(tree, references, value) } } }
+        ExpandedMacro(body, value) -> {
+            appendBodyReferences(tree, references, body)
+            match value { Some(expression) -> appendExpressionReferences(tree, references, expression) None -> {} }
+        }
+        MacroCall(name, arguments, input) -> { for value in arguments { appendExpressionReferences(tree, references, value) } }
+        ArrayLiteral(elements) -> { for value in elements { appendExpressionReferences(tree, references, value) } }
+        Index(base, offset) -> { appendExpressionReferences(tree, references, base) appendExpressionReferences(tree, references, offset) }
+        Transfer(mode, value) -> appendExpressionReferences(tree, references, value)
+        Labelled(name, value) -> appendExpressionReferences(tree, references, value)
+        TypeQuery(mode, value, target) -> appendExpressionReferences(tree, references, value)
+        Member(base, name) -> appendExpressionReferences(tree, references, base)
+        Call(name, arguments) -> { for value in arguments { appendExpressionReferences(tree, references, value) } }
+        GenericCall(name, types, arguments) -> { for value in arguments { appendExpressionReferences(tree, references, value) } }
+        MethodCall(base, name, arguments) -> {
+            appendExpressionReferences(tree, references, base)
+            for value in arguments { appendExpressionReferences(tree, references, value) }
+        }
+        IndirectCall(target, arguments) -> {
+            appendExpressionReferences(tree, references, target)
+            for value in arguments { appendExpressionReferences(tree, references, value) }
+        }
+        Lambda(declared) -> {
+            for annotation in declared.annotations { match annotation { Some(target) -> appendTypeReferences(references, target) None -> {} } }
+            appendBodyReferences(tree, references, declared.body)
+        }
+        KeyPath(declared) -> { match declared.root { Some(root) -> appendTypeReferences(references, root) None -> {} } }
+        Task(declared) -> {
+            for value in declared.written { appendExpressionReferences(tree, references, value) }
+            appendBodyReferences(tree, references, declared.body)
+        }
+        Try(value) -> appendExpressionReferences(tree, references, value)
+        Variant(name, value) -> { match value { Some(payload) -> appendExpressionReferences(tree, references, payload) None -> {} } }
+        StructLiteral(name, types, fields) -> { for field in fields { appendExpressionReferences(tree, references, field.value) } }
+        Unary(operator, value) -> appendExpressionReferences(tree, references, value)
+        Binary(operator, first, second) -> { appendExpressionReferences(tree, references, first) appendExpressionReferences(tree, references, second) }
+        Conditional(condition, first, second) -> {
+            appendExpressionReferences(tree, references, condition)
+            appendExpressionReferences(tree, references, first)
+            appendExpressionReferences(tree, references, second)
+        }
+        MatchValue(subject, arms) -> {
+            appendExpressionReferences(tree, references, subject)
+            for arm in arms { appendBodyReferences(tree, references, arm.body) }
+        }
+        Content(content) -> {
+            match content.call { Some(call) -> appendExpressionReferences(tree, references, call) None -> {} }
+            match content.items { Some(items) -> appendItemReferences(tree, references, items) None -> {} }
+            match content.closure { Some(closure) -> appendExpressionReferences(tree, references, closure) None -> {} }
+            for fill in content.fills { appendExpressionReferences(tree, references, fill) }
+        }
+    }
+}
+
+function appendItemReferences(tree: SyntaxTree, references: borrow mut [TypeReference], items: [Int]) {
+    for item in items {
+        match tree.contentItems[item] {
+            Child(value) -> appendExpressionReferences(tree, references, value)
+            For(name, low, high, body) -> {
+                appendExpressionReferences(tree, references, low)
+                match high { Some(value) -> appendExpressionReferences(tree, references, value) None -> {} }
+                appendItemReferences(tree, references, body)
+            }
+            If(condition, whenTrue, whenFalse) -> {
+                appendExpressionReferences(tree, references, condition)
+                appendItemReferences(tree, references, whenTrue)
+                appendItemReferences(tree, references, whenFalse)
+            }
+        }
+    }
+}

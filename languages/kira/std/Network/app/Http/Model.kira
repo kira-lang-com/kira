@@ -1,0 +1,192 @@
+import Foundation
+
+// HTTP semantics (RFC 9110), shared by every version (DESIGN.md section
+// 7.1). Pseudo-header fields never appear in `Fields`: each version's codec
+// maps them to the typed members.
+
+// Request methods (RFC 9110 section 9). A token no case names stays `@Open`
+// and is refused by the codecs for now.
+@Open
+enum Method: Number {
+    Get = 1
+    Head = 2
+    Post = 3
+    Put = 4
+    Delete = 5
+    Connect = 6
+    Options = 7
+    Trace = 8
+    Patch = 9
+}
+
+function methodToken(method: Method) -> String? {
+    return match method {
+        Get -> .Some("GET")
+        Head -> .Some("HEAD")
+        Post -> .Some("POST")
+        Put -> .Some("PUT")
+        Delete -> .Some("DELETE")
+        Connect -> .Some("CONNECT")
+        Options -> .Some("OPTIONS")
+        Trace -> .Some("TRACE")
+        Patch -> .Some("PATCH")
+        else -> .None
+    }
+}
+
+function methodFrom(token: borrow String) -> Method? {
+    for method in [Method.Get, Method.Head, Method.Post, Method.Put, Method.Delete, Method.Connect, Method.Options, Method.Trace, Method.Patch] {
+        if methodToken(method) == .Some(copy token) { return .Some(method) }
+    }
+    return .None
+}
+
+// Status codes are their own numbers (RFC 9110 section 15); the cases name
+// the ones code reads by name.
+@Open
+enum Status: Number {
+    Continue = 100
+    Ok = 200
+    Created = 201
+    Accepted = 202
+    NoContent = 204
+    MovedPermanently = 301
+    Found = 302
+    NotModified = 304
+    BadRequest = 400
+    Unauthorized = 401
+    Forbidden = 403
+    NotFound = 404
+    Conflict = 409
+    TooManyRequests = 429
+    InternalServerError = 500
+    NotImplemented = 501
+    BadGateway = 502
+    ServiceUnavailable = 503
+}
+
+namespace StatusRange {
+    let lowest: Number = 100
+    let highest: Number = 599
+    let informationalEnd: Number = 200
+    let digits: Number = 3
+    // The character '0'.
+    let zero: Number = 48
+    let radix: Number = 10
+}
+
+struct Field {
+    // Lowercase, as HTTP/2 and HTTP/3 carry it.
+    let name: String
+    let value: String
+    // Never compressed into a shared table, and never recorded by a tap
+    // (DESIGN.md section 8.5).
+    let sensitive: Bool = false
+}
+
+struct Fields {
+    var entries: [Field] = []
+
+    function add(borrow mut self, name: borrow String, value: borrow String) {
+        entries.append(Field { name: name.lowercased(), value: copy value })
+    }
+
+    // The first value of `name`.
+    function first(borrow self, name: borrow String) -> String? {
+        let wanted = name.lowercased()
+        for entry in entries {
+            if entry.name == wanted { return .Some(copy entry.value) }
+        }
+        return .None
+    }
+}
+
+// Where a request goes: the scheme, the authority and the path with its
+// query (RFC 9110 section 7.1).
+struct Target {
+    let scheme: String
+    let authority: String
+    let path: String
+}
+
+// The target an absolute `http` or `https` URL names (RFC 9110 section 4.2,
+// RFC 3986 section 3), or nothing when it is not one. The fragment stays
+// behind: it is never sent. Userinfo is refused, since a sender must not
+// generate it (RFC 9110 section 4.2.4) and it is how credentials leak into
+// logs.
+function targetOf(url: borrow String) -> Target? {
+    let marker = match url.indexOf("://") {
+        Some(value) -> value
+        None -> return .None
+    }
+    let scheme = url.substring(0, marker).lowercased()
+    match scheme {
+        "https" -> {}
+        "http" -> {}
+        else -> return .None
+    }
+    var rest = url.substring(marker + 3, url.count)
+    match rest.indexOf("#") {
+        Some(hash) -> rest = rest.substring(0, hash)
+        None -> {}
+    }
+    var end = rest.count
+    for mark in ["/", "?"] {
+        match rest.indexOf(mark) {
+            Some(at) -> end = min(end, at)
+            None -> {}
+        }
+    }
+    let authority = rest.substring(0, end)
+    if authority.contains("@") { return .None }
+    if splitAuthority(authority, DriverLimit.httpsPort).isNone() { return .None }
+    var path = rest.substring(end, rest.count)
+    if path.startsWith("?") { path = "/" + path }
+    if path.count == 0 { path = "/" }
+    // A space or a control byte would split the request line on HTTP/1.1.
+    for byte in path.utf8() {
+        if byte <= 32 || byte == 127 { return .None }
+    }
+    return .Some(Target { scheme: scheme, authority: authority, path: path })
+}
+
+enum Body {
+    Empty
+    Bytes([UN8])
+}
+
+struct Request {
+    let method: Method
+    let target: Target
+    var fields: Fields = Fields {}
+    var body: Body = .Empty
+    // An extended CONNECT's protocol (RFC 9220); a server sees
+    // "webtransport-h3" on a request for a WebTransport session.
+    var protocolName: String? = .None
+}
+
+struct Response {
+    let status: Status
+    var fields: Fields = Fields {}
+    var body: Body = .Empty
+}
+
+// A message's head as a version's codec reads it: a request's or a
+// response's, before its body.
+enum MessageHead {
+    RequestHead(RequestHead)
+    ResponseHead(ResponseHead)
+}
+
+struct RequestHead {
+    let method: Method
+    let target: Target
+    let fields: Fields
+    // An extended CONNECT's protocol, such as "webtransport-h3" (RFC 9220).
+    let protocolName: String? = .None
+}
+
+struct ResponseHead {
+    let status: Status
+    let fields: Fields
+}

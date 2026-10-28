@@ -1,0 +1,231 @@
+// The parser: one KSL file to its declarations in the shared tree.
+//
+// Every production returns its node or the failure that stops parsing, and
+// `try` hands a failure up to `parseFile`. The oracle recovers and goes on;
+// the first diagnostic it reports is the one this parser stops at. This file
+// holds the cursor and the top-level declarations; shaders, statements and
+// expressions follow in their own files.
+
+function parseFile(tree: SyntaxTree, source: String, file: Int, alias: String) -> Result<SyntaxTree, Failure> {
+    var parser = Parser {
+        source = source, tokens = lex(source, file), position = 0, tree = tree,
+        current = SyntaxFile {
+            file = file, alias = alias, items = [], imports = [], types = [], constants = [],
+            enums = [], functions = [], shaders = []
+        }
+    }
+    while !parser.at(.End) {
+        try parser.declaration()
+    }
+    parser.tree.files.append(parser.current)
+    return .Ok(parser.tree)
+}
+
+struct Parser {
+    let source: String
+    let tokens: [Token]
+    var position: Int
+    var tree: SyntaxTree
+    var current: SyntaxFile
+
+    function token(borrow self) -> Token {
+        return tokens[position]
+    }
+
+    function peek(borrow self, ahead: Int) -> Token {
+        let index = position + ahead
+        if index >= tokens.count { return tokens[tokens.count - 1] }
+        return tokens[index]
+    }
+
+    function at(borrow self, kind: TokenKind) -> Bool {
+        return token().kind == kind
+    }
+
+    function text(borrow self, span: Span) -> String {
+        return utf8Slice(source, span.start, span.end)
+    }
+
+    // Whether the current token is the identifier `word`.
+    function atWord(borrow self, word: String) -> Bool {
+        return at(.Identifier) && text(token().span) == word
+    }
+
+    function advance(borrow mut self) -> Token {
+        let taken = token()
+        if taken.kind != .End { position += 1 }
+        return taken
+    }
+
+    function eat(borrow mut self, kind: TokenKind) -> Bool {
+        if at(kind) {
+            advance()
+            return true
+        }
+        return false
+    }
+
+    function fail(borrow self, diagnostic: Diagnostic, span: Span) -> Failure {
+        return Failure { diagnostic = diagnostic, span = span }
+    }
+
+    function expect(borrow mut self, kind: TokenKind) -> Result<Token, Failure> {
+        if at(kind) { return .Ok(advance()) }
+        return .Error(fail(.Unexpected, token().span))
+    }
+
+    function name(borrow mut self) -> Result<Identifier, Failure> {
+        let found = try expect(.Identifier)
+        return .Ok(Identifier { text = text(found.span), span = found.span })
+    }
+
+    // The span from `start` to the end of the last token taken.
+    function since(borrow self, start: Span) -> Span {
+        var end = start.end
+        if position > 0 { end = tokens[position - 1].span.end }
+        return Span { file = start.file, start = start.start, end = end }
+    }
+
+    function declaration(borrow mut self) -> Result<Bool, Failure> {
+        let kind = token().kind
+        if kind == .Import {
+            current.imports.append(try importDeclaration())
+            current.items.append(Item { kind = .ImportItem, index = current.imports.count - 1 })
+        } else if kind == .Type {
+            current.types.append(try typeDeclaration())
+            current.items.append(Item { kind = .TypeItem, index = current.types.count - 1 })
+        } else if kind == .Const {
+            current.constants.append(try constDeclaration())
+            current.items.append(Item { kind = .ConstItem, index = current.constants.count - 1 })
+        } else if kind == .Enum {
+            current.enums.append(try enumDeclaration())
+            current.items.append(Item { kind = .EnumItem, index = current.enums.count - 1 })
+        } else if kind == .Function {
+            current.functions.append(try functionDeclaration())
+            current.items.append(Item { kind = .FunctionItem, index = current.functions.count - 1 })
+        } else if kind == .Shader {
+            current.shaders.append(try shader())
+            current.items.append(Item { kind = .ShaderItem, index = current.shaders.count - 1 })
+        } else {
+            return .Error(fail(.NotADeclaration, token().span))
+        }
+        return .Ok(true)
+    }
+
+    // `import A.B as C`; without `as`, the last segment is the alias.
+    function importDeclaration(borrow mut self) -> Result<ImportDeclaration, Failure> {
+        let start = advance().span
+        var path: [Identifier] = [try name()]
+        while eat(.Dot) {
+            path.append(try name())
+        }
+        var alias = path[path.count - 1].text
+        if eat(.As) { alias = (try name()).text }
+        return .Ok(ImportDeclaration { path = path, alias = alias, span = since(start) })
+    }
+
+    function typeDeclaration(borrow mut self) -> Result<TypeDeclaration, Failure> {
+        let start = advance().span
+        let declared = try name()
+        try expect(.LeftBrace)
+        var fields: [FieldDeclaration] = []
+        while !at(.RightBrace) && !at(.End) {
+            fields.append(try field())
+        }
+        try expect(.RightBrace)
+        return .Ok(TypeDeclaration { name = declared, fields = fields, span = since(start) })
+    }
+
+    function field(borrow mut self) -> Result<FieldDeclaration, Failure> {
+        let start = token().span
+        var builtin = noIdentifier(start)
+        var interpolation = noIdentifier(start)
+        while at(.At) {
+            advance()
+            let which = try name()
+            try expect(.LeftParen)
+            let argument = try name()
+            try expect(.RightParen)
+            match which.text {
+                "builtin" -> builtin = argument
+                "interpolate" -> interpolation = argument
+                else -> return .Error(fail(.BadAnnotation, start))
+            }
+        }
+        try expect(.Let)
+        let declared = try name()
+        try expect(.Colon)
+        let reference = try typeReference()
+        return .Ok(FieldDeclaration {
+            name = declared, typeReference = reference, builtin = builtin,
+            interpolation = interpolation, span = since(start)
+        })
+    }
+
+    function constDeclaration(borrow mut self) -> Result<ConstDeclaration, Failure> {
+        let start = advance().span
+        let declared = try name()
+        try expect(.Colon)
+        let reference = try typeReference()
+        try expect(.Equals)
+        let value = try expression()
+        return .Ok(ConstDeclaration { name = declared, typeReference = reference, value = value, span = since(start) })
+    }
+
+    // `enum Name { A = 0, B = 1 }`; the commas between variants are optional.
+    function enumDeclaration(borrow mut self) -> Result<EnumDeclaration, Failure> {
+        let start = advance().span
+        let declared = try name()
+        try expect(.LeftBrace)
+        var variants: [EnumVariant] = []
+        while !at(.RightBrace) && !at(.End) {
+            let variantStart = token().span
+            let variant = try name()
+            try expect(.Equals)
+            let value = try expression()
+            variants.append(EnumVariant { name = variant, value = value, span = since(variantStart) })
+            eat(.Comma)
+        }
+        try expect(.RightBrace)
+        return .Ok(EnumDeclaration { name = declared, variants = variants, span = since(start) })
+    }
+
+    function functionDeclaration(borrow mut self) -> Result<FunctionDeclaration, Failure> {
+        let start = advance().span
+        let declared = try name()
+        try expect(.LeftParen)
+        var parameters: [Parameter] = []
+        var more = !at(.RightParen) && !at(.End)
+        while more {
+            let parameterStart = token().span
+            let parameter = try name()
+            try expect(.Colon)
+            let reference = try typeReference()
+            parameters.append(Parameter { name = parameter, typeReference = reference, span = since(parameterStart) })
+            more = eat(.Comma) && !at(.RightParen) && !at(.End)
+        }
+        try expect(.RightParen)
+        var result = -1
+        if eat(.Arrow) { result = try typeReference() }
+        let body = try block()
+        return .Ok(FunctionDeclaration {
+            name = declared, parameters = parameters, result = result, body = body, span = since(start)
+        })
+    }
+
+    // `Float4`, `Lighting.SceneLighting`, or `[T]`.
+    function typeReference(borrow mut self) -> Result<Int, Failure> {
+        let start = token().span
+        if eat(.LeftBracket) {
+            let element = try typeReference()
+            try expect(.RightBracket)
+            return .Ok(tree.addTypeReference(TypeReference { path = [], element = element, span = since(start) }))
+        }
+        var path: [Identifier] = [try name()]
+        while at(.Dot) && peek(1).kind == .Identifier {
+            advance()
+            path.append(try name())
+        }
+        return .Ok(tree.addTypeReference(TypeReference { path = path, element = -1, span = since(start) }))
+    }
+}

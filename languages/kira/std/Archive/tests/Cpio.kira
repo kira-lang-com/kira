@@ -1,0 +1,90 @@
+import Foundation
+
+// The cpio writer and reader: entries come back with their kind, mode and
+// contents, and an archive cut short is refused.
+
+@Test
+function cpioReadsWhatItWrites() {
+    let path = scratchPath("cpio-round-trip.cpio")
+    absorb removePath(path)
+    var writer = match createCpioWriter(path) {
+        Ok(created) -> created
+        Error(failure) -> {
+            expect!((archiveFailureText(failure)) == "")
+            return
+        }
+    }
+    let added = [
+        writer.addDirectory("etc", 493),
+        writer.addFile("etc/motd", 420, "hello\n".utf8()),
+        writer.addFile("etc/odd", 384, "abc".utf8()),
+        writer.addLink("motd", "etc/motd")
+    ]
+    for result in added {
+        match result {
+            Ok -> {}
+            Error(failure) -> {
+                expect!((archiveFailureText(failure)) == "")
+                return
+            }
+        }
+    }
+    let length = match writer.finish() {
+        Ok(size) -> size
+        Error(failure) -> {
+            expect!((archiveFailureText(failure)) == "")
+            return
+        }
+    }
+    let bytes = match readArchiveFile(path) {
+        Ok(read) -> read
+        Error(failure) -> {
+            expect!((archiveFailureText(failure)) == "")
+            return
+        }
+    }
+    // Archives are padded to a multiple of four bytes.
+    expect!((length % 4) == (0))
+    expect!((length) == (bytes.count))
+    let entries = match readCpio(bytes) {
+        Ok(read) -> read
+        Error(failure) -> {
+            expect!((archiveFailureText(failure)) == "")
+            return
+        }
+    }
+    var parts: [String] = []
+    for entry in entries {
+        let contents = textFromBytes(entry.bytes).or("?")
+        parts.append("\(entry.path):\(entry.mode):\(contents.trim())\(entry.target)")
+    }
+    expect!((joined(parts, " ")) == "etc:493: etc/motd:420:hello etc/odd:384:abc motd:511:etc/motd")
+}
+
+@Test
+function cpioRefusesAnArchiveCutShort() {
+    let path = scratchPath("cpio-truncated.cpio")
+    absorb removePath(path)
+    var writer = match createCpioWriter(path) {
+        Ok(created) -> created
+        Error(failure) -> {
+            expect!((archiveFailureText(failure)) == "")
+            return
+        }
+    }
+    absorb writer.addFile("a", 420, "payload".utf8())
+    absorb writer.finish()
+    let bytes = match readArchiveFile(path) {
+        Ok(read) -> read
+        Error(failure) -> {
+            expect!((archiveFailureText(failure)) == "")
+            return
+        }
+    }
+    let cut = byteRun(bytes, 0, 40)
+    let outcome = match readCpio(cut) {
+        Ok(entries) -> "read \(entries.count) entries"
+        Error(failure) -> archiveFailureText(failure)
+    }
+    expect!((outcome) == "malformed: a cpio archive ends without a trailer")
+}

@@ -1,0 +1,257 @@
+// Calls of user functions.
+//
+// The functions a call can name are those of the innermost namespace that
+// declares the name before the call. Among them, the one each argument
+// converts to most cheaply wins, a function over a template on a tie; a
+// template's argument types are deduced from the parameters written as a
+// bare template parameter. A buffer, texture or sampler argument must be
+// an entry's resource or the caller's own bound parameter, of the
+// parameter's type.
+
+// What a candidate costs: a function, or a template's declaration and
+// deduced arguments. `viable` is false when it does not accept the
+// arguments, and `failure` then says why.
+struct Viability {
+    let viable: Bool
+    let routine: Int
+    let declaration: Int
+    let deduced: [Int]
+    let cost: Int
+    let failure: Diagnostic
+
+    function isTemplate(borrow self) -> Bool {
+        return routine < 0
+    }
+}
+
+function refused(failure: Diagnostic) -> Viability {
+    return Viability { viable = false, routine = -1, declaration = -1, deduced = [], cost = 0, failure = failure }
+}
+
+extend Checker {
+    function checkCall(borrow mut self, syntax: Expression) -> Int {
+        let callee = tree.expressions[syntax.left]
+        if callee.kind == .Member { return checkMethod(callee, syntax.arguments, syntax.span) }
+        if callee.kind != .Name { return refuse(.UnsupportedConstruct, syntax.span) }
+        let special = specialCall(callee.text, syntax.arguments, syntax.span)
+        if special >= 0 { return special }
+        let named = userCandidates(callee.text)
+        var arguments: [Int] = []
+        for argument in syntax.arguments {
+            arguments.append(checkExpression(argument))
+        }
+        for argument in arguments {
+            if broken(argument) { return invalid(syntax.span) }
+        }
+        if named.count == 0 { return libraryCall(callee.text, arguments, syntax.span) }
+        return userCall(named, arguments, syntax.span)
+    }
+
+    // The entries a written name may call: those of the first candidate
+    // spelling that has any.
+    function userCandidates(borrow self, name: String) -> [Int] {
+        for candidate in candidates(name) {
+            var found: [Int] = []
+            for index in 0..functionEntries.count {
+                if functionEntries[index].name == candidate { found.append(index) }
+            }
+            if found.count > 0 { return found }
+        }
+        return []
+    }
+
+    function userCall(borrow mut self, named: [Int], arguments: [Int], span: Span) -> Int {
+        var best = refused(.NoMatch)
+        var tied = false
+        var failure: Diagnostic = .NoMatch
+        for entry in named {
+            let candidate = viability(functionEntries[entry], arguments)
+            if !candidate.viable {
+                failure = candidate.failure
+                continue
+            }
+            let better = !best.viable || candidate.cost < best.cost
+                || (candidate.cost == best.cost && best.isTemplate() && !candidate.isTemplate())
+            let same = best.viable && candidate.cost == best.cost && candidate.isTemplate() == best.isTemplate()
+            if better {
+                best = candidate
+                tied = false
+            } else if same {
+                tied = true
+            }
+        }
+        if !best.viable {
+            if named.count == 1 { return refuse(failure, span) }
+            return refuse(.NoMatch, span)
+        }
+        if tied { return refuse(.Ambiguous, span) }
+        var routine = best.routine
+        if routine < 0 { routine = instantiate(best.declaration, best.deduced) }
+        return callOf(routine, arguments, span)
+    }
+
+    // Whether and how cheaply `entry` accepts `arguments`.
+    function viability(borrow mut self, entry: FunctionEntry, arguments: [Int]) -> Viability {
+        let declared = tree.functions[entry.declaration]
+        if declared.parameters.count != arguments.count { return refused(.ArgumentCount) }
+        var deduced: [Int] = []
+        var parameters: [CheckedParameter] = []
+        if entry.routine >= 0 {
+            parameters = program.functions[entry.routine].parameters
+        } else {
+            deduced = deduce(declared, arguments)
+            if deduced.count != declared.templateParameters.count { return refused(.Deduction) }
+            parameters = templateSignature(declared, deduced)
+        }
+        var cost = 0
+        for index in 0..arguments.count {
+            let step = argumentCost(parameters[index], arguments[index])
+            if step == -2 { return refused(.ForeignPointer) }
+            if step < 0 { return refused(.TypeMismatch) }
+            cost += step
+        }
+        return Viability {
+            viable = true, routine = entry.routine, declaration = entry.declaration, deduced = deduced, cost = cost,
+            failure = .NoMatch
+        }
+    }
+
+    // The template arguments the bare-parameter positions give, or fewer
+    // than the template has when they are missing or disagree.
+    function deduce(borrow mut self, declared: FunctionDeclaration, arguments: [Int]) -> [Int] {
+        var deduced: [Int] = []
+        for name in declared.templateParameters {
+            var found = -1
+            for index in 0..declared.parameters.count {
+                let written = tree.types[declared.parameters[index].typeSyntax]
+                if written.name != name || written.typeArguments.count > 0 || written.extents.count > 0 { continue }
+                var argumentType = typeOf(arguments[index])
+                if written.pointer && typeAt(argumentType).shape == .Array {
+                    argumentType = typeAt(argumentType).element
+                }
+                if found >= 0 && found != argumentType { return [] }
+                found = argumentType
+            }
+            if found < 0 { return [] }
+            deduced.append(found)
+        }
+        return deduced
+    }
+
+    // 0 for an exact match, 1 for a scalar conversion, 2 for a splat; -1
+    // when the argument does not convert, -2 when a resource argument is
+    // not a resource.
+    function argumentCost(borrow self, parameter: CheckedParameter, argument: Int) -> Int {
+        let argumentType = typeOf(argument)
+        let checked = program.expressions[argument]
+        match parameter.mode {
+            Bound -> {
+                if argumentType != parameter.parameterType { return -1 }
+                if checked.kind != .Global && checked.kind != .BoundParameter { return -2 }
+                if checked.kind == .Global && !resourceGlobal(checked.target) { return -2 }
+                if checked.readOnly && !parameter.readOnly { return -1 }
+                return 0
+            }
+            ThreadReference -> {
+                if argumentType != parameter.parameterType { return -1 }
+                if parameter.readOnly { return 0 }
+                if !checked.place || checked.readOnly || sharedPlace(argument) { return -1 }
+                return 0
+            }
+            ThreadgroupReference -> {
+                if argumentType != parameter.parameterType { return -1 }
+                if !sharedPlace(argument) || (checked.readOnly && !parameter.readOnly) { return -2 }
+                return 0
+            }
+            ByValue -> {
+                if argumentType == parameter.parameterType { return 0 }
+                if !converts(argumentType, parameter.parameterType, false) { return -1 }
+                if isScalar(argumentType) && isVector(parameter.parameterType) { return 2 }
+                return 1
+            }
+        }
+    }
+
+    function resourceGlobal(borrow self, global: Int) -> Bool {
+        let kind = program.globals[global].kind
+        return kind == .Buffer || kind == .Texture || kind == .SamplerGlobal
+    }
+
+    // Whether `argument` is a whole workgroup variable, or a `threadgroup`
+    // reference parameter.
+    function sharedPlace(borrow self, argument: Int) -> Bool {
+        let checked = program.expressions[argument]
+        if checked.kind == .Global { return program.globals[checked.target].kind == .Threadgroup }
+        if checked.kind == .Local { return locals[checked.target].shared }
+        return false
+    }
+
+    function callOf(borrow mut self, routine: Int, arguments: [Int], span: Span) -> Int {
+        let parameters = program.functions[routine].parameters
+        var converted: [Int] = []
+        var bound = false
+        for index in 0..arguments.count {
+            if parameters[index].mode == .ByValue {
+                converted.append(convertTo(arguments[index], parameters[index].parameterType))
+            } else {
+                converted.append(arguments[index])
+            }
+            if parameters[index].mode == .Bound { bound = true }
+        }
+        if !contains(callNames(), decimalText(routine)) { calls.append(routine) }
+        if bound { boundCalls.append(BoundCall { caller = current, callee = routine, arguments = converted }) }
+        var made = expressionOf(.Call, program.functions[routine].result, span)
+        made.target = routine
+        made.arguments = converted
+        return add(made)
+    }
+
+    function callNames(borrow self) -> [String] {
+        var names: [String] = []
+        for callee in calls {
+            names.append(decimalText(callee))
+        }
+        return names
+    }
+
+    // Marks each sampler global with how it is sampled, through the
+    // functions it is passed to.
+    function markSamplers(borrow mut self) {
+        var changed = true
+        while changed {
+            changed = false
+            for call in boundCalls {
+                let parameters = program.functions[call.callee].parameters
+                for index in 0..call.arguments.count {
+                    let parameter = parameters[index]
+                    if parameter.mode != .Bound || !(parameter.plain || parameter.comparison) { continue }
+                    if markSampler(call.arguments[index], parameter.plain, parameter.comparison, call.caller) {
+                        changed = true
+                    }
+                }
+            }
+        }
+        for global in program.globals {
+            if global.plain && global.comparison { report(.TypeMismatch, global.span) }
+        }
+    }
+
+    // Records that `sampler`, an argument in `function`, is sampled
+    // plainly or comparing; whether that is news.
+    function markSampler(borrow mut self, sampler: Int, plain: Bool, comparison: Bool, routine: Int) -> Bool {
+        let checked = program.expressions[sampler]
+        if checked.kind == .Global {
+            let known = program.globals[checked.target]
+            let news = (plain && !known.plain) || (comparison && !known.comparison)
+            if plain { program.globals[checked.target].plain = true }
+            if comparison { program.globals[checked.target].comparison = true }
+            return news
+        }
+        if checked.kind != .BoundParameter || routine < 0 { return false }
+        let known = program.functions[routine].parameters[checked.target]
+        let news = (plain && !known.plain) || (comparison && !known.comparison)
+        if plain { program.functions[routine].parameters[checked.target].plain = true }
+        if comparison { program.functions[routine].parameters[checked.target].comparison = true }
+        return news
+    }
+}

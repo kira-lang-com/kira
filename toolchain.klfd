@@ -1,0 +1,89 @@
+// The languages this repository defines, and what an installed toolchain of
+// each carries.
+//
+// Each language is a definition package under `languages/<name>/`, built with
+// `klf build <path> -o bin/<binary>`. `knvm binstall` run anywhere in this
+// repository reads this file, registers every language it lists, and installs
+// each one as that language's dev toolchain: the binary, then every `files`
+// entry copied from the package to the toolchain root.
+//
+// `isDefault` names the language a `knvm` verb acts on when the invocation names
+// none; at most one language sets it.
+//
+// `shaderOuts` names the other shader languages whose `emit` this one reaches.
+// `klf build` links each into the driver, so one binary writes every target its
+// language declares rather than only the one it was named for. A surface
+// language needs the outs; an out needs the other outs and the surface language,
+// because a shader toolchain that answers only for its own target answers
+// `no out writes it` for a shader the user asked to convert.
+//
+// It is the caller that decides. A driver built with none of these links holds
+// its own definition alone and reports every other target as unsupported, which
+// is true of it rather than a failure.
+
+construct KiraToolchains() extends Toolchains {
+    let languages: [ToolchainLanguage] = [
+        ToolchainLanguage {
+            name = "kira",
+            path = "languages/kira",
+            binary = "kira",
+            isDefault = true,
+            // The driver reads its definitions and its standard library beside
+            // its own `bin`. The std holds Foundation, Heap and the bundled
+            // libraries (Archive, Build, Elf, Kten, Network, Seyoul), each
+            // resolved by name from it.
+            files = [
+                ToolchainFile { from = "definitions", to = "definitions" },
+                ToolchainFile { from = "std", to = "std" },
+                ToolchainFile { from = "formatter.json", to = "formatter.json" }
+            ]
+        },
+        ToolchainLanguage {
+            name = "ksl",
+            path = "languages/ksl",
+            binary = "ksl",
+            isDefault = false,
+            // An installed shader driver reads its library from
+            // `share/<lang>/library` (KLF-KSL 5.6).
+            files = [
+                ToolchainFile { from = "library", to = "share/ksl/library" }
+            ],
+            // A surface language with no out reaches no target, and reports
+            // every shader as one the toolchain cannot express, so its driver
+            // holds every one of them.
+            shaderOuts = ["msl", "glsl", "hlsl", "wgsl"]
+        },
+        ToolchainLanguage {
+            name = "msl",
+            path = "languages/msl",
+            binary = "kmsl",
+            isDefault = false,
+            files = [],
+            shaderOuts = ["glsl", "hlsl", "wgsl", "ksl"]
+        },
+        ToolchainLanguage {
+            name = "glsl",
+            path = "languages/glsl",
+            binary = "kglsl",
+            isDefault = false,
+            files = [],
+            shaderOuts = ["msl", "hlsl", "wgsl", "ksl"]
+        },
+        ToolchainLanguage {
+            name = "hlsl",
+            path = "languages/hlsl",
+            binary = "khlsl",
+            isDefault = false,
+            files = [],
+            shaderOuts = ["msl", "glsl", "wgsl", "ksl"]
+        },
+        ToolchainLanguage {
+            name = "wgsl",
+            path = "languages/wgsl",
+            binary = "kwgsl",
+            isDefault = false,
+            files = [],
+            shaderOuts = ["msl", "glsl", "hlsl", "ksl"]
+        }
+    ]
+}

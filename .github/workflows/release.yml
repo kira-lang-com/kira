@@ -1,0 +1,132 @@
+name: Release
+
+# Every language `toolchain.klfd` lists, and knvm, for every host: the newest
+# released klf (`klf setup`) builds a first kira, that kira builds knvm, and
+# `knvm binstall` builds every language as knvm installs one. Each installed
+# tree is packed as `<language>-<version>-<host>.tar.gz`, and knvm with the
+# launcher under every compiler's name as `knvm-<version>-<host>.tar.gz`, each
+# beside a `.sha256`: what `knvm setup` and `knvm <language> install` fetch.
+# A tag `v<version>` publishes; a manual run builds, and publishes when asked.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, as `26.10.4`"
+        required: true
+        type: string
+      publish:
+        description: "Publish the release after the build succeeds"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ github.event_name == 'push' && github.ref_name || format('v{0}', inputs.version) }}
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.host }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { host: aarch64-macos, runner: macos-15 }
+          - { host: x86_64-linux-gnu, runner: ubuntu-24.04 }
+          - { host: aarch64-linux-gnu, runner: ubuntu-24.04-arm }
+          - { host: x86_64-windows-msvc, runner: windows-latest }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install klf
+        run: |
+          klf_home="$HOME/.klf"
+          tag=$(gh release view -R kira-lang-com/kira-language-framework --json tagName --jq .tagName)
+          tree="$klf_home/toolchains/klf/release/${tag#v}"
+          mkdir -p "$tree"
+          gh release download "$tag" -R kira-lang-com/kira-language-framework \
+            --pattern "klf-${tag#v}-${{ matrix.host }}.tar.gz" --dir "$RUNNER_TEMP"
+          tar -xzf "$RUNNER_TEMP/klf-${tag#v}-${{ matrix.host }}.tar.gz" -C "$tree"
+          "$tree/bin/klf" setup
+          echo "$klf_home/bin" >> "$GITHUB_PATH"
+
+      - name: Bootstrap kira and knvm
+        run: |
+          mkdir -p "$RUNNER_TEMP/bootstrap"
+          klf build languages/kira -o "$RUNNER_TEMP/bootstrap/kira"
+          "$RUNNER_TEMP/bootstrap/kira" build tools/knvm -o "$RUNNER_TEMP/bootstrap/knvm"
+
+      - name: Build every language
+        run: "$RUNNER_TEMP/bootstrap/knvm" binstall
+
+      - name: Pack
+        run: |
+          version="${TAG#v}"
+          out="$RUNNER_TEMP/out"
+          mkdir -p "$out"
+          pack() { # <name> <tree>
+            local file="$1-$version-${{ matrix.host }}.tar.gz"
+            tar -czf "$out/$file" -C "$2" .
+            (cd "$out" && if command -v sha256sum >/dev/null; then sha256sum "$file"; else shasum -a 256 "$file"; fi > "$file.sha256")
+          }
+          for root in "$HOME"/.klf/toolchains/*/dev/*/; do
+            language=$(basename "$(dirname "$(dirname "$root")")")
+            pack "$language" "$root"
+          done
+          tools="$RUNNER_TEMP/tools/bin"
+          mkdir -p "$tools"
+          kira="$RUNNER_TEMP/bootstrap/kira"
+          "$kira" build tools/knvm -o "$tools/knvm"
+          for name in klf $(sed -n 's/^ *binary = "\(.*\)",*$/\1/p' toolchain.klfd); do
+            "$kira" build tools/launcher -o "$tools/$name"
+          done
+          pack knvm "$RUNNER_TEMP/tools"
+          ls -la "$out"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kira-${{ matrix.host }}
+          path: ${{ runner.temp }}/out/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: build
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kira-*
+          path: dist
+          merge-multiple: true
+
+      - name: The installers, and the version they fetch
+        run: |
+          cp tools/install/install.sh tools/install/install.ps1 dist/
+          echo "${TAG#v}" > dist/version
+
+      - name: Publish the release
+        env:
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "Kira ${TAG#v}" \
+              --notes "Install with \`curl -fsSL https://github.com/kira-lang-com/kira/releases/latest/download/install.sh | sh\`, or on Windows \`irm https://github.com/kira-lang-com/kira/releases/latest/download/install.ps1 | iex\`."
+          fi
+          gh release upload "$TAG" dist/* --clobber

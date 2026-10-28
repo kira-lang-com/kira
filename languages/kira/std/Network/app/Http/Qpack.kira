@@ -1,0 +1,259 @@
+import Foundation
+
+// QPACK field sections (RFC 9204 section 4.5) with the static table only:
+// this endpoint announces a dynamic table capacity of 0, so every section it
+// sends or accepts has a Required Insert Count of 0 and no dynamic
+// reference (DESIGN.md section 7.2).
+
+namespace QpackBits {
+    // First-byte patterns of the field line representations.
+    let indexed: Number = 128
+    let staticFlag: Number = 64
+    let literalWithName: Number = 64
+    let literalNameStatic: Number = 16
+    let literalNever: Number = 32
+    let literalLiteral: Number = 32
+    let literalLiteralNever: Number = 16
+    let literalLiteralHuffman: Number = 8
+    let stringHuffman: Number = 128
+    // Patterns of the representations that reference the dynamic table.
+    let postBaseIndexed: Number = 16
+    // Prefix lengths of each representation's integer.
+    let indexedPrefix: Number = 6
+    let nameReferencePrefix: Number = 4
+    let literalNamePrefix: Number = 3
+    let stringPrefix: Number = 7
+    let insertCountPrefix: Number = 8
+    let deltaBasePrefix: Number = 7
+    // An integer's continuation bytes carry seven bits each.
+    let continuation: Number = 128
+    let continuationBits: Number = 7
+    // The largest integer read, below 2^63.
+    let largestShift: Number = 56
+}
+
+// `value` as a prefixed integer (RFC 7541 section 5.1) whose first byte
+// carries `flags` above its `prefix` low bits.
+function writePrefixed(
+    writer: borrow mut WireWriter,
+    value: Number,
+    prefix: Number,
+    flags: Number
+) {
+    let limit = (1 << prefix) - 1
+    if value < limit {
+        writer.writeByte(flags | value)
+        return
+    }
+    writer.writeByte(flags | limit)
+    var rest = value - limit
+    while rest >= QpackBits.continuation {
+        writer.writeByte(QpackBits.continuation | (rest % QpackBits.continuation))
+        rest = trunc(rest / QpackBits.continuation)
+    }
+    writer.writeByte(rest)
+}
+
+// A prefixed integer whose first byte is `first`.
+function readPrefixed(
+    reader: borrow mut WireReader,
+    first: Number,
+    prefix: Number
+) -> Result<Number, Http3Error> {
+    let limit = (1 << prefix) - 1
+    var value = first & limit
+    if value < limit { return .Ok(value) }
+    var shift: Number = 0
+    while true {
+        let byte = try reader.readByte() otherwise return .Error(.QpackDecompressionFailed)
+        if shift > QpackBits.largestShift { return .Error(.QpackDecompressionFailed) }
+        value += (byte & (QpackBits.continuation - 1)) << shift
+        shift += QpackBits.continuationBits
+        if (byte & QpackBits.continuation) == 0 { return .Ok(value) }
+    }
+    return .Ok(value)
+}
+
+// A string literal whose length prefix is `prefix` bits under `huffmanFlag`,
+// Huffman coded when that is shorter.
+function writeString(writer: borrow mut WireWriter, text: borrow String, form: borrow StringForm) {
+    let bytes = text.utf8()
+    let coded = huffmanLength(bytes)
+    if coded < bytes.count {
+        writePrefixed(writer, coded, form.prefix, form.flags | form.huffmanFlag)
+        writer.writeBytes(huffmanEncode(bytes))
+    } else {
+        writePrefixed(writer, bytes.count, form.prefix, form.flags)
+        writer.writeBytes(bytes)
+    }
+}
+
+struct StringForm {
+    let prefix: Number
+    let flags: Number
+    let huffmanFlag: Number
+}
+
+function readString(
+    reader: borrow mut WireReader,
+    first: Number,
+    form: borrow StringForm,
+    limit: Number
+) -> Result<String, Http3Error> {
+    let length = try readPrefixed(reader, first, form.prefix)
+    if length > limit { return .Error(.ExcessiveLoad) }
+    let raw = try reader.readBytes(length) otherwise return .Error(.QpackDecompressionFailed)
+    var bytes = raw
+    if (first & form.huffmanFlag) != 0 {
+        bytes = match huffmanDecode(raw) {
+            Some(value) -> value
+            None -> return .Error(.QpackDecompressionFailed)
+        }
+    }
+    return match textFromBytes(bytes) {
+        Some(text) -> .Ok(text)
+        None -> .Error(.QpackDecompressionFailed)
+    }
+}
+
+// The static entry holding `name` and `value`, and failing that one
+// holding `name`.
+struct StaticMatch {
+    let exact: Number?
+    let name: Number?
+}
+
+function staticMatch(name: borrow String, value: borrow String) -> StaticMatch {
+    var byName: Number? = .None
+    for (index, entry) in QpackStatic.names.enumerated() {
+        if entry != name { continue }
+        if QpackStatic.values[index] == value {
+            return StaticMatch { exact: .Some(index), name: .Some(index) }
+        }
+        if byName.isNone() { byName = .Some(index) }
+    }
+    return StaticMatch { exact: .None, name: byName }
+}
+
+function encodeFieldSection(lines: borrow [Field]) -> [UN8] {
+    var writer = WireWriter {}
+    // Required Insert Count 0, then Base 0 (RFC 9204 section 4.5.1).
+    writePrefixed(writer, 0, QpackBits.insertCountPrefix, 0)
+    writePrefixed(writer, 0, QpackBits.deltaBasePrefix, 0)
+    for line in lines { writeFieldLine(writer, line) }
+    return writer.bytes
+}
+
+function writeFieldLine(writer: borrow mut WireWriter, line: borrow Field) {
+    let found = staticMatch(line.name, line.value)
+    let valueForm = StringForm {
+        prefix: QpackBits.stringPrefix,
+        flags: 0,
+        huffmanFlag: QpackBits.stringHuffman
+    }
+    match found.exact {
+        Some(index) -> {
+            if !line.sensitive {
+                return writePrefixed(
+                    writer,
+                    index,
+                    QpackBits.indexedPrefix,
+                    QpackBits.indexed | QpackBits.staticFlag
+                )
+            }
+        }
+        None -> {}
+    }
+    let never = line.sensitive ? QpackBits.literalNever : 0
+    match found.name {
+        Some(index) -> {
+            let flags = QpackBits.literalWithName | never | QpackBits.literalNameStatic
+            writePrefixed(writer, index, QpackBits.nameReferencePrefix, flags)
+        }
+        None -> {
+            let flags = QpackBits.literalLiteral | (
+                line.sensitive ? QpackBits.literalLiteralNever : 0
+            )
+            let nameForm = StringForm {
+                prefix: QpackBits.literalNamePrefix,
+                flags: flags,
+                huffmanFlag: QpackBits.literalLiteralHuffman
+            }
+            writeString(writer, line.name, nameForm)
+        }
+    }
+    writeString(writer, line.value, valueForm)
+}
+
+// How much a decoded field section may hold.
+struct FieldLimits {
+    // The largest section, counted as RFC 9114 section 4.2.2 counts it:
+    // each line's name and value plus 32.
+    let sectionSize: Number = 65536
+    let lineOverhead: Number = 32
+}
+
+// The field lines of `bytes`. A reference to the dynamic table, which this
+// endpoint never allows, fails decompression (RFC 9204 section 2.2.3).
+function decodeFieldSection(
+    bytes: borrow [UN8],
+    limits: borrow FieldLimits
+) -> Result<[Field], Http3Error> {
+    var reader = WireReader { bytes: copy bytes }
+    let insertFirst = try reader.readByte() otherwise return .Error(.QpackDecompressionFailed)
+    let insertCount = try readPrefixed(reader, insertFirst, QpackBits.insertCountPrefix)
+    if insertCount != 0 { return .Error(.QpackDecompressionFailed) }
+    let baseFirst = try reader.readByte() otherwise return .Error(.QpackDecompressionFailed)
+    try readPrefixed(reader, baseFirst, QpackBits.deltaBasePrefix)
+    var lines: [Field] = []
+    var size = 0
+    while !reader.atEnd() {
+        let line = try readFieldLine(reader, limits.sectionSize)
+        size += line.name.utf8().count + line.value.utf8().count + limits.lineOverhead
+        if size > limits.sectionSize { return .Error(.ExcessiveLoad) }
+        lines.append(line)
+    }
+    return .Ok(lines)
+}
+
+function staticEntry(index: Number) -> Result<Field, Http3Error> {
+    if index >= QpackStatic.names.count { return .Error(.QpackDecompressionFailed) }
+    return .Ok(Field { name: copy QpackStatic.names[index], value: copy QpackStatic.values[index] })
+}
+
+function readFieldLine(reader: borrow mut WireReader, limit: Number) -> Result<Field, Http3Error> {
+    let first = try reader.readByte() otherwise return .Error(.QpackDecompressionFailed)
+    let valueForm = StringForm {
+        prefix: QpackBits.stringPrefix,
+        flags: 0,
+        huffmanFlag: QpackBits.stringHuffman
+    }
+    if (first & QpackBits.indexed) != 0 {
+        if (first & QpackBits.staticFlag) == 0 { return .Error(.QpackDecompressionFailed) }
+        let index = try readPrefixed(reader, first, QpackBits.indexedPrefix)
+        return staticEntry(index)
+    }
+    if (first & QpackBits.literalWithName) != 0 {
+        if (first & QpackBits.literalNameStatic) == 0 { return .Error(.QpackDecompressionFailed) }
+        let index = try readPrefixed(reader, first, QpackBits.nameReferencePrefix)
+        let entry = try staticEntry(index)
+        let valueFirst = try reader.readByte() otherwise return .Error(.QpackDecompressionFailed)
+        let value = try readString(reader, valueFirst, valueForm, limit)
+        let sensitive = (first & QpackBits.literalNever) != 0
+        return .Ok(Field { name: entry.name, value: value, sensitive: sensitive })
+    }
+    if (first & QpackBits.literalLiteral) != 0 {
+        let nameForm = StringForm {
+            prefix: QpackBits.literalNamePrefix,
+            flags: 0,
+            huffmanFlag: QpackBits.literalLiteralHuffman
+        }
+        let name = try readString(reader, first, nameForm, limit)
+        let valueFirst = try reader.readByte() otherwise return .Error(.QpackDecompressionFailed)
+        let value = try readString(reader, valueFirst, valueForm, limit)
+        let sensitive = (first & QpackBits.literalLiteralNever) != 0
+        return .Ok(Field { name: name, value: value, sensitive: sensitive })
+    }
+    // Post-base references name the dynamic table.
+    return .Error(.QpackDecompressionFailed)
+}

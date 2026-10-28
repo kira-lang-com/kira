@@ -1,0 +1,50 @@
+extend Parser {
+    function classDeclaration(borrow mut self) -> Result<Span, Failure> {
+        let start = try expect(.Class)
+        let name = try identifier(.ExpectedClassName)
+        let genericParameters = try genericParameters(name)
+        try conformances(templateReference(name, genericParameters))
+        var parents: [TypeReference] = []
+        if eat(.Extends) {
+            parents.append(try typeReference())
+            while eat(.Comma) { parents.append(try typeReference()) }
+        }
+        try expect(.LeftBrace)
+        var fields: [FieldDeclaration] = []
+        var methods: [FunctionDeclaration] = []
+        var overrides: [ClassFieldOverride] = []
+        while !at(.RightBrace) {
+            if eat(.Override) {
+                if at(.Function) {
+                    methods.append(try memberFunction([]))
+                } else if at(.Let) || at(.Var) {
+                    advance()
+                    let field = try identifier(.ExpectedFieldName)
+                    var annotation: Optional<TypeReference> = .None
+                    if eat(.Colon) { annotation = .Some(try typeReference()) }
+                    try expect(.Equals)
+                    overrides.append(ClassFieldOverride { name = field, annotation = annotation, initial = try expression() })
+                } else {
+                    return .Error(failure(.ExpectedMember))
+                }
+            } else if at(.Let) || at(.Var) || at(.Function) || at(.At) || atPrivate() {
+                let memberStart = current().span
+                let prefix = try memberPrefix()
+                if at(.Let) || at(.Var) {
+                    let field = try fieldDeclaration(prefix.annotations, memberStart)
+                    keepPrivate(prefix, field.name)
+                    fields.append(field)
+                } else {
+                    let method = try memberFunction(prefix.annotations)
+                    keepPrivate(prefix, method.name)
+                    methods.append(method)
+                }
+            } else {
+                return .Error(failure(.ExpectedMember))
+            }
+        }
+        try expect(.RightBrace)
+        tree.classes.append(ClassDeclaration { name = name, genericParameters = genericParameters, parents = parents, fields = fields, methods = methods, overrides = overrides })
+        return .Ok(spanFrom(start.span))
+    }
+}

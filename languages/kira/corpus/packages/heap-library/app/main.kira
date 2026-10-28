@@ -1,0 +1,122 @@
+// The Heap library end to end: checked layouts, raw memory, owned blocks
+// and their views, boxes and arenas. Each check that fails folds its code
+// into the exit, so 42 means every one held.
+import Heap
+import Foundation
+
+@FFI.Struct { layout: c }
+struct Pair {
+    let tag: U8
+    let value: U32
+}
+
+var failures = 0
+
+function check(condition: Bool, code: Int) {
+    if !condition { failures = failures * 100 + code }
+}
+
+function layouts() {
+    let pair = layoutOf<Pair>()
+    check(pair.size == 8 && pair.alignment == 4, 1)
+    check(arrayLayout<Pair>(3).size == 24, 2)
+    check(alignUp(13, 8) == 16 && alignDown(13, 8) == 8 && alignUp(16, 8) == 16, 3)
+    let header = memoryLayout(1, 1)
+    check(header.fieldOffset(layoutOf<U64>()) == 8, 4)
+    let joined = header.extended(layoutOf<U32>())
+    check(joined.size == 8 && joined.alignment == 4 && joined.padded().size == 8, 5)
+    check(isPowerOfTwo(64) && !isPowerOfTwo(48) && !isPowerOfTwo(0), 6)
+}
+
+function rawMemory() {
+    let layout = memoryLayout(32, 16)
+    let a = allocateZeroed(layout)
+    check(isAligned(a, 16), 10)
+    let b = allocate(layout)
+    fillBytes(b, U8(7), 32)
+    check(compareBytes(a, b, 32) < 0 && !bytesEqual(a, b, 32), 11)
+    copyBytes(a, b, 32)
+    check(bytesEqual(a, b, 32), 12)
+    heapStore<U8>(a, 31, U8(9))
+    check(compareBytes(a, b, 32) > 0, 13)
+    for at in 0..8 { heapStore<U8>(a, at, U8(at)) }
+    moveBytes(heapOffset(a, 2), a, 6)
+    check(heapLoad<U8>(a, 2) == U8(0) && heapLoad<U8>(a, 7) == U8(5), 14)
+    moveBytes(a, heapOffset(a, 2), 6)
+    check(heapLoad<U8>(a, 0) == U8(0) && heapLoad<U8>(a, 5) == U8(5), 15)
+    let grown = reallocate(a, layout, 64)
+    check(heapLoad<U8>(grown, 5) == U8(5) && heapLoad<U8>(grown, 31) == U8(9), 16)
+    check(pointerDistance(b, heapOffset(b, 12)) == 12, 17)
+    check(isNull(nullPointer()) && !isNull(b), 18)
+    check(pointerAddress(pointerAt(pointerAddress(b))) == pointerAddress(b), 19)
+    deallocate(grown)
+    deallocate(b)
+    deallocate(nullPointer())
+}
+
+function blocks() {
+    var block = zeroedBlock(16, 8)
+    let view = block.view()
+    view.writeU32(0, U32(0xdeadbeef))
+    view.writeU16(4, U16(513))
+    view.writeBool(6, true)
+    view.writeF64(8, 2.5)
+    check(view.readU32(0) == U32(0xdeadbeef) && view.readU8(4) == U8(1) && view.readU8(5) == U8(2), 20)
+    check(view.readBool(6) && view.readF64(8) == 2.5, 21)
+    check(view.slice(4, 2).readU16(0) == U16(513), 22)
+    blockStore<Pair>(block, 8, Pair { tag = U8(3), value = U32(77) })
+    let pair: Pair = blockLoad<Pair>(block, 8)
+    check(pair.tag == U8(3) && pair.value == U32(77), 23)
+    block.resize(32)
+    check(block.count == 32 && block.view().readU8(4) == U8(1) && block.view().readU64(24) == U64(0), 24)
+    let twin = block.duplicate()
+    check(twin.view().equals(block.view()), 25)
+    twin.view().writeU8(31, U8(1))
+    check(twin.view().order(block.view()) > 0, 26)
+    let bytes = blockFromBytes([U8(1), U8(2), U8(3)])
+    check(viewBytes(bytes.view()).count == 3 && bytes.view().readU8(2) == U8(3), 27)
+    var owned = blockOf<U32>(4)
+    setViewElement<U32>(owned.view(), 3, U32(12))
+    check(viewElement<U32>(owned.view(), 3) == U32(12), 28)
+    let raw = owned.release()
+    let adopted = adoptBlock(raw, 16, 4)
+    check(viewElement<U32>(adopted.view(), 3) == U32(12), 29)
+}
+
+function boxes() {
+    let box = boxed<Pair>(Pair { tag = U8(1), value = U32(2) })
+    setBoxedValue<Pair>(box, Pair { tag = U8(5), value = U32(6) })
+    let read: Pair = boxedValue<Pair>(box)
+    check(read.tag == U8(5) && read.value == U32(6), 30)
+    let number = boxed<Int>(41)
+    check(boxedValue<Int>(number) == 41, 31)
+}
+
+function arenas() {
+    var arena = makeArena(256)
+    for round in 0..3 {
+        for step in 0..40 {
+            let address = arenaStore<U64>(arena, U64(step))
+            check(isAligned(address, 8) && heapLoad<U64>(address) == U64(step), 40)
+        }
+        let wide = arena.allocate(memoryLayout(8, 64))
+        check(isAligned(wide, 64), 41)
+        let big = arenaArray<Pair>(arena, 100)
+        check(big.count == 800 && big.readU64(792) == U64(0), 42)
+        check(arena.blockCount() > 2, 43)
+        arena.reset()
+        check(arena.blockCount() == 1, 44)
+    }
+    let view = arena.zeroedView(10, 2)
+    check(view.count == 10, 45)
+}
+
+@Main
+function main() -> Int {
+    layouts()
+    rawMemory()
+    blocks()
+    boxes()
+    arenas()
+    return failures + 42
+}

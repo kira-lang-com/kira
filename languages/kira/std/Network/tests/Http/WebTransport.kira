@@ -1,0 +1,206 @@
+import Foundation
+
+// WebTransport over HTTP/3: the error code mapping, the close capsule, and
+// a session end to end through one `Network` on loopback.
+
+@Test
+function transportErrorCodesSkipReservedPoints() {
+    let expected: String = "0>0>Some(0) 29>29>Some(29) 30>31>Some(30) 4294967295>4438132871>Some(4294967295) None None Error(Http3Problem.Invalid(Http3Error.MessageError))"
+    var parts: [String] = []
+    for error in [0, 29, 30, 4294967295] {
+        let wire = match transportErrorCode(error) {
+            Ok(value) -> value
+            Error(problem) -> {
+                expect!((traceText(problem)) == expected)
+                return
+            }
+        }
+        parts.append(
+            "\(error)>\(wire - WebTransport.firstApplicationError)>\(traceText(applicationError(wire)))"
+        )
+    }
+    // 0x52e4a40fa8db + 30 is reserved (0x1f * N + 0x21), so 30 goes one
+    // past it; codes outside the range carry none.
+    parts.append(traceText(applicationError(WebTransport.firstApplicationError + 30)))
+    parts.append(traceText(applicationError(code(Http3Error.WtSessionGone))))
+    parts.append(traceText(transportErrorCode(4294967296)))
+    expect!((joined(parts, " ")) == expected)
+}
+
+
+// The close capsule's message is cut at 1024 bytes on a character's
+// boundary, and reads back.
+function closeCapsulesKeepWholeCharactersOutcome() -> String {
+    var long = "a"
+    for _ in 0..1023 { long = long + "é" }
+    let capsule = closeCapsule(7, long)
+    var reader = WireReader { bytes: copy capsule }
+    let kind = try reader.readVarint() otherwise return "kind"
+    let length = try reader.readVarint() otherwise return "length"
+    let value = reader.readRest()
+    let close = match quicReadClose(QuicStreamNumber(0), value) {
+        Some(found) -> found
+        None -> return "unreadable"
+    }
+    return "\(kind) \(length) \(close.error) \(close.reason.utf8().count) \(traceText(quicReadClose(QuicStreamNumber(0), [0, 0])))"
+}
+
+@Test
+function closeCapsulesKeepWholeCharacters() {
+    let expected: String = "10307 1027 7 1023 None"
+    expect!(closeCapsulesKeepWholeCharactersOutcome() == expected)
+}
+
+
+
+// What each side of a session saw.
+struct SessionNotes {
+    var client: SessionId? = .None
+    var server: SessionId? = .None
+    var lines: [String] = []
+    var clientDone: Number = 0
+    var closed: Bool = false
+
+    function side(borrow self, session: SessionId) -> String {
+        return client == .Some(session) ? "client" : "server"
+    }
+}
+
+// The server accepts, echoes each stream in capitals and each datagram
+// back, and resets a stream of its own; the client sends one stream and one
+// datagram, then closes.
+function sessionEvent(
+    network: borrow mut Network,
+    notes: borrow mut SessionNotes,
+    event: borrow NetworkEvent
+) {
+    match event {
+        Incoming(incoming) -> {
+            notes.lines.append(
+                "incoming \(traceText(incoming.message.method)) \(incoming.message.target.path) \(traceText(incoming.message.protocolName))"
+            )
+            match network.acceptSession(incoming.request, Fields {}) {
+                Ok(id) -> notes.server = .Some(id)
+                Error(failure) -> notes.lines.append("accept \(traceText(failure))")
+            }
+        }
+        SessionOpened(id) -> {
+            notes.lines.append("opened")
+            let stream = match network.openStream(id, .Bidirectional) {
+                Ok(value) -> value
+                Error(failure) -> return notes.lines.append("open \(traceText(failure))")
+            }
+            absorb network.writeStream(id, stream, "hello".utf8(), true)
+            absorb network.sendDatagram(id, "ping".utf8())
+        }
+        StreamOpened(opened) -> {
+            notes.lines.append("\(notes.side(opened.session)) stream \(traceText(opened.kind))")
+            // A stream of the server's own, reset at once: the reset still
+            // carries its header, so the client knows its session.
+            if notes.side(opened.session) == "server" {
+                let stream = match network.openStream(opened.session, .Unidirectional) {
+                    Ok(value) -> value
+                    Error(failure) -> return notes.lines.append("open \(traceText(failure))")
+                }
+                absorb network.writeStream(opened.session, stream, "lost".utf8(), false)
+                absorb network.resetStream(opened.session, stream, 5)
+            }
+        }
+        StreamData(data) -> {
+            let text = bodyText(data.bytes)
+            notes.lines.append("\(notes.side(data.session)) data \(text)")
+            if notes.side(data.session) == "server" {
+                absorb network.writeStream(
+                    data.session,
+                    data.stream,
+                    text.uppercased().utf8(),
+                    true
+                )
+            }
+        }
+        StreamEnded(end) -> {
+            notes.lines.append("\(notes.side(end.session)) ended \(traceText(end.ending))")
+            if notes.side(end.session) == "client" { notes.clientDone += 1 }
+        }
+        Datagram(datagram) -> {
+            let text = bodyText(datagram.bytes)
+            notes.lines.append("\(notes.side(datagram.session)) datagram \(text)")
+            if notes.side(datagram.session) == "server" {
+                absorb network.sendDatagram(datagram.session, "pong".utf8())
+            } else {
+                notes.clientDone += 1
+            }
+        }
+        SessionDraining(id) -> notes.lines.append("\(notes.side(id)) draining")
+        SessionClosed(close) -> {
+            notes.lines.append(
+                "\(notes.side(close.session)) closed \(close.error) \(close.reason) \(traceText(close.failure))"
+            )
+            notes.closed = true
+        }
+        ResponseHead(_) -> notes.lines.append(traceText(event))
+        ResponseBody(_) -> notes.lines.append(traceText(event))
+        ResponseEnded(_) -> notes.lines.append(traceText(event))
+    }
+}
+
+@Test
+function driverCarriesAWebTransportSession() {
+    let expected: String = "client data HELLO; client datagram pong; client ended StreamEnding.Finished; client ended StreamEnding.Reset(Some(5)); client stream QuicStreamKind.Unidirectional; incoming Method.Connect /chat Some(\"webtransport-h3\"); opened; server closed 7 bye None; server data hello; server datagram ping; server ended StreamEnding.Finished; server stream QuicStreamKind.Bidirectional"
+    let identity = match NetworkTesting.identity() {
+        Ok(value) -> value
+        Error(text) -> {
+            expect!((text) == expected)
+            return
+        }
+    }
+    var network = match openNetwork(NetworkOptions { anchors: NetworkTesting.anchors() }) {
+        Ok(value) -> value
+        Error(failure) -> {
+            expect!((traceText(failure)) == expected)
+            return
+        }
+    }
+    let serving = ServeOptions { address: "127.0.0.1:0", identity: identity }
+    let server = match network.serve(serving) {
+        Ok(value) -> value
+        Error(failure) -> {
+            expect!((traceText(failure)) == expected)
+            return
+        }
+    }
+    let address = match network.address(server) {
+        Ok(value) -> value
+        Error(failure) -> {
+            expect!((traceText(failure)) == expected)
+            return
+        }
+    }
+    var notes = SessionNotes {}
+    let target = Target { scheme: "https", authority: address, path: "/chat" }
+    notes.client = match network.openSession(target, Fields {}) {
+        Ok(value) -> .Some(value)
+        Error(failure) -> {
+            expect!((traceText(failure)) == expected)
+            return
+        }
+    }
+    let deadline = network.now().plus(DriverTest.patience)
+    var closing = false
+    while !notes.closed && network.now().raw < deadline.raw {
+        for event in network.wait(.Some(deadline)) { sessionEvent(network, notes, event) }
+        // The echoed stream, the reset one and the datagram back: the client
+        // is done.
+        if notes.clientDone == 3 && !closing {
+            closing = true
+            match notes.client {
+                Some(id) -> absorb network.closeSession(id, 7, "bye")
+                None -> {}
+            }
+        }
+    }
+    // Stream and datagram notes race each other; their order is not the
+    // protocol's.
+    expect!((joined(notes.lines.sorted({ a, b in return compare(a, b) == .Less }), "; ")) == expected)
+}
+

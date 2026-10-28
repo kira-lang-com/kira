@@ -1,0 +1,143 @@
+// Embed actual toolchain-generated shader artifacts from the caller's package.
+// Missing source or output is an error; an empty shader is never synthesized.
+// The `ksl` shader driver writes them first (`KLF-KSL.md` 24.3); without it
+// on the path, what an earlier build left in `generated/shaders` is read.
+function kslInputPath(input: String, origin: Span) -> Result<String, Failure> {
+    let tokens = try lex(input, origin.file)
+    if tokens.count != 2 { return .Error(Failure { diagnostic = .OutsideSubset, span = origin }) }
+    if tokens[0].kind != .StringLiteral { return .Error(Failure { diagnostic = .OutsideSubset, span = origin }) }
+    let span = tokens[0].span
+    let raw = utf8Slice(input, span.start, span.end)
+    match stringLiteralText(raw) {
+        Some(path) -> return .Ok(path)
+        None -> return .Ok(utf8Slice(raw, 1, utf8Count(raw) - 1))
+    }
+}
+
+function kslShaderStem(path: String, origin: Span) -> Result<String, Failure> {
+    let count = utf8Count(path)
+    if count < 5 { return .Error(Failure { diagnostic = .OutsideSubset, span = origin }) }
+    if utf8Slice(path, count - 4, count) != ".ksl" {
+        return .Error(Failure { diagnostic = .OutsideSubset, span = origin })
+    }
+    var start = 0
+    for index in 0..count {
+        if utf8Byte(path, index) == 47 { start = index + 1 }
+    }
+    if start >= count - 4 { return .Error(Failure { diagnostic = .OutsideSubset, span = origin }) }
+    return .Ok(utf8Slice(path, start, count - 4))
+}
+
+function kslGeneratedText(session: Session, root: String, stem: String, suffix: String) -> String {
+    let path = joinPath(root, joinText(["generated/shaders/", stem, suffix]))
+    let file = readFile(session, path)
+    if file < 0 { return "" }
+    return fileText(session, file as SourceFile)
+}
+
+function kslEntry(source: String, name: String) -> String {
+    if utf8Count(source) < utf8Count(name) { return "" }
+    if containsText(source, joinText([name, "("])) { return name }
+    return ""
+}
+
+function kslSpirvSource(text: String, origin: Span) -> Result<String, Failure> {
+    let count = utf8Count(text)
+    if count == 0 { return .Ok("[]") }
+    if count % 8 != 0 || utf8Slice(text, 0, 8) != "07230203" {
+        return .Error(Failure { diagnostic = .OutsideSubset, span = origin })
+    }
+    var words: [String] = ["["]
+    for index in 0..count / 8 {
+        let word = utf8Slice(text, index * 8, index * 8 + 8)
+        for digit in 0..8 {
+            if !isHexDigit(utf8Byte(word, digit)) { return .Error(Failure { diagnostic = .OutsideSubset, span = origin }) }
+        }
+        if index > 0 { words.append(", ") }
+        words.append(joinText(["0x", word]))
+    }
+    words.append("]")
+    return .Ok(joinText(words))
+}
+
+function kslArtifactSource(session: Session, root: String, stem: String, origin: Span) -> Result<String, Failure> {
+    let fields: [String] = ["combinedMsl", "vertexHlsl", "fragmentHlsl", "computeHlsl", "vertexGlsl", "fragmentGlsl", "computeGlsl", "vertexWgsl", "fragmentWgsl", "computeWgsl", "resourceReflection"]
+    let suffixes: [String] = [".metal", ".vert.hlsl", ".frag.hlsl", ".comp.hlsl", ".vert.glsl", ".frag.glsl", ".comp.glsl", ".vert.wgsl", ".frag.wgsl", ".comp.wgsl", ".resources"]
+    var parts: [String] = ["KslArtifact { shaderName = ", escapedSourceString(stem)]
+    var stages: [String] = []
+    var emitted = false
+    for index in 0..fields.count {
+        let text = kslGeneratedText(session, root, stem, suffixes[index])
+        parts.append(joinText([", ", fields[index], " = ", escapedSourceString(text)]))
+        if index < fields.count - 1 {
+            stages.append(text)
+            if utf8Count(text) > 0 { emitted = true }
+        }
+    }
+    if !emitted { return .Error(Failure { diagnostic = .ShaderOutputMissing, span = origin }) }
+    let source = joinText(stages)
+    let spirvFields: [String] = ["vertexSpirv", "fragmentSpirv", "computeSpirv"]
+    let spirvSuffixes: [String] = [".vert.spv", ".frag.spv", ".comp.spv"]
+    for index in 0..spirvFields.count {
+        let text = kslGeneratedText(session, root, stem, spirvSuffixes[index])
+        let words = try kslSpirvSource(text, origin)
+        parts.append(joinText([", ", spirvFields[index], " = ", words]))
+    }
+    for entry in ["vertex", "fragment", "compute"] {
+        let name = joinText([entry, "_main"])
+        parts.append(joinText([", ", entry, "Entry = ", escapedSourceString(kslEntry(source, name))]))
+    }
+    parts.append(" }")
+    return .Ok(joinText(parts))
+}
+
+// Runs `ksl build` over the shader at `path` in the package at `root`. Its
+// diagnostics go to the driver's error output, as its own would.
+function buildKslShader(root: String, path: String, origin: Span) -> Result<Bool, Failure> {
+    let output = joinPath(root, "generated/shaders")
+    let status = runCommand(["ksl", "build", joinPath(root, path), "--out", output])
+    if status == -2 { return .Ok(false) }
+    if status == 0 { return .Ok(true) }
+    writeDriverError(commandOutput(2))
+    return .Error(Failure { diagnostic = .ShaderBuildFailed, span = origin })
+}
+
+// What a shader's artifact is kept under between builds: its path and the
+// SHA-256 of every `.ksl` file beside it, which are the modules its imports
+// can name. An unchanged shader then costs no `ksl build` and no read of what
+// it generated. The key starts from the toolchain that answers it, and
+// `ksl` is installed with it, so a new shader compiler is a new key.
+function kslArtifactKey(session: Session, root: String, path: String) -> String {
+    var lines: [String] = ["ksl artifact\n", path, "\n"]
+    let count = readDirectory(session, directoryOf(joinPath(root, path)), "ksl")
+    for index in 0..count {
+        let file = source_directory_file(session, index)
+        lines.append(fileName(session, file as SourceFile))
+        for word in 0..4 { lines.append(joinText([" ", hexadecimalWord(source_digest(session, file as SourceFile, word))])) }
+        lines.append("\n")
+    }
+    return joinText(lines)
+}
+
+function expandKslArtifact(session: Session, tree: SyntaxTree, input: String, origin: Span) -> Result<Int, Failure> {
+    let path = try kslInputPath(input, origin)
+    let stem = try kslShaderStem(path, origin)
+    match macroSourceUnit(tree, origin.file) {
+        Some(context) -> {
+            let root = tree.modules[context.module].root
+            if readFile(session, joinPath(root, path)) < 0 {
+                return .Error(Failure { diagnostic = .OutsideSubset, span = origin })
+            }
+            let key = kslArtifactKey(session, root, path)
+            let recalled = subquery_recall(session, origin.file as SourceFile, key)
+            if recalled >= 0 { return .Ok(recalled) }
+            try buildKslShader(root, path, origin)
+            let source = try kslArtifactSource(session, root, stem, origin)
+            let file = addSource(session, origin.file as SourceFile, source)
+            if file < 0 { return .Error(Failure { diagnostic = .OutsideSubset, span = origin }) }
+            subquery_keep(session, key, file as SourceFile)
+            return .Ok(file)
+        }
+        None -> return .Error(Failure { diagnostic = .OutsideSubset, span = origin })
+    }
+}

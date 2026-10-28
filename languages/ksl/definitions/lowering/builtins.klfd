@@ -1,0 +1,158 @@
+// Built-in calls. Every sample reads level zero, so a sample means the
+// same in every stage and under any control flow; component-wise math
+// widens a scalar beside a vector to the vector's lanes.
+
+function mathName(which: BuiltinFunction) -> String {
+    match which {
+        Dot -> return "dot"
+        Cross -> return "cross"
+        Normalize -> return "normalize"
+        Length -> return "length"
+        Abs -> return "abs"
+        Floor -> return "floor"
+        Ceil -> return "ceil"
+        Min -> return "min"
+        Max -> return "max"
+        Clamp -> return "clamp"
+        Mix -> return "mix"
+        Step -> return "step"
+        Smoothstep -> return "smoothstep"
+        Fma -> return "fma"
+        Pack2x16Float -> return "pack2x16float"
+        Unpack2x16Float -> return "unpack2x16float"
+        Pow -> return "pow"
+        Sqrt -> return "sqrt"
+        Sin -> return "sin"
+        Cos -> return "cos"
+        Tan -> return "tan"
+        Atan2 -> return "atan2"
+        Exp -> return "exp"
+        Exp2 -> return "exp2"
+        Log -> return "log"
+        Log2 -> return "log2"
+        Fract -> return "fract"
+        Round -> return "round"
+        Sign -> return "sign"
+        Dpdx -> return ""
+        Dpdy -> return ""
+        Fwidth -> return ""
+        Mul -> return ""
+        Sample -> return ""
+        Load -> return ""
+        Store -> return ""
+        AtomicAdd -> return ""
+    }
+}
+
+extend Lowering {
+    function builtinCall(borrow mut self, checked: CheckedExpression) -> Int {
+        if utf8Count(mathName(checked.builtin)) > 0 { return math(checked) }
+        match checked.builtin {
+            Mul -> {
+                let left = value(checked.arguments[0])
+                let right = value(checked.arguments[1])
+                return shader_expr_binary(module, builder, "multiply", left, right)
+            }
+            Sample -> return sample(checked)
+            Load -> return load(checked)
+            Store -> {
+                let operands = values(checked.arguments)
+                let coordinate = integralCoordinate(operands[1], typeOf(checked.arguments[1]))
+                pushAll([operands[0], coordinate, -1, operands[2]])
+                shader_stmt_image_store(module, builder)
+                return -1
+            }
+            AtomicAdd -> {
+                let buffer = shader_expr_global(module, builder, globals[program.expressions[checked.arguments[0]].target])
+                let element = shader_expr_access(module, builder, buffer, value(checked.arguments[1]))
+                return shader_stmt_atomic(module, builder, element, "add", value(checked.arguments[2]), -1, 1)
+            }
+            Dot -> return -1
+            Cross -> return -1
+            Normalize -> return -1
+            Length -> return -1
+            Abs -> return -1
+            Floor -> return -1
+            Ceil -> return -1
+            Min -> return -1
+            Max -> return -1
+            Clamp -> return -1
+            Mix -> return -1
+            Step -> return -1
+            Smoothstep -> return -1
+            Fma -> return -1
+            Pack2x16Float -> return -1
+            Unpack2x16Float -> return -1
+            Pow -> return -1
+            Sqrt -> return -1
+            Sin -> return -1
+            Cos -> return -1
+            Tan -> return -1
+            Atan2 -> return -1
+            Exp -> return -1
+            Exp2 -> return -1
+            Log -> return -1
+            Log2 -> return -1
+            Fract -> return -1
+            Round -> return -1
+            Sign -> return -1
+            Dpdx -> return derivative(checked, "x")
+            Dpdy -> return derivative(checked, "y")
+            Fwidth -> return derivative(checked, "width")
+        }
+    }
+
+    function math(borrow mut self, checked: CheckedExpression) -> Int {
+        var width = 1
+        if checked.expressionType.shape == .Vector { width = checked.expressionType.width }
+        var operands: [Int] = []
+        for argument in checked.arguments {
+            let computed = value(argument)
+            let packing = checked.builtin == .Pack2x16Float || checked.builtin == .Unpack2x16Float
+            if checked.builtin == .Dot || checked.builtin == .Length || packing {
+                operands.append(computed)
+            } else {
+                operands.append(widened(computed, typeOf(argument), width))
+            }
+        }
+        pushAll(operands)
+        return shader_expr_math(module, builder, mathName(checked.builtin))
+    }
+
+    // A screen-space derivative, as fragments in a quad see it; the device
+    // chooses coarse or fine.
+    function derivative(borrow mut self, checked: CheckedExpression, axis: String) -> Int {
+        return shader_expr_derivative(module, builder, axis, "none", value(checked.arguments[0]))
+    }
+
+    function sample(borrow mut self, checked: CheckedExpression) -> Int {
+        let operands = values(checked.arguments)
+        pushAll([operands[0], operands[1], operands[2], -1, -1, -1, -1, -1, -1])
+        let sampled = shader_expr_image_sample(module, builder, "zero")
+        // A depth texture samples one value; KSL reads it as four lanes.
+        if typeOf(checked.arguments[0]).texture == .Depth2d {
+            return shader_expr_splat(module, builder, 4, sampled)
+        }
+        return sampled
+    }
+
+    function load(borrow mut self, checked: CheckedExpression) -> Int {
+        let operands = values(checked.arguments)
+        let coordinate = integralCoordinate(operands[1], typeOf(checked.arguments[1]))
+        // A sampled texture is read at a mip level; a storage image has none.
+        var level = literal(builder, ConstValue { scalar = .Int, text = "0" })
+        let image = program.expressions[checked.arguments[0]]
+        if image.kind == .Resource {
+            let access = program.resources[image.target].access
+            if access == .Write || access == .ReadWrite { level = -1 }
+        }
+        pushAll([operands[0], coordinate, -1, -1, level])
+        return shader_expr_image_load(module, builder)
+    }
+
+    // A texel coordinate: integers as written, floats truncated to `Int`s.
+    function integralCoordinate(borrow mut self, coordinate: Int, written: ShaderType) -> Int {
+        if written.scalar != .Float { return coordinate }
+        return shader_expr_convert(module, builder, coordinate, "i32")
+    }
+}

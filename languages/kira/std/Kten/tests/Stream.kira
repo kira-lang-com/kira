@@ -1,0 +1,38 @@
+import Foundation
+
+// The stream reads values as they arrive, a byte at a time, and waits for a
+// value that is not whole yet.
+
+// Values fed one byte at a time come out whole and in order.
+@Test
+function valuesSplitAcrossPiecesComeOutWhole() {
+    var bytes = Kten.Text("héllo").encoded()
+    bytes.appendAll(sample().encoded())
+    bytes.appendAll(ktenCase("Done", []).encoded())
+    var stream = KtenStream {}
+    var parts: [String] = []
+    for byte in bytes {
+        stream.feed([byte])
+        let found = match stream.next() {
+            Ok(value) -> value
+            Error(failure) -> {
+                expect!((traceText(failure)) == "")
+                return
+            }
+        }
+        match found {
+            Some(value) -> parts.append(value.written())
+            None -> continue
+        }
+    }
+    expect!((joined(parts, " ")) == "\"héllo\" Message { id: 300, delta: -1, cost: 0.0025, huge: 18446744073709551615, text: \"é \\\"quoted\\\"\\n\", raw: 0x00abff, done: true, parts: [.None, .Role(\"user\"), .Idle], extra: { } } .Done")
+    expect!((stream.holdsPart()) == (false))
+}
+
+// A byte that begins no kind is refused by the stream with the reason.
+@Test
+function badKindInTheStreamIsRefused() {
+    var stream = KtenStream {}
+    stream.feed([9])
+    expect!((traceText(stream.next())) == "Error(KtenDecodeFailure.UnknownKind(9))")
+}

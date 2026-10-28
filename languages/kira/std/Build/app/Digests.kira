@@ -1,0 +1,343 @@
+import Foundation
+import Kten
+
+// Digests: of bytes, of files through the stat cache, and of trees through
+// their listing (DESIGN.md section 6.1).
+
+namespace HexText {
+    let digits: String = "0123456789abcdef"
+    let sixteen: Number = 16
+}
+
+function digestHex(bytes: borrow [UN8]) -> String {
+    var text = ""
+    for byte in bytes {
+        let value = Number(byte)
+        let high = trunc(value / HexText.sixteen)
+        let low = value % HexText.sixteen
+        text += HexText.digits.substring(high, high + 1) + HexText.digits.substring(low, low + 1)
+    }
+    return text
+}
+
+// The SHA-256 of `bytes` as hexadecimal.
+function sha256Hex(bytes: borrow [UN8]) -> Result<String, BuildFailure> {
+    return match digest(.Sha256, bytes) {
+        Ok(sum) -> .Ok(digestHex(sum))
+        Error(failure) -> .Error(.Files("cannot hash: \(traceText(failure))"))
+    }
+}
+
+// What the stat cache remembers of a file: when its size, modification time
+// and inode are unchanged, so is its digest.
+struct Remembered {
+    let size: Number
+    let modified: Number
+    let inode: Number
+    let digest: String
+}
+
+struct StatCache {
+    var entries: Map<String, Remembered> = Map<String, Remembered>()
+    var changed: Bool = false
+
+    // The SHA-256 of the file at `path` as hexadecimal.
+    function fileHex(borrow mut self, path: borrow String) -> Result<String, BuildFailure> {
+        let status = match fileStatus(path) {
+            Ok(found) -> found
+            Error(failure) -> return .Error(.Files("cannot read \(path): \(traceText(failure))"))
+        }
+        match entries.value(path) {
+            Some(known) -> {
+                let same = known.size == status.size && known.modified == status.modified
+                    && known.inode == status.inode
+                if same { return .Ok(copy known.digest) }
+            }
+            None -> {}
+        }
+        let sum = match digestFile(.Sha256, path) {
+            Ok(bytes) -> digestHex(bytes)
+            Error(failure) -> return .Error(.Files("cannot hash \(path): \(traceText(failure))"))
+        }
+        entries.set(
+            copy path,
+            Remembered {
+                size: status.size,
+                modified: status.modified,
+                inode: status.inode,
+                digest: copy sum
+            }
+        )
+        changed = true
+        return .Ok(sum)
+    }
+
+    // Remembers that the file at `path` holds the bytes of the stored file
+    // `blob`, whose SHA-256 is `digest`, when the two are the same size.
+    function remember(
+        borrow mut self,
+        path: borrow String,
+        blob: borrow String,
+        digest: borrow String
+    ) {
+        let status = match fileStatus(path) {
+            Ok(found) -> found
+            Error(failure) -> {
+                absorb failure
+                return
+            }
+        }
+        let stored = match fileStatus(blob) {
+            Ok(found) -> found
+            Error(failure) -> {
+                absorb failure
+                return
+            }
+        }
+        if stored.size != status.size { return }
+        entries.set(
+            copy path,
+            Remembered {
+                size: status.size,
+                modified: status.modified,
+                inode: status.inode,
+                digest: copy digest
+            }
+        )
+    }
+
+    // The cache as kept on disk, without the files that are gone.
+    function encoded(borrow self) -> [UN8] {
+        var items: [Kten] = []
+        for entry in entries.entries() {
+            if !fileExists(entry.key) { continue }
+            items.append(
+                ktenBare(
+                    [
+                        ktenField("path", .Text(copy entry.key)),
+                        ktenField("size", .Number(entry.value.size)),
+                        ktenField("modified", .Number(entry.value.modified)),
+                        ktenField("inode", .Number(entry.value.inode)),
+                        ktenField("digest", .Text(copy entry.value.digest))
+                    ]
+                )
+            )
+        }
+        return Kten.List(items).encoded()
+    }
+}
+
+// The stat cache kept at `path`; an empty one when there is none or it does
+// not read, which costs only hashing again.
+function loadStatCache(path: borrow String) -> StatCache {
+    var cache = StatCache {}
+    if !fileExists(path) { return cache }
+    match readKtenFile(path) {
+        Ok(value) -> match value.items() {
+            Ok(items) -> {
+                for item in items {
+                    match rememberedOf(item) {
+                        Some(pair) -> cache.entries.set(pair.0, pair.1)
+                        None -> {}
+                    }
+                }
+            }
+            Error(failure) -> absorb failure
+        }
+        Error(failure) -> absorb failure
+    }
+    return cache
+}
+
+// The Kten value the file at `path` holds in its binary form.
+function readKtenFile(path: borrow String) -> Result<Kten, BuildFailure> {
+    let bytes = match readFileBytes(path) {
+        Ok(read) -> read
+        Error(failure) -> return .Error(.Files("cannot read \(path): \(traceText(failure))"))
+    }
+    return match decodeKten(bytes) {
+        Ok(value) -> .Ok(value)
+        Error(failure) -> .Error(.Files("\(path) does not read as Kten: \(traceText(failure))"))
+    }
+}
+
+function writeKtenFile(path: borrow String, value: borrow Kten) -> Result<Void, BuildFailure> {
+    return match writeFileBytes(path, value.encoded()) {
+        Ok -> .Ok
+        Error(failure) -> .Error(.Files("cannot write \(path): \(traceText(failure))"))
+    }
+}
+
+function rememberedOf(item: borrow Kten) -> (String, Remembered)? {
+    match ktenTextField(item, "path") {
+        Some(name) -> match ktenTextField(item, "digest") {
+            Some(sum) -> {
+                let known = Remembered {
+                    size: ktenNumberField(item, "size").or(-1),
+                    modified: ktenNumberField(item, "modified").or(-1),
+                    inode: ktenNumberField(item, "inode").or(-1),
+                    digest: sum
+                }
+                return .Some((name, known))
+            }
+            None -> return .None
+        }
+        None -> return .None
+    }
+}
+
+function ktenTextField(item: borrow Kten, name: borrow String) -> String? {
+    match item.field(name) {
+        Ok(value) -> match value.text() {
+            Ok(text) -> return .Some(text)
+            Error(failure) -> absorb failure
+        }
+        Error(failure) -> absorb failure
+    }
+    return .None
+}
+
+function ktenNumberField(item: borrow Kten, name: borrow String) -> Number? {
+    match item.field(name) {
+        Ok(value) -> match value.number() {
+            Ok(number) -> return .Some(number)
+            Error(failure) -> absorb failure
+        }
+        Error(failure) -> absorb failure
+    }
+    return .None
+}
+
+// Every entry under `root` but those under a path of `excluding`, in byte
+// order of their paths. A file's content is its digest.
+function walkTree(
+    cache: borrow mut StatCache,
+    root: borrow String,
+    excluding: borrow [String]
+) -> Result<[TreeEntry], BuildFailure> {
+    var entries: [TreeEntry] = []
+    match walkInto(cache, root, "", excluding, entries) {
+        Ok -> {}
+        Error(failure) -> return .Error(failure)
+    }
+    return .Ok(sortedEntries(entries))
+}
+
+function walkInto(
+    cache: borrow mut StatCache,
+    root: borrow String,
+    relative: borrow String,
+    excluding: borrow [String],
+    entries: borrow mut [TreeEntry]
+) -> Result<Void, BuildFailure> {
+    let directory = joinPath(root, relative)
+    let names = match listDirectory(directory) {
+        Ok(listing) -> listing.entries
+        Error(failure) -> return .Error(.Files("cannot list \(directory): \(traceText(failure))"))
+    }
+    for name in names {
+        let path = relative.count == 0 ? copy name : relative + "/" + name
+        var skipped = false
+        for excluded in excluding {
+            if pathUnder(path, excluded) { skipped = true }
+        }
+        if skipped { continue }
+        let full = joinPath(root, path)
+        let status = match linkStatus(full) {
+            Ok(found) -> found
+            Error(failure) -> return .Error(.Files("cannot read \(full): \(traceText(failure))"))
+        }
+        match status.kind {
+            Directory -> {
+                entries.append(
+                    TreeEntry { path: copy path, kind: .Directory, mode: status.mode, content: "" }
+                )
+                match walkInto(cache, root, path, excluding, entries) {
+                    Ok -> {}
+                    Error(failure) -> return .Error(failure)
+                }
+            }
+            File -> {
+                let sum = match cache.fileHex(full) {
+                    Ok(hex) -> hex
+                    Error(failure) -> return .Error(failure)
+                }
+                entries.append(
+                    TreeEntry { path: copy path, kind: .File, mode: status.mode, content: sum }
+                )
+            }
+            Link -> {
+                let target = match readSymbolicLink(full) {
+                    Ok(text) -> text
+                    Error(failure) -> return .Error(
+                        .Files("cannot read the link \(full): \(traceText(failure))")
+                    )
+                }
+                entries.append(
+                    TreeEntry { path: copy path, kind: .Link, mode: status.mode, content: target }
+                )
+            }
+            Other -> return .Error(.Files("\(full) is neither a file, a directory nor a link"))
+        }
+    }
+    return .Ok
+}
+
+function sortedEntries(entries: borrow [TreeEntry]) -> [TreeEntry] {
+    return entries.sorted({ left, right in return orderStrings(left.path, right.path) < 0 })
+}
+
+// A tree's listing as Kten: what its digest is the digest of, and what the
+// store keeps of it.
+function listingKten(entries: borrow [TreeEntry]) -> Kten {
+    var items: [Kten] = []
+    for entry in entries {
+        items.append(
+            ktenBare(
+                [
+                    ktenField("path", .Text(copy entry.path)),
+                    ktenField("kind", .Text(entryKindName(entry.kind))),
+                    ktenField("mode", .Number(entry.mode)),
+                    ktenField("content", .Text(copy entry.content))
+                ]
+            )
+        )
+    }
+    return .List(items)
+}
+
+function entryKindName(kind: TreeEntryKind) -> String {
+    return match kind {
+        File -> "file"
+        Directory -> "directory"
+        Link -> "link"
+    }
+}
+
+function listingOf(bytes: borrow [UN8]) -> Result<[TreeEntry], BuildFailure> {
+    let items = match decodeKten(bytes) {
+        Ok(value) -> match value.items() {
+            Ok(list) -> list
+            Error(failure) -> return .Error(
+                .Files("a tree listing is not a list: \(traceText(failure))")
+            )
+        }
+        Error(failure) -> return .Error(
+            .Files("a tree listing does not read: \(traceText(failure))")
+        )
+    }
+    var entries: [TreeEntry] = []
+    for item in items {
+        let path = ktenTextField(item, "path").or("")
+        let content = ktenTextField(item, "content").or("")
+        let mode = ktenNumberField(item, "mode").or(0)
+        let kind = match ktenTextField(item, "kind").or("") {
+            "file" -> TreeEntryKind.File
+            "directory" -> TreeEntryKind.Directory
+            "link" -> TreeEntryKind.Link
+            else -> return .Error(.Files("a tree listing has an entry of no kind"))
+        }
+        entries.append(TreeEntry { path: path, kind: kind, mode: mode, content: content })
+    }
+    return .Ok(entries)
+}

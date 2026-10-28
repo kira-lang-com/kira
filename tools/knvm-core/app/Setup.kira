@@ -1,0 +1,158 @@
+import Foundation
+
+// Setting up a machine from releases: `knvm setup`.
+//
+// Nothing is built. `klf` comes first, from the framework's releases, and its
+// own `klf setup` finishes it: the RIDL LLVM it links with, and the selection
+// brought up to date. Then every published language, newest release each, and
+// last `knvm` and a launcher per compiler, out of knvm's own release archive,
+// which carries every one of them already executable.
+//
+// Run on a machine that already has them, it brings each up to date: an
+// installed version is selected as it stands, and the tools are replaced the
+// way `sinstall` replaces them, the running `knvm` renamed out of the way.
+
+// The release archive the tools come in, `knvm-<version>-<host>.tar.gz`.
+public let toolsArchiveName: String = "knvm"
+
+public enum SetupFailure {
+    // A compiler's newest release could not be installed, said in full.
+    Install(String)
+    // `klf setup` exited with this status.
+    KlfSetup(Number)
+    // knvm's own release could not be listed or fetched.
+    Source(SourceFailure)
+    // The tools could not be landed, at this path.
+    Tools(String)
+}
+
+public struct SetupReport {
+    var installed: [Installed] = []
+    var tools: SelfInstalled = SelfInstalled {}
+}
+
+public enum SetupOutcome {
+    Ready(SetupReport)
+    Failed(SetupFailure)
+}
+
+public function setupFromReleases(shellHome: borrow String, shell: borrow String) -> SetupOutcome {
+    var report = SetupReport {}
+    let klf = klfCompiler()
+    match installNewest(klf) {
+        Failed(failure) -> { return .Failed(.Install("installing " + klf.name + ": " + installFailureText(failure))) }
+        Installed(installed) -> {
+            let arguments: [String] = ["setup"]
+            let status = runTool(binaryPath(installed.root, klf), arguments)
+            if status != 0 { return .Failed(.KlfSetup(status)) }
+            report.installed.append(installed)
+        }
+    }
+    for language in publishedLanguages() {
+        match installNewest(language) {
+            Failed(failure) -> { return .Failed(.Install("installing " + language.name + ": " + installFailureText(failure))) }
+            Installed(installed) -> {
+                if !register(language) { return .Failed(.Tools(compilerRoot(language))) }
+                report.installed.append(installed)
+            }
+        }
+    }
+    match installTools(shellHome, shell) {
+        Failed(failure) -> { return .Failed(failure) }
+        Ready(tools) -> { report.tools = tools.tools }
+    }
+    return .Ready(report)
+}
+
+// The newest release of `compiler`, installed and selected.
+public function installNewest(compiler: borrow Compiler) -> InstallOutcome {
+    return installToolchain(compiler, defaultSource(compiler), VersionSpec { latest: true }, .Release)
+}
+
+// What knvm's own release is published as: an archive of `bin/`, holding
+// `knvm` and the launcher under every compiler's name.
+public function toolsRelease() -> Compiler {
+    let parts: [String] = [joinPath(binaryDirectoryName, managerToolName)]
+    return Compiler {
+        name: toolsArchiveName,
+        binary: managerToolName,
+        parts: copy parts,
+        repository: languagesRepository,
+        feedVariable: feedVariableFor(toolsArchiveName)
+    }
+}
+
+// knvm and the launchers out of the newest tools release, into
+// `<klf-home>/bin`, and that directory onto PATH.
+public function installTools(shellHome: borrow String, shell: borrow String) -> SetupOutcome {
+    let release = toolsRelease()
+    let source = defaultSource(release)
+    var version = ""
+    match resolveVersion(source, VersionSpec { latest: true }, .Release) {
+        Failed(failure) -> { return .Failed(.Source(failure)) }
+        Found(found) -> version = found
+    }
+    let staging = joinPath(stagingRoot(), "setup-" + processTag())
+    if !makeDirectoryTree(staging) { return .Failed(.Tools(staging)) }
+    var archive = ""
+    match fetchArchive(source, release, .Release, version, staging) {
+        Failed(failure) -> {
+            removeTree(staging)
+            return .Failed(.Source(failure))
+        }
+        Fetched(path) -> archive = path
+    }
+    let tree = joinPath(staging, "tree")
+    match unpackArchive(archive, tree) {
+        Failed(failure) -> {
+            removeTree(staging)
+            return .Failed(.Install("unpacking knvm's release: " + installFailureText(failure)))
+        }
+        Extracted -> {}
+    }
+    let landed = landTools(joinPath(tree, binaryDirectoryName), shellHome, shell)
+    removeTree(staging)
+    return landed
+}
+
+// Every tool `unpacked` holds, in place of the installed one.
+public function landTools(unpacked: borrow String, shellHome: borrow String, shell: borrow String) -> SetupOutcome {
+    let binDirectory = joinPath(klfHome(), toolsDirectoryName)
+    if !makeDirectoryTree(binDirectory) { return .Failed(.Tools(binDirectory)) }
+    sweepDisplaced(binDirectory)
+    var tools: [String] = []
+    for name in installedToolNames() {
+        let built = joinPath(unpacked, name)
+        if !fileExists(built) { continue }
+        let destination = joinPath(binDirectory, name)
+        if !displace(destination) { return .Failed(.Tools(destination)) }
+        if !succeeded(renamePath(built, destination)) { return .Failed(.Tools(destination)) }
+        tools.append(name)
+    }
+    match configurePath(shellHome, shell, binDirectory) {
+        Failed(failure) -> { return .Failed(.Tools(failure)) }
+        Ready(path) -> {
+            var report = SetupReport {}
+            report.tools = SelfInstalled {
+                binDirectory: binDirectory,
+                tools: tools,
+                environmentScript: path.environmentScript,
+                startupFile: path.startupFile,
+                updatedPath: path.updated
+            }
+            return .Ready(report)
+        }
+    }
+    return .Failed(.Tools(binDirectory))
+}
+
+// Why setting up failed, in one line.
+public function setupFailureText(failure: borrow SetupFailure) -> String {
+    match failure {
+        Install(detail) -> { return detail }
+        KlfSetup(status) -> { return "`klf setup` exited with " + String(status) }
+        Source(reason) -> { return "knvm's own release: " + sourceFailureText(reason) }
+        Tools(path) -> { return "could not land the tools at `" + path + "`" }
+    }
+    return ""
+}

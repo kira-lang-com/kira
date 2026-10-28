@@ -1,0 +1,381 @@
+// The TLS 1.3 handshake engine (DESIGN.md section 5). It owns no socket and
+// reads no clock: handshake bytes go in with the level they arrived at, and
+// bytes to send, secrets and the outcome come out as events. QUIC carries the
+// bytes in CRYPTO frames (RFC 9001 section 4); `TlsStream` carries them in
+// records over TCP.
+
+enum TlsEncryptionLevel {
+    Initial
+    Handshake
+    Application
+}
+
+enum TlsRole {
+    Client
+    Server
+}
+
+// What carries the handshake, which changes what it must say: QUIC requires
+// ALPN and transport parameters and forbids the legacy session ID (RFC 9001
+// section 8).
+enum TlsCarrier {
+    Quic
+    Records
+}
+
+namespace TlsOffer {
+    let suites: [CipherSuite] = [.Aes128GcmSha256, .Aes256GcmSha384, .ChaCha20Poly1305Sha256]
+    // X25519 first: its share is half the size and it is the common choice.
+    let groups: [KeyGroup] = [.X25519, .Secp256r1]
+    let schemes: [SignatureScheme] = [
+        .EcdsaSecp256r1Sha256,
+        .Ed25519,
+        .RsaPssRsaeSha256,
+        .EcdsaSecp384r1Sha384,
+        .RsaPssRsaeSha384
+    ]
+}
+
+struct TlsLevelBytes {
+    let level: TlsEncryptionLevel
+    let bytes: [UN8]
+}
+
+// The traffic secrets of one level, each direction's own.
+struct TlsLevelSecrets {
+    let level: TlsEncryptionLevel
+    let parameters: TlsSuiteParameters
+    let client: [UN8]
+    let server: [UN8]
+}
+
+// What a finished handshake agreed.
+struct TlsAgreement {
+    let suite: CipherSuite
+    let applicationProtocol: String?
+    let peerTransportParameters: [UN8]?
+    // The peer's chain, end entity first; empty from a client that sent none.
+    let peerCertificates: [[UN8]]
+}
+
+enum TlsEvent {
+    Send(TlsLevelBytes)
+    Secrets(TlsLevelSecrets)
+    Complete(TlsAgreement)
+    // The peer moved to new sending keys; `true` when it asks for ours too
+    // (RFC 8446 section 4.6.3). Records only.
+    PeerUpdatedKeys(Bool)
+}
+
+enum TlsHandshakeStage {
+    AwaitServerHello
+    AwaitEncryptedExtensions
+    AwaitCertificate
+    AwaitCertificateVerify
+    AwaitServerFinished
+    AwaitClientHello
+    AwaitRetriedHello
+    AwaitClientFinished
+    Connected
+    Failed
+}
+
+struct TlsClientSettings {
+    let carrier: TlsCarrier
+    // The name the certificate must hold, and the SNI unless it is an address.
+    let serverName: String
+    let protocols: [String]
+    // The time certificates are checked at, in seconds since the Unix epoch.
+    let seconds: Number
+    // Trust anchors besides the bundled roots, each DER behind a 24-bit length.
+    let anchors: [UN8] = []
+    // QUIC's transport parameters, encoded by the transport.
+    let transportParameters: [UN8] = []
+}
+
+// The certificate chain a server presents and the key that proves it.
+struct TlsServerIdentity {
+    let certificates: [[UN8]]
+    let key: SigningKey
+    let scheme: SignatureScheme
+}
+
+struct TlsServerSettings {
+    let carrier: TlsCarrier
+    let identity: TlsServerIdentity
+    // In preference order; empty when the server speaks no ALPN protocol.
+    let protocols: [String]
+    let transportParameters: [UN8] = []
+}
+
+// A key share this client sent, kept until the server picks one.
+struct TlsShareOffer {
+    let group: KeyGroup
+    let agreement: KeyAgreement
+}
+
+// A stage's secret and the two traffic secrets derived from it.
+struct TlsStageKeys {
+    let parameters: TlsSuiteParameters
+    let secret: [UN8]
+    let client: [UN8]
+    let server: [UN8]
+}
+
+function tlsStageKeys(
+    parameters: borrow TlsSuiteParameters,
+    secret: borrow [UN8],
+    level: TlsEncryptionLevel,
+    transcriptHash: borrow [UN8]
+) -> Result<TlsStageKeys, CryptoFailure> {
+    let (clientLabel, serverLabel) = match level {
+        Application -> ("c ap traffic", "s ap traffic")
+        Handshake -> ("c hs traffic", "s hs traffic")
+        Initial -> ("c hs traffic", "s hs traffic")
+    }
+    let client = try tlsDeriveSecret(parameters, secret, clientLabel, transcriptHash)
+    let server = try tlsDeriveSecret(parameters, secret, serverLabel, transcriptHash)
+    return .Ok(
+        TlsStageKeys {
+            parameters: copy parameters,
+            secret: copy secret,
+            client: client,
+            server: server
+        }
+    )
+}
+
+struct TlsHandshake {
+    let role: TlsRole
+    let carrier: TlsCarrier
+    let serverName: String
+    let protocols: [String]
+    let seconds: Number
+    let anchors: [UN8]
+    let transportParameters: [UN8]
+    let identity: TlsServerIdentity?
+    var stage: TlsHandshakeStage
+    var transcript: TlsTranscript = TlsTranscript {}
+    var buffer: TlsMessageBuffer = TlsMessageBuffer {}
+    var events: [TlsEvent] = []
+    var delivered: Number = 0
+    var random: [UN8] = []
+    var sessionId: [UN8] = []
+    var offers: [TlsShareOffer] = []
+    var cookie: [UN8]? = .None
+    var retrySuite: CipherSuite? = .None
+    var requestedGroup: KeyGroup? = .None
+    var keys: TlsStageKeys? = .None
+    var applicationKeys: TlsStageKeys? = .None
+    var peerChain: [[UN8]] = []
+    var certificateContext: [UN8]? = .None
+    var chosenProtocol: String? = .None
+    var peerTransport: [UN8]? = .None
+
+    // The next event, oldest first.
+    function event(borrow mut self) -> TlsEvent? {
+        if delivered == events.count {
+            if delivered > 0 {
+                events = []
+                delivered = 0
+            }
+            return .None
+        }
+        let next = copy events[delivered]
+        delivered += 1
+        return .Some(next)
+    }
+
+    function isConnected(borrow self) -> Bool {
+        return stage == .Connected
+    }
+
+    // Handshake bytes the peer sent at `level`. A failure ends the
+    // handshake: the caller sends the alert, and every later call fails.
+    function receive(
+        borrow mut self,
+        level: TlsEncryptionLevel,
+        bytes: borrow [UN8]
+    ) -> Result<Void, TlsAlert> {
+        if stage == .Failed { return .Error(.UnexpectedMessage) }
+        match absorb(level, bytes) {
+            Ok -> return .Ok
+            Error(alert) -> {
+                stage = .Failed
+                return .Error(alert)
+            }
+        }
+    }
+
+    function absorb(
+        borrow mut self,
+        level: TlsEncryptionLevel,
+        bytes: borrow [UN8]
+    ) -> Result<Void, TlsAlert> {
+        if level != expectedLevel() { return .Error(.UnexpectedMessage) }
+        buffer.add(bytes)
+        while true {
+            let next = try buffer.next()
+            match next {
+                Some(message) -> {
+                    try take(message)
+                    // A message may not straddle a change of keys (RFC 8446
+                    // section 5.1).
+                    if expectedLevel() != level && !buffer.isEmpty() {
+                        return .Error(.UnexpectedMessage)
+                    }
+                }
+                None -> return .Ok
+            }
+        }
+        return .Ok
+    }
+
+    function expectedLevel(borrow self) -> TlsEncryptionLevel {
+        return match stage {
+            AwaitServerHello -> .Initial
+            AwaitClientHello -> .Initial
+            AwaitRetriedHello -> .Initial
+            AwaitEncryptedExtensions -> .Handshake
+            AwaitCertificate -> .Handshake
+            AwaitCertificateVerify -> .Handshake
+            AwaitServerFinished -> .Handshake
+            AwaitClientFinished -> .Handshake
+            Connected -> .Application
+            Failed -> .Application
+        }
+    }
+
+    function take(borrow mut self, message: borrow TlsHandshakeMessage) -> Result<Void, TlsAlert> {
+        return match stage {
+            AwaitServerHello -> takeServerHello(message)
+            AwaitEncryptedExtensions -> takeEncryptedExtensions(message)
+            AwaitCertificate -> takeServerCertificate(message)
+            AwaitCertificateVerify -> takeCertificateVerify(message)
+            AwaitServerFinished -> takeServerFinished(message)
+            AwaitClientHello -> takeClientHello(message)
+            AwaitRetriedHello -> takeClientHello(message)
+            AwaitClientFinished -> takeClientFinished(message)
+            Connected -> takePostHandshake(message)
+            Failed -> .Error(.UnexpectedMessage)
+        }
+    }
+
+    // After the handshake only tickets and key updates may arrive. Tickets
+    // are dropped: this engine does not resume sessions yet.
+    function takePostHandshake(
+        borrow mut self,
+        message: borrow TlsHandshakeMessage
+    ) -> Result<Void, TlsAlert> {
+        match message.kind {
+            NewSessionTicket -> {
+                if role == .Server { return .Error(.UnexpectedMessage) }
+                return .Ok
+            }
+            KeyUpdate -> {
+                // QUIC updates keys itself and forbids this message (RFC
+                // 9001 section 6).
+                if carrier == .Quic { return .Error(.UnexpectedMessage) }
+                if message.body.count != 1 || message.body[0] > 1 { return .Error(.DecodeError) }
+                events.append(.PeerUpdatedKeys(message.body[0] == 1))
+                return .Ok
+            }
+            else -> return .Error(.UnexpectedMessage)
+        }
+    }
+
+    function send(borrow mut self, level: TlsEncryptionLevel, message: borrow TlsHandshakeMessage) {
+        transcript.add(message.encoded)
+        events.append(.Send(TlsLevelBytes { level: level, bytes: copy message.encoded }))
+    }
+
+    function transcriptHash(
+        borrow self,
+        parameters: borrow TlsSuiteParameters
+    ) -> Result<[UN8], TlsAlert> {
+        let hash = try transcript.hashed(parameters.hash) otherwise return .Error(.InternalError)
+        return .Ok(hash)
+    }
+
+    function handshakeKeys(borrow self) -> Result<TlsStageKeys, TlsAlert> {
+        return match keys {
+            Some(value) -> .Ok(value)
+            None -> .Error(.InternalError)
+        }
+    }
+
+    // The handshake secret from the shared secret, with the handshake
+    // traffic secrets over the transcript through ServerHello.
+    function enterHandshake(
+        borrow mut self,
+        parameters: borrow TlsSuiteParameters,
+        shared: borrow [UN8]
+    ) -> Result<Void, TlsAlert> {
+        let secret = try tlsHandshakeSecret(parameters, shared) otherwise return .Error(
+            .InternalError
+        )
+        let hash = try transcriptHash(parameters)
+        let derived = try tlsStageKeys(parameters, secret, .Handshake, hash)
+        otherwise return .Error(.InternalError)
+        events.append(.Secrets(tlsLevelSecrets(.Handshake, derived)))
+        keys = .Some(derived)
+        return .Ok
+    }
+
+    // The application traffic secrets over the transcript through the
+    // server's Finished.
+    function enterApplication(borrow mut self) -> Result<Void, TlsAlert> {
+        let current = try handshakeKeys()
+        let master = try tlsMasterSecret(current.parameters, current.secret)
+        otherwise return .Error(.InternalError)
+        let hash = try transcriptHash(current.parameters)
+        let derived = try tlsStageKeys(current.parameters, master, .Application, hash)
+        otherwise return .Error(.InternalError)
+        events.append(.Secrets(tlsLevelSecrets(.Application, derived)))
+        applicationKeys = .Some(derived)
+        return .Ok
+    }
+
+    // The Finished `sender` sends now, over the transcript so far.
+    function finishedFor(borrow self, sender: TlsRole) -> Result<[UN8], TlsAlert> {
+        let current = try handshakeKeys()
+        let hash = try transcriptHash(current.parameters)
+        let secret = match sender {
+            Client -> current.client
+            Server -> current.server
+        }
+        let data = try tlsFinishedData(current.parameters, secret, hash)
+        otherwise return .Error(.InternalError)
+        return .Ok(data)
+    }
+
+    function complete(borrow mut self) -> Result<Void, TlsAlert> {
+        let current = try handshakeKeys()
+        let agreement = TlsAgreement {
+            suite: current.parameters.suite,
+            applicationProtocol: copy chosenProtocol,
+            peerTransportParameters: copy peerTransport,
+            peerCertificates: copy peerChain
+        }
+        events.append(.Complete(agreement))
+        stage = .Connected
+        return .Ok
+    }
+}
+
+function tlsLevelSecrets(level: TlsEncryptionLevel, keys: borrow TlsStageKeys) -> TlsLevelSecrets {
+    return TlsLevelSecrets {
+        level: level,
+        parameters: copy keys.parameters,
+        client: copy keys.client,
+        server: copy keys.server
+    }
+}
+
+// The protocol both sides name, taken in `preferred`'s order.
+function tlsFirstShared(preferred: borrow [String], offered: borrow [String]) -> String? {
+    for name in preferred {
+        if offered.contains(name) { return .Some(copy name) }
+    }
+    return .None
+}

@@ -1,0 +1,45 @@
+function canonicalAliasReference(aliases: [AliasDeclaration], reference: TypeReference, depth: Int) -> TypeReference {
+    if depth > aliases.count {
+        report(.AliasCycle, reference.name.span)
+        return reference
+    }
+    for alias in aliases {
+        if alias.name.text == reference.name.text {
+            if alias.genericParameters.count != reference.arguments.count {
+                report(.UnknownType, reference.name.span)
+                return reference
+            }
+            let expanded = substituteGenericReference(alias.target, alias.genericParameters, reference.arguments)
+            return canonicalAliasReference(aliases, expanded, depth + 1)
+        }
+    }
+    var arguments: [TypeReference] = []
+    for argument in reference.arguments {
+        arguments.append(canonicalAliasReference(aliases, argument, depth))
+    }
+    var name = reference.name
+    match name.text {
+        "F64" -> name = Identifier { text = "Float", span = name.span }
+        "Int32" -> name = Identifier { text = "I32", span = name.span }
+        "UNumber" -> name = Identifier { text = "Number", span = name.span }
+        else -> {}
+    }
+    var instanceName = referenceInstanceName(name.text, arguments, reference.modes)
+    if arguments.count == 0 && name.text == reference.name.text { instanceName = reference.instanceName }
+    return TypeReference {
+        qualifier = reference.qualifier, name = name, arguments = arguments, modes = reference.modes, instanceName = instanceName
+    }
+}
+
+function checkAliasNames(declarations: Declarations) {
+    for index in 0..declarations.aliases.count {
+        let alias = declarations.aliases[index]
+        if declarations.typeNamed(alias.name.text).isSome() { report(.AliasDuplicate, alias.name.span) }
+        for earlier in 0..index {
+            if declarations.aliases[earlier].name.text == alias.name.text {
+                report(.AliasDuplicate, alias.name.span)
+                break
+            }
+        }
+    }
+}

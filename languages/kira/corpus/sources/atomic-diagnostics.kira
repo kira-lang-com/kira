@@ -1,0 +1,26 @@
+// What the atomics refuse: an operand no machine word holds, arithmetic on a
+// pointer, an ordering written as anything but a case, and orderings the
+// operation cannot have -- a releasing load, an acquiring store, a relaxed
+// fence and a compare-exchange failing stronger than it succeeds.
+enum MemoryOrder {
+    Relaxed
+    Acquire
+    Release
+    AcquireRelease
+    SequentiallyConsistent
+}
+
+@Main
+function main() -> Int {
+    let cell = heapAllocateRaw(8, 8)
+    let order: MemoryOrder = .Relaxed
+    atomicAdd<Float>(cell, 1.0, .Relaxed)
+    atomicAdd<RawPtr>(cell, cell, .Relaxed)
+    atomicStore<Int>(cell, 1, order)
+    let loaded = atomicLoad<Int>(cell, .Release)
+    atomicStore<Int>(cell, 2, .Acquire)
+    atomicFence(.Relaxed)
+    let read = atomicCompareExchange<Int>(cell, 0, 1, .Relaxed, .Acquire)
+    heapFreeRaw(cell)
+    return 0
+}

@@ -1,0 +1,129 @@
+// The builtins Kira answers from a value's shape: `code(e)` and
+// `fromCode<E>(n)` for an enum's variant index, `compare(a, b)` for the
+// three-way order as Foundation's `Ordering`, and `hash(v)` for the fold that
+// agrees with `==`. Each yields to a local or a function of the same name,
+// as the nearer, written name wins.
+
+extend Checker {
+    function shapeBuiltinFree(borrow self, name: String) -> Bool {
+        return lookup(name).isNone() && declarations.findFunction(.None, name).isNone()
+    }
+
+    function invalidBuiltin(borrow mut self, span: Span) -> Int {
+        return add(.Integer(0), Type.invalid(), span)
+    }
+
+    function checkCode(borrow mut self, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 1 {
+            report(.BuiltinArguments, span)
+            return invalidBuiltin(span)
+        }
+        let value = expression(arguments[0], .None)
+        let valueType = typeOf(value)
+        if valueType.isInvalid() { return invalidBuiltin(span) }
+        if valueType.kind != .Enumeration {
+            report(.BuiltinArgumentType, span)
+            return invalidBuiltin(span)
+        }
+        match declarations.findFunction(.Some(valueType), "rawValue") {
+            Some(target) -> return callChecked(target, .Some(value), [], span)
+            None -> {}
+        }
+        let code = add(.EnumCode(value), Type.int(), span)
+        match program.enums[valueType.declaration].representation {
+            Some(representation) -> {
+                // A decimal representation is a `Number`, which an integer
+                // widens into through the runtime, not a resize.
+                if representation.isNumber() { return numberCall(2, [code], representation, span) }
+                return add(.Convert(code), representation, span)
+            }
+            None -> return code
+        }
+    }
+
+    // `fromCode<E>(n)`: `E` is an enum whose variants carry no payload, as
+    // there is no payload to rebuild, and `n` an integer.
+    function checkFromCode(borrow mut self, types: [TypeReference], arguments: [Int], span: Span) -> Int {
+        if types.count != 1 {
+            report(.BuiltinArgumentType, span)
+            return invalidBuiltin(span)
+        }
+        let target = resolveType(types[0])
+        if target.isInvalid() { return invalidBuiltin(span) }
+        if target.kind != .Enumeration || carriesPayload(program, target) {
+            report(.BuiltinArgumentType, span)
+            return invalidBuiltin(span)
+        }
+        match declarations.findFunction(.Some(target), "fromRawValue") {
+            Some(found) -> return call(found, .None, arguments, span)
+            None -> {}
+        }
+        if arguments.count != 1 {
+            report(.BuiltinArguments, span)
+            return invalidBuiltin(span)
+        }
+        var expected = Type.int()
+        match program.enums[target.declaration].representation {
+            Some(representation) -> expected = representation
+            None -> {}
+        }
+        var code = expression(arguments[0], .Some(expected))
+        let codeType = typeOf(code)
+        if codeType.isInvalid() { return invalidBuiltin(span) }
+        if codeType.kind == .Decimal { code = fromNumber(code, Type.int(), span) }
+        if !typeOf(code).isInteger() {
+            report(.BuiltinArgumentType, span)
+            return invalidBuiltin(span)
+        }
+        if !typeOf(code).equals(Type.int()) { code = add(.Convert(code), Type.int(), span) }
+        return add(.EnumFromCode(code), target, span)
+    }
+
+    function checkHash(borrow mut self, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 1 {
+            report(.BuiltinArguments, span)
+            return invalidBuiltin(span)
+        }
+        let value = expression(arguments[0], .None)
+        let valueType = typeOf(value)
+        if valueType.isInvalid() { return invalidBuiltin(span) }
+        if shapeLeaf(program, declarations, valueType, .Hashable, []).isSome() {
+            report(.NotHashable, span)
+            return invalidBuiltin(span)
+        }
+        return add(.Hash(value), Type.int(), span)
+    }
+
+    // `compare(a, b)`: the structural sign shifted into `Ordering`'s
+    // variants, `Less`, `Equal` and `Greater` in that order.
+    function checkCompareBuiltin(borrow mut self, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 2 {
+            report(.BuiltinArguments, span)
+            return invalidBuiltin(span)
+        }
+        let first = expression(arguments[0], .None)
+        let second = expression(arguments[1], .Some(typeOf(first)))
+        let operands = reconcile(first, second, .BuiltinArgumentType)
+        let operandType = typeOf(operands.left)
+        if operandType.isInvalid() || typeOf(operands.right).isInvalid() { return invalidBuiltin(span) }
+        if shapeLeaf(program, declarations, operandType, .Ordered, []).isSome() {
+            report(.NotOrdered, span)
+            return invalidBuiltin(span)
+        }
+        match declarations.typeNamed("Ordering") {
+            Some(ordering) -> {
+                if ordering.kind != .Enumeration || program.enums[ordering.declaration].variants.count != 3 {
+                    report(.BuiltinArgumentType, span)
+                    return invalidBuiltin(span)
+                }
+                let sign = add(.Order(operands.left, operands.right), Type.int(), span)
+                let shifted = add(.Arithmetic(.Add, sign, add(.Integer(1), Type.int(), span)), Type.int(), span)
+                return add(.EnumFromCode(shifted), ordering, span)
+            }
+            None -> {
+                report(.BuiltinArgumentType, span)
+                return invalidBuiltin(span)
+            }
+        }
+    }
+}

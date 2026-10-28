@@ -1,0 +1,286 @@
+// Expressions: what each computes and its type.
+//
+// A constant, written or named, retypes to what its position expects;
+// anything else must already match. A scalar beside a vector of its kind
+// scales it, in either order.
+
+function isOrdering(op: Operator) -> Bool {
+    return op == .Less || op == .LessEqual || op == .Greater || op == .GreaterEqual
+}
+
+function isComparison(op: Operator) -> Bool {
+    return op == .Equal || op == .NotEqual || isOrdering(op)
+}
+
+function isLogical(op: Operator) -> Bool {
+    return op == .LogicalAnd || op == .LogicalOr
+}
+
+// The scalar a constant beside `operand` takes.
+function elementOf(operand: ShaderType) -> ShaderType {
+    if operand.shape == .Vector || operand.shape == .Matrix { return operand.component() }
+    return operand
+}
+
+extend Checker {
+    function blank(borrow self, kind: CheckedKind, expressionType: ShaderType, span: Span) -> CheckedExpression {
+        return CheckedExpression {
+            kind = kind, expressionType = expressionType, value = ConstValue { scalar = .Bool, text = "" },
+            target = -1, left = -1, right = -1, arguments = [], components = [], operator = .Add,
+            builtin = .Mul, span = span
+        }
+    }
+
+    function push(borrow mut self, expression: CheckedExpression) -> Int {
+        program.expressions.append(expression)
+        return program.expressions.count - 1
+    }
+
+    function alloc(borrow mut self, kind: CheckedKind, expressionType: ShaderType, span: Span) -> Int {
+        return push(blank(kind, expressionType, span))
+    }
+
+    function invalid(borrow mut self, span: Span) -> Int {
+        return alloc(.Invalid, voidType(), span)
+    }
+
+    function constantExpression(borrow mut self, constantType: ShaderType, value: ConstValue, span: Span) -> Int {
+        var expression = blank(.Constant, constantType, span)
+        expression.value = value
+        return push(expression)
+    }
+
+    function typeOf(borrow self, expression: Int) -> ShaderType {
+        return program.expressions[expression].expressionType
+    }
+
+    function checkExpression(borrow mut self, index: Int) -> Int {
+        let written = tree.expressions[index]
+        match written.kind {
+            IntegerLiteral -> {
+                let value = literalValue(written.text)
+                return constantExpression(scalarType(value.scalar), value, written.span)
+            }
+            FloatLiteral -> return constantExpression(
+                scalarType(.Float), ConstValue { scalar = .Float, text = written.text }, written.span
+            )
+            BooleanLiteral -> return constantExpression(
+                scalarType(.Bool), ConstValue { scalar = .Bool, text = written.text }, written.span
+            )
+            Name -> return nameExpression(written.text, written.span)
+            Field -> {
+                // An enum is a namespace, not a value: `Ink.Low` is found by
+                // its whole written path before `Ink` is looked up.
+                let path = constantPath(index)
+                if path >= 0 { return path }
+                return member(checkExpression(written.left), written.text, written.span)
+            }
+            Index -> return indexExpression(written)
+            Call -> return call(written)
+            Unary -> return unaryExpression(written.operator, checkExpression(written.left), written.span)
+            Binary -> {
+                let left = checkExpression(written.left)
+                let right = checkExpression(written.right)
+                return binaryExpression(written.operator, left, right, written.span)
+            }
+        }
+    }
+
+    function constantPath(borrow mut self, index: Int) -> Int {
+        match writtenPath(index) {
+            Some(path) -> {
+                let found = constantNamed(path)
+                if found < 0 { return -1 }
+                let named = constants[found]
+                return constantExpression(named.constantType, named.value, tree.expressions[index].span)
+            }
+            None -> return -1
+        }
+    }
+
+    // A local, then a resource, then an option, then a constant of this
+    // file, then any constant.
+    function nameExpression(borrow mut self, name: String, span: Span) -> Int {
+        let local = lookup(name)
+        if local >= 0 {
+            var expression = blank(.Local, locals[local].localType, span)
+            expression.target = local
+            return push(expression)
+        }
+        let resource = lastNamed(resourceNames, name)
+        if resource >= 0 {
+            var expression = blank(.Resource, program.resources[resource].resourceType, span)
+            expression.target = resource
+            return push(expression)
+        }
+        let option = lastNamed(optionNames, name)
+        if option >= 0 {
+            var expression = blank(.OptionValue, program.options[option].optionType, span)
+            expression.target = option
+            return push(expression)
+        }
+        var found = constantNamed(qualified(name))
+        if found < 0 { found = constantNamed(name) }
+        if found >= 0 {
+            return constantExpression(constants[found].constantType, constants[found].value, span)
+        }
+        report(.UnknownName, span)
+        return invalid(span)
+    }
+
+    // A struct field, a vector swizzle, or an array's `count`.
+    function member(borrow mut self, base: Int, name: String, span: Span) -> Int {
+        let baseType = typeOf(base)
+        if baseType.array {
+            if name != "count" {
+                report(.NoSuchMember, span)
+                return invalid(span)
+            }
+            var expression = blank(.ArrayLength, scalarType(.UInt), span)
+            expression.left = base
+            return push(expression)
+        }
+        match baseType.shape {
+            Struct -> {
+                let fields = program.structs[baseType.index].fields
+                for position in 0..fields.count {
+                    if fields[position].name == name {
+                        var expression = blank(.Field, fields[position].fieldType, span)
+                        expression.left = base
+                        expression.target = position
+                        return push(expression)
+                    }
+                }
+            }
+            Vector -> {
+                match swizzle(name) {
+                    Some(components) -> {
+                        var fits = true
+                        for component in components {
+                            if component >= baseType.width { fits = false }
+                        }
+                        if fits {
+                            var selected = scalarType(baseType.scalar)
+                            if components.count > 1 { selected = vectorType(baseType.scalar, components.count) }
+                            var expression = blank(.Swizzle, selected, span)
+                            expression.left = base
+                            expression.components = components
+                            return push(expression)
+                        }
+                    }
+                    None -> {}
+                }
+            }
+            Void -> return invalid(span)
+            ScalarShape -> {}
+            Matrix -> {}
+            Texture -> {}
+            Sampler -> {}
+        }
+        report(.NoSuchMember, span)
+        return invalid(span)
+    }
+
+    function indexExpression(borrow mut self, written: Expression) -> Int {
+        let base = checkExpression(written.left)
+        let index = coerce(checkExpression(written.right), scalarType(.UInt), written.span)
+        let baseType = typeOf(base)
+        var element = voidType()
+        if baseType.array {
+            element = baseType.element()
+        } else if baseType.shape == .Vector {
+            element = scalarType(baseType.scalar)
+        } else {
+            if !baseType.isVoid() { report(.TypeMismatch, written.span) }
+            return invalid(written.span)
+        }
+        var expression = blank(.Index, element, written.span)
+        expression.left = base
+        expression.right = index
+        return push(expression)
+    }
+
+    function unaryExpression(borrow mut self, op: Operator, operand: Int, span: Span) -> Int {
+        let operandType = typeOf(operand)
+        var legal = false
+        if op == .Negate { legal = operandType.isNumeric() }
+        if op == .Not { legal = operandType.isScalar(.Bool) }
+        if !legal {
+            report(.BadOperator, span)
+            return invalid(span)
+        }
+        var expression = blank(.Unary, operandType, span)
+        expression.operator = op
+        expression.left = operand
+        return push(expression)
+    }
+
+    function binaryExpression(borrow mut self, op: Operator, written: Int, writtenRight: Int, span: Span) -> Int {
+        var left = written
+        var right = writtenRight
+        var leftType = typeOf(left)
+        var rightType = typeOf(right)
+        if leftType.isVoid() || rightType.isVoid() { return invalid(span) }
+        if !leftType.same(rightType) {
+            if isLiteral(right) {
+                right = coerce(right, elementOf(leftType), span)
+                rightType = typeOf(right)
+            } else if isLiteral(left) {
+                left = coerce(left, elementOf(rightType), span)
+                leftType = typeOf(left)
+            }
+        }
+        if isOrdering(op) && leftType.isScalar(.Bool) {
+            report(.BadOperator, span)
+            return invalid(span)
+        }
+        var resultType = voidType()
+        if isLogical(op) {
+            if !leftType.isScalar(.Bool) || !rightType.isScalar(.Bool) {
+                report(.BadOperator, span)
+                return invalid(span)
+            }
+            resultType = leftType
+        } else if isComparison(op) {
+            if !leftType.same(rightType) {
+                report(.BadOperator, span)
+                return invalid(span)
+            }
+            resultType = scalarType(.Bool)
+        } else if leftType.same(rightType) {
+            resultType = leftType
+        } else if leftType.shape == .Vector && !leftType.array && rightType.isScalar(leftType.scalar) {
+            resultType = leftType
+        } else if rightType.shape == .Vector && !rightType.array && leftType.isScalar(rightType.scalar) {
+            resultType = rightType
+        } else {
+            report(.BadOperator, span)
+            return invalid(span)
+        }
+        var expression = blank(.Binary, resultType, span)
+        expression.operator = op
+        expression.left = left
+        expression.right = right
+        return push(expression)
+    }
+
+    function isLiteral(borrow self, expression: Int) -> Bool {
+        return program.expressions[expression].kind == .Constant
+    }
+
+    // `expression` as `expected`: unchanged when it already is, a retyped
+    // copy when it is a constant that may retype, else reported.
+    function coerce(borrow mut self, expression: Int, expected: ShaderType, span: Span) -> Int {
+        let actual = typeOf(expression)
+        if actual.same(expected) || actual.isVoid() || expected.isVoid() { return expression }
+        let checked = program.expressions[expression]
+        if checked.kind == .Constant && expected.shape == .ScalarShape && !expected.array {
+            match retype(checked.value, expected.scalar) {
+                Some(value) -> return constantExpression(expected, value, checked.span)
+                None -> {}
+            }
+        }
+        report(.TypeMismatch, span)
+        return expression
+    }
+}

@@ -1,0 +1,196 @@
+// KSIR types, and KSL's packing for every struct.
+//
+// Every struct is laid out explicitly, std140-like: a scalar is 4 bytes
+// aligned to 4, a 2-wide vector 8 aligned to 8, a 3- or 4-wide vector 16
+// aligned to 16, a matrix one 16-byte column per column, and a nested
+// struct its uniform size aligned to at least 16.
+// Its own KSIR alignment is its widest member's, as a storage array of it
+// steps by, and its size is its end rounded to that; reflection raises a
+// uniform's alignment to 16 itself.
+
+function roundUp(value: Int, alignment: Int) -> Int {
+    if alignment <= 0 { return value }
+    return (value + alignment - 1) / alignment * alignment
+}
+
+function vectorText(scalar: Scalar, width: Int) -> String {
+    return joinText(["vec", decimalText(width), "<", scalar.name(), ">"])
+}
+
+// A texture's KSIR type: sampled, or a storage image when written.
+function textureText(kind: TextureKind, access: Access) -> String {
+    let written = access == .Write || access == .ReadWrite
+    var mode = "store"
+    if access == .ReadWrite { mode = "load store" }
+    match kind {
+        Texture2d -> {
+            if written { return joinText(["image<2d, storage<rgba8unorm, ", mode, ">>"]) }
+            return "image<2d, sampled<float>>"
+        }
+        Texture2dUint -> {
+            if written { return joinText(["image<2d, storage<r32uint, ", mode, ">>"]) }
+            return "image<2d, sampled<uint>>"
+        }
+        TextureCube -> return "image<cube, sampled<float>>"
+        Depth2d -> return "image<2d, depth>"
+    }
+}
+
+function groupClass(name: String) -> String {
+    for class in ["frame", "pass", "material", "object", "draw", "dispatch"] {
+        if sameIgnoringCase(name, class) { return class }
+    }
+    return "custom"
+}
+
+extend Lowering {
+    // The KSIR spelling of a value type; a struct is declared first.
+    function typeText(borrow mut self, shaderType: ShaderType) -> String {
+        if shaderType.array {
+            let element = shaderType.element()
+            return joinText([
+                "array<", typeText(element), ", runtime, stride ", decimalText(storageStride(element)), ">"
+            ])
+        }
+        match shaderType.shape {
+            Void -> return "void"
+            ScalarShape -> return shaderType.scalar.name()
+            Vector -> return vectorText(shaderType.scalar, shaderType.width)
+            Matrix -> return joinText([
+                "mat", decimalText(shaderType.width), "x", decimalText(shaderType.rows), "<f32>"
+            ])
+            Struct -> {
+                declareStruct(shaderType.index)
+                return joinText(["%", program.structs[shaderType.index].name])
+            }
+            Texture -> return textureText(shaderType.texture, .Unwritten)
+            Sampler -> {
+                if shaderType.index == 1 { return "sampler<comparison>" }
+                return "sampler"
+            }
+        }
+    }
+
+    function typeHandle(borrow mut self, shaderType: ShaderType) -> Int {
+        return shader_type(module, typeText(shaderType))
+    }
+
+    // A member's packed size and alignment.
+    function packedSize(borrow self, member: ShaderType) -> Int {
+        if member.array { return 0 }
+        match member.shape {
+            ScalarShape -> return 4
+            Vector -> {
+                if member.width == 2 { return 8 }
+                return 16
+            }
+            Matrix -> return 16 * member.width
+            Struct -> return roundUp(structEnd(member.index), uniformAlign(member.index))
+            Void -> return 0
+            Texture -> return 0
+            Sampler -> return 0
+        }
+    }
+
+    function packedAlign(borrow self, member: ShaderType) -> Int {
+        if member.array { return 16 }
+        match member.shape {
+            ScalarShape -> return 4
+            Vector -> {
+                if member.width == 2 { return 8 }
+                return 16
+            }
+            Matrix -> return 16
+            Struct -> return uniformAlign(member.index)
+            Void -> return 1
+            Texture -> return 1
+            Sampler -> return 1
+        }
+    }
+
+    function uniformAlign(borrow self, structure: Int) -> Int {
+        var alignment = 16
+        for field in program.structs[structure].fields {
+            let fieldAlign = packedAlign(field.fieldType)
+            if fieldAlign > alignment { alignment = fieldAlign }
+        }
+        return alignment
+    }
+
+    // Where each member of `structure` starts, then where the last ends.
+    function offsets(borrow self, structure: Int) -> [Int] {
+        var placed: [Int] = []
+        var cursor = 0
+        for field in program.structs[structure].fields {
+            cursor = roundUp(cursor, packedAlign(field.fieldType))
+            placed.append(cursor)
+            cursor += packedSize(field.fieldType)
+        }
+        placed.append(cursor)
+        return placed
+    }
+
+    function structEnd(borrow self, structure: Int) -> Int {
+        let placed = offsets(structure)
+        return placed[placed.count - 1]
+    }
+
+    function storageAlign(borrow self, member: ShaderType) -> Int {
+        if member.shape != .Struct || member.array { return packedAlign(member) }
+        var alignment = 4
+        for field in program.structs[member.index].fields {
+            let fieldAlign = storageAlign(field.fieldType)
+            if fieldAlign > alignment { alignment = fieldAlign }
+        }
+        return alignment
+    }
+
+    function storageStride(borrow self, element: ShaderType) -> Int {
+        if element.shape == .Struct { return roundUp(structEnd(element.index), storageAlign(element)) }
+        return roundUp(packedSize(element), packedAlign(element))
+    }
+
+    // Declares struct `structure` and every struct it holds, each once.
+    function declareStruct(borrow mut self, structure: Int) {
+        if structHandles[structure] >= 0 { return }
+        let declared = program.structs[structure]
+        var types: [Int] = []
+        for field in declared.fields {
+            types.append(typeHandle(field.fieldType))
+        }
+        let placed = offsets(structure)
+        // Every struct carries KSL's packing, interface ones too: the oracle
+        // reflects each declared type with it.
+        for position in 0..declared.fields.count {
+            let field = declared.fields[position]
+            var binding = ""
+            if interface[structure] { binding = memberBinding(field) }
+            shader_span(module, field.span.file, field.span.start, field.span.end)
+            shader_type_member(
+                module, field.name, types[position], binding, placed[position],
+                packedSize(field.fieldType), packedAlign(field.fieldType)
+            )
+        }
+        let alignment = storageAlign(structType(structure))
+        let size = roundUp(placed[placed.count - 1], alignment)
+        shader_span(module, declared.span.file, declared.span.start, declared.span.end)
+        structHandles[structure] = shader_type_struct_explicit(module, declared.name, size, alignment)
+    }
+
+    // A stage interface member: its built-in, or the next location, flat
+    // when it holds integers.
+    function memberBinding(borrow self, field: CheckedField) -> String {
+        if utf8Count(field.builtin) > 0 {
+            match builtinValue(field.builtin) {
+                Some(value) -> return joinText(["@builtin(", value, ")"])
+                None -> return ""
+            }
+        }
+        var interpolation = field.interpolation
+        let numeric = field.fieldType.shape == .ScalarShape || field.fieldType.shape == .Vector
+        let integral = numeric && (field.fieldType.scalar == .Int || field.fieldType.scalar == .UInt)
+        if utf8Count(interpolation) == 0 && integral { interpolation = "flat" }
+        if utf8Count(interpolation) == 0 { return "@location(auto)" }
+        return joinText(["@location(auto) @interpolate(", interpolation, ")"])
+    }
+}

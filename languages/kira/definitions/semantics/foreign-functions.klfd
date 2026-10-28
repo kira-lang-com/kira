@@ -1,0 +1,512 @@
+// `@FFI.Extern` and `@FFI.Address` functions (KLF section 26): a C symbol
+// named in a package's native library, called with the platform C
+// convention. The block is checked as kira checks it, and each parameter and
+// the result get the seam they cross as; a call converts its arguments to
+// what C reads, and a `CString` result to the `String` Kira sees.
+
+extend Checker {
+    function checkForeignFunctions(borrow mut self) {
+        for index in 0..declarations.signatures.count {
+            let signature = declarations.signatures[index]
+            match foreignMarkIndex(tree, signature.declaration.annotations) {
+                Some(markIndex) -> {
+                    var mark = tree.foreignMarks[markIndex]
+                    if !isCallableForm(mark.form) {
+                        report(.ForeignFormPosition, mark.span)
+                        continue
+                    }
+                    if !uniqueForeignName(index) { continue }
+                    var variadic = false
+                    var primary: Optional<ForeignMark> = .None
+                    for marked in foreignMarkIndices(tree, signature.declaration.annotations) {
+                        let other = tree.foreignMarks[marked]
+                        if other.form == .Variadic {
+                            if variadic { report(.ForeignFieldTwice, other.span) }
+                            if other.fields.count > 0 { report(.ForeignUnknownField, other.fields[0].key.span) }
+                            variadic = true
+                        } else if primary.isSome() {
+                            report(.ForeignFormPosition, other.span)
+                        } else {
+                            primary = .Some(other)
+                        }
+                    }
+                    match primary {
+                        Some(chosen) -> mark = chosen
+                        None -> {
+                            report(.ForeignVariadicAlone, mark.span)
+                            continue
+                        }
+                    }
+                    if variadic && mark.form != .Extern {
+                        report(.ForeignVariadicAlone, mark.span)
+                        continue
+                    }
+                    match foreignFunction(signature, mark, variadic) {
+                        Some(foreign) -> {
+                            program.foreignFunctions.append(foreign)
+                            program.functions[index].foreign = .Some(program.foreignFunctions.count - 1)
+                        }
+                        None -> {}
+                    }
+                }
+                None -> {}
+            }
+        }
+        var crosses = program.foreignFunctions.count > 0
+        for structure in program.structs {
+            if isCallbackShape(structure.shape) { crosses = true }
+        }
+        if !crosses { return }
+        for name in ["stringFromCString", "cStringKeptCopy", "cStringKept", "cStringFrom"] {
+            match declarations.findFunction(.None, name) {
+                Some(helper) -> program.foreignHelpers.append(helper)
+                None -> report(.UndefinedFunction, tree.foreignMarks[0].span)
+            }
+        }
+    }
+
+    // A foreign name shares the call namespace, so it names nothing else: a
+    // second function of that name is 3184, a second foreign one 3185, both
+    // at the later declaration.
+    function uniqueForeignName(borrow self, index: Int) -> Bool {
+        let signature = declarations.signatures[index]
+        if signature.owner.isSome() { return true }
+        for other in declarations.overloadsOf(.None, signature.name.text) {
+            if other == index { continue }
+            let foreign = hasAttribute(declarations.signatures[other].declaration.annotations, .Foreign)
+            if !foreign && declarations.sameModule(signature.name.span.file, declarations.signatures[other].name.span.file) {
+                report(.ForeignNameTaken, signature.name.span)
+                return false
+            }
+        }
+        return true
+    }
+
+    // An earlier function binding the same C symbol. Two Kira names may bind
+    // one symbol, as kira's distinct and plain views of `ffi_id_u32` do,
+    // only when C sees one signature.
+    function sharedForeignSymbol(borrow self, foreign: ForeignFunction) -> Optional<Int> {
+        for index in 0..program.foreignFunctions.count {
+            if program.foreignFunctions[index].symbol == foreign.symbol { return .Some(index) }
+        }
+        return .None
+    }
+
+    function sameForeignSignature(borrow self, left: ForeignFunction, right: ForeignFunction) -> Bool {
+        if left.address != right.address || left.variadic != right.variadic || left.parameters.count != right.parameters.count { return false }
+        if !sameCType(left.resultType, right.resultType) { return false }
+        for index in 0..left.parameters.count {
+            if !sameCType(left.parameterTypes[index], right.parameterTypes[index]) { return false }
+        }
+        return true
+    }
+
+    // Whether two Kira types cross as one C type: a distinct as its
+    // representation, everything else as itself.
+    function sameCType(borrow self, left: Type, right: Type) -> Bool {
+        return seamType(left).equals(seamType(right))
+    }
+
+    function seamType(borrow self, valueType: Type) -> Type {
+        if valueType.kind == .Structure && program.structs[valueType.declaration].genericBase == "Distinct" {
+            return program.structs[valueType.declaration].fields[0].valueType
+        }
+        return valueType
+    }
+
+    // The checked row of one callable form, or none when its block or its
+    // signature cannot cross; every mistake is reported, not just the first.
+    function foreignFunction(borrow mut self, signature: Signature, mark: ForeignMark, variadic: Bool) -> Optional<ForeignFunction> {
+        var clean = foreignAnnotationsClean(signature, mark)
+        match mark.form {
+            Extern -> {}
+            Address -> {}
+            Syscall -> {}
+            Variadic -> return .None
+            Struct -> return .None
+            Union -> return .None
+            Pointer -> return .None
+            Array -> return .None
+            Callback -> return .None
+            Alias -> return .None
+        }
+        let address = mark.form == .Address
+        let syscall = mark.form == .Syscall
+        if syscall && !grantsSystemCalls(signature.name.span.file) {
+            report(.SystemCallOutsideSystem, signature.name.span)
+            clean = false
+        }
+        let fields = foreignFields(mark, syscall)
+        if !fields.clean { clean = false }
+        var libraryIndex = 0 - 1
+        match foreignTarget(fields, mark, syscall, address) {
+            Some(index) -> libraryIndex = index
+            None -> clean = false
+        }
+        let called = fields.called
+        let symbol = fields.symbol
+        let retains = fields.retains
+        let declared = signature.declaration
+        if address {
+            if declared.parameters.count > 0 {
+                report(.ForeignAddressParameters, declared.parameters[0].name.span)
+                clean = false
+            }
+            if !signature.result.equals(Type.pointer()) {
+                report(.ForeignAddressResult, signature.name.span)
+                clean = false
+            }
+        }
+        let parameterShape = foreignParameterShape(signature, retains)
+        if !parameterShape.clean { clean = false }
+        var result: Seam = .Nothing
+        match seamOf(signature.result, false) {
+            Some(seam) -> result = seam
+            None -> {
+                report(.ForeignSeamType, signature.name.span)
+                clean = false
+            }
+        }
+        var systemCall = ""
+        match called {
+            Some(named) -> {
+                systemCall = named.text
+                if !syscallSignature(signature) { clean = false }
+            }
+            None -> {}
+        }
+        if !clean { return .None }
+        var text = ""
+        match symbol {
+            Some(named) -> text = named.text
+            None -> {}
+        }
+        if syscall { text = joinText(["__klf_syscall_", systemCall]) }
+        return .Some(ForeignFunction {
+            symbol = text, library = libraryIndex, parameters = parameterShape.seams, parameterTypes = parameterShape.types,
+            result = result, resultType = signature.result, retained = parameterShape.retained, address = address, variadic = variadic, syscall = systemCall
+        })
+    }
+
+    // A C function is called, not run as an entry, on the main thread, on a
+    // chosen engine or exported.
+    function foreignAnnotationsClean(borrow self, signature: Signature, mark: ForeignMark) -> Bool {
+        var clean = true
+        let annotations = signature.declaration.annotations
+        for annotation in annotations {
+            if enteredAttribute(annotation) {
+                report(.ForeignAnnotation, mark.span)
+                clean = false
+            }
+        }
+        if signature.entry && clean {
+            report(.ForeignAnnotation, mark.span)
+            clean = false
+        }
+        if signature.declaration.body.count > 0 || signature.owner.isSome() || signature.declaration.typeParameters.count > 0 {
+            report(.ForeignFormPosition, mark.span)
+            clean = false
+        }
+        return clean
+    }
+
+    function nativeLibraryIndex(borrow self, name: String) -> Int {
+        for index in 0..program.nativeLibraries.count {
+            if program.nativeLibraries[index].name.text == name { return index }
+        }
+        return 0 - 1
+    }
+
+    function seamOf(borrow self, valueType: Type, parameter: Bool) -> Optional<Seam> {
+        return foreignSeam(program, valueType, parameter)
+    }
+
+    // A call to a C function: each argument converted to what C reads, and
+    // a `CString` result read back as a `String`.
+    function foreignCall(borrow mut self, target: Int, foreign: ForeignFunction, arguments: [Int], span: Span) -> Int {
+        if arguments.count < foreign.parameters.count || (!foreign.variadic && arguments.count > foreign.parameters.count) {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        var values: [Int] = []
+        for index in 0..foreign.parameters.count {
+            let argument = arguments[index]
+            let retained = foreign.retained[index]
+            if retained && program.expressions[argument].operation.movingOperand().isNone() {
+                report(.ForeignRetainsMove, program.expressions[argument].span)
+            }
+            values.append(foreignCoerce(argument, foreign.parameterTypes[index], retained))
+        }
+        if foreign.variadic {
+            var extras: [Type] = []
+            for index in foreign.parameters.count..arguments.count {
+                let promoted = variadicArgument(arguments[index])
+                values.append(promoted)
+                extras.append(typeOf(promoted))
+            }
+            if variadicShapeOf(program, target, extras) < 0 {
+                program.variadicShapes.append(VariadicShape { callee = target, extras = extras })
+            }
+        }
+        let call = add(.Call(target, values), foreign.resultType, span)
+        if !isCStringType(program, foreign.resultType) || program.foreignHelpers.count == 0 { return call }
+        let read = program.foreignHelpers[0]
+        return add(.Call(read, [call]), declarations.signatures[read].result, span)
+    }
+
+    // A variadic argument as C passes it: an integer narrower than an `int`
+    // as an `int`, a `Bool` as an `int`, an `F32` as a double, and a
+    // `String` as a `CString` for the call. A distinct crosses as its
+    // representation does; anything with no single C word is refused.
+    function variadicArgument(borrow mut self, value: Int) -> Int {
+        let actual = typeOf(value)
+        let span = program.expressions[value].span
+        match actual.kind {
+            Integer -> {
+                if actual.bits < 32 { return add(.Convert(value), Type.integer(32, actual.signed), span) }
+                return value
+            }
+            Decimal -> {}
+            Floating -> {
+                if actual.bits < 64 { return add(.Convert(value), Type.floating(64), span) }
+                return value
+            }
+            Boolean -> {
+                let word = Type.integer(32, true)
+                return add(.Select(value, add(.Integer(1), word, span), add(.Integer(0), word, span)), word, span)
+            }
+            Pointer -> return value
+            Invalid -> return value
+            Void -> {}
+            Enumeration -> {
+                match seamOf(actual, true) {
+                    Some -> return value
+                    None -> {}
+                }
+            }
+            Structure -> {
+                if isStringType(program, actual) {
+                    match declarations.typeNamed("CString") {
+                        Some(cString) -> return cStringOf(value, cString, span)
+                        None -> {}
+                    }
+                }
+                let structure = program.structs[actual.declaration]
+                if structure.genericBase == "Distinct" {
+                    let representation = structure.fields[0].valueType
+                    if representation.kind == .Structure { return value }
+                    return variadicArgument(add(.Member(value, 0), representation, span))
+                }
+                if isCStringType(program, actual) { return value }
+                match structure.shape {
+                    Callback -> return value
+                    CPointer -> return value
+                    Plain -> {}
+                    CLayout -> {}
+                    CUnion -> {}
+                    CArray -> {}
+                }
+            }
+        }
+        report(.ForeignSeamType, span)
+        return add(.Integer(0), Type.invalid(), span)
+    }
+
+    // A value where C reads `target`: besides what `coerce` converts, an
+    // `@FFI.Pointer` takes its target struct, an `@FFI.Array` of it or a
+    // C struct leading with it, as the address of a C image; a `RawPtr`
+    // takes an array of scalars, as the address of its elements. A string C
+    // keeps is copied into storage nothing collects.
+    function foreignCoerce(borrow mut self, value: Int, target: Type, retained: Bool) -> Int {
+        let actual = typeOf(value)
+        let span = program.expressions[value].span
+        if actual.isInvalid() || target.isInvalid() { return value }
+        if target.kind == .Pointer && isNativeStateType(program, declarations, actual) {
+            let registry = retained ? "nativeStateExport" : "nativeStateBorrow"
+            return nativeStateRegistryCall(registry, [add(.Member(value, 0), Type.int(), span)], span)
+        }
+        if target.kind == .Structure && actual.kind == .Structure && !actual.equals(target) {
+            match program.structs[target.declaration].shape {
+                CPointer(pointee) -> {
+                    match pointee {
+                        Some(pointed) -> {
+                            if fillsPointer(actual.declaration, pointed) { return add(.ForeignImage(value, retained), target, span) }
+                        }
+                        None -> {}
+                    }
+                }
+                Plain -> {}
+                CLayout -> {}
+                CUnion -> {}
+                CArray -> {}
+                Callback -> {}
+            }
+        }
+        if isArrayType(program, actual) && isSeamScalar(program.structs[actual.declaration].typeArguments[0]) {
+            if target.kind == .Pointer { return add(.ForeignElements(value, retained), target, span) }
+            if target.kind == .Structure {
+                match program.structs[target.declaration].shape {
+                    CPointer(pointee) -> {
+                        let element = program.structs[actual.declaration].typeArguments[0]
+                        var compatible = pointee.isNone()
+                        match pointee {
+                            Some(pointed) -> {
+                                let pointedType = Type.structure(pointed)
+                                compatible = element.equals(pointedType) || (element.kind == .Pointer && isForeignPointerValue(program, pointedType))
+                            }
+                            None -> {}
+                        }
+                        if compatible {
+                            let pointer = add(.ForeignElements(value, retained), Type.pointer(), span)
+                            return add(.Construct([pointer]), target, span)
+                        }
+                    }
+                    Plain -> {}
+                    CLayout -> {}
+                    CUnion -> {}
+                    CArray -> {}
+                    Callback -> {}
+                }
+            }
+        }
+        if retained && isCStringType(program, target) && isStringType(program, actual) && program.foreignHelpers.count == 4 {
+            return add(.Call(program.foreignHelpers[2], [value]), target, span)
+        }
+        return coerce(value, target, .ArgumentTypeMismatch)
+    }
+
+    // Whether a value of struct `given` fills a pointer to `pointee`: it is
+    // one, an `@FFI.Array` of them, or a C struct whose first member is one,
+    // which shares its address.
+    function fillsPointer(borrow self, given: Int, pointee: Int) -> Bool {
+        if given == pointee { return true }
+        let structure = program.structs[given]
+        match structure.shape {
+            CArray -> {
+                let elements = structure.fields[0].valueType
+                let element = program.structs[elements.declaration].typeArguments[0]
+                return element.kind == .Structure && element.declaration == pointee
+            }
+            CLayout -> {
+                if structure.fields.count == 0 { return false }
+                let first = structure.fields[0].valueType
+                return first.kind == .Structure && first.declaration == pointee
+            }
+            Plain -> return false
+            CUnion -> return false
+            Callback -> return false
+            CPointer -> return false
+        }
+    }
+
+    // `pointer.member`: a member of the C struct an `@FFI.Pointer` points
+    // at, read through it.
+    function foreignMember(borrow mut self, base: Int, field: Identifier, span: Span) -> Optional<Int> {
+        let baseType = typeOf(base)
+        match program.structs[baseType.declaration].shape {
+            CPointer(pointee) -> {
+                match pointee {
+                    Some(pointed) -> {
+                        match program.structs[pointed].field(field.text) {
+                            Some(index) -> {
+                                let fieldType = program.structs[pointed].fields[index].valueType
+                                return .Some(add(.ForeignRead(base, index), fieldType, span))
+                            }
+                            None -> return .None
+                        }
+                    }
+                    None -> return .None
+                }
+            }
+            Plain -> return .None
+            CLayout -> return .None
+            CUnion -> return .None
+            CArray -> return .None
+            Callback -> return .None
+        }
+    }
+}
+
+// The scalars C reads as themselves.
+function isSeamScalar(valueType: Type) -> Bool {
+    match valueType.kind {
+        Integer -> return true
+        Decimal -> return false
+        Floating -> return true
+        Boolean -> return true
+        Pointer -> return true
+        Void -> return false
+        Enumeration -> return false
+        Structure -> return false
+        Invalid -> return false
+    }
+}
+
+// The shape a call of `callee` passing `extras` past its fixed parameters
+// takes, or -1 before one does.
+function variadicShapeOf(program: CheckedProgram, callee: Int, extras: [Type]) -> Int {
+    for index in 0..program.variadicShapes.count {
+        let shape = program.variadicShapes[index]
+        if shape.callee != callee || shape.extras.count != extras.count { continue }
+        var same = true
+        for at in 0..extras.count {
+            if !shape.extras[at].equals(extras[at]) { same = false }
+        }
+        if same { return index }
+    }
+    return 0 - 1
+}
+
+// What a value of `valueType` crosses as, or none when C has no reading
+// of it. An array is a parameter's alone: a C result says nothing of how
+// many elements are behind it.
+function foreignSeam(program: CheckedProgram, valueType: Type, parameter: Bool) -> Optional<Seam> {
+    match valueType.kind {
+        Integer -> return .Some(.Word)
+        // A `Number` has no C counterpart.
+        Decimal -> return .None
+        Floating -> return .Some(.Word)
+        Boolean -> return .Some(.Word)
+        Pointer -> return .Some(.Word)
+        Void -> {
+            if parameter { return .None }
+            return .Some(.Nothing)
+        }
+        Enumeration -> {
+            for variant in program.enums[valueType.declaration].variants {
+                if variant.payload.isSome() { return .None }
+            }
+            return .Some(.Number)
+        }
+        Invalid -> return .Some(.Word)
+        Structure -> {
+            let structure = program.structs[valueType.declaration]
+            if isArrayType(program, valueType) {
+                if parameter && isSeamScalar(structure.typeArguments[0]) { return .Some(.Elements) }
+                return .None
+            }
+            if isCStringType(program, valueType) { return .Some(.Field) }
+            if structure.genericBase == "Distinct" { return .Some(.Field) }
+            match structure.shape {
+                CLayout -> return .Some(.Image)
+                CUnion -> return .Some(.Image)
+                CArray -> return .None
+                Callback -> return .Some(.Field)
+                CPointer -> return .Some(.Field)
+                Plain -> {
+                    if structure.genericBase == "" && structure.fields.count == 1 && isSeamScalar(structure.fields[0].valueType) {
+                        return .Some(.Image)
+                    }
+                    return .None
+                }
+            }
+        }
+    }
+}
+
+// Whether the annotation makes its function an entry, runs it on the main
+// thread or a chosen engine, or exports it.
+function enteredAttribute(annotation: Annotation) -> Bool {
+    return isAttribute(annotation, .Main) || isAttribute(annotation, .MainThread) || isAttribute(annotation, .Runtime)
+        || isAttribute(annotation, .Native) || isAttribute(annotation, .Export) || isAttribute(annotation, .AtExit)
+}

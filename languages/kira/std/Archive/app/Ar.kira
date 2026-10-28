@@ -1,0 +1,108 @@
+import Foundation
+
+// Reading ar archives, as a Debian package is one: a signature, then each
+// member's 60-byte header and contents, padded to an even length. GNU long
+// names come from the `//` member, BSD ones (`#1/<length>`) from the start of
+// the contents; the `/` symbol table is passed over.
+
+namespace ArFormat {
+    let signature: String = "!<arch>\n"
+    let header: Number = 60
+    let modeAt: Number = 40
+    let sizeAt: Number = 48
+    let endAt: Number = 58
+}
+
+// Every member of the ar archive at `from`, unpacked into `target` as files.
+function unpackAr(
+    from: borrow String,
+    target: borrow mut UnpackTarget
+) -> Result<Void, ArchiveFailure> {
+    let bytes = match readArchiveFile(from) {
+        Ok(read) -> read
+        Error(failure) -> return .Error(failure)
+    }
+    let signature = ArFormat.signature.utf8()
+    if bytes.count < signature.count || textOfBytes(
+        bytes,
+        0,
+        signature.count
+    ) != ArFormat.signature {
+        return .Error(.Malformed("\(from) is not an ar archive"))
+    }
+    let header = ArFormat.header
+    var names: [UN8] = []
+    var at = signature.count
+    while at < bytes.count {
+        if at + header > bytes.count { return .Error(.Malformed("an ar header is cut off")) }
+        if bytes[at + ArFormat.endAt] != 96 || bytes[at + ArFormat.endAt + 1] != 10 {
+            return .Error(.Malformed("an ar header does not end in `\\n"))
+        }
+        let field = textOfBytes(bytes, at, 16).trim()
+        let size = match memberNumber(bytes, at + ArFormat.sizeAt, 10, 10) {
+            Some(read) -> read
+            None -> return .Error(.Malformed("the ar member \(field) has no size"))
+        }
+        let mode = memberNumber(bytes, at + ArFormat.modeAt, 8, 8).or(420) & 4095
+        var start = at + header
+        let end = start + size
+        if end > bytes.count { return .Error(.Malformed("the ar member \(field) is cut off")) }
+        var name = copy field
+        if field == "//" {
+            names = []
+            for index in start..end { names.append(bytes[index]) }
+            name = ""
+        } else if field == "/" || field == "/SYM64/" {
+            name = ""
+        } else if field.startsWith("#1/") {
+            let length = match tarDecimal(field.substring(3, field.count)) {
+                Some(read) -> read
+                None -> return .Error(.Malformed("the ar name \(field) does not read"))
+            }
+            if length > size { return .Error(.Malformed("the ar name \(field) is too long")) }
+            name = textOfBytes(bytes, start, length)
+            start += length
+        } else if field.startsWith("/") {
+            let offset = match tarDecimal(field.substring(1, field.count)) {
+                Some(read) -> read
+                None -> return .Error(.Malformed("the ar name \(field) does not read"))
+            }
+            var stop = offset
+            while stop < names.count && names[stop] != 10 { stop += 1 }
+            name = textFromByteRun(names, min(offset, names.count), stop).or("")
+            if name.endsWith("/") { name = name.substring(0, name.count - 1) }
+        } else if field.endsWith("/") {
+            name = field.substring(0, field.count - 1)
+        }
+        if name.count > 0 && !target.excludes(name) {
+            if name.contains("/") || name == "." || name == ".." {
+                return .Error(.Malformed("the ar member \(name) is no plain name"))
+            }
+            var contents: [UN8] = []
+            for index in start..end { contents.append(bytes[index]) }
+            match target.heldFile(name, mode, contents) {
+                Ok -> {}
+                Error(failure) -> return .Error(failure)
+            }
+        }
+        at = end + size % 2
+    }
+    return .Ok
+}
+
+// A number field of `count` bytes in base `base`, padded with spaces.
+function memberNumber(bytes: borrow [UN8], at: Number, count: Number, base: Number) -> Number? {
+    var value: Number = 0
+    var digits: Number = 0
+    for index in at..(at + count) {
+        let byte = Number(bytes[index])
+        if byte == 32 {
+            if digits > 0 { break }
+            continue
+        }
+        if byte < 48 || byte >= 48 + base { return .None }
+        value = value * base + byte - 48
+        digits += 1
+    }
+    return digits > 0 ? .Some(value) : .None
+}

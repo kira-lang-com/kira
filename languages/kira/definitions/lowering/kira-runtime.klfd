@@ -1,0 +1,92 @@
+// Kira's own runtime library. A package names it as the `NativeLibrary`
+// whose `linkMode` is `LinkMode.Runtime`, the archive Kira puts on every link
+// line, and binds its raw-memory primitives with `@FFI.Extern`. Here that
+// archive is the KLF heap, so each primitive lowers in place to the heap and
+// memory operations it stands for, and no C symbol is linked. Any other symbol
+// bound through it, such as libc's `strcmp`, which every process has loaded,
+// is called as C.
+//
+// `kira_dynamic_alloc` returns zeroed bytes, as Kira's does, and
+// `kira_dynamic_free` of a null pointer frees nothing. The readers and writers
+// at a byte offset move the width the declaration gives the value.
+
+function runtimeForeign(program: CheckedProgram, foreign: ForeignFunction) -> Bool {
+    if foreign.library < 0 || !program.nativeLibraries[foreign.library].runtime || foreign.address { return false }
+    let symbol = foreign.symbol
+    match symbol {
+        "kira_dynamic_alloc", "kira_dynamic_free", "kira_dynamic_null_ptr", "kira_dynamic_ptr_is_null" -> return true
+        else -> {}
+    }
+    if !endsWithText(symbol, "_at") { return false }
+    if startsWithText(symbol, "kira_dynamic_read_") { return foreign.parameters.count == 2 }
+    return startsWithText(symbol, "kira_dynamic_write_") && foreign.parameters.count == 3
+}
+
+extend FunctionLowering {
+    function runtimeCall(borrow mut self, foreign: ForeignFunction, arguments: [Int]) -> KirValue {
+        let unused = kir.integer(types.integer64, 0)
+        let symbol = foreign.symbol
+        match symbol {
+            "kira_dynamic_alloc" -> {
+                let byteCount = value(arguments[0])
+                let block = kir.allocateRaw(byteCount, kir.integer(types.integer64, 16))
+                zeroRuntimeBytes(block, byteCount)
+                return block
+            }
+            "kira_dynamic_free" -> {
+                kir.freeRaw(value(arguments[0]))
+                return unused
+            }
+            "kira_dynamic_null_ptr" -> return kir.convert(convertBitcast, kir.integer(types.integer64, 0), types.pointer)
+            "kira_dynamic_ptr_is_null" -> {
+                let word = kir.convert(convertBitcast, value(arguments[0]), types.integer64)
+                return kir.compare(kirPredicate(.Equal, false), word, kir.integer(types.integer64, 0))
+            }
+            else -> {}
+        }
+        let place = kir.offsetBytes(value(arguments[0]), value(arguments[1]))
+        if startsWithText(symbol, "kira_dynamic_read_") { return kir.load(kir.typedMemory(place, types.of(foreign.resultType))) }
+        kir.store(value(arguments[2]), kir.typedMemory(place, types.of(foreign.parameterTypes[2])))
+        return unused
+    }
+
+    function zeroRuntimeBytes(borrow mut self, start: KirValue, byteCount: KirValue) {
+        kir.setBytes(start, kir.integer(types.integer8, 0), byteCount)
+    }
+}
+
+// The owner counts of native state, exported for the C code a program links,
+// as Kira's runtime exports them: `kira_rt_native_state_retain(token)` and
+// `kira_rt_native_state_release(token)` add and remove an owner of the state
+// `token` names, through Foundation's registry, and answer 0.
+function lowerRuntimeHooks(builder: KirModuleBuilder, program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder]) {
+    if program.nativeLibraries.count == 0 { return }
+    exportRuntimeHook(builder, program, types, functions, "kira_rt_native_state_retain", "nativeStateRetainToken")
+    exportRuntimeHook(builder, program, types, functions, "kira_rt_native_state_release", "nativeStateReleaseToken")
+}
+
+function exportRuntimeHook(builder: KirModuleBuilder, program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder], symbol: String, target: String) {
+    let callee = runtimeHookTarget(program, target)
+    if callee < 0 { return }
+    let name = program.functions[callee].name
+    let signature = kir_signature_new(builder, name.start, name.end, types.integer32)
+    for index in 0..utf8Count(symbol) { kir_signature_name_byte(signature, utf8Byte(symbol, index)) }
+    kir_signature_parameter(signature, types.integer64)
+    kir_signature_export(signature)
+    let hook = kir_signature_define(signature)
+    var lowering = FunctionLowering.startChecked(program, types, functions, helperChecked(name, Type.integer(32, false)), hook)
+    let body = lowering.kir.block()
+    lowering.enter(body)
+    lowering.kir.argument(lowering.kir.convert(convertBitcast, lowering.kir.parameter(0), types.pointer))
+    lowering.kir.callVoid(functions[callee])
+    lowering.kir.returnValue(lowering.kir.integer(types.integer32, 0))
+    lowering.kir.switchTo(lowering.entry)
+    lowering.kir.branch(body)
+}
+
+function runtimeHookTarget(program: CheckedProgram, symbol: String) -> Int {
+    for index in 0..program.functions.count {
+        if program.functions[index].symbol == symbol { return index }
+    }
+    return -1
+}

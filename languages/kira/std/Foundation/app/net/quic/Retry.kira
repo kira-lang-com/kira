@@ -1,0 +1,95 @@
+// Retry packets (RFC 9000 section 17.2.5): a server that wants proof of a
+// client's address answers its first Initial with a token, and the client
+// starts again with it, to a connection ID the server chose.
+
+// The fixed key and nonce of the Retry integrity tag (RFC 9001 section 5.8).
+namespace QuicRetryIntegrity {
+    let key: [UN8] = [190, 12, 105, 11, 159, 102, 87, 90, 29, 118, 107, 84, 227, 104, 200, 78]
+    let nonce: [UN8] = [70, 21, 153, 211, 93, 99, 43, 242, 35, 152, 37, 187]
+}
+
+function quicRetryKey() -> AeadKey {
+    return AeadKey { suite: .Aes128GcmSha256, key: QuicRetryIntegrity.key }
+}
+
+// The Retry pseudo-packet: the ID the client first sent to, then the Retry
+// without its tag.
+function quicRetryPseudoPacket(original: borrow [UN8], packet: borrow [UN8]) -> [UN8] {
+    var writer = WireWriter {}
+    writer.writeVector(original, Tls.shortVector)
+    writer.writeBytes(packet)
+    return writer.bytes
+}
+
+// What a server needs to send a Retry.
+struct QuicRetryRequest {
+    // The client's IDs, from its Initial.
+    let clientSource: [UN8]
+    let original: [UN8]
+    // The ID the client sends to from now on.
+    let source: [UN8]
+    let token: [UN8]
+}
+
+function quicRetryPacket(request: borrow QuicRetryRequest) -> Result<[UN8], CryptoFailure> {
+    var writer = WireWriter {}
+    let kind = code(QuicLongPacketType.Retry) << Quic.longTypeShift
+    writer.writeByte(Quic.longHeader | Quic.fixedBit | kind)
+    writer.writeInteger(Quic.version1, QuicPacketLimit.versionBytes)
+    writer.writeVector(request.clientSource, Tls.shortVector)
+    writer.writeVector(request.source, Tls.shortVector)
+    writer.writeBytes(request.token)
+    let empty: [UN8] = []
+    let tag = try sealAead(
+        quicRetryKey(),
+        QuicRetryIntegrity.nonce,
+        quicRetryPseudoPacket(request.original, writer.bytes),
+        empty
+    )
+    return .Ok(joinedBytes(writer.bytes, tag))
+}
+
+// The token of the Retry `raw` describes, when its tag proves it answers a
+// client whose first Initial went to `original`.
+function quicRetryToken(
+    datagram: borrow [UN8],
+    raw: borrow QuicRawHeader,
+    original: borrow [UN8]
+) -> [UN8]? {
+    let packet = byteRun(datagram, raw.start, raw.end)
+    // A Retry with an empty token is discarded (RFC 9000 section 17.2.5.2).
+    if raw.token.count <= CryptoService.tagBytes { return .None }
+    let tagAt = packet.count - CryptoService.tagBytes
+    let body = byteRun(packet, 0, tagAt)
+    let tag = byteRun(packet, tagAt, packet.count)
+    let pseudo = quicRetryPseudoPacket(original, body)
+    let opened = try openAead(
+        quicRetryKey(),
+        QuicRetryIntegrity.nonce,
+        pseudo,
+        tag
+    ) otherwise return .None
+    if opened.count != 0 { return .None }
+    return .Some(byteRun(raw.token, 0, raw.token.count - CryptoService.tagBytes))
+}
+
+extend QuicConnection {
+    // A Retry is taken once, before any Initial from the server; the client
+    // then sends its Initial again, with the token, to the server's new ID
+    // and under keys from that ID (RFC 9001 section 5.2). Packet numbers
+    // go on from where they were (RFC 9000 section 17.2.5.3).
+    function takeRetry(borrow mut self, datagram: borrow [UN8], raw: borrow QuicRawHeader) {
+        if role != .Client || retrySource.isSome() { return }
+        if recovery.space(.Initial).largestReceived.isSome() { return }
+        let newToken = match quicRetryToken(datagram, raw, originalDestination) {
+            Some(value) -> value
+            None -> return
+        }
+        let keys = try quicInitialLevelKeys(raw.source, role) otherwise return
+        token = newToken
+        peerId = copy raw.source
+        retrySource = .Some(copy raw.source)
+        initialKeys = .Some(keys)
+        for packet in recovery.forget(.Initial) { requeue(.Initial, packet.frames) }
+    }
+}

@@ -1,0 +1,172 @@
+import Heap
+
+// Poll-based futures: the std half of Kira's async.
+//
+// A future is a value that is driven, never a thread that runs. `poll` either
+// finishes (`.Ready`) or reports `.Pending` after arranging for the waker in
+// its context to be called once progress is possible again. Executors (the
+// std `blockOn` below, Seyoul's scheduler) own the loop that polls; a future
+// only owns its own state, in place, so a chain of awaits is one contiguous
+// value and polling it touches nothing else.
+
+enum Poll<Value> {
+    Ready(Value)
+    Pending
+
+    function isReady(borrow self) -> Bool {
+        return match self {
+            Ready(value) -> true
+            Pending -> false
+        }
+    }
+
+    function isPending(borrow self) -> Bool {
+        return !isReady()
+    }
+}
+
+// How a future asks to be polled again. Three words, no allocation, no
+// reference count: `wake(target, slot)` is a plain function and `target` and
+// `slot` are whatever its executor uses to find the task (a run queue and an
+// index, a flag in a frame). The executor guarantees `target` outlives every
+// copy of the waker it hands out.
+struct Waker {
+    let wake: (RawPtr, Number) -> Void
+    let target: RawPtr
+    let slot: Number
+
+    function wakeUp(borrow self) {
+        let wake = self.wake
+        wake(self.target, self.slot)
+    }
+
+    // Two wakers that would wake the same task; a future keeps the one it
+    // stored when they match instead of replacing it.
+    function willWakeSame(borrow self, other: borrow Waker) -> Bool {
+        return Heap.pointerAddress(self.target) == Heap.pointerAddress(
+            other.target
+        ) && self.slot == other.slot
+    }
+}
+
+// What one `poll` call is given. Today only the waker; the struct leaves room
+// for executor-scoped state without changing every `poll` signature.
+struct Context {
+    let waker: Waker
+}
+
+trait Future<Output> {
+    function poll(borrow mut self, context: borrow Context) -> Poll<Output>
+}
+
+// A future that is already finished: `.Ready` on the first poll.
+struct ReadyFuture<Output>: Future<Output> {
+    var value: Output?
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Output> {
+        let taken: Output? = move self.value
+        self.value = .None
+        match taken {
+            Some(value) -> { return .Ready(move value) }
+            None -> {}
+        }
+        // Polled again after it was ready.
+        runtimeTrap()
+        return .Pending
+    }
+}
+
+function ready<Output>(value: Output) -> ReadyFuture<Output> {
+    return ReadyFuture<Output> { value = .Some(move value) }
+}
+
+// Pending exactly once, waking itself first: the cooperative yield point.
+struct YieldFuture: Future<Number> {
+    var yielded: Bool = false
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Number> {
+        if self.yielded { return .Ready(0) }
+        self.yielded = true
+        context.waker.wakeUp()
+        return .Pending
+    }
+}
+
+function yieldNow() -> YieldFuture {
+    return YieldFuture { yielded = false }
+}
+
+// The flag `blockOn`'s waker raises; `slot` is unused.
+function blockOnWake(target: RawPtr, slot: Number) {
+    heapStore<Bool>(target, true)
+}
+
+// Drives one future to its end on this thread. A pending poll must already
+// have woken the waker -- std has no reactor to sleep on -- so a future that
+// waits for I/O or time belongs on Seyoul's executor, and `blockOn` traps
+// rather than spin forever on one.
+function blockOn<F: Future<Output>, Output>(future: F) -> Output {
+    var driven = move future
+    let flag = Heap.allocateRaw(8, 8)
+    heapStore<Bool>(flag, false)
+    let context = Context { waker = Waker { wake = blockOnWake, target = flag, slot = 0 } }
+    while true {
+        match driven.poll(context) {
+            Ready(value) -> {
+                Heap.freeRaw(flag)
+                return move value
+            }
+            Pending -> {
+                if !heapLoad<Bool>(flag) { runtimeTrap() }
+                heapStore<Bool>(flag, false)
+            }
+        }
+    }
+    runtimeTrap()
+}
+
+// What every `async function` returns: its frame and the state machine the
+// compiler wrote for its body. The frame is one heap block holding the
+// body's locals, its pending sub-future and its resume point, so polling a
+// chain of awaits walks memory the chain owns and nothing else. Every async
+// function with the same output has this one type, so a scheduler keeps
+// them in a plain array.
+//
+// The first word of the frame is the resume point: 0 before the body starts,
+// `k` while it waits at its `k`th await, -1 once it has returned. Dropping an
+// unfinished future writes `-2 - k` there and runs the machine once more,
+// which destroys exactly what is live at that await.
+struct Async<Output>: Future<Output>, Drop {
+    var frame: RawPtr
+    let resume: (RawPtr, borrow Context) -> Poll<Output>
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Output> {
+        // Polled again after it finished.
+        if Heap.isNull(self.frame) { runtimeTrap() }
+        let resume = self.resume
+        let polled = resume(self.frame, context)
+        if polled.isReady() {
+            Heap.freeRaw(self.frame)
+            self.frame = Heap.nullPointer()
+        }
+        return polled
+    }
+
+    function drop(borrow mut self) {
+        if Heap.isNull(self.frame) { return }
+        heapStore<Int>(self.frame, -2 - heapLoad<Int>(self.frame))
+        let resume = self.resume
+        let cancelled = resume(self.frame, asyncCancelContext())
+        Heap.freeRaw(self.frame)
+        self.frame = Heap.nullPointer()
+    }
+}
+
+function asyncCancelWake(target: RawPtr, slot: Number) {}
+
+// The context an unfinished future is dropped with: nothing it wakes runs.
+function asyncCancelContext() -> Context {
+    return Context {
+        waker = Waker { wake = asyncCancelWake, target = Heap.nullPointer(), slot = 0 }
+    }
+}

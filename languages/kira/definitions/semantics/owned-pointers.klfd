@@ -1,0 +1,327 @@
+// An owned `@FFI.Pointer` (KLF section 26.2) is freed once, by whoever holds
+// it last, so it is moved and never copied: a value read out of storage is
+// only borrowed, through a member, a `borrow` parameter or a C call, or
+// handed over with `move`. Anywhere else the read would copy the handle and
+// free it twice.
+
+extend Checker {
+    function checkOwnedPointerCopies(borrow mut self, first: Int, firstStatement: Int) {
+        if program.expressions.count <= first { return }
+        var borrowed: [Bool] = []
+        for _ in first..program.expressions.count { borrowed.append(false) }
+        for index in first..program.expressions.count {
+            for operand in borrowedOperands(program.expressions[index].operation) {
+                if operand >= first { borrowed[operand - first] = true }
+            }
+        }
+        // The place an assignment writes is replaced, not read. A match reads
+        // its subject in place: an arm that would take a payload out of a
+        // named value is refused on its own (3399), so the read copies
+        // nothing.
+        for statement in firstStatement..program.statements.count {
+            match program.statements[statement] {
+                Assign(place, _) -> {
+                    if place >= first { borrowed[place - first] = true }
+                }
+                Dispatch(subject, _) -> {
+                    if subject >= first { borrowed[subject - first] = true }
+                }
+                Declare -> {}
+                InitializeGlobal -> {}
+                Evaluate -> {}
+                Branch -> {}
+                Loop -> {}
+                Count -> {}
+                Iterate -> {}
+                Attempt -> {}
+                Return -> {}
+                Break -> {}
+                Continue -> {}
+            }
+        }
+        var drops = DropsMemo {}
+        for _ in 0..program.structs.count { drops.structs.append(0) }
+        for _ in 0..program.enums.count { drops.enums.append(0) }
+        for index in first..program.expressions.count {
+            let expression = program.expressions[index]
+            if borrowed[index - first] || !expression.operation.readsStorage() { continue }
+            if isOwnedPointerType(typeOf(index)) {
+                report(.ForeignPointerCopy, expression.span)
+            } else if dropsOnce(typeOf(index), drops) {
+                report(.DroppedValueCopy, expression.span)
+            }
+        }
+    }
+
+    // Whether a value of this type runs a `drop`, its own, a field's or a
+    // case payload's: a copy of one would run it twice. Each type is a node
+    // and its fields and payloads its edges, so this is reachability from the
+    // type to one with a `drop`, walked once per type with the answers kept:
+    // following every path instead is exponential in how wide and deep the
+    // types nest.
+    function dropsOnce(borrow self, valueType: Type, memo: borrow mut DropsMemo) -> Bool {
+        let known = memo.answer(valueType)
+        if known != 0 { return known == 2 }
+        var visit = DropsVisit {}
+        for _ in 0..program.structs.count { visit.structs.append(false) }
+        for _ in 0..program.enums.count { visit.enums.append(false) }
+        let drops = dropsReach(valueType, memo, visit)
+        if drops {
+            memo.record(valueType, 2)
+            return true
+        }
+        // Nothing this walk reached drops, so nothing it visited does either.
+        for index in 0..visit.structs.count {
+            if visit.structs[index] { memo.structs[index] = 3 }
+        }
+        for index in 0..visit.enums.count {
+            if visit.enums[index] { memo.enums[index] = 3 }
+        }
+        return false
+    }
+
+    function dropsReach(borrow self, valueType: Type, memo: borrow mut DropsMemo, visit: borrow mut DropsVisit) -> Bool {
+        let known = memo.answer(valueType)
+        if known != 0 { return known == 2 }
+        if valueType.kind == .Enumeration {
+            if visit.enums[valueType.declaration] { return false }
+            visit.enums[valueType.declaration] = true
+            for variant in program.enums[valueType.declaration].variants {
+                match variant.payload {
+                    Some(payload) -> {
+                        if dropsReach(payload, memo, visit) {
+                            memo.record(valueType, 2)
+                            return true
+                        }
+                    }
+                    None -> {}
+                }
+            }
+            return false
+        }
+        if valueType.kind != .Structure { return false }
+        let declaration = valueType.declaration
+        if visit.structs[declaration] { return false }
+        visit.structs[declaration] = true
+        let structure = program.structs[declaration]
+        if structure.genericBase == "Class" || structure.genericBase == "Array" || structure.genericBase == "NativeState" { return false }
+        if program.dropFunctions[declaration] >= 0 {
+            memo.record(valueType, 2)
+            return true
+        }
+        for field in structure.fields {
+            if dropsReach(field.valueType, memo, visit) {
+                memo.record(valueType, 2)
+                return true
+            }
+        }
+        return false
+    }
+
+    function isOwnedPointerType(borrow self, valueType: Type) -> Bool {
+        if valueType.kind != .Structure { return false }
+        match program.structs[valueType.declaration].shape {
+            CPointer -> return program.pointerFrees[valueType.declaration] >= 0
+            Plain -> return false
+            CLayout -> return false
+            CUnion -> return false
+            CArray -> return false
+            Callback -> return false
+        }
+    }
+
+    // The operands an operation reads in place rather than taking a copy
+    // of: a call's borrowed arguments, and every argument C is given.
+    function borrowedOperands(borrow self, operation: Operation) -> [Int] {
+        match operation.invocation() {
+            Some(invocation) -> {
+                if program.functions[invocation.target].foreign.isSome() { return invocation.arguments }
+                let parameters = declarations.signatures[invocation.target].parameters
+                var taken: [Int] = []
+                for index in 0..invocation.arguments.count {
+                    if index < parameters.count && parameters[index].mode != .Owned { taken.append(invocation.arguments[index]) }
+                }
+                return taken
+            }
+            None -> return operation.inPlaceOperands()
+        }
+    }
+}
+
+extend Operation {
+    // The operands read where they are held: a moved value, and the base a
+    // member is read from.
+    function inPlaceOperands(borrow self) -> [Int] {
+        match self {
+            StringText -> return []
+            Sequence -> return []
+            Integer -> return []
+            FloatLiteral -> return []
+            BoxAny -> return []
+            TypeIs -> return []
+            UnboxAny -> return []
+            FunctionReference -> return []
+            IndirectCall -> return []
+            MakeClosure -> return []
+            GlobalRead -> return []
+            TaskSpawn -> return []
+            TaskReady -> return []
+            TaskAwait -> return []
+            TaskCancel -> return []
+            TaskDetach -> return []
+            Async -> return []
+            RuntimeTrap -> return []
+            Try -> return []
+            ChannelCreate -> return []
+            ChannelReceiver -> return []
+            ChannelSend -> return []
+            ChannelClose -> return []
+            ClassView -> return []
+            ClassCall -> return []
+            Boolean -> return []
+            StringLiteral -> return []
+            StringConcat -> return []
+            TraceText(value) -> return [value]
+            HeapAllocateRaw -> return []
+            HeapFreeRaw -> return []
+            Print -> return []
+            HeapRead -> return []
+            HeapWrite -> return []
+            Atomic -> return []
+            HeapCopy -> return []
+            HeapFill -> return []
+            HeapOffset -> return []
+            HeapLayout -> return []
+            ArrayLiteral -> return []
+            ArrayIndex -> return []
+            ArrayAppend -> return []
+            Transfer(mode, value) -> {
+                if mode == .Move { return [value] }
+                return []
+            }
+            Read -> return []
+            Member(base, _) -> return [base]
+            Call -> return []
+            Construct -> return []
+            Tagged -> return []
+            Unary -> return []
+            Arithmetic -> return []
+            Wrapping -> return []
+            Compare -> return []
+            EnumCode -> return []
+            EnumFromCode -> return []
+            Order -> return []
+            Hash -> return []
+            Logical -> return []
+            Select -> return []
+            Choice(subject, _) -> return [subject]
+            Bitcast -> return []
+            Convert -> return []
+            ForeignImage(value, _) -> return [value]
+            ForeignElements -> return []
+            ForeignCallback -> return []
+            ForeignRead(base, _) -> return [base]
+            ForeignUnion -> return []
+        }
+    }
+
+    // Whether the operation reads a value held in storage, which using it as
+    // a value copies.
+    function readsStorage(borrow self) -> Bool {
+        match self {
+            StringText -> return false
+            Sequence -> return false
+            Integer -> return false
+            FloatLiteral -> return false
+            BoxAny -> return false
+            TypeIs -> return false
+            UnboxAny -> return false
+            FunctionReference -> return false
+            IndirectCall -> return false
+            MakeClosure -> return false
+            GlobalRead -> return true
+            TaskSpawn -> return false
+            TaskReady -> return false
+            TaskAwait -> return false
+            TaskCancel -> return false
+            TaskDetach -> return false
+            Async -> return false
+            RuntimeTrap -> return false
+            Try -> return false
+            ChannelCreate -> return false
+            ChannelReceiver -> return false
+            ChannelSend -> return false
+            ChannelClose -> return false
+            ClassView -> return false
+            ClassCall -> return false
+            Boolean -> return false
+            StringLiteral -> return false
+            StringConcat -> return false
+            TraceText -> return false
+            HeapAllocateRaw -> return false
+            HeapFreeRaw -> return false
+            Print -> return false
+            HeapRead -> return false
+            HeapWrite -> return false
+            Atomic -> return false
+            HeapCopy -> return false
+            HeapFill -> return false
+            HeapOffset -> return false
+            HeapLayout -> return false
+            ArrayLiteral -> return false
+            ArrayIndex -> return true
+            ArrayAppend -> return false
+            Transfer -> return false
+            Read -> return true
+            Member -> return true
+            Call -> return false
+            Construct -> return false
+            Tagged -> return false
+            Unary -> return false
+            Arithmetic -> return false
+            Wrapping -> return false
+            Compare -> return false
+            EnumCode -> return false
+            EnumFromCode -> return false
+            Order -> return false
+            Hash -> return false
+            Logical -> return false
+            Select -> return false
+            Choice -> return false
+            Bitcast -> return false
+            Convert -> return false
+            ForeignImage -> return false
+            ForeignElements -> return false
+            ForeignCallback -> return false
+            ForeignRead -> return true
+            ForeignUnion -> return false
+        }
+    }
+}
+
+// What `dropsOnce` has settled for each struct and enum declaration: 0 not
+// yet, 2 drops, 3 does not.
+struct DropsMemo {
+    var structs: [Int] = []
+    var enums: [Int] = []
+}
+
+extend DropsMemo {
+    function answer(borrow self, valueType: Type) -> Int {
+        if valueType.kind == .Enumeration { return enums[valueType.declaration] }
+        if valueType.kind == .Structure { return structs[valueType.declaration] }
+        return 3
+    }
+
+    function record(borrow mut self, valueType: Type, answer: Int) {
+        if valueType.kind == .Enumeration { enums[valueType.declaration] = answer }
+        if valueType.kind == .Structure { structs[valueType.declaration] = answer }
+    }
+}
+
+// The declarations one `dropsOnce` walk has entered.
+struct DropsVisit {
+    var structs: [Bool] = []
+    var enums: [Bool] = []
+}
+

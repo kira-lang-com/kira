@@ -1,0 +1,131 @@
+import Foundation
+
+struct Handle {
+    let value: Int
+}
+
+function zeroInts(n: Int) -> [Int] {
+    var a: [Int] = []
+    var i = 0
+    while i < n {
+        a.append(0)
+        i += 1
+    }
+    return a
+}
+
+function zeroBools(n: Int) -> [Bool] {
+    var a: [Bool] = []
+    var i = 0
+    while i < n {
+        a.append(false)
+        i += 1
+    }
+    return a
+}
+
+function zeroHandles(n: Int) -> [Handle] {
+    var a: [Handle] = []
+    var i = 0
+    while i < n {
+        a.append(Handle { value = 0 })
+        i += 1
+    }
+    return a
+}
+
+function ones(n: Int) -> [Int] {
+    var a: [Int] = []
+    var i = 0
+    while i < n {
+        a.append(1)
+        i += 1
+    }
+    return a
+}
+
+function stepped(n: Int) -> [Int] {
+    var a: [Int] = []
+    var i = 0
+    while i < n {
+        a.append(0)
+        i += 2
+    }
+    return a
+}
+
+function quadValues(n: Int) -> [U32] {
+    var a: [U32] = []
+    var i = 0
+    while i < n {
+        let base = i * 4
+        a.append(base)
+        a.append(base + 1)
+        a.append(base + 2)
+        a.append(base)
+        a.append(base + 2)
+        a.append(base + 3)
+        i += 1
+    }
+    return a
+}
+
+function nearLimit(n: Int) -> [U32] {
+    var a: [U32] = []
+    var i = 0
+    while i < n {
+        a.append(i + 4294967294)
+        i += 1
+    }
+    return a
+}
+
+function wideIntermediate(n: Int) -> [U32] {
+    var a: [U32] = []
+    var i = 0
+    while i < n {
+        let unused = i * 4294967295
+        a.append(1)
+        i += 1
+    }
+    return a
+}
+
+function require(ok: Bool) -> Int {
+    if ok { return 0 }
+    var zero = 0
+    return 1 / zero
+}
+
+@Main
+function main() -> Int {
+    for n in [-3, 0, 1, 4, 5, 12, 13, 4096] {
+        var a = zeroInts(n)
+        let b = zeroBools(n)
+        let handles = zeroHandles(n)
+        let length = n > 0 ? n : 0
+        var capacity = 0
+        while capacity < length { capacity = capacity * 2 + 4 }
+        require(a.count == length && b.count == length && handles.count == length)
+        require(a.capacity == capacity && b.capacity == capacity && handles.capacity == capacity)
+        for i in 0..length { require(a[i] == 0 && !b[i] && handles[i].value == 0) }
+        var duplicate = copy a
+        duplicate.append(7)
+        require(a.count == length && duplicate.count == length + 1 && duplicate[length] == 7)
+        a.append(9)
+        require(a[length] == 9 && duplicate[length] == 7)
+    }
+    let quads = quadValues(3)
+    require(quads.count == 18 && quads.capacity == 28)
+    require(quads[0] == 0 && quads[5] == 3 && quads[12] == 8 && quads[17] == 11)
+    require(quadValues(-1).count == 0)
+    let largeQuads = quadValues(4096)
+    require(largeQuads.count == 24576 && largeQuads[24575] == U32(16383))
+    let near = nearLimit(2)
+    require(near[0] == U32(4294967294) && near[1] == U32(4294967295))
+    require(nearLimit(-1).count == 0 && nearLimit(0).count == 0)
+    let wide = wideIntermediate(3)
+    require(wide.count == 3 && wide[2] == U32(1))
+    require(ones(8)[7] == 1 && stepped(8).count == 4)
+    return 0
+}

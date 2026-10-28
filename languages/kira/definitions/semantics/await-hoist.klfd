@@ -1,0 +1,352 @@
+// `.await` inside an expression of an async body.
+//
+// Lowering keeps nothing but frame slots across a suspension, so an await
+// may only be the whole value of the statement that writes it
+// (semantics/async.klfd). An await written deeper -- an argument, an
+// operand, a `match` subject, an `if` condition -- is taken out before the
+// statement into a binding of its own, and the statement reads that binding
+// where the await was. Whatever is evaluated before the await and has an
+// effect is taken out first, in order, so the statement computes what it
+// would have in the order it would have. Every binding is a frame slot, so
+// what was taken out survives the suspension.
+//
+// Only positions evaluated once, before the statement runs, are taken out of:
+// the value a `return`, assignment or binding takes, an evaluated
+// expression, an `if` condition, a `match` subject and a `for` loop's bounds
+// or array. An await on the right of `&&` or `||`, in a branch of a
+// conditional, in an arm of a `match` value, in a `while` condition or in a
+// lambda runs only some of the time, and stays outside the subset.
+//
+// The syntax tree is rewritten only while the statement is checked: a body
+// checked again, for another instance, finds it as written.
+
+struct AwaitHoisting {
+    // The bindings that run before the statement, checked.
+    var statements: [Int]
+    // The expressions rewritten to read a binding, and what each was.
+    var replaced: [Int]
+    var originals: [Expression]
+}
+
+extend Checker {
+    // Checks statement `index` into `into`: the bindings its inner awaits
+    // need first, then the statement.
+    function checkStatementInto(borrow mut self, index: Int, into: borrow mut [Int]) {
+        var hoisting = AwaitHoisting { statements = [], replaced = [], originals = [] }
+        if asyncBody.isSome() { hoistStatement(index, hoisting) }
+        for statement in hoisting.statements { into.append(statement) }
+        into.append(checkStatement(index))
+        for position in 0..hoisting.replaced.count {
+            tree.expressions[hoisting.replaced[position]] = hoisting.originals[position]
+        }
+    }
+
+    function hoistStatement(borrow mut self, index: Int, hoisting: borrow mut AwaitHoisting) {
+        let statement = tree.statements[index]
+        match statement.kind {
+            Return(value) -> {
+                match value {
+                    Some(returned) -> hoistWithin(returned, true, hoisting)
+                    None -> {}
+                }
+            }
+            Assignment(target, value) -> hoistWithin(value, true, hoisting)
+            Evaluation(value) -> hoistWithin(value, true, hoisting)
+            Binding(binding) -> hoistWithin(binding.value, true, hoisting)
+            // A whole-value await here is `awaitThenCompound`'s.
+            CompoundAssignment(operator, target, value) -> hoistWithin(value, true, hoisting)
+            If(condition, whenTrue, whenFalse) -> hoistWithin(condition, false, hoisting)
+            Match(subject, arms) -> hoistWithin(subject, false, hoisting)
+            For(name, low, high, body) -> hoistSiblings([low, high], false, hoisting)
+            ForEach(name, array, body) -> hoistWithin(array, false, hoisting)
+            While -> {}
+            Attempt -> {}
+            Break -> {}
+            Continue -> {}
+        }
+    }
+
+    // Takes the awaits out of expression `index`. `whole` when the statement
+    // may keep an await that is all of `index`.
+    function hoistWithin(borrow mut self, index: Int, whole: Bool, hoisting: borrow mut AwaitHoisting) {
+        if !containsAwait(index) { return }
+        match awaitedFuture(index) {
+            Some(future) -> {
+                hoistWithin(future, false, hoisting)
+                if !whole { hoistValue(index, true, hoisting) }
+                return
+            }
+            None -> {}
+        }
+        let receiver = isMethodCallSyntax(index)
+        hoistSiblings(evaluatedChildren(index), receiver, hoisting)
+    }
+
+    // `children` in evaluation order. Up to the last one holding an await,
+    // each has its awaits taken out and, when something after it suspends
+    // and it has an effect, is taken out itself; the rest are left to run
+    // after. `receiverFirst` when the first is a method's receiver, which is
+    // read where it was rather than moved.
+    function hoistSiblings(borrow mut self, children: [Int], receiverFirst: Bool, hoisting: borrow mut AwaitHoisting) {
+        var last = -1
+        for position in 0..children.count {
+            if containsAwait(children[position]) { last = position }
+        }
+        for position in 0..(last + 1) {
+            let child = children[position]
+            if containsAwait(child) { hoistWithin(child, false, hoisting) }
+            if position < last && !settled(child) {
+                hoistValue(unlabelled(child), !(receiverFirst && position == 0), hoisting)
+            }
+        }
+    }
+
+    // Binds expression `index` before the statement and rewrites it to read
+    // the binding: moved out of it, or read in place for a receiver.
+    function hoistValue(borrow mut self, index: Int, moved: Bool, hoisting: borrow mut AwaitHoisting) {
+        let original = tree.expressions[index]
+        let span = original.span
+        let copied = tree.addExpression(copy original.kind, span)
+        let saved = allowAwait(copied)
+        let value = expression(copied, .None)
+        restoreAwait(saved)
+        let name = joinText(["#hoisted", decimalText(locals.count)])
+        let held = declareLocal(name, typeOf(value), false, false)
+        hoisting.statements.append(program.addStatement(.Declare(held, value)))
+        let read = tree.addExpression(.Name(Identifier { text = name, span = span }), span)
+        hoisting.replaced.append(index)
+        hoisting.originals.append(original)
+        if moved {
+            tree.expressions[index] = Expression { kind = .Transfer(.Move, read), span = span }
+        } else {
+            tree.expressions[index] = Expression { kind = .Name(Identifier { text = name, span = span }), span = span }
+        }
+    }
+
+    // An argument's value without its label: what is bound is the value.
+    function unlabelled(borrow self, index: Int) -> Int {
+        match tree.expressions[index].kind {
+            Labelled(label, value) -> return unlabelled(value)
+            Quote -> return index
+            IntegerLiteral -> return index
+            FloatLiteral -> return index
+            BooleanLiteral -> return index
+            StringLiteral -> return index
+            ArrayLiteral -> return index
+            Index -> return index
+            Transfer -> return index
+            TypeQuery -> return index
+            Name -> return index
+            Member -> return index
+            ExpandedMacro -> return index
+            MacroCall -> return index
+            Call -> return index
+            GenericCall -> return index
+            MethodCall -> return index
+            IndirectCall -> return index
+            Lambda -> return index
+            KeyPath -> return index
+            Task -> return index
+            Try -> return index
+            Variant -> return index
+            StructLiteral -> return index
+            Unary -> return index
+            Binary -> return index
+            Conditional -> return index
+            MatchValue -> return index
+            Content -> return index
+        }
+    }
+
+    // The future `index` awaits, when it is `future.await`.
+    function awaitedFuture(borrow self, index: Int) -> Optional<Int> {
+        match tree.expressions[index].kind {
+            Member(base, name) -> {
+                if name.text == "await" { return .Some(base) }
+                return .None
+            }
+            Quote -> return .None
+            IntegerLiteral -> return .None
+            FloatLiteral -> return .None
+            BooleanLiteral -> return .None
+            StringLiteral -> return .None
+            ArrayLiteral -> return .None
+            Index -> return .None
+            Transfer -> return .None
+            Labelled -> return .None
+            TypeQuery -> return .None
+            Name -> return .None
+            ExpandedMacro -> return .None
+            MacroCall -> return .None
+            Call -> return .None
+            GenericCall -> return .None
+            MethodCall -> return .None
+            IndirectCall -> return .None
+            Lambda -> return .None
+            KeyPath -> return .None
+            Task -> return .None
+            Try -> return .None
+            Variant -> return .None
+            StructLiteral -> return .None
+            Unary -> return .None
+            Binary -> return .None
+            Conditional -> return .None
+            MatchValue -> return .None
+            Content -> return .None
+        }
+    }
+
+    // Whether an await is in a position of `index` that is taken out of.
+    function containsAwait(borrow self, index: Int) -> Bool {
+        if awaitedFuture(index).isSome() { return true }
+        for child in evaluatedChildren(index) {
+            if containsAwait(child) { return true }
+        }
+        return false
+    }
+
+    function isMethodCallSyntax(borrow self, index: Int) -> Bool {
+        match tree.expressions[index].kind {
+            MethodCall -> return true
+            Quote -> return false
+            IntegerLiteral -> return false
+            FloatLiteral -> return false
+            BooleanLiteral -> return false
+            StringLiteral -> return false
+            ArrayLiteral -> return false
+            Index -> return false
+            Transfer -> return false
+            Labelled -> return false
+            TypeQuery -> return false
+            Name -> return false
+            Member -> return false
+            ExpandedMacro -> return false
+            MacroCall -> return false
+            Call -> return false
+            GenericCall -> return false
+            IndirectCall -> return false
+            Lambda -> return false
+            KeyPath -> return false
+            Task -> return false
+            Try -> return false
+            Variant -> return false
+            StructLiteral -> return false
+            Unary -> return false
+            Binary -> return false
+            Conditional -> return false
+            MatchValue -> return false
+            Content -> return false
+        }
+    }
+
+    // The subexpressions of `index` that always run, each before `index`
+    // itself, in the order they run.
+    function evaluatedChildren(borrow self, index: Int) -> [Int] {
+        match tree.expressions[index].kind {
+            ArrayLiteral(items) -> return items
+            Index(base, position) -> return [base, position]
+            Transfer(mode, value) -> return [value]
+            Labelled(label, value) -> return [value]
+            Member(base, name) -> return [base]
+            Call(name, arguments) -> return arguments
+            GenericCall(name, types, arguments) -> return arguments
+            MethodCall(receiver, name, arguments) -> {
+                var children = [receiver]
+                for argument in arguments { children.append(argument) }
+                return children
+            }
+            IndirectCall(callee, arguments) -> {
+                var children = [callee]
+                for argument in arguments { children.append(argument) }
+                return children
+            }
+            Try(value) -> return [value]
+            Variant(name, payload) -> {
+                match payload {
+                    Some(value) -> return [value]
+                    None -> return []
+                }
+            }
+            StructLiteral(name, types, fields) -> {
+                var children: [Int] = []
+                for field in fields { children.append(field.value) }
+                return children
+            }
+            Unary(operator, value) -> return [value]
+            Binary(operator, left, right) -> {
+                match operator {
+                    Or -> return [left]
+                    And -> return [left]
+                    BitOr -> return [left, right]
+                    BitXor -> return [left, right]
+                    BitAnd -> return [left, right]
+                    Equal -> return [left, right]
+                    NotEqual -> return [left, right]
+                    Less -> return [left, right]
+                    LessEqual -> return [left, right]
+                    Greater -> return [left, right]
+                    GreaterEqual -> return [left, right]
+                    ShiftLeft -> return [left, right]
+                    ShiftRight -> return [left, right]
+                    Add -> return [left, right]
+                    Subtract -> return [left, right]
+                    Multiply -> return [left, right]
+                    Divide -> return [left, right]
+                    Remainder -> return [left, right]
+                }
+            }
+            Conditional(condition, whenTrue, whenFalse) -> return [condition]
+            MatchValue(subject, arms) -> return [subject]
+            Quote -> return []
+            IntegerLiteral -> return []
+            FloatLiteral -> return []
+            BooleanLiteral -> return []
+            StringLiteral -> return []
+            TypeQuery -> return []
+            Name -> return []
+            ExpandedMacro -> return []
+            MacroCall -> return []
+            Lambda -> return []
+            KeyPath -> return []
+            Task -> return []
+            Content -> return []
+        }
+    }
+
+    // Whether `index` reads the same and does nothing, run before a
+    // suspension or after it: a name, a literal, or a place or plain
+    // operation over those.
+    function settled(borrow self, index: Int) -> Bool {
+        match tree.expressions[index].kind {
+            Name -> return true
+            IntegerLiteral -> return true
+            FloatLiteral -> return true
+            BooleanLiteral -> return true
+            StringLiteral -> return true
+            Member(base, name) -> return name.text != "await" && settled(base)
+            Index(base, position) -> return settled(base) && settled(position)
+            Transfer(mode, value) -> return settled(value)
+            Labelled(label, value) -> return settled(value)
+            Unary(operator, value) -> return settled(value)
+            Quote -> return false
+            ArrayLiteral -> return false
+            TypeQuery -> return false
+            ExpandedMacro -> return false
+            MacroCall -> return false
+            Call -> return false
+            GenericCall -> return false
+            MethodCall -> return false
+            IndirectCall -> return false
+            Lambda -> return false
+            KeyPath -> return false
+            Task -> return false
+            Try -> return false
+            Variant -> return false
+            StructLiteral -> return false
+            Binary -> return false
+            Conditional -> return false
+            MatchValue -> return false
+            Content -> return false
+        }
+    }
+}

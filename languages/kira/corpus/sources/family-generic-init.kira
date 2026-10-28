@@ -1,0 +1,58 @@
+// A generic construct's init may take type parameters of its own: written
+// in a family's slot, the construct takes its own from the slot and the
+// init's from its arguments, a key path's value and a closure's result.
+
+import Foundation
+
+struct Row {
+    let name: String
+    let size: Int
+}
+
+construct Column {
+    @Required function read(row: borrow Any) -> Int
+}
+
+construct Field<RowValue>(measure: (borrow RowValue) -> Int) extends Column<RowValue> {
+    init(title: String, value: KeyPath<RowValue, String>) {
+        let read = copy value
+        return Field<RowValue>(measure: { row in return read(row).count })
+    }
+
+    init<Value>(title: String, value: KeyPath<RowValue, Value>, content: (borrow RowValue) -> Int) {
+        return Field<RowValue>(measure: content)
+    }
+
+    function read(row: borrow Any) -> Int {
+        if row is RowValue {
+            let value = row as RowValue
+            return measure(value)
+        }
+        return 0
+    }
+}
+
+construct Report {
+    @Required function total() -> Int
+}
+
+construct Sheet<Value>(rows: [Value]) extends Report {
+    let columns: [some Column<Value>]
+
+    function total() -> Int {
+        var sum = 0
+        for row in rows {
+            for column in columns { sum = sum + column.read(row) }
+        }
+        return sum
+    }
+}
+
+@Main
+function main() -> Int {
+    let sheet = Sheet(rows: [Row { name: "abc", size: 4 }]) {
+        Field("Name", value: \.name)
+        Field("Size", value: \.size) { row in row.size * 10 }
+    }
+    return sheet.total()
+}

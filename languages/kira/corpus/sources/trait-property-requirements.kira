@@ -1,0 +1,38 @@
+// A trait may require properties: a stored field of the name and type
+// satisfies one, read through generics and through the trait's existential,
+// and assigned through it when the requirement is `{ get set }`.
+
+import Foundation
+
+trait Named {
+    var name: String { get }
+}
+
+trait Counted {
+    var count: Int { get set }
+}
+
+struct Cat: Named, Counted {
+    let name: String
+    var count: Int
+}
+
+struct Dog: Named {
+    let name: String
+    let good: Bool
+}
+
+function nameOf<Value: Named>(value: borrow Value) -> String {
+    return value.name
+}
+
+@Main
+function main() -> Int {
+    let pets: [Named] = [Cat { name: "tom", count: 1 }, Dog { name: "rex", good: true }]
+    var letters = 0
+    for pet in pets { letters = letters + pet.name.count }
+    var counted: Counted = Cat { name: "kit", count: 30 }
+    counted.count = counted.count + 6
+    if nameOf(Dog { name: "rex", good: true }) != "rex" { return 0 }
+    return letters + counted.count
+}

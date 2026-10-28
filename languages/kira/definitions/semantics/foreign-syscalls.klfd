@@ -1,0 +1,62 @@
+// `@FFI.Syscall { name: write }` (KLF section 26.2): a Linux system call
+// made directly, by its `man 2` name. The toolchain numbers it for the
+// target's architecture and refuses a target that cannot make it; here its
+// signature is held to what the kernel entry passes, words in registers.
+
+extend Checker {
+    // Whether the package declaring `file` is the system itself, the one
+    // place a system call is made from (D-382).
+    function grantsSystemCalls(borrow self, file: Int) -> Bool {
+        match declarations.moduleOf(file) {
+            Some(module) -> return declarations.modules[module].systemCalls
+            None -> return false
+        }
+    }
+
+    // A system call takes at most six words, integers or addresses, and
+    // returns an integer, an address or nothing.
+    function syscallSignature(borrow self, signature: Signature) -> Bool {
+        var clean = true
+        if signature.parameters.count > 6 {
+            report(.ForeignSyscallArguments, signature.parameters[6].name.span)
+            clean = false
+        }
+        for parameter in signature.parameters {
+            if !syscallWord(seamType(parameter.valueType), true) {
+                report(.ForeignSeamType, parameter.name.span)
+                clean = false
+            }
+        }
+        if !syscallWord(seamType(signature.result), false) {
+            report(.ForeignSeamType, signature.name.span)
+            clean = false
+        }
+        return clean
+    }
+
+    function syscallWord(borrow self, valueType: Type, parameter: Bool) -> Bool {
+        match valueType.kind {
+            Integer -> return true
+            Pointer -> return true
+            Boolean -> return parameter
+            Enumeration -> return parameter
+            Void -> return !parameter
+            Invalid -> return true
+            Decimal -> return false
+            Floating -> return false
+            Structure -> {
+                if !parameter { return false }
+                if isCStringType(program, valueType) { return true }
+                if isArrayType(program, valueType) { return isSeamScalar(program.structs[valueType.declaration].typeArguments[0]) }
+                match program.structs[valueType.declaration].shape {
+                    CPointer -> return true
+                    Callback -> return true
+                    Plain -> return false
+                    CLayout -> return false
+                    CUnion -> return false
+                    CArray -> return false
+                }
+            }
+        }
+    }
+}

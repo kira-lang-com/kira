@@ -1,0 +1,113 @@
+import Foundation
+import Elf
+
+// Actions on built binaries (DESIGN.md section 5.6), over the Elf library.
+
+/// A binary split in two: what a program needs to run, and what a debugger reads beside it.
+public struct StrippedBinary {
+    /// The binary without its debug information, under the built one's mode.
+    let binary: Artifact
+    /// That information alone, mode 644.
+    let debug: Artifact
+}
+
+extend Graph {
+    // The ELF executable or shared library `binary` split as `llvm-strip
+    // --strip-unneeded` and `llvm-objcopy --only-keep-debug` split it, the
+    // stripped binary called `name` and its debug information `name.debug`.
+    function strip(
+        borrow mut self,
+        name: borrow String,
+        binary: borrow Artifact
+    ) -> StrippedBinary {
+        let label = "strip \(name)"
+        checkArtifact(binary, label)
+        checkTreePath(name, label)
+        if holdsTree(binary) { problems.append("\(label) strips a tree, not a file") }
+        let called = lastName(name)
+        let outputs = native(
+            NativeAction {
+                label: label,
+                code: sourceDigest!("package"),
+                inputs: [binary],
+                outputs: [Output { name: copy called }, Output { name: "\(called).debug" }],
+                work: { run in
+                    let bytes = match readFileBytes(run.inputs[0]) {
+                        Ok(read) -> read
+                        Error(failure) -> return .Error(
+                            .Files("cannot read \(run.inputs[0]): \(traceText(failure))")
+                        )
+                    }
+                    let stripped = match stripDebugInformation(bytes) {
+                        Ok(split) -> split
+                        Error(failure) -> return .Error(.Failed(elfFailureText(failure)))
+                    }
+                    match writeBinaryFile(run.outputs[0], stripped, run.modes[0]) {
+                        Ok -> {}
+                        Error(failure) -> return .Error(failure)
+                    }
+                    let debug = match debugInformation(bytes) {
+                        Ok(split) -> split
+                        Error(failure) -> return .Error(.Failed(elfFailureText(failure)))
+                    }
+                    return writeBinaryFile(run.outputs[1], debug, 420)
+                }
+            }
+        )
+        return StrippedBinary { binary: outputs[0], debug: outputs[1] }
+    }
+
+    // The interface stub of the ELF shared library `binary`, called `name`,
+    // as `llvm-ifs --output-elf` writes one: its dynamic symbols, the
+    // libraries it needs and its soname, and nothing else, so what links
+    // against the stub is linked again only when the library's interface
+    // changes, not its code. Mode 644.
+    function interfaceStub(
+        borrow mut self,
+        name: borrow String,
+        binary: borrow Artifact
+    ) -> Artifact {
+        let label = "interface stub \(name)"
+        checkArtifact(binary, label)
+        checkTreePath(name, label)
+        if holdsTree(binary) { problems.append("\(label) reads a tree, not a file") }
+        let outputs = native(
+            NativeAction {
+                label: label,
+                code: sourceDigest!("package"),
+                inputs: [binary],
+                outputs: [Output { name: lastName(name) }],
+                work: { run in
+                    let bytes = match readFileBytes(run.inputs[0]) {
+                        Ok(read) -> read
+                        Error(failure) -> return .Error(
+                            .Files("cannot read \(run.inputs[0]): \(traceText(failure))")
+                        )
+                    }
+                    let stub = match interfaceStub(bytes) {
+                        Ok(made) -> made
+                        Error(failure) -> return .Error(.Failed(elfFailureText(failure)))
+                    }
+                    return writeBinaryFile(run.outputs[0], stub, 420)
+                }
+            }
+        )
+        return outputs[0]
+    }
+}
+
+// Writes `bytes` to the new file `path` with the permission bits `mode`.
+function writeBinaryFile(
+    path: borrow String,
+    bytes: borrow [UN8],
+    mode: UNumber
+) -> Result<Void, BuildFailure> {
+    match writeFileBytes(path, bytes) {
+        Ok -> {}
+        Error(failure) -> return .Error(.Files("cannot write \(path): \(traceText(failure))"))
+    }
+    return match setFileMode(path, mode) {
+        Ok -> .Ok
+        Error(failure) -> .Error(.Files("cannot set the mode of \(path): \(traceText(failure))"))
+    }
+}

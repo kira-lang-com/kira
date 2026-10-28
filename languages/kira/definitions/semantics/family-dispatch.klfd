@@ -1,0 +1,128 @@
+// Families a package built apart declares (KLF-RIDL section 9.1).
+//
+// A public family of a package built as a unit of its own is a trait object,
+// `Any Family`, as one crossing RIDL is: the declarations seen through it
+// may be written in any package depending on it, which the family's unit
+// does not see. Its values stay in the program, though, so no witness table
+// carries its members. The program's own unit sees every package, so it
+// defines each member: the member reads the number of the declaration the
+// value's box holds and calls that declaration's own method, or the
+// family's default, as Kira calls any function (`lowering/family-dispatch`).
+// Every other unit declares the members it calls.
+
+// A member of such a family as the program's own unit defines it.
+struct FamilyDispatch {
+    let dispatcher: Int
+    // The struct of each declaration seen through the family, and the method
+    // it answers the member with, or -1 where the family's default does.
+    let members: [Int]
+    let targets: [Int]
+    // The family's default for the member, or -1.
+    let fallback: Int
+}
+
+// Per struct, whether it is the trait object of a family a package built
+// apart declares: one built in a unit of its own, or the one the unit
+// builds, that is not a framework's.
+function dispatchedFamilies(tree: borrow SyntaxTree, declarations: Declarations) -> [Bool] {
+    var families: [Bool] = []
+    for structure in declarations.structs {
+        families.append(structure.genericBase == "Witnessed" && builtApart(tree, declarations, structure.name.span.file))
+    }
+    return families
+}
+
+function builtApart(tree: borrow SyntaxTree, declarations: Declarations, file: Int) -> Bool {
+    let position = declarations.sourcePosition(file)
+    if position < 0 { return false }
+    let module = declarations.sources[position].module
+    if tree.modules[module].framework { return false }
+    return tree.modules[module].separate || (module == 0 && tree.dependencyUnit)
+}
+
+// Per declared function, whether it is a member of such a family.
+function familyDispatchers(tree: borrow SyntaxTree, declarations: Declarations, families: [Bool]) -> [Bool] {
+    var dispatchers: [Bool] = []
+    for signature in declarations.signatures {
+        dispatchers.append(dispatchesFamily(tree, signature, families))
+    }
+    return dispatchers
+}
+
+function dispatchesFamily(tree: borrow SyntaxTree, signature: Signature, families: [Bool]) -> Bool {
+    match signature.owner {
+        Some(owner) -> {
+            if owner.kind != .Structure || !families[owner.declaration] { return false }
+            let role = witnessRole(tree, signature.declaration.annotations)
+            return (role == witnessMember || role == witnessDefault) && ridlImportModule(tree, signature.declaration.annotations).isSome()
+        }
+        None -> return false
+    }
+}
+
+// What the program's own unit calls for each member of every such family.
+// The structs and functions past `families` and `dispatchers` are the
+// instances of generic declarations minted since, none of them a family or
+// its member.
+function familyDispatches(tree: borrow SyntaxTree, declarations: Declarations, families: [Bool], dispatchers: [Bool]) -> [FamilyDispatch] {
+    var answers: [[Int]] = []
+    for _ in 0..declarations.structs.count {
+        let none: [Int] = []
+        answers.append(none)
+    }
+    var boxes: [Int] = []
+    var defaults: [Int] = []
+    for index in 0..declarations.signatures.count {
+        let signature = declarations.signatures[index]
+        let role = witnessRole(tree, signature.declaration.annotations)
+        if utf8Count(role) == 0 { continue }
+        match signature.owner {
+            Some(owner) -> {
+                if owner.kind != .Structure { continue }
+                if role == witnessExport {
+                    answers[owner.declaration].append(index)
+                } else if boxesWitness(role) {
+                    if signature.result.kind == .Structure && flagged(families, signature.result.declaration) { boxes.append(index) }
+                } else if role == witnessDefault && flagged(families, owner.declaration) && ridlImportModule(tree, signature.declaration.annotations).isNone() {
+                    defaults.append(index)
+                }
+            }
+            None -> {}
+        }
+    }
+    var dispatches: [FamilyDispatch] = []
+    for index in 0..declarations.signatures.count {
+        if !flagged(dispatchers, index) { continue }
+        let signature = declarations.signatures[index]
+        let family = signature.owner.unwrap().declaration
+        var members: [Int] = []
+        var targets: [Int] = []
+        for box in boxes {
+            if declarations.signatures[box].result.declaration != family { continue }
+            let declaration = declarations.signatures[box].owner.unwrap().declaration
+            members.append(declaration)
+            targets.append(answeringMethod(declarations, answers[declaration], signature.member))
+        }
+        var fallback = -1
+        for candidate in defaults {
+            let written = declarations.signatures[candidate]
+            if written.owner.unwrap().declaration == family && written.member == witnessDefaultName(signature.member) { fallback = candidate }
+        }
+        dispatches.append(FamilyDispatch { dispatcher = index, members = members, targets = targets, fallback = fallback })
+    }
+    return dispatches
+}
+
+// The method of `answers` a declaration answers `member` with: its own, or
+// the reader of the value member it holds; -1 when it has neither.
+function answeringMethod(declarations: Declarations, answers: [Int], member: String) -> Int {
+    for answer in answers {
+        let name = declarations.signatures[answer].member
+        if name == member || name == witnessReaderName(member) { return answer }
+    }
+    return -1
+}
+
+function flagged(flags: [Bool], index: Int) -> Bool {
+    return index < flags.count && flags[index]
+}

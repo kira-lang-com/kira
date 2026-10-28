@@ -1,0 +1,161 @@
+import Foundation
+
+// Pinning a directory tree to a toolchain, and finding the pin that governs it.
+//
+// The launcher prefers a pin over the global selection, the same reason a
+// project's `rust-toolchain.toml` outranks the default toolchain.
+
+// What pinning or unpinning produced.
+public enum PinOutcome {
+    Pinned(Pin)
+    // Whether there was a pin to remove.
+    Unpinned(Bool)
+    NotInstalled(String)
+    Failed(String)
+}
+
+// Pins `directory` to an installed toolchain and writes the pin file.
+//
+// The version must be installed: a pin at a version this machine does not have
+// would leave every later `kira` in the tree refusing to dispatch, which is a
+// failure better reported now, by the command that caused it.
+public function pinToolchain(
+    compiler: borrow Compiler,
+    directory: borrow String,
+    channel: borrow Channel,
+    version: borrow String
+) -> PinOutcome {
+    let listed = listToolchains(compiler)
+    match listed {
+        Failed(failure) -> { return .Failed(manageFailureText(compiler, failure)) }
+        Selected(report) -> { return .Failed("listing answered with a selection") }
+        Removed(report) -> { return .Failed("listing answered with a removal") }
+        Listed(installed) -> {
+            if !isInstalled(installed, channel, version) {
+                return .NotInstalled(
+                    "`" + version + "` of " + compiler.name + " is not installed on the `" + channelName(
+                        channel
+                    ) + "` channel; install it first with `" + installCommand(
+                        compiler,
+                        channel,
+                        version
+                    ) + "`"
+                )
+            }
+            let path = joinPath(directory, pinFileName(compiler))
+            let pin = Pin { channel: channel, version: version, path: path }
+            if !writePin(compiler, directory, pin) {
+                return .Failed("could not write `" + path + "`")
+            }
+            return .Pinned(pin)
+        }
+    }
+    return .Failed("could not read `" + directory + "`")
+}
+
+// Whether the listing holds this channel and version.
+public function isInstalled(
+    installed: borrow [InstalledToolchain],
+    channel: borrow Channel,
+    version: borrow String
+) -> Bool {
+    for index in 0..installed.count {
+        if installed[index].channel == channel && installed[index].version == version {
+            return true
+        }
+    }
+    return false
+}
+
+// Removes the pin in `directory`, reporting whether there was one.
+public function unpinTree(compiler: borrow Compiler, directory: borrow String) -> PinOutcome {
+    let path = joinPath(directory, pinFileName(compiler))
+    if !pathExists(path) { return .Unpinned(false) }
+    if !removePin(compiler, directory) { return .Failed("could not remove `" + path + "`") }
+    return .Unpinned(true)
+}
+
+// The toolchain this invocation runs: a directory tree's pin, else the global
+// selection.
+//
+// The pin wins because it is the more specific statement. A pin whose toolchain
+// is not installed is refused here rather than falling back: falling back would
+// run a compiler the tree explicitly said it does not want, silently.
+public struct ToolchainChoice {
+    var channel: Channel = .Release
+    var version: String = ""
+}
+
+public enum Resolution {
+    Toolchain(ToolchainChoice)
+    Refused(String)
+}
+
+public function resolveToolchain(compiler: borrow Compiler, directory: borrow String) -> Resolution {
+    if directory.isEmpty() {
+        return resolutionFromSelection(compiler, readSelection(compiler))
+    }
+    let pin = findPin(compiler, directory)
+    match pin {
+        NoPin -> { return resolutionFromSelection(compiler, readSelection(compiler)) }
+        Unusable(failure) -> {
+            return .Refused(
+                stateFailureText(
+                    compiler,
+                    failure
+                ) + "; fix it, or drop it with `knvm " + compiler.name + " unpin`"
+            )
+        }
+        Pinned(found) -> {
+            let root = toolchainRoot(compiler, found.channel, found.version)
+            if !isDirectory(root) {
+                return .Refused(
+                    "`" + found.path + "` pins " + channelName(
+                        found.channel
+                    ) + "/" + found.version + ", which is not installed; install it with `" + installCommand(
+                        compiler,
+                        found.channel,
+                        found.version
+                    ) + "`, or drop the pin with `knvm " + compiler.name + " unpin`"
+                )
+            }
+            let choice = ToolchainChoice { channel: found.channel, version: found.version }
+            return .Toolchain(choice)
+        }
+    }
+    return .Refused("no toolchain selected")
+}
+
+public function resolutionFromSelection(compiler: borrow Compiler, state: SelectionState) -> Resolution {
+    match state {
+        NothingSelected -> {
+            return .Refused(
+                "no " + compiler.name + " selected (" + currentToolchainPath(
+                    compiler
+                ) + " does not exist); install one with `" + provisionCommand(compiler) + "`"
+            )
+        }
+        Selected(selection) -> {
+            let root = toolchainRoot(compiler, selection.channel, selection.version)
+            if !isDirectory(root) {
+                return .Refused(
+                    "selected toolchain " + channelName(
+                        selection.channel
+                    ) + "/" + selection.version + " is not installed at " + root + "; repair it with `" + provisionCommand(
+                        compiler
+                    ) + "`"
+                )
+            }
+            let choice = ToolchainChoice { channel: selection.channel, version: selection.version }
+            return .Toolchain(choice)
+        }
+        Unusable(failure) -> {
+            return .Refused(
+                stateFailureText(compiler, failure) + "; repair it with `" + provisionCommand(
+                    compiler
+                ) + "`"
+            )
+        }
+    }
+    return .Refused("no toolchain selected")
+}

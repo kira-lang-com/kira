@@ -1,0 +1,39 @@
+// Construct members written without a type take their initializer's, and
+// a family reads them through its cases.
+
+import Foundation
+
+struct Pair {
+    let a: Int
+    let b: String
+}
+
+construct Guide {
+    @Required let name: String
+    let count = 3
+}
+
+construct Leading() extends Guide {
+    let name = "lead"
+    let pair = Pair { a = 4, b = "four" }
+}
+
+function pick(flag: Bool) -> String {
+    return flag ? "yes" : "no"
+}
+
+@Main
+function main() -> Int {
+    let p = Pair { a = 1, b = "one" }
+    let q = Pair { a = 2, b = "two" }
+    let r = pick(false) == "no" ? p : q
+    let l = Leading()
+    if pick(true) != "yes" { return 1 }
+    if r.b != "one" { return 2 }
+    if l.name != "lead" { return 3 }
+    if l.count != 3 { return 4 }
+    if l.pair.b != "four" { return 5 }
+    let g: Any Guide = Leading()
+    if g.count != 3 || g.name != "lead" { return 6 }
+    return 42
+}

@@ -1,0 +1,58 @@
+// `@FFI.Union` and `@FFI.Alias` across the C seam.
+
+@FFI.Union { layout: c }
+struct SeamWord {
+    var bits: U32
+    var value: F32
+}
+
+@FFI.Pointer { target: SeamWord, ownership: borrowed }
+struct SeamWordPtr {}
+
+@FFI.Struct { layout: c }
+struct SeamTagged {
+    let tag: I32
+    let word: SeamWord
+}
+
+@FFI.Alias { target: U64 }
+struct CULong {}
+
+@FFI.Alias { target: Int }
+struct CLong {}
+
+@FFI.Extern { library: klfseam, symbol: seam_word_of_float, abi: c }
+function wordOfFloat(value: F32) -> SeamWord
+
+@FFI.Extern { library: klfseam, symbol: seam_word_bits, abi: c }
+function wordBits(word: SeamWord) -> U32
+
+@FFI.Extern { library: klfseam, symbol: seam_word_value, abi: c }
+function wordValue(word: SeamWordPtr) -> F32
+
+@FFI.Extern { library: klfseam, symbol: seam_tagged_sum, abi: c }
+function taggedSum(tagged: SeamTagged) -> Int
+
+@FFI.Extern { library: klfseam, symbol: seam_ulong_twice, abi: c }
+function ulongTwice(value: CULong) -> CULong
+
+@FFI.Extern { library: klfseam, symbol: seam_long_negate, abi: c }
+function longNegate(value: CLong) -> CLong
+
+@Main
+function main() {
+    let one = wordOfFloat(1.0)
+    print(one.bits)
+    print(wordBits(SeamWord { value: 2.0 }))
+    print(wordBits(SeamWord { bits: 7 }))
+    print(wordBits(SeamWord {}))
+    print(wordValue(SeamWord { bits: 1065353216 }))
+    var word = SeamWord { bits: 0 }
+    word.value = 0.5
+    print(word.bits)
+    print(taggedSum(SeamTagged { tag: 5, word: SeamWord { bits: 10 } }))
+    let wide: CULong = 3000000000
+    print(ulongTwice(wide))
+    print(longNegate(42))
+    return
+}

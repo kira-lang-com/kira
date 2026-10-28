@@ -1,0 +1,627 @@
+// A QUIC node: one value that owns a poller, the UDP sockets and every
+// connection on them, for a program that speaks its own protocol over
+// bidirectional streams. Like Network's driver it is moved with `wait` or
+// `poll`, and what happened comes back as events; nothing blocks but the
+// poller's wait. A node listens, dials, or both, and holds any number of
+// connections in one thread. Every connection speaks the one ALPN protocol
+// the options name.
+
+distinct QuicConnectionId = Number
+
+distinct QuicListenerId = Number
+
+// A stream of a connection; `number` is its QUIC stream ID (RFC 9000
+// section 2.1).
+struct QuicStreamId {
+    let connection: QuicConnectionId
+    let number: Number
+}
+
+struct QuicNodeOptions {
+    // The ALPN protocol every connection speaks.
+    let protocol: String
+    let limits: QuicLimits = QuicLimits {}
+}
+
+// A server's certificate chain, leaf first, each DER, and the leaf's private
+// key, PKCS #8 DER, signing with `scheme`.
+struct QuicIdentity {
+    let certificates: [[UN8]]
+    let key: [UN8]
+    let scheme: SignatureScheme = .EcdsaSecp256r1Sha256
+}
+
+// Where a client connects: `address` is a socket address, "127.0.0.1:4433"
+// or "[::1]:4433", with no host name to resolve; `serverName` is the name
+// the server's certificate must carry; `anchors` are DER certificates
+// trusted besides the bundled roots.
+struct QuicDial {
+    let address: String
+    let serverName: String
+    let anchors: [[UN8]] = []
+}
+
+enum QuicFailure {
+    Net(NetFailure)
+    // The identity's key does not load.
+    Key(CryptoFailure)
+    // The QUIC transport error that stopped a connection or an endpoint
+    // from starting.
+    Transport(Number)
+    Stream(QuicStreamProblem)
+    // No connection of this node has that ID, or it has closed.
+    UnknownConnection
+    UnknownListener
+}
+
+struct QuicOpened {
+    let connection: QuicConnectionId
+    // The listener that accepted it; none for a connection this node dialed.
+    let listener: QuicListenerId?
+}
+
+struct QuicClosed {
+    let connection: QuicConnectionId
+    let code: Number
+    let reason: String
+    // The peer closed it, not this node or its idle timer.
+    let byPeer: Bool
+    // The code is the application's, not a QUIC transport error.
+    let application: Bool
+}
+
+struct QuicStreamBytes {
+    let stream: QuicStreamId
+    let bytes: [UN8]
+}
+
+enum QuicStreamEnding {
+    // The peer finished its side; every byte it sent has come.
+    Finished
+    // The peer reset its side with this code.
+    Reset(Number)
+    // The peer stops reading this side, with this code; the node resets the
+    // side with it (RFC 9000 section 3.5).
+    Stopped(Number)
+}
+
+struct QuicStreamEnd {
+    let stream: QuicStreamId
+    let ending: QuicStreamEnding
+}
+
+enum QuicNodeEvent {
+    // The handshake completed.
+    Opened(QuicOpened)
+    Closed(QuicClosed)
+    // The peer opened a stream.
+    StreamOpened(QuicStreamId)
+    StreamData(QuicStreamBytes)
+    StreamEnded(QuicStreamEnd)
+}
+
+namespace QuicNodeLimit {
+    let datagramRoom: Number = 65536
+    let eventRoom: Number = 256
+    let nanosecondsPerMicrosecond: Number = 1000
+    let microsecondsPerSecond: Number = 1000000
+    let millisecondsPerSecond: Number = 1000
+    let anyIpv4: String = "0.0.0.0:0"
+    let anyIpv6: String = "[::]:0"
+}
+
+// One UDP socket and the QUIC endpoint behind it.
+struct QuicNodeSlot {
+    let socket: UdpSocket
+    let token: Number
+    var endpoint: QuicEndpoint
+    // A dialing slot carries one address family; a listening one has its
+    // own ID.
+    let ipv6: Bool
+    let listener: QuicListenerId?
+}
+
+struct QuicNodeConnection {
+    let id: QuicConnectionId
+    let slot: Number
+    let handle: QuicConnectionHandle
+    let listener: QuicListenerId?
+    // The streams whose end was given, so it is given once.
+    var finished: [Number] = []
+}
+
+struct QuicNode {
+    let options: QuicNodeOptions
+    let poller: Poller
+    // Poller tokens, listener IDs and connection IDs share one counter.
+    var nextId: Number = 1
+    var slots: [QuicNodeSlot] = []
+    var connections: [QuicNodeConnection] = []
+    var events: [QuicNodeEvent] = []
+
+    function now(borrow self) -> QuicInstant {
+        return QuicInstant(
+            Number(floor(monotonicNanoseconds() / QuicNodeLimit.nanosecondsPerMicrosecond))
+        )
+    }
+
+    function takeId(borrow mut self) -> Number {
+        let id = nextId
+        nextId += 1
+        return id
+    }
+
+    // Accepts connections on `address`, "host:port", port 0 taking any free
+    // one, with `identity`.
+    function listen(
+        borrow mut self,
+        address: borrow String,
+        identity: QuicIdentity
+    ) -> Result<QuicListenerId, QuicFailure> {
+        let key = match loadSigningKey(identity.key) {
+            Ok(value) -> value
+            Error(failure) -> return .Error(.Key(failure))
+        }
+        let server = QuicServerSettings {
+            identity: TlsServerIdentity {
+                certificates: copy identity.certificates,
+                key: key,
+                scheme: identity.scheme
+            },
+            protocols: [copy options.protocol],
+            limits: copy options.limits
+        }
+        let listener = QuicListenerId(takeId())
+        let slot = try openSlot(
+            address,
+            QuicEndpointSettings { server: .Some(server) },
+            .Some(listener)
+        )
+        absorb slot
+        return .Ok(listener)
+    }
+
+    // The address `listener` is bound to, its port chosen when it asked for
+    // 0.
+    function listenerAddress(borrow self, listener: QuicListenerId) -> Result<String, QuicFailure> {
+        for slot in slots {
+            if slot.listener != .Some(listener) { continue }
+            return match slot.socket.localAddress() {
+                Ok(address) -> .Ok(address)
+                Error(failure) -> .Error(.Net(failure))
+            }
+        }
+        return .Error(.UnknownListener)
+    }
+
+    // Starts a connection to `dial`; `Opened` comes when its handshake
+    // completes, `Closed` when it fails.
+    function connect(borrow mut self, dial: QuicDial) -> Result<QuicConnectionId, QuicFailure> {
+        let slot = try dialingSlot(dial.address.startsWith("["))
+        var anchors = WireWriter {}
+        for certificate in dial.anchors { anchors.writeVector(certificate, Tls.longVector) }
+        let settings = QuicClientSettings {
+            serverName: copy dial.serverName,
+            protocols: [copy options.protocol],
+            seconds: floor(unixMillis() / QuicNodeLimit.millisecondsPerSecond),
+            anchors: anchors.bytes,
+            limits: copy options.limits
+        }
+        let handle = match slots[slot].endpoint.connect(move settings, dial.address, now()) {
+            Ok(value) -> value
+            Error(problem) -> return .Error(.Transport(code(problem)))
+        }
+        let id = QuicConnectionId(takeId())
+        connections.append(
+            QuicNodeConnection { id: id, slot: slot, handle: handle, listener: .None }
+        )
+        return .Ok(id)
+    }
+
+    // A new bidirectional stream on an opened connection.
+    function openStream(
+        borrow mut self,
+        connection: QuicConnectionId
+    ) -> Result<QuicStreamId, QuicFailure> {
+        let found = try place(connection)
+        let opened = slots[found.0].endpoint.connections[found.1].connection.openStream(
+            .Bidirectional
+        )
+        return match opened {
+            Ok(number) -> .Ok(QuicStreamId { connection: connection, number: number.raw })
+            Error(problem) -> .Error(.Stream(problem))
+        }
+    }
+
+    // Queues `bytes` on `stream`.
+    function write(
+        borrow mut self,
+        stream: borrow QuicStreamId,
+        bytes: borrow [UN8]
+    ) -> Result<Void, QuicFailure> {
+        let found = try place(stream.connection)
+        return quicStreamOutcome(
+            slots[found.0].endpoint.connections[found.1].connection.write(
+                QuicStreamNumber(Number(stream.number)),
+                bytes,
+                false
+            )
+        )
+    }
+
+    // Ends this side of `stream` after what was written.
+    function finish(borrow mut self, stream: borrow QuicStreamId) -> Result<Void, QuicFailure> {
+        let found = try place(stream.connection)
+        let empty: [UN8] = []
+        return quicStreamOutcome(
+            slots[found.0].endpoint.connections[found.1].connection.write(
+                QuicStreamNumber(Number(stream.number)),
+                empty,
+                true
+            )
+        )
+    }
+
+    // Abandons this side of `stream` with `code`.
+    function reset(
+        borrow mut self,
+        stream: borrow QuicStreamId,
+        code: Number
+    ) -> Result<Void, QuicFailure> {
+        let found = try place(stream.connection)
+        return quicStreamOutcome(
+            slots[found.0].endpoint.connections[found.1].connection.resetStream(
+                QuicStreamNumber(Number(stream.number)),
+                Number(code)
+            )
+        )
+    }
+
+    // Asks the peer to stop sending on `stream`, with `code`.
+    function stop(
+        borrow mut self,
+        stream: borrow QuicStreamId,
+        code: Number
+    ) -> Result<Void, QuicFailure> {
+        let found = try place(stream.connection)
+        return quicStreamOutcome(
+            slots[found.0].endpoint.connections[found.1].connection.stopSending(
+                QuicStreamNumber(Number(stream.number)),
+                Number(code)
+            )
+        )
+    }
+
+    // Closes `connection` with the application's `code` and `reason`; its
+    // `Closed` follows.
+    function close(
+        borrow mut self,
+        connection: QuicConnectionId,
+        code: Number,
+        reason: borrow String
+    ) -> Result<Void, QuicFailure> {
+        let found = try place(connection)
+        slots[found.0].endpoint.connections[found.1].connection.close(Number(code), reason, true)
+        return .Ok
+    }
+
+    // Closes every socket and the poller; the connections end without a
+    // word to their peers.
+    function shutdown(borrow mut self) {
+        for slot in slots { absorb slot.socket.close() }
+        match closeHandle(poller.handle) {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+        slots = []
+        connections = []
+    }
+
+    // Blocks until something happens or `until` passes, then gives what
+    // happened.
+    function wait(borrow mut self, until: QuicInstant?) -> [QuicNodeEvent] {
+        // What calls since the last turn queued goes out before blocking,
+        // and what they produced is returned at once.
+        advance()
+        if events.count > 0 { return poll() }
+        var deadline = copy until
+        for slot in slots { deadline = quicEarliest(deadline, slot.endpoint.deadline()) }
+        let timeout: Number? = match deadline {
+            Some(at) -> .Some(
+                trunc(Number(max(at.raw - now().raw, 0)) / QuicNodeLimit.microsecondsPerSecond)
+            )
+            None -> .None
+        }
+        return turn(timeout)
+    }
+
+    // What happened, without blocking.
+    function poll(borrow mut self) -> [QuicNodeEvent] {
+        return turn(.Some(0))
+    }
+
+    function turn(borrow mut self, timeout: borrow Number?) -> [QuicNodeEvent] {
+        match poller.wait(copy timeout, QuicNodeLimit.eventRoom) {
+            Ok(ready) -> {
+                for event in ready { takeReadiness(event) }
+            }
+            Error(failure) -> absorb failure
+        }
+        advance()
+        let out = events
+        events = []
+        return out
+    }
+
+    // Timers that are due, engine events, and datagrams to send.
+    function advance(borrow mut self) {
+        let at = now()
+        for index in 0..slots.count {
+            match slots[index].endpoint.deadline() {
+                Some(when) -> {
+                    if at.raw >= when.raw { slots[index].endpoint.expire(at) }
+                }
+                None -> {}
+            }
+        }
+        var kept: [QuicNodeConnection] = []
+        for index in 0..connections.count {
+            if pump(index) { kept.append(copy connections[index]) }
+        }
+        connections = kept
+        for index in 0..slots.count {
+            while true {
+                let datagram = match slots[index].endpoint.transmit(at) {
+                    Some(value) -> value
+                    None -> break
+                }
+                // A datagram the socket refuses is as if lost; recovery
+                // sends its content again.
+                absorb slots[index].socket.send(datagram.bytes, datagram.peer)
+            }
+        }
+    }
+
+    // The engine events of the connection at `index` as the node's;
+    // answers whether it is still open.
+    function pump(borrow mut self, index: Number) -> Bool {
+        let id = connections[index].id
+        let slot = connections[index].slot
+        let position = match slots[slot].endpoint.index(connections[index].handle) {
+            Some(value) -> value
+            None -> {
+                events.append(
+                    .Closed(
+                        QuicClosed {
+                            connection: id,
+                            code: 0,
+                            reason: "",
+                            byPeer: false,
+                            application: false
+                        }
+                    )
+                )
+                return false
+            }
+        }
+        var open = true
+        while true {
+            let event = match slots[slot].endpoint.connections[position].connection.event() {
+                Some(value) -> value
+                None -> break
+            }
+            match event {
+                Connected(agreement) -> {
+                    absorb agreement
+                    events.append(
+                        .Opened(
+                            QuicOpened { connection: id, listener: connections[index].listener }
+                        )
+                    )
+                }
+                StreamOpened(number) -> events.append(
+                    .StreamOpened(QuicStreamId { connection: id, number: number.raw })
+                )
+                StreamReadable(number) -> read(index, position, number)
+                StreamReset(failure) -> events.append(
+                    .StreamEnded(
+                        QuicStreamEnd {
+                            stream: QuicStreamId { connection: id, number: failure.id.raw },
+                            ending: .Reset(failure.error)
+                        }
+                    )
+                )
+                StreamStopped(failure) -> events.append(
+                    .StreamEnded(
+                        QuicStreamEnd {
+                            stream: QuicStreamId { connection: id, number: failure.id.raw },
+                            ending: .Stopped(failure.error)
+                        }
+                    )
+                )
+                Datagram(bytes) -> absorb bytes
+                Closed(end) -> {
+                    // The events after it are taken too, so the endpoint
+                    // lets the connection go.
+                    if open {
+                        events.append(
+                            .Closed(
+                                QuicClosed {
+                                    connection: id,
+                                    code: end.error,
+                                    reason: copy end.reason,
+                                    byPeer: end.byPeer,
+                                    application: end.application
+                                }
+                            )
+                        )
+                    }
+                    open = false
+                }
+            }
+        }
+        return open
+    }
+
+    // What arrived on stream `number`, then its end once.
+    function read(borrow mut self, index: Number, position: Number, number: QuicStreamNumber) {
+        let slot = connections[index].slot
+        let read = match slots[slot].endpoint.connections[position].connection.read(number) {
+            Ok(value) -> value
+            Error(problem) -> {
+                absorb problem
+                return
+            }
+        }
+        let stream = QuicStreamId { connection: connections[index].id, number: number.raw }
+        if read.data.count > 0 {
+            events.append(
+                .StreamData(QuicStreamBytes { stream: copy stream, bytes: copy read.data })
+            )
+        }
+        if !read.finished || connections[index].finished.contains(number.raw) { return }
+        connections[index].finished.append(number.raw)
+        events.append(.StreamEnded(QuicStreamEnd { stream: stream, ending: .Finished }))
+    }
+
+    function takeReadiness(borrow mut self, event: borrow NetEvent) {
+        let token = match event.token {
+            Some(value) -> value
+            None -> return
+        }
+        for index in 0..slots.count {
+            if slots[index].token == token { return drain(index) }
+        }
+    }
+
+    // Every datagram the socket at `index` holds, then the connections its
+    // listener accepted.
+    function drain(borrow mut self, index: Number) {
+        let at = now()
+        while true {
+            let datagram = match slots[index].socket.receive(QuicNodeLimit.datagramRoom) {
+                Ok(value) -> value
+                Error(failure) -> {
+                    absorb failure
+                    break
+                }
+            }
+            slots[index].endpoint.receive(datagram, at)
+        }
+        let listener = match slots[index].listener {
+            Some(value) -> value
+            None -> return
+        }
+        while true {
+            let handle = match slots[index].endpoint.accept() {
+                Some(value) -> value
+                None -> break
+            }
+            connections.append(
+                QuicNodeConnection {
+                    id: QuicConnectionId(takeId()),
+                    slot: index,
+                    handle: handle,
+                    listener: .Some(listener)
+                }
+            )
+        }
+    }
+
+    // The slot and endpoint position of `connection`.
+    function place(borrow self, connection: QuicConnectionId) -> Result<(
+        Number, Number
+    ), QuicFailure> {
+        for entry in connections {
+            if entry.id != connection { continue }
+            return match slots[entry.slot].endpoint.index(entry.handle) {
+                Some(position) -> .Ok((entry.slot, Number(position)))
+                None -> .Error(.UnknownConnection)
+            }
+        }
+        return .Error(.UnknownConnection)
+    }
+
+    // The dialing socket for one address family, opened on first use.
+    function dialingSlot(borrow mut self, ipv6: Bool) -> Result<Number, QuicFailure> {
+        for (index, slot) in slots.enumerated() {
+            if slot.listener.isNone() && slot.ipv6 == ipv6 { return .Ok(index) }
+        }
+        return openSlot(
+            ipv6 ? QuicNodeLimit.anyIpv6 : QuicNodeLimit.anyIpv4,
+            QuicEndpointSettings {},
+            .None
+        )
+    }
+
+    // A new UDP socket the poller watches.
+    function openSlot(
+        borrow mut self,
+        address: borrow String,
+        settings: QuicEndpointSettings,
+        listener: QuicListenerId?
+    ) -> Result<Number, QuicFailure> {
+        let socket = match bindUdp(address) {
+            Ok(value) -> value
+            Error(failure) -> return .Error(.Net(failure))
+        }
+        let endpoint = match quicEndpoint(move settings) {
+            Ok(value) -> value
+            Error(problem) -> {
+                match socket.close() {
+                    Ok -> {}
+                    Error(failure) -> absorb failure
+                }
+                return .Error(.Transport(code(problem)))
+            }
+        }
+        let token = Number(takeId())
+        match poller.watch(socket.handle, .Readable, token) {
+            Ok -> {}
+            Error(failure) -> {
+                match socket.close() {
+                    Ok -> {}
+                    Error(failure) -> absorb failure
+                }
+                return .Error(.Net(failure))
+            }
+        }
+        slots.append(
+            QuicNodeSlot {
+                socket: socket,
+                token: token,
+                endpoint: move endpoint,
+                ipv6: address.startsWith("["),
+                listener: move listener
+            }
+        )
+        return .Ok(slots.count - 1)
+    }
+}
+
+function openQuicNode(options: QuicNodeOptions) -> Result<QuicNode, QuicFailure> {
+    let poller = match makePoller() {
+        Ok(value) -> value
+        Error(failure) -> return .Error(.Net(failure))
+    }
+    return .Ok(QuicNode { options: move options, poller: poller })
+}
+
+function quicStreamOutcome(
+    outcome: borrow Result<Void, QuicStreamProblem>
+) -> Result<Void, QuicFailure> {
+    return match outcome {
+        Ok -> .Ok
+        Error(problem) -> .Error(.Stream(problem))
+    }
+}
+
+// The test PKI's leaf identity, for localhost and 127.0.0.1.
+function quicTestIdentity() -> QuicIdentity {
+    return QuicIdentity { certificates: [copy QuicTestPki.leaf], key: copy QuicTestPki.leafKey }
+}
+
+// The test PKI's authority, which `quicTestIdentity` chains to.
+function quicTestAnchors() -> [[UN8]] {
+    return [copy QuicTestPki.authority]
+}

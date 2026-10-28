@@ -1,0 +1,155 @@
+import Foundation
+
+// An HTTP/1.1 head: the start line, the fields, and from them how the body
+// is framed (RFC 9112 sections 3, 4 and 6).
+
+extend Http1Reader {
+    function takeHead(borrow mut self) -> Result<Bool, Http1Failure> {
+        // Empty lines before a request are ignored (RFC 9112 section 2.2).
+        while buffer.count >= 2 && Number(buffer[0]) == Http1.carriageReturn
+            && Number(buffer[1]) == Http1.lineFeed {
+            buffer = byteRun(buffer, 2, buffer.count)
+        }
+        let end = match blockEnd(buffer) {
+            Some(value) -> value
+            None -> {
+                if buffer.count > Http1.headLimit { return .Error(.TooLarge) }
+                return .Ok(false)
+            }
+        }
+        if end > Http1.headLimit { return .Error(.TooLarge) }
+        let block = byteRun(buffer, 0, end)
+        buffer = byteRun(buffer, end, buffer.count)
+        let lines = try splitHeadLines(block)
+        if lines.count == 0 { return .Error(.Malformed) }
+        var fields = Fields {}
+        for (index, line) in lines.enumerated() {
+            if index == 0 { continue }
+            let field = try parseHttp1Field(line)
+            fields.entries.append(field)
+        }
+        let framing = try bodyFraming(fields)
+        match incoming {
+            Request -> try takeRequestHead(lines[0], move fields, framing)
+            Response -> try takeResponseHead(lines[0], move fields, framing)
+        }
+        return .Ok(true)
+    }
+
+    function takeRequestHead(
+        borrow mut self,
+        line: borrow String,
+        fields: Fields,
+        framing: borrow BodyFraming
+    ) -> Result<Void, Http1Failure> {
+        let parts = line.split(" ")
+        if parts.count != 3 || parts[2] != Http1.version { return .Error(.Malformed) }
+        let method = match methodFrom(parts[0]) {
+            Some(value) -> value
+            None -> return .Error(.Malformed)
+        }
+        // Exactly one Host (RFC 9112 section 3.2).
+        var hosts: [String] = []
+        for field in fields.entries {
+            if field.name == "host" { hosts.append(copy field.value) }
+        }
+        if hosts.count != 1 { return .Error(.Malformed) }
+        let target = Target { scheme: copy scheme, authority: copy hosts[0], path: copy parts[1] }
+        events.append(
+            .Head(.RequestHead(RequestHead { method: method, target: target, fields: fields }))
+        )
+        // A request with neither length nor coding has no body (RFC 9112
+        // section 6.3).
+        startBody(framing, false)
+        return .Ok
+    }
+
+    function takeResponseHead(
+        borrow mut self,
+        line: borrow String,
+        fields: Fields,
+        framing: borrow BodyFraming
+    ) -> Result<Void, Http1Failure> {
+        if !line.startsWith("\(Http1.version) ") { return .Error(.Malformed) }
+        let digits = line.substring(Http1.version.count + 1, line.count)
+        if digits.count < StatusRange.digits { return .Error(.Malformed) }
+        let status = try statusNumber(digits.substring(0, StatusRange.digits))
+        let rest = digits.substring(StatusRange.digits, digits.count)
+        if rest.count > 0 && !rest.startsWith(" ") { return .Error(.Malformed) }
+        events.append(
+            .Head(.ResponseHead(ResponseHead { status: fromCode<Status>(status), fields: fields }))
+        )
+        // Informational responses precede the final one.
+        if status < StatusRange.informationalEnd { return .Ok }
+        let bodiless = answersHead || status == code(Status.NoContent) || status == code(
+            Status.NotModified
+        )
+        answersHead = false
+        if bodiless {
+            endMessage(Fields {})
+            return .Ok
+        }
+        startBody(framing, true)
+        return .Ok
+    }
+
+    // `untilClose`: a response with neither length nor coding runs to the
+    // end of the connection.
+    function startBody(borrow mut self, framing: borrow BodyFraming, untilClose: Bool) {
+        match framing {
+            Empty -> {
+                if untilClose {
+                    stage = .UntilClose
+                } else {
+                    endMessage(Fields {})
+                }
+            }
+            Length(length) -> {
+                if length == 0 {
+                    endMessage(Fields {})
+                } else {
+                    left = length
+                    stage = .Length
+                }
+            }
+            Chunked -> stage = .ChunkSize
+        }
+    }
+}
+
+function statusNumber(text: borrow String) -> Result<Number, Http1Failure> {
+    var number: Number = 0
+    for byte in text.utf8() {
+        let digit = Number(byte) - StatusRange.zero
+        if digit < 0 || digit >= StatusRange.radix { return .Error(.Malformed) }
+        number = number * StatusRange.radix + digit
+    }
+    if number < StatusRange.lowest || number > StatusRange.highest { return .Error(.Malformed) }
+    return .Ok(number)
+}
+
+// How the fields frame the body; `Empty` when they say nothing.
+function bodyFraming(fields: borrow Fields) -> Result<BodyFraming, Http1Failure> {
+    var codings: [String] = []
+    var lengths: [String] = []
+    for field in fields.entries {
+        if field.name == "transfer-encoding" { codings.append(field.value.lowercased()) }
+        if field.name == "content-length" { lengths.append(copy field.value) }
+    }
+    if codings.count > 0 {
+        if lengths.count > 0 || codings.count != 1 || codings[0] != "chunked" {
+            return .Error(.Malformed)
+        }
+        return .Ok(.Chunked)
+    }
+    if lengths.count == 0 { return .Ok(.Empty) }
+    for length in lengths {
+        if length != lengths[0] { return .Error(.Malformed) }
+    }
+    var fieldsOfLength = Fields {}
+    fieldsOfLength.add("content-length", lengths[0])
+    return match declaredLength(fieldsOfLength) {
+        Some(length) -> .Ok(.Length(length))
+        None -> .Error(.Malformed)
+    }
+}

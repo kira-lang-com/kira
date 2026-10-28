@@ -1,0 +1,371 @@
+// A native library: the C code a package's `@FFI` declarations reach. Two
+// spellings declare one. KLF's names the files outright:
+//
+//     NativeLibrary { name: "sokol", binary: "native/libsokol.a",
+//                     header: "native/sokol_app.h", klffi: "native/sokol.klffi",
+//                     linkerFlags: ["-lm"] }
+//
+// Kira's says how the library is built and what each target links:
+//
+//     NativeLibrary {
+//         name: "sokol", linkMode: LinkMode.Static,
+//         headers: Headers { entrypoint: "sokol.h", includeDirs: ["vendor"], defines: ["SOKOL_GLCORE"] },
+//         sources: ["NativeLibs/Sokol/sokol_impl.c"],
+//         autobind: Autobind { module: "sokol", headers: ["sokol.h"], mode: AutobindMode.AllPublic },
+//         nativeTargets: [NativeTarget { triple: "aarch64-linux-gnu", systemLibs: ["dl"] }]
+//     }
+//
+// `name` is what `@FFI.Extern { library: ... }` writes. `klffi` names a file
+// of the declarations. `autobind` has them made from the C headers it names
+// (`klf ffi gen`), every function or, with `AutobindMode.Selected`, the
+// `functions` it lists, and the structs, enums and constants either way. A
+// package that keeps `app/bindings/<module>.kira`, as Kira's own autobind
+// writes it, has its bindings already: that file is read like any other
+// source and the headers are not.
+// Paths are the package's. A member the declaration does not know is 4003 in
+// a `construct` manifest and ignored in a `Package Name` one, as Kira does.
+
+enum NativeLinkMode {
+    Static
+    Dynamic
+    // Opened by the runtime when the program first calls it; never linked.
+    Runtime
+}
+
+// One target's row: what links on `triple`, beside the library's sources.
+struct NativeTarget {
+    let triple: String
+    let span: Span
+    let staticLib: String
+    let dynamicLib: String
+    let defines: [String]
+    let frameworks: [String]
+    let systemLibs: [String]
+    let compilerFlags: [String]
+    let linkerFlags: [String]
+    let runtimeFiles: [String]
+}
+
+struct NativeLibrary {
+    let name: Identifier
+    let binary: String
+    let header: String
+    // The spans of `header` and `klffi`, for the diagnostics that name them.
+    let headerSpan: Span
+    let klffi: String
+    let klffiSpan: Span
+    let linkerFlags: [String]
+    let linkMode: NativeLinkMode
+    // A target with no row links nothing, and a missing file is no error.
+    let optional: Bool
+    let includeDirs: [String]
+    let defines: [String]
+    let sources: [String]
+    let targets: [NativeTarget]
+    let autobind: Optional<NativeAutobind>
+}
+
+struct NativeAutobind {
+    let module: String
+    let headers: [String]
+    // Empty for every function the headers declare.
+    let functions: [String]
+    // Pointer types (`float_ptr`, `uint32_t_ptr`, ...) another header of the package
+    // already declares: this one uses them without declaring them again.
+    let sharedPointerAliases: [String]
+}
+
+struct NativeHeaders {
+    let entrypoint: String
+    let includeDirs: [String]
+    let defines: [String]
+}
+
+extend Parser {
+    function nativeLibraryList(borrow mut self, typed: Bool) -> Result<[NativeLibrary], Failure> {
+        try expectAs(.LeftBracket, .PackageMemberType)
+        var libraries: [NativeLibrary] = []
+        while !at(.RightBracket) {
+            libraries.append(try nativeLibrary(typed))
+            if !eat(.Comma) { break }
+        }
+        try expectAs(.RightBracket, .MalformedManifest)
+        return .Ok(libraries)
+    }
+
+    // A library names itself and something to link: a `binary`, or rows for
+    // its targets. A static row needs an archive, the library's sources or
+    // something for the link to take. Each is 4034 otherwise.
+    function nativeLibrary(borrow mut self, typed: Bool) -> Result<NativeLibrary, Failure> {
+        let start = current().span
+        if !atWord("NativeLibrary") { return .Error(failure(.PackageMemberType)) }
+        advance()
+        try expectAs(.LeftBrace, .MalformedManifest)
+        var name = Identifier { text = "", span = start }
+        var binary = ""
+        var header = ""
+        var headerSpan = start
+        var klffi = ""
+        var klffiSpan = start
+        var linkerFlags: [String] = []
+        var linkMode: NativeLinkMode = .Static
+        var optional = false
+        var includeDirs: [String] = []
+        var defines: [String] = []
+        var sources: [String] = []
+        var targets: [NativeTarget] = []
+        var autobind: Optional<NativeAutobind> = .None
+        while !at(.RightBrace) {
+            let key = try fieldKey()
+            match key.text {
+                "name" -> name = try stringValue()
+                "binary" -> binary = (try stringValue()).text
+                "header" -> {
+                    let value = try stringValue()
+                    header = value.text
+                    headerSpan = value.span
+                }
+                "klffi" -> {
+                    let value = try stringValue()
+                    klffi = value.text
+                    klffiSpan = value.span
+                }
+                "linkerFlags" -> linkerFlags = try stringList()
+                "linkMode" -> linkMode = try nativeLinkMode()
+                "availability" -> optional = try nativeAvailability()
+                "headers" -> {
+                    let declared = try nativeHeaders(typed)
+                    header = declared.entrypoint
+                    includeDirs = declared.includeDirs
+                    defines = declared.defines
+                }
+                "sources" -> sources = try stringList()
+                "autobind" -> autobind = .Some(try nativeAutobind(typed))
+                "nativeTargets" -> targets = try nativeTargetList(typed)
+                else -> try ignoredField(key, typed)
+            }
+            if !eat(.Comma) { break }
+        }
+        try expectAs(.RightBrace, .MalformedManifest)
+        let span = spanFrom(start)
+        let malformed = Failure { diagnostic = .MalformedNativeLibrary, span = span }
+        if utf8Count(name.text) == 0 { return .Error(malformed) }
+        if utf8Count(binary) == 0 && targets.count == 0 { return .Error(malformed) }
+        for index in 0..targets.count {
+            let row = targets[index]
+            for earlier in 0..index {
+                if targets[earlier].triple == row.triple { return .Error(Failure { diagnostic = .MalformedNativeLibrary, span = row.span }) }
+            }
+            let linksSomething = utf8Count(row.staticLib) > 0 || sources.count > 0 || row.defines.count > 0
+                || row.frameworks.count > 0 || row.systemLibs.count > 0 || row.compilerFlags.count > 0
+                || row.linkerFlags.count > 0 || row.runtimeFiles.count > 0
+            if linkMode == .Static && !linksSomething {
+                return .Error(Failure { diagnostic = .MalformedNativeLibrary, span = row.span })
+            }
+        }
+        return .Ok(NativeLibrary {
+            name = name, binary = binary, header = header, headerSpan = headerSpan, klffi = klffi,
+            klffiSpan = klffiSpan, linkerFlags = linkerFlags,
+            linkMode = linkMode, optional = optional, includeDirs = includeDirs, defines = defines,
+            sources = sources, targets = targets, autobind = autobind
+        })
+    }
+
+    // `Autobind { module: "text", headers: [...], mode: AutobindMode.AllPublic }`,
+    // or `.Selected` with the `functions` to keep.
+    function nativeAutobind(borrow mut self, typed: Bool) -> Result<NativeAutobind, Failure> {
+        let start = current().span
+        if !atWord("Autobind") { return .Error(failure(.PackageMemberType)) }
+        advance()
+        try expectAs(.LeftBrace, .MalformedManifest)
+        var module = ""
+        var headers: [String] = []
+        var functions: [String] = []
+        var selected = false
+        var sharedPointers: [String] = []
+        while !at(.RightBrace) {
+            let key = try fieldKey()
+            match key.text {
+                "module" -> module = (try stringValue()).text
+                "headers" -> headers = try stringList()
+                "functions" -> functions = try stringList()
+                "sharedPointerAliases" -> sharedPointers = try stringList()
+                "mode" -> {
+                    let written = try caseName("AutobindMode")
+                    match written.text {
+                        "AllPublic", "allPublic" -> selected = false
+                        "Selected", "selected" -> selected = true
+                        else -> return .Error(Failure { diagnostic = .PackageMemberType, span = written.span })
+                    }
+                }
+                else -> try ignoredField(key, typed)
+            }
+            if !eat(.Comma) { break }
+        }
+        try expectAs(.RightBrace, .MalformedManifest)
+        // A selection of nothing binds no function, which an empty list
+        // would read as every one.
+        if utf8Count(module) == 0 || headers.count == 0 || (selected && functions.count == 0) {
+            return .Error(Failure { diagnostic = .MalformedNativeLibrary, span = spanFrom(start) })
+        }
+        if !selected { functions = [] }
+        return .Ok(NativeAutobind { module = module, headers = headers, functions = functions, sharedPointerAliases = sharedPointers })
+    }
+
+    function nativeTargetList(borrow mut self, typed: Bool) -> Result<[NativeTarget], Failure> {
+        try expectAs(.LeftBracket, .PackageMemberType)
+        var targets: [NativeTarget] = []
+        while !at(.RightBracket) {
+            targets.append(try nativeTarget(typed))
+            if !eat(.Comma) { break }
+        }
+        try expectAs(.RightBracket, .MalformedManifest)
+        return .Ok(targets)
+    }
+
+    // `NativeTarget { triple: "aarch64-linux-gnu", staticLib: "...", ... }`.
+    function nativeTarget(borrow mut self, typed: Bool) -> Result<NativeTarget, Failure> {
+        let start = current().span
+        if !atWord("NativeTarget") { return .Error(failure(.PackageMemberType)) }
+        advance()
+        try expectAs(.LeftBrace, .MalformedManifest)
+        var triple = ""
+        var staticLib = ""
+        var dynamicLib = ""
+        var defines: [String] = []
+        var frameworks: [String] = []
+        var systemLibs: [String] = []
+        var compilerFlags: [String] = []
+        var linkerFlags: [String] = []
+        var runtimeFiles: [String] = []
+        while !at(.RightBrace) {
+            let key = try fieldKey()
+            match key.text {
+                "triple" -> triple = (try stringValue()).text
+                "staticLib" -> staticLib = (try stringValue()).text
+                "dynamicLib" -> dynamicLib = (try stringValue()).text
+                "defines" -> defines = try stringList()
+                "frameworks" -> frameworks = try stringList()
+                "systemLibs" -> systemLibs = try stringList()
+                "compilerFlags" -> compilerFlags = try stringList()
+                "linkerFlags" -> linkerFlags = try stringList()
+                "runtimeFiles" -> runtimeFiles = try stringList()
+                else -> try ignoredField(key, typed)
+            }
+            if !eat(.Comma) { break }
+        }
+        try expectAs(.RightBrace, .MalformedManifest)
+        let span = spanFrom(start)
+        if utf8Count(triple) == 0 { return .Error(Failure { diagnostic = .MalformedNativeLibrary, span = span }) }
+        return .Ok(NativeTarget {
+            triple = triple, span = span, staticLib = trimmed(staticLib), dynamicLib = trimmed(dynamicLib),
+            defines = defines, frameworks = frameworks, systemLibs = systemLibs,
+            compilerFlags = compilerFlags, linkerFlags = linkerFlags, runtimeFiles = runtimeFiles
+        })
+    }
+
+    // `Headers { entrypoint: "...", includeDirs: [...], defines: [...] }`.
+    function nativeHeaders(borrow mut self, typed: Bool) -> Result<NativeHeaders, Failure> {
+        if !atWord("Headers") { return .Error(failure(.PackageMemberType)) }
+        advance()
+        try expectAs(.LeftBrace, .MalformedManifest)
+        var entrypoint = ""
+        var includeDirs: [String] = []
+        var defines: [String] = []
+        while !at(.RightBrace) {
+            let key = try fieldKey()
+            match key.text {
+                "entrypoint" -> entrypoint = (try stringValue()).text
+                "includeDirs" -> includeDirs = try stringList()
+                "defines" -> defines = try stringList()
+                else -> try ignoredField(key, typed)
+            }
+            if !eat(.Comma) { break }
+        }
+        try expectAs(.RightBrace, .MalformedManifest)
+        return .Ok(NativeHeaders { entrypoint = entrypoint, includeDirs = includeDirs, defines = defines })
+    }
+
+    function nativeLinkMode(borrow mut self) -> Result<NativeLinkMode, Failure> {
+        let written = try caseName("LinkMode")
+        match written.text {
+            "Static", "static" -> return .Ok(.Static)
+            "Dynamic", "dynamic" -> return .Ok(.Dynamic)
+            "Runtime", "runtime" -> return .Ok(.Runtime)
+            else -> return .Error(Failure { diagnostic = .PackageMemberType, span = written.span })
+        }
+    }
+
+    // Whether the library is `Availability.Optional` rather than `.Required`.
+    function nativeAvailability(borrow mut self) -> Result<Bool, Failure> {
+        let written = try caseName("Availability")
+        match written.text {
+            "Required", "required" -> return .Ok(false)
+            "Optional", "optional" -> return .Ok(true)
+            else -> return .Error(Failure { diagnostic = .PackageMemberType, span = written.span })
+        }
+    }
+
+    // A case written `.Name` or `Type.Name`.
+    function caseName(borrow mut self, typeName: String) -> Result<Identifier, Failure> {
+        if atWord(typeName) { advance() }
+        try expectAs(.Dot, .PackageMemberType)
+        return identifier(.PackageMemberType)
+    }
+
+    // A record field's name and the `:` (or `=`) after it.
+    function fieldKey(borrow mut self) -> Result<Identifier, Failure> {
+        let key = try identifier(.MalformedManifest)
+        if !eat(.Colon) { try expectAs(.Equals, .MalformedManifest) }
+        return .Ok(key)
+    }
+
+    function stringList(borrow mut self) -> Result<[String], Failure> {
+        try expectAs(.LeftBracket, .PackageMemberType)
+        var values: [String] = []
+        while !at(.RightBracket) {
+            values.append((try stringValue()).text)
+            if !eat(.Comma) { break }
+        }
+        try expectAs(.RightBracket, .MalformedManifest)
+        return .Ok(values)
+    }
+
+    // A `Name { ... }` record this toolchain reads nothing from.
+    function skipRecord(borrow mut self, typeName: String) -> Result<Bool, Failure> {
+        if !atWord(typeName) { return .Error(failure(.PackageMemberType)) }
+        return skipFieldValue()
+    }
+
+    // A field this declaration does not know: 4003 in a `construct`
+    // manifest, skipped in a `Package Name` one.
+    function ignoredField(borrow mut self, key: Identifier, typed: Bool) -> Result<Bool, Failure> {
+        if typed { return .Error(Failure { diagnostic = .UnknownPackageMember, span = key.span }) }
+        return skipFieldValue()
+    }
+
+    // A field value, up to the `,` or closing bracket after it outside any
+    // bracket of its own.
+    function skipFieldValue(borrow mut self) -> Result<Bool, Failure> {
+        var depth = 0
+        var count = 0
+        while count == 0 || depth > 0 || (!at(.Comma) && !at(.RightBrace) && !at(.RightBracket)) {
+            if at(.End) { return .Error(failure(.MalformedManifest)) }
+            let kind = advance().kind
+            if kind == .LeftParen || kind == .LeftBrace || kind == .LeftBracket { depth += 1 }
+            if kind == .RightParen || kind == .RightBrace || kind == .RightBracket { depth -= 1 }
+            count += 1
+        }
+        return .Ok(true)
+    }
+}
+
+// `text` without its leading and trailing spaces: Kira reads a blank path
+// as no path.
+function trimmed(text: String) -> String {
+    var start = 0
+    var end = utf8Count(text)
+    while start < end && utf8Byte(text, start) == 32 { start += 1 }
+    while end > start && utf8Byte(text, end - 1) == 32 { end -= 1 }
+    return utf8Slice(text, start, end)
+}

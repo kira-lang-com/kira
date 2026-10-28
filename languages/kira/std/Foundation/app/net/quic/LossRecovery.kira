@@ -1,0 +1,240 @@
+// The three packet number spaces, the RTT estimate and the congestion
+// controller together: what a connection tells recovery, and what recovery
+// tells it back (RFC 9002 appendix A).
+
+struct QuicLossRecovery {
+    var initial: QuicPacketSpace = QuicPacketSpace {}
+    var handshake: QuicPacketSpace = QuicPacketSpace {}
+    var application: QuicPacketSpace = QuicPacketSpace {}
+    var rtt: QuicRttEstimator = QuicRttEstimator {}
+    var probes: Number = 0
+    var congestion: QuicNewReno
+    var peerMaxAckDelay: Number = QuicParameterLimit.defaultMaxAckDelay * QuicTime.millisecond
+    var peerAckDelayExponent: Number = QuicParameterLimit.defaultAckDelayExponent
+    var handshakeConfirmed: Bool = false
+
+    function space(borrow self, level: TlsEncryptionLevel) -> QuicPacketSpace {
+        return match level {
+            Initial -> copy initial
+            Handshake -> copy handshake
+            Application -> copy application
+        }
+    }
+
+    function store(borrow mut self, level: TlsEncryptionLevel, updated: QuicPacketSpace) {
+        match level {
+            Initial -> initial = updated
+            Handshake -> handshake = updated
+            Application -> application = updated
+        }
+    }
+
+    function onSent(borrow mut self, level: TlsEncryptionLevel, packet: QuicSentPacket) {
+        if packet.inFlight { congestion.onSent(packet.size) }
+        var current = space(level)
+        current.record(move packet)
+        store(level, move current)
+    }
+
+    function onAck(
+        borrow mut self,
+        level: TlsEncryptionLevel,
+        ack: borrow QuicAckFrame,
+        now: QuicInstant
+    ) -> Result<QuicAckOutcome, QuicTransportError> {
+        var current = space(level)
+        let largest = ack.ranges[0].largest
+        if largest >= current.nextNumber { return .Error(.ProtocolViolation) }
+        current.largestAcknowledged = .Some(
+            match current.largestAcknowledged {
+                Some(value) -> max(value, largest)
+                None -> largest
+            }
+        )
+        let acknowledged = current.takeAcknowledged(ack)
+        if acknowledged.count == 0 {
+            store(level, move current)
+            return .Ok(QuicAckOutcome { acknowledged: [], lost: [] })
+        }
+        sample(level, acknowledged, ack, now)
+        let lost = current.takeLost(rtt, now)
+        store(level, move current)
+        for packet in acknowledged { congestion.onAcked(packet) }
+        judgeLost(lost, now)
+        probes = 0
+        return .Ok(QuicAckOutcome { acknowledged: acknowledged, lost: lost })
+    }
+
+    // An RTT sample when the largest acknowledged packet is newly so and
+    // asked for an ACK (RFC 9002 section 5.1).
+    function sample(
+        borrow mut self,
+        level: TlsEncryptionLevel,
+        acknowledged: borrow [QuicSentPacket],
+        ack: borrow QuicAckFrame,
+        now: QuicInstant
+    ) {
+        let largest = ack.ranges[0].largest
+        var newest: QuicSentPacket? = .None
+        var eliciting = false
+        for packet in acknowledged {
+            if packet.number == largest { newest = .Some(copy packet) }
+            if packet.elicitsAck { eliciting = true }
+        }
+        let packet = match newest {
+            Some(value) -> value
+            None -> return
+        }
+        if !eliciting { return }
+        // Initial and Handshake ACKs are not delayed on purpose, so their
+        // reported delay is not subtracted.
+        let delay = level == .Application ? ack.delay << peerAckDelayExponent : 0
+        let maxDelay = handshakeConfirmed ? peerMaxAckDelay : 0
+        rtt.update(now.since(packet.sentAt), delay, maxDelay)
+    }
+
+    function judgeLost(borrow mut self, lost: borrow [QuicSentPacket], now: QuicInstant) {
+        if lost.count == 0 { return }
+        var bytes = 0
+        var newest = lost[0].sentAt
+        var oldestEliciting: QuicInstant? = .None
+        var newestEliciting: QuicInstant? = .None
+        for packet in lost {
+            if packet.inFlight { bytes += packet.size }
+            if packet.sentAt.raw > newest.raw { newest = packet.sentAt }
+            if packet.elicitsAck {
+                oldestEliciting = quicEarliest(oldestEliciting, .Some(packet.sentAt))
+                newestEliciting = .Some(packet.sentAt)
+            }
+        }
+        congestion.onLost(bytes, newest, now)
+        persistentCongestion(oldestEliciting, newestEliciting)
+    }
+
+    // Losses spanning three probe timeouts collapse the window (RFC 9002
+    // section 7.6); only once an RTT has been measured.
+    function persistentCongestion(
+        borrow mut self,
+        oldest: borrow QuicInstant?,
+        newest: borrow QuicInstant?
+    ) {
+        if !rtt.sampled { return }
+        match oldest {
+            Some(first) -> match newest {
+                Some(last) -> {
+                    let period = rtt.probeTimeout(
+                        peerMaxAckDelay
+                    ) * QuicCongestion.persistentPeriods
+                    if last.since(first) > period { congestion.onPersistentCongestion() }
+                }
+                None -> {}
+            }
+            None -> {}
+        }
+    }
+
+    // Stops tracking a space whose keys are gone (RFC 9002 section 6.4).
+    function discard(borrow mut self, level: TlsEncryptionLevel) {
+        // The packets it held are lost with their keys; nothing resends them.
+        let _ = forget(level)
+        var current = space(level)
+        current.discarded = true
+        store(level, move current)
+    }
+
+    // The packets in flight at `level`, taken out of flight with no verdict
+    // on them; the space keeps its packet numbers.
+    function forget(borrow mut self, level: TlsEncryptionLevel) -> [QuicSentPacket] {
+        var current = space(level)
+        var bytes = 0
+        for packet in current.sent {
+            if packet.inFlight { bytes += packet.size }
+        }
+        congestion.onDiscarded(bytes)
+        let forgotten = current.sent
+        current.sent = []
+        current.lossTime = .None
+        store(level, move current)
+        probes = 0
+        return forgotten
+    }
+
+    function lossTimer(borrow self) -> QuicRecoveryTimer? {
+        var timer: QuicRecoveryTimer? = .None
+        for level in [TlsEncryptionLevel.Initial, TlsEncryptionLevel.Handshake, TlsEncryptionLevel.Application] {
+            match space(level).lossTime {
+                Some(at) -> timer = quicSooner(
+                    timer,
+                    QuicRecoveryTimer { at: at, level: level, kind: .Loss }
+                )
+                None -> {}
+            }
+        }
+        return timer
+    }
+
+    // When the probe timeout fires: per space with ack-eliciting packets in
+    // flight, doubled per probe already sent (RFC 9002 section 6.2.1). The
+    // application space waits for the handshake to be confirmed.
+    function probeTimer(borrow self) -> QuicRecoveryTimer? {
+        var timer: QuicRecoveryTimer? = .None
+        for level in [TlsEncryptionLevel.Initial, TlsEncryptionLevel.Handshake, TlsEncryptionLevel.Application] {
+            let current = space(level)
+            if current.discarded || !current.elicitingInFlight() { continue }
+            if level == .Application && !handshakeConfirmed { continue }
+            let delay = level == .Application ? peerMaxAckDelay : 0
+            let duration = rtt.probeTimeout(delay) << probes
+            match current.lastElicitingAt {
+                Some(at) -> timer = quicSooner(
+                    timer,
+                    QuicRecoveryTimer { at: at.plus(duration), level: level, kind: .Probe }
+                )
+                None -> {}
+            }
+        }
+        return timer
+    }
+
+    function timer(borrow self) -> QuicRecoveryTimer? {
+        let loss = lossTimer()
+        if loss.isSome() { return loss }
+        return probeTimer()
+    }
+
+    // The loss timer's packets now lost; a probe timeout counts itself and
+    // gives none.
+    function onTimer(
+        borrow mut self,
+        fired: borrow QuicRecoveryTimer,
+        now: QuicInstant
+    ) -> [QuicSentPacket] {
+        match fired.kind {
+            Loss -> {
+                var current = space(fired.level)
+                let lost = current.takeLost(rtt, now)
+                store(fired.level, move current)
+                judgeLost(lost, now)
+                return lost
+            }
+            Probe -> {
+                probes += 1
+                return []
+            }
+        }
+    }
+
+    // Whether congestion control lets `bytes` more go out now.
+    function canSend(borrow self, bytes: Number) -> Bool {
+        return congestion.inFlight() + bytes <= congestion.window()
+    }
+}
+
+function quicSooner(
+    current: borrow QuicRecoveryTimer?,
+    candidate: QuicRecoveryTimer
+) -> QuicRecoveryTimer? {
+    return match current {
+        Some(timer) -> .Some(timer.at.raw <= candidate.at.raw ? copy timer : candidate)
+        None -> .Some(candidate)
+    }
+}

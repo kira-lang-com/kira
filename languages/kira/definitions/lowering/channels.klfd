@@ -1,0 +1,23 @@
+extend FunctionLowering {
+    function createChannel(borrow mut self, valueType: Type) -> KirAddress {
+        let id = kir.call(functions[program.channelFunctions[0]], types.integer64)
+        return taskHandle(id, valueType)
+    }
+
+    // The boxed value is handed over owned, as to any call: the channel keeps
+    // it, so this function no longer drops it.
+    function sendChannel(borrow mut self, channel: Int, value: Int) {
+        let id = taskId(channel)
+        let owned = temporary(program.typeOf(value))
+        write(value, owned)
+        forgetTracked(owned)
+        kir.argument(id)
+        kir.argument(kir.pointer(owned))
+        kir.callVoid(functions[program.channelFunctions[1]])
+    }
+
+    function closeChannel(borrow mut self, channel: Int) {
+        kir.argument(taskId(channel))
+        kir.callVoid(functions[program.channelFunctions[2]])
+    }
+}

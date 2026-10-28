@@ -1,0 +1,21 @@
+import Foundation
+
+// Depfiles: the Make-style rule a compiler writes lists the inputs it read;
+// escaped spaces and dollars come back as the characters they stand for.
+
+@Test
+function depfileEscapesAreRead() {
+    let text = "out/a\\ b: \\\n  /x/a\\ b.kira \\\n  rel/../c$$d.kira\t/e#f\n"
+    var paths: [String] = []
+    for path in depfilePaths(text) { paths.append(plainPath(path)) }
+    expect!((paths.count) == (3))
+    expect!((paths[0]) == "/x/a b.kira")
+    expect!((paths[1]) == "c$d.kira")
+    expect!((paths[2]) == "/e#f")
+}
+
+@Test
+function plainPathsAreNormalised() {
+    expect!((plainPath("/a/./b/../../c")) == "/c")
+    expect!((plainPath("a/..")) == "")
+}

@@ -1,0 +1,26 @@
+// `@FFI.Syscall` in a package whose manifest grants system calls: a Linux
+// system call by its `man 2` name, made directly.
+
+@FFI.Syscall { name: write }
+function sysWrite(fd: Int, text: CString, count: Int): Int
+
+@FFI.Syscall { name: getrandom }
+function sysGetrandom(bytes: [U8], count: U64, flags: U32): Int
+
+@FFI.Syscall { name: getpid }
+function sysGetpid(): Int
+
+@FFI.Syscall { name: getppid }
+function sysGetppid(): I32
+
+@Main
+function main() {
+    let written = sysWrite(1, "hello from write\n", 17)
+    let bytes: [U8] = [0, 0, 0, 0, 0, 0, 0, 0]
+    let more = sysGetrandom(bytes, 8, 0)
+    print(written)
+    print(more)
+    print(sysWrite(99, "x", 1))
+    print(sysGetpid() > 0)
+    print(sysGetppid() > 0)
+}

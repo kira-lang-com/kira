@@ -1,0 +1,73 @@
+// Cases whose payload holds their own enum in place, as a family case whose
+// declaration stores a value of the family. Such a value would be infinitely
+// large, so lowering keeps the payload in a heap cell the case points to.
+
+function recursiveCases(program: CheckedProgram) -> [[Bool]] {
+    var cases: [[Bool]] = []
+    for index in 0..program.enums.count {
+        var flags: [Bool] = []
+        for variant in program.enums[index].variants {
+            match variant.payload {
+                Some(payload) -> {
+                    var visited: [Int] = []
+                    flags.append(holdsEnum(program, payload, index, visited))
+                }
+                None -> flags.append(false)
+            }
+        }
+        cases.append(flags)
+    }
+    return cases
+}
+
+// Whether a value of `valueType` holds a value of enum `target` in place,
+// rather than behind the pointer of an array, a string or a class handle.
+// `visited` keys a struct by twice its index and an enum by one more.
+function holdsEnum(program: CheckedProgram, valueType: Type, target: Int, visited: borrow mut [Int]) -> Bool {
+    match valueType.kind {
+        Structure -> {
+            let key = valueType.declaration * 2
+            if hasKey(visited, key) { return false }
+            visited.append(key)
+            let declared = program.structs[valueType.declaration]
+            if declared.genericBase == "Class" { return false }
+            for field in declared.fields {
+                if holdsEnum(program, field.valueType, target, visited) { return true }
+            }
+            return false
+        }
+        Enumeration -> {
+            if valueType.declaration == target { return true }
+            let key = valueType.declaration * 2 + 1
+            if hasKey(visited, key) { return false }
+            visited.append(key)
+            for variant in program.enums[valueType.declaration].variants {
+                match variant.payload {
+                    Some(payload) -> {
+                        if holdsEnum(program, payload, target, visited) { return true }
+                    }
+                    None -> {}
+                }
+            }
+            return false
+        }
+        Integer -> return false
+        Decimal -> return false
+        Floating -> return false
+        Boolean -> return false
+        Pointer -> return false
+        Void -> return false
+        Invalid -> return false
+    }
+}
+
+function hasKey(keys: [Int], key: Int) -> Bool {
+    for present in keys {
+        if present == key { return true }
+    }
+    return false
+}
+
+function isRecursiveCase(program: CheckedProgram, enumIndex: Int, variant: Int) -> Bool {
+    return program.recursiveCases[enumIndex][variant]
+}

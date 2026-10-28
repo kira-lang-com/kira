@@ -1,0 +1,300 @@
+import Foundation
+import Kten
+
+/// A reference to one immutable artifact in the shared store. No artifact is copied.
+public struct ArtifactReference {
+    /// The name the artifact is known by.
+    let name: String
+    /// The SHA-256 the artifact is stored under, as lowercase hexadecimal.
+    let digest: String
+    /// Whether the artifact is a file or a tree.
+    let kind: OutputKind
+    /// The permission bits of the artifact; 420 is 644.
+    let mode: UNumber = 420
+}
+
+/// An immutable manifest of a build: its metadata and the artifacts it names.
+public struct BuildSnapshot {
+    /// What the snapshot records about the build that made it.
+    let metadata: Kten
+    /// The artifacts the snapshot names.
+    let artifacts: [ArtifactReference]
+}
+
+function referenceMade(reference: borrow ArtifactReference) -> Made {
+    return Made { digest: copy reference.digest, tree: reference.kind == .Tree, mode: reference.mode }
+}
+
+function snapshotDigestValid(value: borrow String) -> Bool {
+    if value.count != 64 { return false }
+    for index in 0..value.count {
+        if !"0123456789abcdef".contains(value.substring(index, index + 1)) { return false }
+    }
+    return true
+}
+
+extend Graph {
+    // A pinned artifact is an input by identity, without a checkout copy.
+    function reference(borrow mut self, reference: ArtifactReference) -> Artifact {
+        if !snapshotDigestValid(reference.digest) {
+            problems.append("snapshot artifact \(reference.name) has no SHA-256")
+        }
+        if !placeablePath(reference.name) || reference.name.contains("/") {
+            problems.append("snapshot artifact \(reference.name) has no plain file name")
+        }
+        origins.append(.Stored(move reference))
+        return Artifact { id: origins.count - 1 }
+    }
+}
+
+function referenceKten(reference: borrow ArtifactReference) -> Kten {
+    return ktenBare([
+        ktenField("name", .Text(copy reference.name)),
+        ktenField("digest", .Text(copy reference.digest)),
+        ktenField("kind", .Text(reference.kind == .Tree ? "tree" : "file")),
+        ktenField("mode", .Number(reference.mode))
+    ])
+}
+
+function referenceOf(value: borrow Kten) -> Result<ArtifactReference, BuildFailure> {
+    let name = ktenTextField(value, "name").or("")
+    let digest = ktenTextField(value, "digest").or("")
+    let kind = ktenTextField(value, "kind").or("")
+    if !placeablePath(name) || name.contains("/") || !snapshotDigestValid(digest)
+        || (kind != "tree" && kind != "file") {
+        return .Error(.Files("invalid artifact reference in snapshot"))
+    }
+    let mode = ktenNumberField(value, "mode").or(420)
+    if mode < 0 || mode > 4095 { return .Error(.Files("invalid snapshot artifact mode")) }
+    return .Ok(ArtifactReference {
+        name: name,
+        digest: digest,
+        kind: kind == "tree" ? .Tree : .File,
+        mode: UNumber(mode)
+    })
+}
+
+// A corrupt pin stops collection instead of losing a train's artifacts.
+function snapshotNeeds(value: borrow Kten) -> Result<Needs, BuildFailure> {
+    var needs = Needs {}
+    let keys = match value.field("keys") {
+        Ok(list) -> match list.items() {
+            Ok(items) -> items
+            Error(failure) -> return .Error(.Files("invalid snapshot keys"))
+        }
+        Error(failure) -> return .Error(.Files("missing snapshot keys"))
+    }
+    for item in keys {
+        let key = match item.text() {
+            Ok(text) -> text
+            Error(failure) -> return .Error(.Files("invalid snapshot action key"))
+        }
+        if !snapshotDigestValid(key) { return .Error(.Files("invalid snapshot action key")) }
+        needs.keys.append(key)
+    }
+    let made = match value.field("artifacts") {
+        Ok(list) -> match list.items() {
+            Ok(items) -> items
+            Error(failure) -> return .Error(.Files("invalid snapshot artifacts"))
+        }
+        Error(failure) -> return .Error(.Files("missing snapshot artifacts"))
+    }
+    for item in made {
+        let reference = try referenceOf(item)
+        needs.made.append(referenceMade(reference))
+    }
+    return .Ok(needs)
+}
+
+extend ContentStore {
+    function snapshotPath(borrow self, digest: borrow String) -> String {
+        return joinPath(joinPath(root, "snapshots"), digest)
+    }
+
+    function readSnapshot(borrow self, digest: borrow String) -> Result<Kten, BuildFailure> {
+        if !snapshotDigestValid(digest) { return .Error(.Files("invalid snapshot SHA-256")) }
+        let path = snapshotPath(digest)
+        let bytes = match readFileBytes(path) {
+            Ok(read) -> read
+            Error(failure) -> return .Error(.Files("cannot read snapshot \(digest): \(traceText(failure))"))
+        }
+        let actual = try sha256Hex(bytes)
+        if actual != digest { return .Error(.Files("snapshot \(digest) failed its digest check")) }
+        return match decodeKten(bytes) {
+            Ok(value) -> .Ok(value)
+            Error(failure) -> .Error(.Files("invalid snapshot encoding: \(traceText(failure))"))
+        }
+    }
+
+    function pinnedNeeds(borrow self) -> Result<[Needs], BuildFailure> {
+        let directory = joinPath(root, "snapshots")
+        if !isDirectory(directory) { return .Ok([]) }
+        let entries = match listDirectory(directory) {
+            Ok(listing) -> listing.entries
+            Error(failure) -> return .Error(.Files("cannot list snapshots: \(traceText(failure))"))
+        }
+        var needs: [Needs] = []
+        for name in entries {
+            if name.endsWith(".part") { continue }
+            let value = try readSnapshot(name)
+            needs.append(try snapshotNeeds(value))
+        }
+        return .Ok(needs)
+    }
+}
+
+/// The build snapshot stored under `digest`, or the reason it cannot be read.
+public function loadBuildSnapshot(digest: borrow String) -> Result<BuildSnapshot, BuildFailure> {
+    let store = try openStore()
+    let value = try store.readSnapshot(digest)
+    // Validate action keys as well as artifact references before use.
+    let needs = try snapshotNeeds(value)
+    absorb needs
+    let metadata = match value.field("metadata") {
+        Ok(found) -> found
+        Error(failure) -> return .Error(.Files("snapshot has no metadata"))
+    }
+    let items = match value.field("artifacts") {
+        Ok(list) -> match list.items() {
+            Ok(found) -> found
+            Error(failure) -> return .Error(.Files("snapshot has no artifacts"))
+        }
+        Error(failure) -> return .Error(.Files("snapshot has no artifacts"))
+    }
+    var artifacts: [ArtifactReference] = []
+    for item in items { artifacts.append(try referenceOf(item)) }
+    return .Ok(BuildSnapshot { metadata: metadata, artifacts: artifacts })
+}
+
+extend Engine {
+    function pinStep(
+        borrow self,
+        graph: borrow Graph,
+        step: borrow Step,
+        metadata: borrow Kten
+    ) -> Result<String, BuildFailure> {
+        var artifacts: [Kten] = []
+        for artifact in step.produces {
+            let known = match made[artifact.id] {
+                Some(found) -> found
+                None -> return .Error(.Failed("cannot pin an unbuilt artifact"))
+            }
+            artifacts.append(referenceKten(ArtifactReference {
+                name: inputName(graph, artifact), digest: copy known.digest,
+                kind: known.tree ? .Tree : .File, mode: known.mode
+            }))
+        }
+        var chosen: [Number] = []
+        for (index, known) in graph.steps.enumerated() {
+            if known.name == step.name { chosen.append(index) }
+        }
+        let needed = graph.neededActions(chosen)
+        var keptKeys: [Kten] = []
+        for index in 0..needed.count {
+            if needed[index] { keptKeys.append(.Text(copy keys[index])) }
+        }
+        let value = ktenObject("Snapshot", [
+            ktenField("metadata", copy metadata),
+            ktenField("keys", .List(keptKeys)),
+            ktenField("artifacts", .List(artifacts))
+        ])
+        let bytes = value.encoded()
+        let digest = try sha256Hex(bytes)
+        let path = store.snapshotPath(digest)
+        if fileExists(path) {
+            let existing = try store.readSnapshot(digest)
+            absorb existing
+            return .Ok(digest)
+        }
+        try makePathTree(parentPath(path))
+        let part = path + ".part"
+        match writeFileBytes(part, bytes) {
+            Ok -> {}
+            Error(failure) -> return .Error(.Files("cannot write snapshot: \(traceText(failure))"))
+        }
+        match renamePath(part, path) {
+            Ok -> return .Ok(digest)
+            Error(failure) -> return .Error(.Files("cannot publish snapshot: \(traceText(failure))"))
+        }
+    }
+}
+
+/// One shared materialization of an immutable artifact, outside every source workspace. A train and all its workspaces resolve to the same view.
+public function resolveBuildArtifact(reference: borrow ArtifactReference) -> Result<String, BuildFailure> {
+    if !snapshotDigestValid(reference.digest) { return .Error(.Files("invalid artifact SHA-256")) }
+    let store = try openStore()
+    let held = try holdLock(joinPath(store.root, SweepNames.lock), true)
+    let result = sharedArtifactView(store, reference)
+    match held {
+        Some(lock) -> match lock.close() {
+            Ok -> {}
+            Error(failure) -> return .Error(.Files("cannot unlock artifact store: \(traceText(failure))"))
+        }
+        None -> return .Error(.Files("cannot lock artifact store"))
+    }
+    return result
+}
+
+function sharedArtifactView(
+    store: borrow ContentStore,
+    reference: borrow ArtifactReference
+) -> Result<String, BuildFailure> {
+    let known = referenceMade(reference)
+    if !store.holds(known) { return .Error(.Files("artifact is missing from the store")) }
+    let directory = joinPath(joinPath(store.root, "views"), reference.digest)
+    try makePathTree(directory)
+    let path = joinPath(directory, known.tree ? "tree" : "file-\(reference.mode)")
+    if !pathExists(path) {
+        let part = path + ".part"
+        if pathExists(part) { try clearPath(part) }
+        try store.place(known, part, false)
+        match renamePath(part, path) {
+            Ok -> {}
+            Error(failure) -> return .Error(.Files("cannot place shared artifact: \(traceText(failure))"))
+        }
+    }
+    return .Ok(path)
+}
+
+function removeUnusedViews(root: borrow String, kept: borrow Map<String, Bool>) {
+    let directory = joinPath(root, "views")
+    if !isDirectory(directory) { return }
+    let entries = match listDirectory(directory) {
+        Ok(listing) -> listing.entries
+        Error(failure) -> {
+            printError("kira build: cannot list shared views: \(traceText(failure))")
+            return
+        }
+    }
+    for name in entries {
+        if kept.value(name).or(false) { continue }
+        match clearPath(joinPath(directory, name)) {
+            Ok -> {}
+            Error(failure) -> printError("kira build: cannot remove shared view: \(failureText(failure))")
+        }
+    }
+}
+
+/// The entries of the tree artifact `reference`. Fails when the artifact is not a tree or its digest is not valid.
+public function buildArtifactEntries(reference: borrow ArtifactReference) -> Result<[TreeEntry], BuildFailure> {
+    if reference.kind != .Tree || !snapshotDigestValid(reference.digest) {
+        return .Error(.Files("artifact is not a stored tree"))
+    }
+    let store = try openStore()
+    return store.treeEntries(reference.digest)
+}
+
+/// A directory for derived immutable resources, such as a train's installed VM base volume. It shares the artifact's lifetime and is collected with its shared view.
+public function buildArtifactAuxiliaryDirectory(
+    reference: borrow ArtifactReference,
+    name: borrow String
+) -> Result<String, BuildFailure> {
+    if !snapshotDigestValid(reference.digest) || !placeablePath(name) || name.contains("/") {
+        return .Error(.Files("invalid artifact auxiliary directory"))
+    }
+    let store = try openStore()
+    if !store.holds(referenceMade(reference)) { return .Error(.Files("artifact is missing from the store")) }
+    let path = joinPath(joinPath(joinPath(store.root, "views"), reference.digest), "aux/" + name)
+    try makePathTree(path)
+    return .Ok(path)
+}

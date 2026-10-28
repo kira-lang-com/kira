@@ -1,0 +1,315 @@
+// Expressions as KSL writes them. One that bakes is bound to a temporary
+// where its `emit` evaluates it; every other one is written where it is
+// used. A pointer is written as the place it names, so a load is the place
+// itself.
+
+function binaryWord(op: String) -> String {
+    match op {
+        "add" -> return "+"
+        "subtract" -> return "-"
+        "multiply" -> return "*"
+        "divide" -> return "/"
+        "modulo" -> return "%"
+        "equal" -> return "=="
+        "not_equal" -> return "!="
+        "less" -> return "<"
+        "less_equal" -> return "<="
+        "greater" -> return ">"
+        "greater_equal" -> return ">="
+        "and" -> return "&"
+        "inclusive_or" -> return "|"
+        "exclusive_or" -> return "^"
+        "logical_and" -> return "&&"
+        "logical_or" -> return "||"
+        "shift_left" -> return "<<"
+        "shift_right" -> return ">>"
+        else -> return ""
+    }
+}
+
+// The math functions KSL calls by their KSIR names.
+function kslMath(name: String) -> Bool {
+    for known in ["dot", "cross", "normalize", "length", "abs", "floor", "ceil", "min", "max", "clamp", "mix",
+        "step", "smoothstep", "fma", "pow", "sqrt", "sin", "cos", "tan", "atan2", "exp", "exp2", "log",
+        "log2", "fract", "round", "sign", "pack2x16float", "unpack2x16float"] {
+        if name == known { return true }
+    }
+    return false
+}
+
+function negativeText(value: String) -> Bool {
+    return utf8Count(value) > 0 && utf8Byte(value, 0) == 45
+}
+
+extend KslOut {
+    // A literal of `scalar`. Where the type is not known from the position,
+    // `typed` spells it: an integer literal is an `Int` unless converted.
+    function literalText(borrow mut self, value: String, scalar: String, at: Int, typed: Bool) -> String {
+        var written = value
+        if negativeText(value) { written = joinText(["(", value, ")"]) }
+        match scalar {
+            "bool" -> return value
+            "i32" -> return written
+            "u32" -> {
+                if typed { return joinText(["UInt(", value, ")"]) }
+                return value
+            }
+            "f32" -> {
+                if value == "inf" || value == "-inf" || value == "NaN" {
+                    refuse("float that is not finite", at)
+                    return "0.0"
+                }
+                return written
+            }
+            else -> {
+                refuse(joinText(["`", scalar, "` literal"]), at)
+                return "0"
+            }
+        }
+    }
+
+    function expression(borrow mut self, index: Int) -> String {
+        if index < 0 { return "" }
+        if bound[index] { return temporaryName(index) }
+        let which = expressionKind(index)
+        match which {
+            "literal" -> return literalText(
+                text("expressions", current, index, "literal"), text("expressions", current, index, "scalar"), index, true
+            )
+            "constant" -> return constantName(operand(index, "constant"))
+            "override" -> return optionName(operand(index, "override"))
+            "zero" -> return zeroValue(typeOf(index), index)
+            "compose" -> return construction(index)
+            "access" -> return joinText([
+                expression(operand(index, "base")), "[", expression(operand(index, "index")), "]"
+            ])
+            "access_index" -> return memberText(index)
+            "splat" -> return joinText([
+                typeName(typeOf(index), index), "(", expression(operand(index, "value")), ")"
+            ])
+            "swizzle" -> return joinText([
+                expression(operand(index, "vector")), ".", text("expressions", current, index, "pattern")
+            ])
+            "arg" -> return argumentNames[operand(index, "argument")]
+            "global" -> return globalNames[operand(index, "global")]
+            "local" -> return localNames[operand(index, "local")]
+            "load" -> return expression(operand(index, "pointer"))
+            "image_sample" -> return sampleText(index)
+            "image_load" -> return loadText(index)
+            "unary" -> return unaryText(index)
+            "binary" -> return binaryText(index)
+            "math" -> return mathText(index)
+            "derivative" -> return derivativeText(index)
+            "convert" -> return convertText(index)
+            "array_length" -> return lengthText(index)
+            else -> {
+                refuse(joinText(["`", which, "` expression"]), index)
+                return "0"
+            }
+        }
+    }
+
+    // The zero of a scalar or vector, written in place; "" for one that is
+    // declared as a temporary instead.
+    function zeroText(borrow mut self, typeIndex: Int) -> String {
+        let which = kind("types", -1, typeIndex)
+        let scalar = text("types", -1, typeIndex, "scalar")
+        var zero = "0.0"
+        if scalar == "i32" { zero = "0" }
+        if scalar == "u32" { zero = "UInt(0)" }
+        if scalar == "bool" { zero = "false" }
+        if which == "scalar" { return zero }
+        if which == "vector" { return joinText([typeName(typeIndex, -1), "(", zero, ")"]) }
+        return ""
+    }
+
+    function zeroValue(borrow mut self, typeIndex: Int, at: Int) -> String {
+        let zero = zeroText(typeIndex)
+        if utf8Count(zero) == 0 {
+            refuse("zero value of this type in place", at)
+            return "0"
+        }
+        return zero
+    }
+
+    function items(borrow mut self, index: Int) -> String {
+        var parts: [String] = []
+        let total = fieldCount("expressions", current, index, "items")
+        for position in 0..total {
+            parts.append(expression(fieldItem("expressions", current, index, "items", position)))
+        }
+        return joinWith(parts, ", ")
+    }
+
+    function construction(borrow mut self, index: Int) -> String {
+        let typeIndex = typeOf(index)
+        if kind("types", -1, typeIndex) == "array" {
+            refuse("array value", index)
+            return "0"
+        }
+        let parts = items(index)
+        return joinText([typeName(typeIndex, index), "(", parts, ")"])
+    }
+
+    // A member of a struct, a lane of a vector, or a column or element.
+    function memberText(borrow mut self, index: Int) -> String {
+        let base = operand(index, "base")
+        let position = operand(index, "index")
+        let baseType = pointee(typeOf(base))
+        let written = expression(base)
+        let which = kind("types", -1, baseType)
+        if which == "struct" {
+            return joinText([written, ".", kslName(text("members", baseType, position, "name"))])
+        }
+        if which == "vector" {
+            let lanes = ["x", "y", "z", "w"]
+            return joinText([written, ".", lanes[position]])
+        }
+        return joinText([written, "[", decimalText(position), "]"])
+    }
+
+    function zeroLiteral(borrow self, index: Int) -> Bool {
+        if index < 0 || expressionKind(index) != "literal" { return false }
+        let value = text("expressions", current, index, "literal")
+        return value == "0" || value == "0.0" || value == "-0.0"
+    }
+
+    function isDepthImage(borrow self, image: Int) -> Bool {
+        let imageType = pointee(typeOf(image))
+        return text("types", -1, imageType, "class") == "depth"
+    }
+
+    // KSL samples level zero, with no offset, array layer, comparison or
+    // gather.
+    function sampleText(borrow mut self, index: Int) -> String {
+        let level = text("expressions", current, index, "level")
+        let zero = level == "zero" || (level == "exact" && zeroLiteral(operand(index, "level_value")))
+        if !zero { refuse(joinText(["sample at level `", level, "`"]), index) }
+        if operand(index, "offset") >= 0 { refuse("sample offset", index) }
+        if operand(index, "array_index") >= 0 { refuse("sample of an image array", index) }
+        if operand(index, "depth_ref") >= 0 { refuse("depth comparison sample", index) }
+        if operand(index, "gather") >= 0 { refuse("gather", index) }
+        let image = operand(index, "image")
+        let sampled = joinText([
+            "sample(", expression(image), ", ", expression(operand(index, "sampler")), ", ",
+            expression(operand(index, "coordinate")), ")"
+        ])
+        // KSL reads a depth sample as four lanes; KSIR's is one.
+        if isDepthImage(image) { return joinText([sampled, ".x"]) }
+        return sampled
+    }
+
+    function loadText(borrow mut self, index: Int) -> String {
+        if operand(index, "array_index") >= 0 { refuse("load from an image array", index) }
+        if operand(index, "sample") >= 0 { refuse("load of one sample", index) }
+        let level = operand(index, "level_value")
+        if level >= 0 && !zeroLiteral(level) { refuse("load from a level other than zero", index) }
+        return joinText([
+            "load(", expression(operand(index, "image")), ", ", expression(operand(index, "coordinate")), ")"
+        ])
+    }
+
+    function unaryText(borrow mut self, index: Int) -> String {
+        let op = text("expressions", current, index, "op")
+        let value = expression(operand(index, "expr"))
+        if op == "negate" { return joinText(["-", value]) }
+        if op == "not" { return joinText(["!", value]) }
+        refuse(joinText(["`", op, "` operator"]), index)
+        return value
+    }
+
+    // `*` never multiplies a matrix in KSL; `mul(matrix, value)` does.
+    function binaryText(borrow mut self, index: Int) -> String {
+        let op = text("expressions", current, index, "op")
+        let left = operand(index, "left")
+        let right = operand(index, "right")
+        let leftMatrix = kind("types", -1, typeOf(left)) == "matrix"
+        let rightMatrix = kind("types", -1, typeOf(right)) == "matrix"
+        if op == "multiply" && (leftMatrix || rightMatrix) {
+            if !leftMatrix || kind("types", -1, typeOf(right)) == "scalar" {
+                refuse("product of these operands", index)
+            }
+            return joinText(["mul(", expression(left), ", ", expression(right), ")"])
+        }
+        let word = binaryWord(op)
+        if utf8Count(word) == 0 { refuse(joinText(["`", op, "` operator"]), index) }
+        return joinText(["(", expression(left), " ", word, " ", expression(right), ")"])
+    }
+
+    function mathText(borrow mut self, index: Int) -> String {
+        let name = text("expressions", current, index, "fun")
+        if name == "saturate" {
+            return joinText(["clamp(", items(index), ", 0.0, 1.0)"])
+        }
+        if !kslMath(name) { refuse(joinText(["`", name, "` function"]), index) }
+        return joinText([name, "(", items(index), ")"])
+    }
+
+    function derivativeText(borrow mut self, index: Int) -> String {
+        let axis = text("expressions", current, index, "axis")
+        var name = "fwidth"
+        if axis == "x" {
+            name = "dpdx"
+        } else if axis == "y" {
+            name = "dpdy"
+        }
+        return joinText([name, "(", expression(operand(index, "expr")), ")"])
+    }
+
+    function convertText(borrow mut self, index: Int) -> String {
+        let value = operand(index, "expr")
+        let from = text("types", -1, typeOf(value), "scalar")
+        let to = text("types", -1, typeOf(index), "scalar")
+        if from == "bool" || to == "bool" { refuse("conversion to or from Bool", index) }
+        return joinText([typeName(typeOf(index), index), "(", expression(value), ")"])
+    }
+
+    function lengthText(borrow mut self, index: Int) -> String {
+        let pointer = operand(index, "pointer")
+        if expressionKind(pointer) != "global" {
+            refuse("length of an array that is not a storage resource", index)
+            return "0"
+        }
+        return joinText([expression(pointer), ".count"])
+    }
+
+    // The expressions `index` reads.
+    function operandsOf(borrow self, index: Int) -> [Int] {
+        var reads: [Int] = []
+        let which = expressionKind(index)
+        var names: [String] = []
+        match which {
+            "access" -> names = ["base", "index"]
+            "access_index" -> names = ["base"]
+            "splat" -> names = ["value"]
+            "swizzle" -> names = ["vector"]
+            "load" -> names = ["pointer"]
+            "array_length" -> names = ["pointer"]
+            "image_sample" -> names = [
+                "image", "sampler", "coordinate", "array_index", "offset", "level_value", "gradient_x",
+                "gradient_y", "depth_ref"
+            ]
+            "image_load" -> names = ["image", "coordinate", "array_index", "sample", "level_value"]
+            "image_query" -> names = ["image", "level_value"]
+            "unary" -> names = ["expr"]
+            "derivative" -> names = ["expr"]
+            "convert" -> names = ["expr"]
+            "bitcast" -> names = ["expr"]
+            "binary" -> names = ["left", "right"]
+            "select" -> names = ["condition", "accept", "reject"]
+            "relational" -> names = ["argument"]
+            else -> {}
+        }
+        for name in names {
+            let read = operand(index, name)
+            if read >= 0 { reads.append(read) }
+        }
+        if which == "compose" || which == "math" {
+            let total = fieldCount("expressions", current, index, "items")
+            for position in 0..total {
+                reads.append(fieldItem("expressions", current, index, "items", position))
+            }
+        }
+        return reads
+    }
+}

@@ -1,0 +1,236 @@
+// MSL spellings of types. KSIR and Metal agree on matrices: `floatCxR` has
+// `C` columns, stored column by column.
+
+function mslScalar(scalar: String) -> String {
+    if scalar == "bool" { return "bool" }
+    if scalar == "i32" { return "int" }
+    if scalar == "u32" { return "uint" }
+    if scalar == "f32" { return "float" }
+    if scalar == "f16" { return "half" }
+    if scalar == "i64" { return "long" }
+    if scalar == "u64" { return "ulong" }
+    return typeFailure(joinText(["MSL has no ", scalar]))
+}
+
+function mslTexel(scalar: String) -> String {
+    if scalar == "f32" { return "float" }
+    if scalar == "i32" { return "int" }
+    if scalar == "u32" { return "uint" }
+    return typeFailure("a texture of bool")
+}
+
+extend TextOut {
+    function mslImage(borrow self, typeIndex: Int) -> String {
+        let dimension = typeText(typeIndex, "dimension")
+        var array = ""
+        if flag("types", -1, typeIndex, "arrayed") { array = "_array" }
+        var ms = ""
+        if flag("types", -1, typeIndex, "multisampled") { ms = "_ms" }
+        let imageClass = typeText(typeIndex, "class")
+        if imageClass == "depth" { return joinText(["depth", dimension, ms, array, "<float>"]) }
+        let texel = mslTexel(typeText(typeIndex, "scalar"))
+        if failedText(texel) { return texel }
+        if imageClass == "sampled" { return joinText(["texture", dimension, ms, array, "<", texel, ">"]) }
+        let access = typeText(typeIndex, "access")
+        var mode = "write"
+        if containsWord(access, "load") && containsWord(access, "store") {
+            mode = "read_write"
+        } else if containsWord(access, "load") {
+            mode = "read"
+        }
+        return joinText(["texture", dimension, array, "<", texel, ", access::", mode, ">"])
+    }
+
+    // The text of a type, or why MSL has none.
+    function mslType(borrow self, typeIndex: Int) -> String {
+        let shape = typeKind(typeIndex)
+        let scalar = typeText(typeIndex, "scalar")
+        match shape {
+            "scalar" -> return mslScalar(scalar)
+            "atomic" -> {
+                let base = mslScalar(scalar)
+                if failedText(base) { return base }
+                return joinText(["atomic_", base])
+            }
+            "vector" -> {
+                let base = mslScalar(scalar)
+                if failedText(base) { return base }
+                return joinText([base, decimalText(typeField(typeIndex, "lanes"))])
+            }
+            "matrix" -> {
+                let base = mslScalar(scalar)
+                if failedText(base) { return base }
+                return joinText([base, decimalText(typeField(typeIndex, "columns")), "x",
+                    decimalText(typeField(typeIndex, "rows"))])
+            }
+            "pointer" -> return mslType(typeField(typeIndex, "base"))
+            "array" -> {
+                let base = mslType(typeField(typeIndex, "base"))
+                if failedText(base) { return base }
+                let length = typeField(typeIndex, "length")
+                if length >= 0 { return joinText(["metal::array<", base, ", ", decimalText(length), ">"]) }
+                if typeField(typeIndex, "length_override") >= 0 { return typeFailure("an array sized by a kept override") }
+                return joinText(["metal::array<", base, ", 1>"])
+            }
+            "struct" -> return structName(typeIndex)
+            "image" -> return mslImage(typeIndex)
+            "sampler" -> return "sampler"
+            else -> return typeFailure("a type MSL has no form for")
+        }
+    }
+
+    // A type's text where the module declares it: why it has none is
+    // refused at the type.
+    function typeName(borrow self, typeIndex: Int) -> String {
+        let written = mslType(typeIndex)
+        if failedText(written) {
+            refuseAt(failureText(written), "types", -1, typeIndex)
+            return ""
+        }
+        return written
+    }
+
+    // The type of an expression's result, in a body.
+    function resultType(borrow self, expression: Int) -> String {
+        let written = mslType(typeOf(expression))
+        if failedText(written) { return joinText(["/* ", failureText(written), " */"]) }
+        return written
+    }
+
+    // A brace initializer for a struct, with an empty one per padding
+    // array.
+    function structValue(borrow self, typeIndex: Int, parts: [String]) -> String {
+        let name = structName(typeIndex)
+        if !dialect.padded[typeIndex] { return joinText([name, " { ", joinWith(parts, ", "), " }"]) }
+        var texts: [String] = []
+        for slot in dialect.slots[typeIndex] {
+            if slot < 0 {
+                texts.append("{}")
+            } else if slot < parts.count {
+                texts.append(parts[slot])
+            } else {
+                texts.append("")
+            }
+        }
+        return joinText([name, " { ", joinWith(texts, ", "), " }"])
+    }
+
+    // The parameter that carries a global into a function: a reference in
+    // its address space, or a texture or sampler by value.
+    function parameter(borrow self, global: Int, name: String) -> String {
+        let globalType = field("globals", -1, global, "type")
+        let written = mslType(globalType)
+        if failedText(written) { return written }
+        let space = text("globals", -1, global, "space")
+        if space == "uniform" { return joinText(["constant ", written, "& ", name]) }
+        if space == "storage" {
+            let access = text("globals", -1, global, "access")
+            var constness = "const "
+            if containsWord(access, "store") || containsWord(access, "atomic") { constness = "" }
+            if typeKind(globalType) == "array" && typeField(globalType, "length") < 0
+                && typeField(globalType, "length_override") < 0 {
+                let base = mslType(typeField(globalType, "base"))
+                if failedText(base) { return base }
+                return joinText([constness, "device ", base, "* ", name])
+            }
+            return joinText([constness, "device ", written, "& ", name])
+        }
+        if space == "handle" { return joinText([written, " ", name]) }
+        if space == "workgroup" { return joinText(["threadgroup ", written, "& ", name]) }
+        if space == "private" { return joinText(["thread ", written, "& ", name]) }
+        return typeFailure(joinText(["global `", text("globals", -1, global, "name"), "` in a space MSL has no form for"]))
+    }
+
+    // The size and alignment Metal gives a host-shareable type.
+    function naturalSize(borrow self, typeIndex: Int) -> Int {
+        let shape = typeKind(typeIndex)
+        if shape == "struct" { return typeField(typeIndex, "size") }
+        if shape == "array" {
+            var length = typeField(typeIndex, "length")
+            if length < 0 { length = 1 }
+            return length * typeField(typeIndex, "stride")
+        }
+        if shape == "pointer" || shape == "image" || shape == "sampler" { return 0 }
+        return typeField(typeIndex, "size_msl")
+    }
+
+    function naturalAlign(borrow self, typeIndex: Int) -> Int {
+        let shape = typeKind(typeIndex)
+        if shape == "struct" {
+            let members = count("members", typeIndex)
+            if members == 0 { return 4 }
+            var widest = 0
+            for member in 0..members {
+                let align = naturalAlign(field("members", typeIndex, member, "type"))
+                if align > widest { widest = align }
+            }
+            return widest
+        }
+        if shape == "array" { return naturalAlign(typeField(typeIndex, "base")) }
+        if shape == "pointer" || shape == "image" || shape == "sampler" { return 1 }
+        return typeField(typeIndex, "align_msl")
+    }
+
+    // The stride Metal gives an array element.
+    function mslStride(borrow self, base: Int) -> Int {
+        return alignUp(naturalSize(base), naturalAlign(base))
+    }
+
+    // Whether a member is a three-component vector whose recorded slot is
+    // narrower or less aligned than Metal's `float3`, so that it is written
+    // as `packed_float3` (section 19.1 rule 4).
+    function packedMember(borrow self, typeIndex: Int, member: Int) -> Bool {
+        let memberType = field("members", typeIndex, member, "type")
+        if typeKind(memberType) != "vector" || typeField(memberType, "lanes") != 3 { return false }
+        let full = 4 * scalarWidth(typeText(memberType, "scalar"))
+        let offset = field("members", typeIndex, member, "offset")
+        var end = typeField(typeIndex, "size")
+        let members = count("members", typeIndex)
+        for other in 0..members {
+            let at = field("members", typeIndex, other, "offset")
+            if at > offset && at < end { end = at }
+        }
+        return offset % full != 0 || end - offset < full
+    }
+
+    // Pads every host-shared struct to its recorded layout.
+    function prepareSlots(borrow mut self) {
+        let types = count("types", -1)
+        for typeIndex in 0..types {
+            var slots: [Int] = []
+            var padded = false
+            if typeKind(typeIndex) == "struct" && flag("types", -1, typeIndex, "host_shared") {
+                let members = count("members", typeIndex)
+                let size = typeField(typeIndex, "size")
+                var sizes: [Int] = []
+                var aligns: [Int] = []
+                for member in 0..members {
+                    let memberType = field("members", typeIndex, member, "type")
+                    if typeKind(memberType) == "array"
+                        && mslStride(typeField(memberType, "base")) != typeField(memberType, "stride") {
+                        refuseAt(joinText(["member `", text("members", typeIndex, member, "name"),
+                            "` has array stride ", decimalText(typeField(memberType, "stride")),
+                            ", which Metal cannot give"]), "types", -1, typeIndex)
+                    }
+                    if packedMember(typeIndex, member) {
+                        let width = scalarWidth(typeText(memberType, "scalar"))
+                        sizes.append(3 * width)
+                        aligns.append(width)
+                    } else {
+                        sizes.append(naturalSize(memberType))
+                        aligns.append(naturalAlign(memberType))
+                    }
+                }
+                let padding = paddedSlots(typeIndex, size, sizes, aligns)
+                if utf8Count(padding.problem) > 0 {
+                    refuseAt(padding.problem, "types", -1, typeIndex)
+                } else {
+                    slots = padding.slots
+                    padded = true
+                }
+            }
+            dialect.padded.append(padded)
+            dialect.slots.append(slots)
+        }
+    }
+}

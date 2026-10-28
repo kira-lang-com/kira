@@ -1,0 +1,293 @@
+// A QUIC connection (DESIGN.md section 6), sans-I/O: datagrams and the
+// time go in through `receive` and `expire`, datagrams come out of
+// `transmit`, `deadline` says when to call `expire`, and `event` drains what
+// happened.
+
+// One level's keys, each way.
+struct QuicLevelKeys {
+    let seal: TlsTrafficKeys
+    let open: TlsTrafficKeys
+}
+
+// The 1-RTT secrets, kept to derive the next keys of a key update (RFC 9001
+// section 6).
+struct QuicPhaseSecrets {
+    let parameters: TlsSuiteParameters
+    let sealing: [UN8]
+    let opening: [UN8]
+}
+
+enum QuicConnectionState {
+    Handshaking
+    Connected
+    // A CONNECTION_CLOSE was sent or received; the connection lingers for
+    // three probe timeouts so stray packets are not taken for new ones
+    // (RFC 9000 section 10.2).
+    Closing
+    Draining
+    Closed
+}
+
+struct QuicConnectionEnd {
+    let application: Bool
+    let error: Number
+    let reason: String
+    let byPeer: Bool
+}
+
+struct QuicStreamFailure {
+    let id: QuicStreamNumber
+    let error: Number
+}
+
+enum QuicEvent {
+    Connected(TlsAgreement)
+    StreamOpened(QuicStreamNumber)
+    StreamReadable(QuicStreamNumber)
+    StreamReset(QuicStreamFailure)
+    StreamStopped(QuicStreamFailure)
+    Datagram([UN8])
+    Closed(QuicConnectionEnd)
+}
+
+struct QuicClientSettings {
+    let serverName: String
+    let protocols: [String]
+    let seconds: Number
+    let anchors: [UN8] = []
+    let limits: QuicLimits = QuicLimits {}
+}
+
+struct QuicServerSettings {
+    let identity: TlsServerIdentity
+    let protocols: [String]
+    let limits: QuicLimits = QuicLimits {}
+}
+
+namespace QuicIdle {
+    // Closing and draining last three probe timeouts (RFC 9000 section 10.2).
+    let closingPeriods: Number = 3
+    // Until the peer says otherwise, at most a minimum datagram goes out.
+    let amplificationFactor: Number = 3
+}
+
+struct QuicConnection {
+    let role: TlsRole
+    let limits: QuicLimits
+    var tls: TlsHandshake
+    var state: QuicConnectionState = .Handshaking
+    var localId: [UN8]
+    var peerId: [UN8]
+    // The ID the client's first Initial went to, which keys the Initials.
+    let originalDestination: [UN8]
+    var token: [UN8] = []
+    // The ID a client's Retry came from, which the server's transport
+    // parameters must name (RFC 9000 section 7.3).
+    var retrySource: [UN8]? = .None
+    var initialKeys: QuicLevelKeys? = .None
+    var handshakeKeys: QuicLevelKeys? = .None
+    var applicationKeys: QuicLevelKeys? = .None
+    var phaseSecrets: QuicPhaseSecrets? = .None
+    var keyPhase: Bool = false
+    var recovery: QuicLossRecovery
+    var cryptoIn: [QuicReassembly] = [QuicReassembly {}, QuicReassembly {}, QuicReassembly {}]
+    var cryptoOut: [[QuicPiece]] = [[], [], []]
+    var cryptoOffset: [Number] = [0, 0, 0]
+    var probing: [Bool] = [false, false, false]
+    var ackDeadline: QuicInstant? = .None
+    var streams: [QuicStream] = []
+    var bidirectional: QuicStreamCounts
+    var unidirectional: QuicStreamCounts
+    var sendLimit: Number = 0
+    var sent: Number = 0
+    var receiveLimit: Number
+    var received: Number = 0
+    var consumed: Number = 0
+    var control: [QuicFrame] = []
+    var datagramsOut: [[UN8]] = []
+    var events: [QuicEvent] = []
+    var delivered: Number = 0
+    var peerParameters: QuicTransportParameters? = .None
+    var lastActivity: QuicInstant
+    var closeFrame: QuicCloseFrame? = .None
+    var closeSent: Bool = false
+    var lingerUntil: QuicInstant? = .None
+    var handshakeConfirmed: Bool = false
+    var addressValidated: Bool
+    var bytesReceived: Number = 0
+    var bytesSent: Number = 0
+
+    function event(borrow mut self) -> QuicEvent? {
+        if delivered == events.count {
+            if delivered > 0 {
+                events = []
+                delivered = 0
+            }
+            return .None
+        }
+        let next = copy events[delivered]
+        delivered += 1
+        return .Some(next)
+    }
+
+    function isClosed(borrow self) -> Bool {
+        return state == .Closed
+    }
+
+    // When `expire` must next be called.
+    function deadline(borrow self) -> QuicInstant? {
+        match state {
+            Closed -> return .None
+            Closing -> return copy lingerUntil
+            Draining -> return copy lingerUntil
+            Handshaking -> {}
+            Connected -> {}
+        }
+        var next = quicEarliest(ackDeadline, .Some(lastActivity.plus(idleTimeout())))
+        match recovery.timer() {
+            Some(timer) -> next = quicEarliest(next, .Some(timer.at))
+            None -> {}
+        }
+        return next
+    }
+
+    function expire(borrow mut self, now: QuicInstant) {
+        match state {
+            Closed -> return
+            Closing -> return lingerExpire(now)
+            Draining -> return lingerExpire(now)
+            Handshaking -> {}
+            Connected -> {}
+        }
+        if now.raw >= lastActivity.plus(idleTimeout()).raw {
+            // An idle timeout ends the connection silently (RFC 9000
+            // section 10.1).
+            state = .Closed
+            events.append(
+                .Closed(
+                    QuicConnectionEnd {
+                        application: false,
+                        error: 0,
+                        reason: "idle",
+                        byPeer: false
+                    }
+                )
+            )
+            return
+        }
+        match recovery.timer() {
+            Some(timer) -> {
+                if now.raw >= timer.at.raw { fireTimer(timer, now) }
+            }
+            None -> {}
+        }
+    }
+
+    function lingerExpire(borrow mut self, now: QuicInstant) {
+        match lingerUntil {
+            Some(until) -> if now.raw >= until.raw { state = .Closed }
+            None -> state = .Closed
+        }
+    }
+
+    function fireTimer(borrow mut self, timer: borrow QuicRecoveryTimer, now: QuicInstant) {
+        let lost = recovery.onTimer(timer, now)
+        for packet in lost { requeue(timer.level, packet.frames) }
+        // A probe sends new data if there is some, or a PING, so the peer
+        // acknowledges and recovery learns what happened (RFC 9002 section
+        // 6.2.4).
+        if timer.kind == .Probe { probing[quicLevelIndex(timer.level)] = true }
+    }
+
+    // The idle timeout both sides agreed on: the smaller nonzero one.
+    function idleTimeout(borrow self) -> Number {
+        let own = Number(limits.maxIdleMilliseconds)
+        let peer = match peerParameters {
+            Some(parameters) -> parameters.maxIdleTimeout
+            None -> 0
+        }
+        let chosen = own == 0 ? peer : peer == 0 ? own : min(own, peer)
+        return chosen == 0 ? trunc(
+            Wire.varintMaximum / QuicTime.second
+        ) : chosen * QuicTime.millisecond
+    }
+
+    function keys(borrow self, level: TlsEncryptionLevel) -> QuicLevelKeys? {
+        return match level {
+            Initial -> copy initialKeys
+            Handshake -> copy handshakeKeys
+            Application -> copy applicationKeys
+        }
+    }
+
+    // Ends the connection with `error`: a CONNECTION_CLOSE is sent, then the
+    // connection lingers in Closing.
+    function close(borrow mut self, error: Number, reason: borrow String, application: Bool) {
+        if state == .Closing || state == .Draining || state == .Closed { return }
+        // Before the handshake an application error goes as the transport's
+        // APPLICATION_ERROR (RFC 9000 section 10.2.3).
+        let hidden = application && applicationKeys.isNone()
+        closeFrame = .Some(
+            QuicCloseFrame {
+                application: application && !hidden,
+                error: hidden ? code(QuicTransportError.ApplicationError) : error,
+                frameType: 0,
+                reason: tlsTextBytes(reason)
+            }
+        )
+        state = .Closing
+        events.append(
+            .Closed(
+                QuicConnectionEnd {
+                    application: application,
+                    error: error,
+                    reason: copy reason,
+                    byPeer: false
+                }
+            )
+        )
+    }
+
+    function fail(borrow mut self, error: QuicTransportError) {
+        close(code(error), traceText(error), false)
+    }
+
+    function lingerFrom(borrow mut self, now: QuicInstant) {
+        let period = recovery.rtt.probeTimeout(recovery.peerMaxAckDelay) * QuicIdle.closingPeriods
+        lingerUntil = .Some(now.plus(period))
+    }
+}
+
+function quicLevelIndex(level: TlsEncryptionLevel) -> Number {
+    return match level {
+        Initial -> 0
+        Handshake -> 1
+        Application -> 2
+    }
+}
+
+// The Initial keys of `destination`, the client's first destination ID
+// (RFC 9001 section 5.2).
+function quicInitialLevelKeys(
+    destination: borrow [UN8],
+    role: TlsRole
+) -> Result<QuicLevelKeys, CryptoFailure> {
+    let parameters = TlsSuiteParameters {
+        suite: .Aes128GcmSha256,
+        hash: .Sha256,
+        hashBytes: TlsSuiteSize.sha256,
+        keyBytes: TlsSuiteSize.aes128Key
+    }
+    let initial = try hkdfExtract(.Sha256, Quic.initialSalt, destination)
+    let empty: [UN8] = []
+    let clientSecret = try tlsExpandLabel(.Sha256, initial, "client in", empty, TlsSuiteSize.sha256)
+    let serverSecret = try tlsExpandLabel(.Sha256, initial, "server in", empty, TlsSuiteSize.sha256)
+    let client = try tlsTrafficKeys(parameters, clientSecret, .Quic)
+    let server = try tlsTrafficKeys(parameters, serverSecret, .Quic)
+    return .Ok(
+        role == .Client ? QuicLevelKeys { seal : client, open: server }: QuicLevelKeys {
+            seal: server,
+            open: client
+        }
+    )
+}

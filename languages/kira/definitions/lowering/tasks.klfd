@@ -1,0 +1,55 @@
+extend FunctionLowering {
+    function taskHandle(borrow mut self, id: KirValue, valueType: Type) -> KirAddress {
+        let header = temporary(valueType)
+        kir.store(id, kir.field(header, 0, types.integer64))
+        return header
+    }
+
+    function taskId(borrow mut self, task: Int) -> KirValue {
+        return kir.load(kir.field(address(task), 0, types.integer64))
+    }
+
+    function spawnTask(borrow mut self, target: Int, values: [Int], workType: Type, taskType: Type) -> KirAddress {
+        let work = makeValueClosure(target, values, workType)
+        forgetTracked(work)
+        kir.argument(kir.pointer(work))
+        let id = kir.call(functions[program.taskFunctions[0]], types.integer64)
+        return taskHandle(id, taskType)
+    }
+
+    function readyTask(borrow mut self, value: Int, taskType: Type) -> KirAddress {
+        let boxed = temporary(program.typeOf(value))
+        write(value, boxed)
+        forgetTracked(boxed)
+        kir.argument(kir.pointer(boxed))
+        let id = kir.call(functions[program.taskFunctions[1]], types.integer64)
+        return taskHandle(id, taskType)
+    }
+
+    function awaitTask(borrow mut self, task: Int, typeId: Int, target: Type, span: Span) -> KirAddress {
+        let awaitFunction = program.functions[program.taskFunctions[2]]
+        let boxed = temporary(awaitFunction.result)
+        let id = taskId(task)
+        kir.argument(kir.pointer(boxed))
+        kir.argument(id)
+        kir.callVoid(functions[program.taskFunctions[2]])
+        markInitialized(boxed)
+        let actual = kir.load(kir.field(boxed, 1, types.integer64))
+        let expected = spelledType(program, program.anyTypeOf(typeId))
+        let report = TrapReport {
+            code = checkTrap,
+            headline = joinText(["the task finished with another type than `", expected, "`"]),
+            label = joinText(["awaits a `", expected, "`"]),
+            note = "`.await` reads the value the task's function returned, a `{text}`",
+            help = "await the task as the type its function returns"
+        }
+        trapUnlessHeld(kir.compare(kirPredicate(.Equal, false), actual, kir.integer(types.integer64, typeId)), span, report, actual)
+        return kir.typedMemory(kir.load(kir.field(boxed, 0, types.pointer)), types.of(program.anyTypeOf(typeId)))
+    }
+
+    function taskAction(borrow mut self, action: Int, task: Int) {
+        let id = taskId(task)
+        kir.argument(id)
+        kir.callVoid(functions[program.taskFunctions[action]])
+    }
+}

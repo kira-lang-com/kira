@@ -1,0 +1,693 @@
+// Traits: the members a type promises, checked where it conforms.
+//
+// A conformance inherits the trait's defaults the type does not write and
+// must present every requirement with the trait's own signature. A trait's
+// name in a type position is an existential, built like a construct family's
+// values: an enum with one case per conforming type and methods that
+// dispatch on the case. `Copyable`, `Drop`, `Send` and `Sync` exist without
+// a declaration.
+
+function isCompilerKnownTrait(name: String) -> Bool {
+    match name {
+        "Copyable", "Drop", "Send", "Sync" -> return true
+        else -> return false
+    }
+}
+
+function traitNamed(traits: [TraitDeclaration], name: String) -> Optional<TraitDeclaration> {
+    for declared in traits {
+        if declared.name.text == name { return .Some(declared) }
+    }
+    return .None
+}
+
+function materializeTraits(move tree: SyntaxTree) -> SyntaxTree {
+    var prepared = move tree
+    prepared.conformances = expandFamilyClaims(prepared)
+    for declared in prepared.traits {
+        if isCompilerKnownTrait(declared.name.text) {
+            report(.CompilerKnownTraitDeclared, declared.name.span)
+            continue
+        }
+        checkSupertraits(prepared.traits, declared)
+        // A trait with associated types answers differently for each
+        // conforming type, so there is no one value of "any" of it: like a
+        // generic trait, it has no existential.
+        if declared.genericParameters.count == 0 && declared.associatedTypes.count == 0 { declareTraitEnum(prepared, declared) }
+        if declared.associatedTypes.count > 0 { bindAssociatedTypes(prepared, declared) }
+    }
+    return prepared
+}
+
+// Each conforming type's associated types, as aliases `Owner.Name`, so a
+// generic's `Value.ID` resolves once `Value` is bound (tree.klfd).
+function bindAssociatedTypes(tree: borrow mut SyntaxTree, declared: TraitDeclaration) {
+    for conformance in tree.conformances {
+        if conformance.traitName.name.text != declared.name.text || isTemplateReference(tree, conformance.owner) { continue }
+        let bindings = associatedBindings(tree, declared, conformance)
+        for index in 0..declared.associatedTypes.count {
+            let associated = declared.associatedTypes[index]
+            match bindings[index] {
+                Some(binding) -> tree.aliases.append(AliasDeclaration {
+                    name = Identifier { text = associatedTypeName(conformance.owner.instanceName, associated.name.text), span = associated.name.span },
+                    genericParameters = [],
+                    target = binding
+                })
+                None -> report(.AssociatedTypeUnbound, conformance.traitName.name.span)
+            }
+        }
+    }
+}
+
+// What each associated type of `declared` is for the type `conformance`
+// names: the type of the member that satisfies a requirement written with
+// it, else its default. Swift infers them the same way.
+function associatedBindings(tree: SyntaxTree, declared: TraitDeclaration, conformance: TypeConformance) -> [Optional<TypeReference>] {
+    var bindings: [Optional<TypeReference>] = []
+    for associated in declared.associatedTypes {
+        var binding: Optional<TypeReference> = .None
+        for requirement in declared.methods {
+            if binding.isSome() { break }
+            match requirement.result {
+                Some(result) -> {
+                    if result.qualifier.isNone() && result.arguments.count == 0 && result.name.text == associated.name.text {
+                        binding = memberResult(tree, conformance.owner, requirement)
+                    }
+                }
+                None -> {}
+            }
+        }
+        // Else a parameter written with it, as `compare(lhs: Compared, ...)`
+        // binds `Compared` from what the member takes there.
+        for requirement in declared.methods {
+            if binding.isSome() { break }
+            for index in 0..requirement.parameters.count {
+                let written = requirement.parameters[index].annotation
+                if written.qualifier.isNone() && written.arguments.count == 0 && written.name.text == associated.name.text {
+                    binding = memberParameter(tree, conformance.owner, requirement, index)
+                    if binding.isSome() { break }
+                }
+            }
+        }
+        if binding.isNone() { binding = associated.initial }
+        bindings.append(binding)
+    }
+    return bindings
+}
+
+// The type the owner's method for `requirement` takes at `index`, as
+// written.
+function memberParameter(tree: SyntaxTree, owner: TypeReference, requirement: FunctionDeclaration, index: Int) -> Optional<TypeReference> {
+    for declared in tree.structs {
+        if declared.name.text != owner.instanceName && declared.name.text != owner.name.text { continue }
+        for method in declared.methods {
+            if method.name.text != requirement.name.text || hasAttribute(method.annotations, .Required) { continue }
+            if method.parameters.count == requirement.parameters.count { return .Some(method.parameters[index].annotation) }
+        }
+    }
+    return .None
+}
+
+// The type the owner's member for `requirement` answers with, as written:
+// a stored field for a property, else the method's result.
+function memberResult(tree: SyntaxTree, owner: TypeReference, requirement: FunctionDeclaration) -> Optional<TypeReference> {
+    let property = hasAttribute(requirement.annotations, .Computed)
+    for declared in tree.structs {
+        if declared.name.text != owner.instanceName && declared.name.text != owner.name.text { continue }
+        if property {
+            for field in declared.fields {
+                if field.name.text == requirement.name.text { return .Some(field.annotation) }
+            }
+        }
+        for method in declared.methods {
+            if method.name.text == requirement.name.text && !hasAttribute(method.annotations, .Required) && !hasAttribute(method.annotations, .ComputedSetter) {
+                return method.result
+            }
+        }
+    }
+    return .None
+}
+
+// The names of a trait's associated types, which its requirements may use.
+function associatedNames(declared: TraitDeclaration) -> [Identifier] {
+    var names: [Identifier] = []
+    for associated in declared.associatedTypes { names.append(associated.name) }
+    return names
+}
+
+// A family claims a trait for each declaration seen through it, unless the
+// declaration claims it itself.
+function expandFamilyClaims(tree: SyntaxTree) -> [TypeConformance] {
+    var conformances: [TypeConformance] = []
+    let constructsByName = constructIndex(tree.constructs)
+    for conformance in tree.conformances {
+        match constructsByName.named(conformance.owner.name.text) {
+            Some(family) -> {
+                if family.parameters.isNone() {
+                    if isCompilerKnownTrait(conformance.traitName.name.text) {
+                        report(.FamilyClaimsCompilerKnown, conformance.traitName.name.span)
+                        continue
+                    }
+                    for declared in tree.constructs {
+                        if declared.parameters.isSome() && constructsByName.seenThrough(declared, family.name.text, 0)
+                            && !claims(tree.conformances, declared.name.text, conformance.traitName.instanceName) {
+                            conformances.append(TypeConformance { owner = namedReference(declared.name), traitName = conformance.traitName })
+                        }
+                    }
+                    continue
+                }
+            }
+            None -> {}
+        }
+        conformances.append(conformance)
+    }
+    return conformances
+}
+
+function claims(conformances: [TypeConformance], owner: String, traitName: String) -> Bool {
+    for conformance in conformances {
+        if conformance.owner.instanceName == owner && conformance.traitName.instanceName == traitName { return true }
+    }
+    return false
+}
+
+function checkSupertraits(traits: [TraitDeclaration], declared: TraitDeclaration) {
+    for supertrait in declared.supertraits {
+        if isCompilerKnownTrait(supertrait.name.text) { continue }
+        if traitNamed(traits, supertrait.name.text).isNone() {
+            report(.SupertraitNotATrait, supertrait.name.span)
+        } else if requiresTrait(traits, supertrait.name.text, declared.name.text, 0) {
+            report(.SupertraitCycle, supertrait.name.span)
+        }
+    }
+}
+
+// Whether `from` requires `target`, directly or through its supertraits.
+function requiresTrait(traits: [TraitDeclaration], from: String, target: String, depth: Int) -> Bool {
+    if from == target { return true }
+    if depth > traits.count { return false }
+    match traitNamed(traits, from) {
+        Some(declared) -> {
+            for supertrait in declared.supertraits {
+                if requiresTrait(traits, supertrait.name.text, target, depth + 1) { return true }
+            }
+        }
+        None -> {}
+    }
+    return false
+}
+
+// The existential `Trait`: one case per type that conforms to it, in name order
+// across the program (`docs/conformers.md`).
+function declareTraitEnum(tree: borrow mut SyntaxTree, declared: TraitDeclaration) {
+    var cases: [CaseDeclaration] = []
+    for conformance in tree.conformances {
+        if conformance.traitName.instanceName != declared.name.text || isTemplateReference(tree, conformance.owner) { continue }
+        var present = false
+        for case in cases {
+            if case.name.text == conformance.owner.instanceName { present = true }
+        }
+        if present { continue }
+        // Name order, whichever conformances the tree read first (construct-families.klfd).
+        cases = withCase(cases, CaseDeclaration {
+            name = Identifier { text = conformance.owner.instanceName, span = conformance.owner.name.span },
+            payload = .Some(conformance.owner), initial = .None
+        })
+    }
+    var methods: [FunctionDeclaration] = []
+    if cases.count > 0 {
+        for method in declared.methods {
+            if hasAttribute(method.annotations, .ComputedSetter) {
+                methods.append(setterDispatcher(tree, cases, method))
+            } else {
+                // A property's arm traps for a type that has no such field,
+                // which is reported as missing the requirement; a method may
+                // come from an extension the tree does not show here.
+                methods.append(dispatcher(tree, cases, method, hasAttribute(method.annotations, .Computed)))
+            }
+        }
+    }
+    tree.enums.append(EnumDeclaration {
+        name = declared.name, genericParameters = [], typeArguments = [], baseNameSpan = declared.name.span,
+        specialized = false, typeSuffix = scopedTypeSuffix(declared.name.text), cases = cases, methods = methods, existential = true
+    })
+}
+
+// The setter of a settable property requirement on the trait's existential:
+// the value it holds, with the property assigned, put back in its place.
+//
+//     match self { Case(__payload) -> { var __updated = __payload  __updated.name = value  self = .Case(__updated) } }
+function setterDispatcher(tree: borrow mut SyntaxTree, cases: [CaseDeclaration], member: FunctionDeclaration) -> FunctionDeclaration {
+    let span = member.span
+    let payload = Identifier { text = "__payload", span = span }
+    let updated = Identifier { text = "__updated", span = span }
+    var arms: [MatchArm] = []
+    for case in cases {
+        var body: [Int] = []
+        // A type whose field is a `let` is already reported as disagreeing
+        // with the requirement; its arm only traps.
+        if !hasMutableField(tree, case.name, member.name.text) {
+            let trap = tree.addExpression(.Call(Identifier { text = "runtimeTrap", span = span }, []), span)
+            body.append(tree.addStatement(.Evaluation(trap), span))
+            arms.append(MatchArm { variant = case.name, binding = .Some(payload), pattern = .Variant, alternatives = [], body = body })
+            continue
+        }
+        body.append(tree.addStatement(.Binding(BindingStatement {
+            mutable = true, name = updated, annotation = .None, prefix = .None, value = tree.addExpression(.Name(payload), span)
+        }), span))
+        body.append(tree.addStatement(.Assignment(
+            tree.addExpression(.Member(tree.addExpression(.Name(updated), span), member.name), span),
+            tree.addExpression(.Name(member.parameters[0].name), span)
+        ), span))
+        body.append(tree.addStatement(.Assignment(
+            tree.addExpression(.Name(Identifier { text = "self", span = span }), span),
+            tree.addExpression(.Variant(case.name, .Some(tree.addExpression(.Name(updated), span))), span)
+        ), span))
+        arms.append(MatchArm { variant = case.name, binding = .Some(payload), pattern = .Variant, alternatives = [], body = body })
+    }
+    let dispatch = tree.addStatement(.Match(tree.addExpression(.Name(Identifier { text = "self", span = span }), span), arms), span)
+    return FunctionDeclaration {
+        name = member.name,
+        annotations = [implicitAnnotation(.Dispatch, span), implicitAnnotation(.ComputedSetter, span)],
+        receiver = .MutablyBorrowed,
+        parameters = member.parameters, result = .None,
+        body = [dispatch], span = span,
+        typeParameters = [], scope = GenericScope.none()
+    }
+}
+
+// Whether the struct a case carries has a `var` field named `name`.
+function hasMutableField(tree: SyntaxTree, declaration: Identifier, name: String) -> Bool {
+    for declared in tree.structs {
+        if declared.name.span.same(declaration.span) {
+            for field in declared.fields { if field.name.text == name { return field.mutable } }
+        }
+    }
+    return false
+}
+
+// A reference to a generic template through its own parameters, as in
+// `struct Holder<Value>: Provider<Value>`, rather than to one instance.
+function isTemplateReference(tree: SyntaxTree, reference: TypeReference) -> Bool {
+    let templates = templateParameters(tree, reference.name.text)
+    if templates.count == 0 || reference.arguments.count != templates.count { return false }
+    for index in 0..templates.count {
+        if reference.arguments[index].instanceName != templates[index].text { return false }
+    }
+    return true
+}
+
+function templateParameters(tree: SyntaxTree, name: String) -> [Identifier] {
+    for template in tree.genericStructs {
+        if template.name.text == name { return template.genericParameters }
+    }
+    for template in tree.genericEnums {
+        if template.name.text == name { return template.genericParameters }
+    }
+    return []
+}
+
+// Every conformance, once the types are declared: defaults join the type,
+// requirements are checked against what the type presents, and the trait's
+// supertraits must be claimed too. A conformance written on a template, as in
+// `struct Holder<Value>: Provider<Value>`, holds for each of its instances.
+function declareConformances(declarations: borrow mut Declarations, tree: SyntaxTree) {
+    var claimed: [Conformance] = []
+    for conformance in tree.conformances {
+        if isCompilerKnownTrait(conformance.traitName.name.text) { continue }
+        if isTemplateReference(tree, conformance.owner) {
+            for instance in templateInstances(declarations, conformance.owner.name.text) {
+                conformInstance(declarations, tree, claimed, conformance, instance)
+            }
+            continue
+        }
+        let owner = declarations.resolve(conformance.owner)
+        if !owner.isInvalid() { conform(declarations, tree, claimed, conformance, owner) }
+    }
+    checkSupertraitClaims(tree, claimed)
+}
+
+// The conformances a template's instance minted during analysis keeps.
+function conformMintedInstance(declarations: borrow mut Declarations, tree: SyntaxTree, instance: Type) {
+    var claimed: [Conformance] = []
+    for conformance in tree.conformances {
+        if isCompilerKnownTrait(conformance.traitName.name.text) || !isTemplateReference(tree, conformance.owner) { continue }
+        if instanceArguments(declarations, instance, conformance.owner.name.text).isSome() {
+            conformInstance(declarations, tree, claimed, conformance, instance)
+        }
+    }
+    checkSupertraitClaims(tree, claimed)
+}
+
+function templateInstances(declarations: Declarations, template: String) -> [Type] {
+    var instances: [Type] = []
+    for index in 0..declarations.structs.count {
+        if declarations.structs[index].specialized && templateName(declarations.structs[index].name.text) == template {
+            instances.append(Type.structure(index))
+        }
+    }
+    for index in 0..declarations.enums.count {
+        if declarations.enums[index].specialized && templateName(declarations.enums[index].name.text) == template {
+            instances.append(Type.enumeration(index))
+        }
+    }
+    return instances
+}
+
+function conformInstance(declarations: borrow mut Declarations, tree: SyntaxTree, claimed: borrow mut [Conformance], conformance: TypeConformance, instance: Type) {
+    match instanceArguments(declarations, instance, conformance.owner.name.text) {
+        Some(arguments) -> {
+            let parameters = templateParameters(tree, conformance.owner.name.text)
+            let traitName = substituteGenericReference(conformance.traitName, parameters, arguments)
+            let owner = declarations.reference(instance, conformance.owner.name.span)
+            conform(declarations, tree, claimed, TypeConformance { owner = owner, traitName = traitName }, instance)
+        }
+        None -> {}
+    }
+}
+
+function conform(declarations: borrow mut Declarations, tree: SyntaxTree, claimed: borrow mut [Conformance], conformance: TypeConformance, owner: Type) {
+    let traitName = conformance.traitName
+    match traitNamed(tree.traits, traitName.name.text) {
+        None -> report(.NotATrait, traitName.name.span)
+        Some(declared) -> {
+            if declared.genericParameters.count != traitName.arguments.count {
+                report(.TypeArgumentCount, traitName.name.span)
+                return
+            }
+            checkBounds(declarations, tree, declared.name.text, declared.genericParameters, traitName.arguments)
+            for earlier in claimed {
+                if earlier.owner.equals(owner) && earlier.traitName.instanceName == traitName.instanceName {
+                    report(.ConformanceRepeated, traitName.name.span)
+                }
+            }
+            claimed.append(Conformance { owner = owner, traitName = traitName })
+            conformMembers(declarations, tree, declared, conformance, owner)
+        }
+    }
+}
+
+// Each claimed trait's supertraits are claimed by the same type.
+function checkSupertraitClaims(tree: SyntaxTree, claimed: [Conformance]) {
+    for conformance in claimed {
+        match traitNamed(tree.traits, conformance.traitName.name.text) {
+            Some(declared) -> {
+                for supertrait in declared.supertraits {
+                    if isCompilerKnownTrait(supertrait.name.text) { continue }
+                    let required = substituteGenericReference(supertrait, declared.genericParameters, conformance.traitName.arguments)
+                    var met = false
+                    for other in claimed {
+                        if other.owner.equals(conformance.owner) && other.traitName.instanceName == required.instanceName { met = true }
+                    }
+                    if !met { report(.SupertraitMissing, conformance.traitName.name.span) }
+                }
+            }
+            None -> {}
+        }
+    }
+}
+
+struct Conformance {
+    let owner: Type
+    let traitName: TypeReference
+}
+
+function conformMembers(declarations: borrow mut Declarations, tree: SyntaxTree, declared: TraitDeclaration, conformance: TypeConformance, owner: Type) {
+    let span = conformance.traitName.name.span
+    // The trait's parameters and associated types, bound for this type.
+    var parameters = declared.genericParameters
+    var arguments = conformance.traitName.arguments
+    let bindings = associatedBindings(tree, declared, conformance)
+    for index in 0..declared.associatedTypes.count {
+        match bindings[index] {
+            Some(binding) -> {
+                parameters.append(declared.associatedTypes[index].name)
+                arguments.append(binding)
+            }
+            // Reported where the binding was looked for.
+            None -> return
+        }
+    }
+    for written in declared.methods {
+        let member = specializeMethods([written], parameters, arguments)[0]
+        // A property requirement is met by a stored field of its name and
+        // type, settable when the requirement is.
+        if hasAttribute(member.annotations, .Computed) || hasAttribute(member.annotations, .ComputedSetter) {
+            match storedField(declarations, owner, member.name.text) {
+                Some(field) -> {
+                    var wanted = Type.invalid()
+                    if hasAttribute(member.annotations, .Computed) {
+                        match member.result {
+                            Some(result) -> wanted = declarations.resolve(result)
+                            None -> {}
+                        }
+                    } else {
+                        wanted = declarations.resolve(member.parameters[0].annotation)
+                    }
+                    let settable = hasAttribute(member.annotations, .Computed) || field.mutable
+                    if !field.valueType.equals(wanted) || !settable {
+                        report(.RequirementMismatch, field.name.span)
+                    }
+                    continue
+                }
+                None -> {}
+            }
+        }
+        match declarations.findFunction(.Some(owner), member.name.text) {
+            Some(existing) -> {
+                if !matchesRequirement(declarations, declarations.signatures[existing], member) {
+                    report(.RequirementMismatch, declarations.signatures[existing].name.span)
+                }
+            }
+            None -> {
+                if hasAttribute(member.annotations, .Required) {
+                    report(.RequirementMissing, span)
+                } else {
+                    declareFunction(declarations, tree, member, .Some(owner))
+                }
+            }
+        }
+    }
+}
+
+// The stored field `name` of `owner`, when it is a structure that has one.
+function storedField(declarations: Declarations, owner: Type, name: String) -> Optional<Field> {
+    if owner.kind != .Structure { return .None }
+    let declaredStruct = declarations.structs[owner.declaration]
+    match declaredStruct.field(name) {
+        Some(index) -> return .Some(declaredStruct.fields[index])
+        None -> return .None
+    }
+}
+
+// A member keeps its requirement's receiver, parameter types and modes, and
+// result.
+function matchesRequirement(declarations: Declarations, signature: Signature, requirement: FunctionDeclaration) -> Bool {
+    if receiverMode(signature.receiver) != receiverMode(requirement.receiver) { return false }
+    var first = 0
+    if signature.receiver != .Static { first = 1 }
+    if signature.parameters.count - first != requirement.parameters.count { return false }
+    for index in 0..requirement.parameters.count {
+        let parameter = signature.parameters[first + index]
+        let wanted = requirement.parameters[index]
+        if parameter.mode != wanted.mode || !parameter.valueType.equals(declarations.resolve(wanted.annotation)) { return false }
+    }
+    var result = Type.void()
+    match requirement.result {
+        Some(reference) -> result = declarations.resolve(reference)
+        None -> {}
+    }
+    return signature.result.equals(result)
+}
+
+// A receiver left out borrows, as `borrow self` does.
+function receiverMode(receiver: Receiver) -> Receiver {
+    if receiver == .Free { return .Borrowed }
+    return receiver
+}
+
+// An `extend Type: Trait` block carries only the members its traits declare.
+function checkExtensionMembers(traits: [TraitDeclaration], extension: ExtensionDeclaration) {
+    if extension.traits.count == 0 { return }
+    for method in extension.methods {
+        var declared = false
+        for traitName in extension.traits {
+            match traitNamed(traits, traitName.name.text) {
+                Some(found) -> {
+                    for member in found.methods {
+                        if member.name.text == method.name.text { declared = true }
+                    }
+                }
+                None -> {
+                    if traitName.name.text == "Drop" && method.name.text == "drop" { declared = true }
+                }
+            }
+        }
+        if !declared { report(.ExtensionMemberOutsideTrait, method.name.span) }
+    }
+}
+
+// Whether a value of `actual` presents `wanted`: its type claims it, the
+// template it instantiates claims it for every instance, a class it extends
+// claims it, or for a compiler-known trait its shape keeps it.
+function conformsTo(declarations: Declarations, tree: SyntaxTree, actual: Type, wanted: TypeReference, depth: Int) -> Bool {
+    if actual.isInvalid() { return true }
+    let name = wanted.name.text
+    match name {
+        "Copyable", "Send", "Sync" -> return keepsMarker(declarations, tree, actual, name)
+        "Equatable" -> { if comparesByShape(declarations, actual, []) { return true } }
+        else -> {}
+    }
+    let spelled = canonicalAliasReference(declarations.aliases, wanted, 0).instanceName
+    for conformance in tree.conformances {
+        if conformance.traitName.name.text != name { continue }
+        if isTemplateReference(tree, conformance.owner) {
+            match instanceArguments(declarations, actual, conformance.owner.name.text) {
+                Some(arguments) -> {
+                    let parameters = templateParameters(tree, conformance.owner.name.text)
+                    let claimed = substituteGenericReference(conformance.traitName, parameters, arguments)
+                    if canonicalAliasReference(declarations.aliases, claimed, 0).instanceName == spelled { return true }
+                }
+                None -> {}
+            }
+        } else if canonicalAliasReference(declarations.aliases, conformance.traitName, 0).instanceName == spelled {
+            match declarations.typeNamed(canonicalAliasReference(declarations.aliases, conformance.owner, 0).instanceName) {
+                Some(owner) -> {
+                    if owner.equals(actual) { return true }
+                }
+                None -> {}
+            }
+        }
+    }
+    if actual.kind == .Structure && depth <= declarations.structs.count {
+        for ancestor in declarations.structs[actual.declaration].ancestors {
+            match declarations.typeNamed(ancestor) {
+                Some(parent) -> {
+                    if conformsTo(declarations, tree, parent, wanted, depth + 1) { return true }
+                }
+                None -> {}
+            }
+        }
+    }
+    return false
+}
+
+// The type arguments `actual` presents the generic trait `traitName` with, as its
+// conformance writes them: `ReadyFuture<Int>: Future<Output>` gives `[Int]`.
+// Nothing when it claims no such conformance of its own.
+function conformanceArguments(declarations: Declarations, tree: SyntaxTree, actual: Type, traitName: String) -> Optional<[TypeReference]> {
+    if actual.isInvalid() { return .None }
+    for conformance in tree.conformances {
+        if conformance.traitName.name.text != traitName { continue }
+        if isTemplateReference(tree, conformance.owner) {
+            match instanceArguments(declarations, actual, conformance.owner.name.text) {
+                Some(arguments) -> {
+                    let parameters = templateParameters(tree, conformance.owner.name.text)
+                    return .Some(substituteGenericReference(conformance.traitName, parameters, arguments).arguments)
+                }
+                None -> {}
+            }
+        } else {
+            match declarations.typeNamed(canonicalAliasReference(declarations.aliases, conformance.owner, 0).instanceName) {
+                Some(owner) -> {
+                    if owner.equals(actual) { return .Some(conformance.traitName.arguments) }
+                }
+                None -> {}
+            }
+        }
+    }
+    return .None
+}
+
+// The arguments `actual` instantiates `template` with, when it is one of its
+// instances.
+function instanceArguments(declarations: Declarations, actual: Type, template: String) -> Optional<[TypeReference]> {
+    var name = ""
+    var arguments: [Type] = []
+    match actual.kind {
+        Structure -> {
+            if !declarations.structs[actual.declaration].specialized { return .None }
+            name = declarations.structs[actual.declaration].name.text
+            // A function type is named by its signature, `(Int) -> Bool`.
+            if declarations.structs[actual.declaration].genericBase == "Closure" { name = "Closure" }
+            arguments = declarations.structs[actual.declaration].typeArguments
+        }
+        Enumeration -> {
+            if !declarations.enums[actual.declaration].specialized { return .None }
+            name = declarations.enums[actual.declaration].name.text
+            arguments = declarations.enums[actual.declaration].typeArguments
+        }
+        Integer -> return .None
+        Decimal -> return .None
+        Floating -> return .None
+        Boolean -> return .None
+        Pointer -> return .None
+        Void -> return .None
+        Invalid -> return .None
+    }
+    if templateName(name) != template { return .None }
+    var references: [TypeReference] = []
+    for argument in arguments {
+        references.append(declarations.reference(argument, declarations.typeNameSpan(actual)))
+    }
+    return .Some(references)
+}
+
+// Every bound `template` declares on its parameters, against the arguments one
+// instance binds them to. A refusal is reported where the argument is written.
+function checkBounds(declarations: Declarations, tree: SyntaxTree, template: String, parameters: [Identifier], arguments: [TypeReference]) {
+    for bound in tree.bounds {
+        if bound.template != template || bound.parameter >= arguments.count { continue }
+        let wanted = substituteGenericReference(bound.traitName, parameters, arguments)
+        match declarations.typeNamed(canonicalAliasReference(declarations.aliases, arguments[bound.parameter], 0).instanceName) {
+            Some(actual) -> {
+                if !conformsTo(declarations, tree, actual, wanted, 0) { report(.BoundUnsatisfied, arguments[bound.parameter].name.span) }
+            }
+            None -> {}
+        }
+    }
+}
+
+// Whether `==` walks `valueType` with no `Equatable` conformance written: a
+// scalar, a string or a distinct value, or a struct or enum whose every
+// field and payload compares so.
+function comparesByShape(declarations: Declarations, valueType: Type, visiting: [Int]) -> Bool {
+    match valueType.kind {
+        Integer -> return true
+        Decimal -> return true
+        Floating -> return true
+        Boolean -> return true
+        Pointer -> return true
+        Void -> return false
+        Invalid -> return true
+        Enumeration -> {
+            let key = declarations.structs.count + valueType.declaration
+            if contains(visiting, key) { return true }
+            var walked = visiting
+            walked.append(key)
+            for variant in declarations.enums[valueType.declaration].variants {
+                match variant.payload {
+                    Some(payload) -> { if !comparesByShape(declarations, payload, walked) { return false } }
+                    None -> {}
+                }
+            }
+            return true
+        }
+        Structure -> {
+            if contains(visiting, valueType.declaration) { return true }
+            let declared = declarations.structs[valueType.declaration]
+            if declared.name.text == "String" { return true }
+            match declared.genericBase {
+                "Distinct" -> return true
+                "Closure", "Task", "MainThreadTask", "NativeState", "Class" -> return false
+                else -> {}
+            }
+            var walked = visiting
+            walked.append(valueType.declaration)
+            for field in declared.fields {
+                if !comparesByShape(declarations, field.valueType, walked) { return false }
+            }
+            return true
+        }
+    }
+}

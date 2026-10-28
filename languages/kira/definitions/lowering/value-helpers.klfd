@@ -1,0 +1,291 @@
+extend KirTypes {
+    function helperIndex(borrow self, program: CheckedProgram, valueType: Type) -> Int {
+        if valueType.kind == .Structure { return valueType.declaration }
+        if valueType.kind == .Enumeration { return program.structs.count + valueType.declaration }
+        abort()
+        return 0
+    }
+
+    function declareValueHelpers(borrow mut self, builder: KirModuleBuilder, program: CheckedProgram) {
+        for index in 0..program.structs.count {
+            declareTypeHelpers(builder, program, Type.structure(index), program.structs[index].baseNameSpan)
+        }
+        for index in 0..program.enums.count {
+            declareTypeHelpers(builder, program, Type.enumeration(index), program.enums[index].baseNameSpan)
+            var copier: Optional<KirFunctionBuilder> = .None
+            if needsArrayCleanup(program, Type.enumeration(index)) {
+                let name = program.named(program.enums[index].baseNameSpan)
+                let copying = kir_signature_new_named(builder, name.start, name.end, unit, generatedSuffix(builder, "copy", typeKey(program, Type.enumeration(index))))
+                kir_signature_parameter(copying, address(Type.enumeration(index)))
+                kir_signature_parameter(copying, address(Type.enumeration(index)))
+                copier = .Some(kir_signature_declare(copying))
+            }
+            copiers.append(copier)
+        }
+    }
+
+    function declareTypeHelpers(borrow mut self, builder: KirModuleBuilder, program: CheckedProgram, valueType: Type, span: Span) {
+        let name = program.named(span)
+        let key = typeKey(program, valueType)
+        let destroy = kir_signature_new_named(builder, name.start, name.end, unit, generatedSuffix(builder, "destroy", key))
+        kir_signature_parameter(destroy, address(valueType))
+        destructors.append(kir_signature_declare(destroy))
+        let equal = kir_signature_new_named(builder, name.start, name.end, boolean, generatedSuffix(builder, "equal", key))
+        kir_signature_parameter(equal, address(valueType))
+        kir_signature_parameter(equal, address(valueType))
+        equalities.append(kir_signature_declare(equal))
+        let order = kir_signature_new_named(builder, name.start, name.end, integer64, generatedSuffix(builder, "order", key))
+        kir_signature_parameter(order, address(valueType))
+        kir_signature_parameter(order, address(valueType))
+        orderings.append(kir_signature_declare(order))
+        let hashing = kir_signature_new_named(builder, name.start, name.end, integer64, generatedSuffix(builder, "hash", key))
+        kir_signature_parameter(hashing, integer64)
+        kir_signature_parameter(hashing, address(valueType))
+        hashers.append(kir_signature_declare(hashing))
+    }
+}
+
+// The destroy, equality, order, hash and copy helpers a lowered body names, and the ones
+// those name in turn, until no more are named. A program's types far
+// outnumber the ones whose values it destroys, compares or copies; a helper
+// nothing names is dropped from the module.
+function lowerValueHelpers(program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder]) {
+    let count = program.structs.count + program.enums.count
+    var destroyed: [Bool] = []
+    var compared: [Bool] = []
+    var ordered: [Bool] = []
+    var hashed: [Bool] = []
+    for index in 0..count {
+        destroyed.append(false)
+        compared.append(false)
+        ordered.append(false)
+        hashed.append(false)
+    }
+    var copied: [Bool] = []
+    for index in 0..program.enums.count { copied.append(false) }
+    // `Any`'s helpers are the program unit's, which defines them for every
+    // unit; a dependency unit only declares them. A unit may destroy an
+    // `Any` it never boxed, held in an `Optional<Any>` of its own, so the
+    // program unit defines them whether or not any unit boxes.
+    match anyStructure(program) {
+        Some(any) -> {
+            if program.dependencyUnit {
+                destroyed[any] = true
+                compared[any] = true
+            } else {
+                lowerDestroyHelper(program, types, functions, Type.structure(any))
+                lowerEqualityHelper(program, types, functions, Type.structure(any))
+                destroyed[any] = true
+                compared[any] = true
+            }
+        }
+        None -> {}
+    }
+    var lowering = true
+    while lowering {
+        lowering = false
+        for index in 0..count {
+            if !destroyed[index] && kir_function_referenced(types.destructors[index]) == 1 {
+                lowerDestroyHelper(program, types, functions, helperType(program, index))
+                destroyed[index] = true
+                lowering = true
+            }
+            if !compared[index] && kir_function_referenced(types.equalities[index]) == 1 {
+                lowerEqualityHelper(program, types, functions, helperType(program, index))
+                compared[index] = true
+                lowering = true
+            }
+            if !ordered[index] && kir_function_referenced(types.orderings[index]) == 1 {
+                lowerOrderingHelper(program, types, functions, helperType(program, index))
+                ordered[index] = true
+                lowering = true
+            }
+            if !hashed[index] && kir_function_referenced(types.hashers[index]) == 1 {
+                lowerHashingHelper(program, types, functions, helperType(program, index))
+                hashed[index] = true
+                lowering = true
+            }
+        }
+        for index in 0..program.enums.count {
+            match types.copiers[index] {
+                Some(copier) -> {
+                    if !copied[index] && kir_function_referenced(copier) == 1 {
+                        lowerCopier(program, types, functions, Type.enumeration(index), copier)
+                        copied[index] = true
+                        lowering = true
+                    }
+                }
+                None -> {}
+            }
+        }
+    }
+    for index in 0..count {
+        if !destroyed[index] { kir_function_discard(types.destructors[index]) }
+        if !compared[index] { kir_function_discard(types.equalities[index]) }
+        if !ordered[index] { kir_function_discard(types.orderings[index]) }
+        if !hashed[index] { kir_function_discard(types.hashers[index]) }
+    }
+    for index in 0..program.enums.count {
+        match types.copiers[index] {
+            Some(copier) -> { if !copied[index] { kir_function_discard(copier) } }
+            None -> {}
+        }
+    }
+}
+
+// The type whose helpers sit at `index`: the structs, then the enums.
+function helperType(program: CheckedProgram, index: Int) -> Type {
+    if index < program.structs.count { return Type.structure(index) }
+    return Type.enumeration(index - program.structs.count)
+}
+
+function helperSpan(program: CheckedProgram, valueType: Type) -> Span {
+    if valueType.kind == .Structure { return program.structs[valueType.declaration].baseNameSpan }
+    return program.enums[valueType.declaration].baseNameSpan
+}
+
+function lowerCopier(program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder], valueType: Type, builder: KirFunctionBuilder) {
+    let span = program.enums[valueType.declaration].baseNameSpan
+    var copier = FunctionLowering.startChecked(program, types, functions, helperChecked(span, Type.void()), builder)
+    let body = copier.kir.block()
+    copier.enter(body)
+    let from = copier.kir.memory(copier.kir.parameter(0), types.of(valueType))
+    let to = copier.kir.memory(copier.kir.parameter(1), types.of(valueType))
+    copier.copyEnum(from, to, valueType)
+    copier.kir.returnVoid()
+    copier.kir.switchTo(copier.entry)
+    copier.kir.branch(body)
+}
+
+function helperChecked(span: Span, result: Type) -> CheckedFunction {
+    return CheckedFunction {
+        symbol = "", name = span, result = result, parameterCount = 0, locals = [], body = [], entry = false,
+        lambda = false, captures = [], globalInitializer = false, service = false, foreign = .None, memberName = ""
+    }
+}
+
+// An enum with no cases, such as a family nothing is declared through, has no
+// values, so its helpers are never entered.
+function uninhabited(program: CheckedProgram, valueType: Type) -> Bool {
+    return valueType.kind == .Enumeration && program.enums[valueType.declaration].variants.count == 0
+}
+
+function lowerDestroyHelper(program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder], valueType: Type) {
+    let helper = types.destructors[types.helperIndex(program, valueType)]
+    var destroy = FunctionLowering.startChecked(program, types, functions, helperChecked(helperSpan(program, valueType), Type.void()), helper)
+    let body = destroy.kir.block()
+    destroy.enter(body)
+    if uninhabited(program, valueType) {
+        destroy.kir.unreachable()
+    } else {
+        let address = destroy.kir.memory(destroy.kir.parameter(0), types.of(valueType))
+        destroy.destroyNominalBody(address, valueType)
+        destroy.kir.returnVoid()
+    }
+    destroy.kir.switchTo(destroy.entry)
+    destroy.kir.branch(body)
+}
+
+function lowerEqualityHelper(program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder], valueType: Type) {
+    let helper = types.equalities[types.helperIndex(program, valueType)]
+    var equal = FunctionLowering.startChecked(program, types, functions, helperChecked(helperSpan(program, valueType), Type.boolean()), helper)
+    let body = equal.kir.block()
+    equal.enter(body)
+    if uninhabited(program, valueType) {
+        equal.kir.unreachable()
+    } else {
+        let left = equal.kir.memory(equal.kir.parameter(0), types.of(valueType))
+        let right = equal.kir.memory(equal.kir.parameter(1), types.of(valueType))
+        equal.kir.returnValue(equal.equalNominalBody(left, right, valueType))
+    }
+    equal.kir.switchTo(equal.entry)
+    equal.kir.branch(body)
+}
+
+extend FunctionLowering {
+    function destroyNominalBody(borrow mut self, address: KirAddress, valueType: Type) {
+        if !needsArrayCleanup(program, valueType) { return }
+        if isArrayType(program, valueType) { destroyArray(address, valueType) return }
+        if isStringType(program, valueType) { arrayRuntimeVoid(3, [arrayData(address, valueType)]) return }
+        if isAnyType(program, valueType) { destroyAnyBody(address) return }
+        if isClosureType(program, valueType) || isContextCallbackType(program, valueType) { destroyClosureBody(address) return }
+        if isClassType(program, valueType) { destroyContext(kir.load(address)) return }
+        if isWitnessedType(program, valueType) { destroyWitnessed(address) return }
+        if valueType.kind == .Structure {
+            let drop = program.dropFunctions[valueType.declaration]
+            if drop >= 0 {
+                kir.argument(kir.pointer(address))
+                kir.callVoid(functions[drop])
+            }
+            let free = pointerFree(program, valueType.declaration)
+            if free >= 0 { freeOwnedPointer(address, free) }
+            let fields = program.structs[valueType.declaration].fields
+            for index in 0..fields.count {
+                let fieldType = fields[index].valueType
+                destroyValue(kir.field(address, index, types.of(fieldType)), fieldType)
+            }
+            return
+        }
+        let variants = program.enums[valueType.declaration].variants
+        let done = kir.block()
+        var blocks: [KirBlockBuilder] = []
+        for index in 0..variants.count {
+            let block = kir.block()
+            blocks.append(block)
+            kir.switchCase(index, block)
+        }
+        kir.switchEnum(address)
+        for index in 0..variants.count {
+            enter(blocks[index])
+            if variants[index].payload.isSome() { destroyPayload(address, valueType, index) }
+            flowInto(done)
+        }
+        enter(done)
+    }
+
+    function equalValues(borrow mut self, left: KirAddress, right: KirAddress, valueType: Type) -> KirValue {
+        if valueType.isAggregate() {
+            kir.argument(kir.pointer(left))
+            kir.argument(kir.pointer(right))
+            return kir.call(types.equalities[types.helperIndex(program, valueType)], types.boolean)
+        }
+        if valueType.kind == .Void { return kir.integer(types.boolean, 1) }
+        if valueType.kind == .Floating {
+            return kir_value_float_compare(kir, 0, kir.load(left), kir.load(right))
+        }
+        if valueType.kind == .Pointer {
+            let first = kir.convert(convertBitcast, kir.load(left), types.integer64)
+            let second = kir.convert(convertBitcast, kir.load(right), types.integer64)
+            return kir.compare(kirPredicate(.Equal, false), first, second)
+        }
+        return kir.compare(kirPredicate(.Equal, valueType.signed), kir.load(left), kir.load(right))
+    }
+
+    function equalNominalBody(borrow mut self, left: KirAddress, right: KirAddress, valueType: Type) -> KirValue {
+        if isClassType(program, valueType) {
+            let first = kir.convert(convertBitcast, kir.load(left), types.integer64)
+            let second = kir.convert(convertBitcast, kir.load(right), types.integer64)
+            return kir.compare(kirPredicate(.Equal, false), first, second)
+        }
+        if isArrayType(program, valueType) { return equalArrayBody(left, right, valueType) }
+        if isStringType(program, valueType) {
+            kir.argument(kir.pointer(left))
+            kir.argument(kir.pointer(right))
+            return kir.call(functions[program.stringFunctions[1]], types.boolean)
+        }
+        if isAnyType(program, valueType) { return equalAnyBody(left, right) }
+        if valueType.kind == .Structure {
+            let fields = program.structs[valueType.declaration].fields
+            var equal = kir.integer(types.boolean, 1)
+            for index in 0..comparedFields(program, valueType) {
+                let fieldType = fields[index].valueType
+                let first = kir.field(left, index, types.of(fieldType))
+                let second = kir.field(right, index, types.of(fieldType))
+                let same = equalValues(first, second, fieldType)
+                equal = kir.binary(kirOperator(.BitAnd, false), false, false, equal, same)
+            }
+            return equal
+        }
+        return equalEnumBody(left, right, valueType)
+    }
+}

@@ -1,0 +1,90 @@
+// A 2D affine transform, laid out as Core Graphics' and Swift Foundation's:
+// a point (x, y) maps to (a x + c y + tx, b x + d y + ty).
+//
+// Foundation's for the same reason `Point` and `Rect` are: a drawing library,
+// a layout library and an app all name one transform, so a value passes
+// between them without a conversion.
+struct AffineTransform {
+    var a: Number = 1.0
+    var b: Number = 0.0
+    var c: Number = 0.0
+    var d: Number = 1.0
+    var tx: Number = 0.0
+    var ty: Number = 0.0
+
+    function isIdentity() -> Bool {
+        return a == 1.0 && b == 0.0 && c == 0.0 && d == 1.0 && tx == 0.0 && ty == 0.0
+    }
+
+    // This transform followed by `other`, as CGAffineTransformConcat.
+    function concatenating(other: borrow AffineTransform) -> AffineTransform {
+        return AffineTransform {
+            a: a * other.a + b * other.c,
+            b: a * other.b + b * other.d,
+            c: c * other.a + d * other.c,
+            d: c * other.b + d * other.d,
+            tx: tx * other.a + ty * other.c + other.tx,
+            ty: tx * other.b + ty * other.d + other.ty
+        }
+    }
+
+    // The translation applied before this transform, as
+    // CGAffineTransformTranslate.
+    function translatedBy(x: Number, y: Number) -> AffineTransform {
+        let translation = AffineTransform { tx: x, ty: y }
+        return translation.concatenating(self)
+    }
+
+    function scaledBy(x: Number, y: Number) -> AffineTransform {
+        let scale = AffineTransform { a: x, d: y }
+        return scale.concatenating(self)
+    }
+
+    function rotatedBy(radians: Number) -> AffineTransform {
+        let sine = sin(radians)
+        let cosine = cos(radians)
+        let rotation = AffineTransform { a: cosine, b: sine, c: -sine, d: cosine }
+        return rotation.concatenating(self)
+    }
+
+    // The inverse, or nothing when the transform collapses the plane onto a
+    // line or a point.
+    function inverted() -> AffineTransform? {
+        let determinant = a * d - b * c
+        if determinant == 0.0 {
+            return .None
+        }
+        return .Some(
+            AffineTransform {
+                a: d / determinant,
+                b: -b / determinant,
+                c: -c / determinant,
+                d: a / determinant,
+                tx: (c * ty - d * tx) / determinant,
+                ty: (b * tx - a * ty) / determinant
+            }
+        )
+    }
+
+    function applying(point: borrow Point) -> Point {
+        return Point { x: a * point.x + c * point.y + tx, y: b * point.x + d * point.y + ty }
+    }
+
+    // The smallest rectangle holding the transformed corners of `rect`, as
+    // CGRectApplyAffineTransform.
+    function applying(rect: borrow Rect) -> Rect {
+        let corners = [
+            applying(Point { x: rect.minX(), y: rect.minY() }),
+            applying(Point { x: rect.maxX(), y: rect.minY() }),
+            applying(Point { x: rect.minX(), y: rect.maxY() }),
+            applying(Point { x: rect.maxX(), y: rect.maxY() })
+        ]
+        var low = copy corners[0]
+        var high = copy corners[0]
+        for corner in corners {
+            low = Point { x: min(low.x, corner.x), y: min(low.y, corner.y) }
+            high = Point { x: max(high.x, corner.x), y: max(high.y, corner.y) }
+        }
+        return Rect { x: low.x, y: low.y, width: high.x - low.x, height: high.y - low.y }
+    }
+}

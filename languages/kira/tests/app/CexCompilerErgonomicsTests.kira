@@ -1,0 +1,236 @@
+import Foundation
+
+// Compiler-ergonomics regression coverage. These cases intentionally exercise
+// the source spelling, not internal HIR helpers, so both backends have to agree
+// on the complete parser -> semantics -> lowering path.
+
+function cexPair(n: Int) -> (Int, String) {
+    return (n + 1, "value=" + String(n))
+}
+
+@Test
+function cexTupleMultiReturn() {
+    let pair: (Int, String) = cexPair(7)
+    let got = pair.0 + pair.1.count
+    expect!(got == 15)
+}
+
+function cexQuad() -> (Int, Int, Int, Int) {
+    return (1, 2, 3, 4)
+}
+
+@Test
+function cexFourElementTuple() {
+    let quad = cexQuad()
+    let got = quad.0 * 1000 + quad.1 * 100 + quad.2 * 10 + quad.3
+    expect!(got == 1234)
+}
+
+// `let (a, b) =` binds each element; `var` makes each one mutable.
+@Test
+function cexTupleDestructuring() {
+    let (n, text) = cexPair(7)
+    var (low, high) = (1, 2)
+    low += high
+    let got = n * 100 + text.count * 10 + low
+    expect!(got == 873)
+}
+
+// A `(` that starts a line opens a tuple; it never calls the line before it.
+function cexAfterCall(values: borrow mut [Int]) -> (Int, Int) {
+    let picked: (Int, Int) = match values.count {
+        0 -> {
+            values.append(5)
+            (values.count, 6)
+        }
+        else -> (0, 0)
+    }
+    return picked
+}
+
+@Test
+function cexTupleStartsLine() {
+    var values: [Int] = []
+    let (count, six) = cexAfterCall(values)
+    let got = count * 10 + six
+    expect!(got == 16)
+}
+
+enum CexPick { A(Int) B(Int) }
+
+function cexMatch(value: CexPick) -> Int {
+    return match value {
+        A(x) -> {
+            let doubled = x * 2
+            doubled + 1
+        }
+        B(x) -> x + 100
+    }
+}
+
+@Test
+function cexExpressionMatchCarriesPayloadAndBlockValue() {
+    let got = cexMatch(.A(7)) + cexMatch(.B(3))
+    expect!(got == 118)
+}
+
+function cexStringMatch(value: Int) -> String {
+    return match value {
+        0 -> {
+            let prefix = "left"
+            prefix + "-zero"
+        }
+        else -> {
+            let prefix = "right"
+            prefix + "-other"
+        }
+    }
+}
+
+@Test
+function cexExpressionMatchOwnsArmLocals() {
+    let left = cexStringMatch(0)
+    let right = cexStringMatch(1)
+    let got = left.count * 100 + right.count
+    expect!(got == 911)
+}
+
+function cexNestedScalarMatch(stream: Int, direct: Bool) -> Int {
+    return match stream <= 0 {
+        true -> 0
+        false -> match stream {
+            1 -> match direct {
+                true -> 10
+                false -> 11
+            }
+            else -> 20
+        }
+    }
+}
+
+@Test
+function cexNestedScalarExpressionMatch() {
+    let got = cexNestedScalarMatch(0, false) * 10000
+            + cexNestedScalarMatch(1, true) * 100
+            + cexNestedScalarMatch(1, false) * 10
+            + cexNestedScalarMatch(2, false)
+    expect!(got == 1130)
+}
+
+struct CexInner { let x: Int let y: Int }
+struct CexOuter { let inner: CexInner let name: String }
+
+@Test
+function cexPlainStructCopyUpdate() {
+    let original = CexOuter { inner: CexInner { x: 1, y: 2 }, name: "old" }
+    let changed = original { let inner.x = 9 let name = "new" }
+    let got = changed.inner.x + changed.inner.y + changed.name.count
+    expect!(got == 14)
+}
+
+function cexNumbers(limit: Int) -> Iterator<Int> {
+    var current = 0
+    return Iterator(
+        next: { in
+            if current >= limit { return .None }
+            current += 1
+            return .Some(current)
+        }
+    )
+}
+
+@Test
+function cexLazyIteratorForLoop() {
+    var total = 0
+    let values = cexNumbers(5)
+    for value in values {
+        if value == 3 { continue }
+        total += value
+    }
+    let got = total
+    expect!(got == 12)
+}
+
+struct CexLerpPoint { let x: Float let y: Float }
+
+// Fieldwise interpolation, written by hand: each field joins the ordinary `lerp`
+// overload set — the `Float` fields use Foundation's scalar `lerp`, and the
+// nested `CexLerpPoint` field resolves to the overload just above it.
+function lerp(from: borrow CexLerpPoint, to: borrow CexLerpPoint, amount: Float) -> CexLerpPoint {
+    return CexLerpPoint { x: lerp(from.x, to.x, amount), y: lerp(from.y, to.y, amount) }
+}
+
+struct CexLerpState { let point: CexLerpPoint let alpha: Float }
+
+function lerp(from: borrow CexLerpState, to: borrow CexLerpState, amount: Float) -> CexLerpState {
+    return CexLerpState {
+        point: lerp(from.point, to.point, amount),
+        alpha: lerp(from.alpha, to.alpha, amount)
+    }
+}
+
+@Test
+function cexDerivedFieldwiseLerp() {
+    let a = CexLerpState { point: CexLerpPoint { x: 0.0, y: 10.0 }, alpha: 0.0 }
+    let b = CexLerpState { point: CexLerpPoint { x: 10.0, y: 30.0 }, alpha: 1.0 }
+    let value = lerp(a, b, 0.25)
+    let got = Int(value.point.x * 10.0) + Int(value.point.y) + Int(value.alpha * 100.0)
+    expect!(got == 65)
+}
+
+@Test
+function cexArrayContainsReverseAndSort() {
+    let sorted = [4, 1, 3, 2].sorted({ a, b in return a < b })
+    let reversed = sorted.reversed()
+    var score = sorted[0] * 1000 + sorted[1] * 100 + sorted[2] * 10 + sorted[3]
+    if sorted.contains(3) { score += 10000 }
+    if sorted.contains(8) == false { score += 20000 }
+    score += reversed[0]
+    let got = score
+    expect!(got == 31238)
+}
+
+@Test
+function cexArraySortBoundaryCases() {
+    let empty: [Int] = []
+    let sortedEmpty = empty.sorted({ a, b in return a < b })
+    let single = [7].sorted({ a, b in return a < b })
+    let got = sortedEmpty.count * 100 + single.count * 10 + single[0]
+    expect!(got == 17)
+}
+
+@Test
+function cexArraySortDuplicates() {
+    let sorted = [5, 1, 3, 1, 4, 2, 5].sorted({ a, b in return a < b })
+    var score = 0
+    for value in sorted { score = score * 10 + value }
+    let got = score
+    expect!(got == 1123455)
+}
+
+@Test
+function cexArraySortDescending() {
+    let sorted = [1, 6, 2, 5, 3, 4].sorted({ a, b in return a > b })
+    var score = 0
+    for value in sorted { score = score * 10 + value }
+    let got = score
+    expect!(got == 654321)
+}
+
+@Test
+function cexReverseForKeepsContinueSemantics() {
+    var total = 0
+    let values = [1, 2, 3, 4]
+    for value in values.reversed() {
+        if value == 3 { continue }
+        total = total * 10 + value
+    }
+    let got = total
+    expect!(got == 421)
+}
+
+@Test
+function cexClampAndCbrt() {
+    let got = clamp(15, 0, 10) + Int(cbrt(27.0))
+    expect!(got == 13)
+}

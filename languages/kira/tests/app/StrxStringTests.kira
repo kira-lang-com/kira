@@ -1,0 +1,371 @@
+import Foundation
+
+// StrxStringTests.kira — deep string coverage for `kira test`.
+// PREFIX: strx / Strx  (all top-level names use this prefix).
+// This file imports Foundation (imports are file-scoped); harness flat namespace already has it.
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function strxBorLen(s: borrow String) -> Int {
+    return s.count
+}
+
+function strxMvLen(s: String) -> Int {
+    return s.count
+}
+
+// Returns one of 5 strings by i%5.
+// Period: "apple"(5) "go"(2) "three"(5) "by"(2) "x"(1) → sum per period = 15
+function strxPk(i: Int) -> String {
+    let m = i % 5
+    if m == 0 {
+        return "apple"
+    }
+    if m == 1 {
+        return "go"
+    }
+    if m == 2 {
+        return "three"
+    }
+    if m == 3 {
+        return "by"
+    }
+    return "x"
+}
+
+// ---------------------------------------------------------------------------
+// Structs
+// ---------------------------------------------------------------------------
+
+struct StrxBox {
+    var name: String
+    var code: Int
+
+    function nameLen() -> Int {
+        return self.name.count
+    }
+
+    function coded() -> Int {
+        return self.code + 1
+    }
+}
+
+function strxBoxBor(b: borrow StrxBox) -> Int {
+    return b.name.count + b.code
+}
+
+struct StrxBoxInner {
+    var word: String
+}
+
+struct StrxBoxOuter {
+    var inner: StrxBoxInner
+    var tag: String
+    var n: Int
+}
+
+function strxOutLen(o: borrow StrxBoxOuter) -> Int {
+    return o.inner.word.count + o.tag.count + o.n
+}
+
+// ---------------------------------------------------------------------------
+// Enum with String payload
+// ---------------------------------------------------------------------------
+
+enum StrxLbl {
+    Named(String)
+    Empty
+}
+
+function strxLblLen(l: borrow StrxLbl) -> Int {
+    match l {
+        Named(s) -> { return s.count }
+        Empty -> { return 0 }
+    }
+}
+
+// Period of 3: Named("hello")(5), Empty(0), Named("ok")(2) → sum = 7
+function strxLblFor(i: Int) -> StrxLbl {
+    let m = i % 3
+    if m == 0 {
+        return .Named("hello")
+    }
+    if m == 1 {
+        return .Empty
+    }
+    return .Named("ok")
+}
+
+// ---------------------------------------------------------------------------
+// Literal .count tests
+// ---------------------------------------------------------------------------
+@Test
+function strxLitA() {
+    expect!("a".count == 1)
+}
+
+@Test
+function strxLitHello() {
+    expect!("hello".count == 5)
+}
+
+@Test
+function strxLitEmpty() {
+    expect!("".count == 0)
+}
+
+@Test
+function strxLitTen() {
+    expect!("abcdefghij".count == 10)
+}
+
+@Test
+function strxLitKira() {
+    expect!("kira".count == 4)
+}
+
+@Test
+function strxLitSpace() {
+    expect!("hello world".count == 11)
+}
+
+@Test
+function strxLitTwelve() {
+    expect!("123456789012".count == 12)
+}
+
+// ---------------------------------------------------------------------------
+// Borrow-len helper tests
+// ---------------------------------------------------------------------------
+
+@Test
+function strxBorLitXyz() {
+    expect!(strxBorLen("xyz") == 3)
+}
+
+@Test
+function strxBorLitEmpty() {
+    expect!(strxBorLen("") == 0)
+}
+
+@Test
+function strxBorVar() {
+    let s = "reuse"
+    expect!(strxBorLen(s) == 5)
+}
+
+@Test
+function strxBorVarTwice() {
+    let s = "ab"
+    var out = strxBorLen(s)
+    out = out + strxBorLen(s)
+    // 2 + 2 = 4
+    expect!(out == 4)
+}
+
+@Test
+function strxBorSix() {
+    expect!(strxBorLen("abcdef") == 6)
+}
+
+@Test
+function strxBorMixed() {
+    var out = strxBorLen("xy")
+    out = out + strxBorLen("abc")
+    // 2 + 3 = 5
+    expect!(out == 5)
+}
+
+// ---------------------------------------------------------------------------
+// Move-len helper tests
+// ---------------------------------------------------------------------------
+
+@Test
+function strxMvLit() {
+    expect!(strxMvLen(move "consume") == 7)
+}
+
+@Test
+function strxMvVar() {
+    let s = "transfer"
+    expect!(strxMvLen(move s) == 8)
+}
+
+// ---------------------------------------------------------------------------
+// String-returning function tests (bind result before .count)
+// ---------------------------------------------------------------------------
+
+@Test
+function strxPkApple() {
+    let s = strxPk(0)
+    // "apple" = 5
+    expect!(s.count == 5)
+}
+
+@Test
+function strxPkGo() {
+    let s = strxPk(1)
+    // "go" = 2
+    expect!(s.count == 2)
+}
+
+@Test
+function strxPkThreeStr() {
+    let s = strxPk(2)
+    // "three" = 5
+    expect!(s.count == 5)
+}
+
+@Test
+function strxPkBy() {
+    let s = strxPk(3)
+    // "by" = 2
+    expect!(s.count == 2)
+}
+
+@Test
+function strxPkX() {
+    let s = strxPk(4)
+    // "x" = 1
+    expect!(s.count == 1)
+}
+
+@Test
+function strxPkWrap() {
+    let s = strxPk(5)
+    // 5 % 5 = 0 -> "apple" = 5
+    expect!(s.count == 5)
+}
+
+@Test
+function strxPkBorBound() {
+    let s = strxPk(2)
+    // "three" = 5
+    expect!(strxBorLen(s) == 5)
+}
+
+@Test
+function strxPkLoop20() {
+    var total = 0
+    for i in 0..20 {
+        let s = strxPk(i)
+        total = total + s.count
+    }
+    // 4 periods of 15 = 60
+    expect!(total == 60)
+}
+
+@Test
+function strxPkLoop40() {
+    var total = 0
+    for i in 0..40 {
+        let s = strxPk(i)
+        total = total + s.count
+    }
+    // 8 periods of 15 = 120
+    expect!(total == 120)
+}
+
+// Return a String from the test block directly
+@Test
+function strxRetHello() {
+    let s = "hello"
+    expect!(s == "hello")
+}
+
+@Test
+function strxRetPk0() {
+    let s = strxPk(0)
+    expect!(s == "apple")
+}
+
+@Test
+function strxRetPk3() {
+    let s = strxPk(3)
+    expect!(s == "by")
+}
+
+// ---------------------------------------------------------------------------
+// Struct with String field
+// ---------------------------------------------------------------------------
+
+@Test
+function strxBoxNameLen() {
+    let b = StrxBox { name: "test", code: 0 }
+    // "test" = 4
+    expect!(b.name.count == 4)
+}
+
+@Test
+function strxBoxMethod() {
+    let b = StrxBox { name: "hello", code: 0 }
+    // "hello" = 5
+    expect!(b.nameLen() == 5)
+}
+
+@Test
+function strxBoxCoded() {
+    let b = StrxBox { name: "", code: 99 }
+    // 99 + 1 = 100
+    expect!(b.coded() == 100)
+}
+
+@Test
+function strxBoxBorFn() {
+    let b = StrxBox { name: "abc", code: 7 }
+    // 3 + 7 = 10
+    expect!(strxBoxBor(b) == 10)
+}
+
+@Test
+function strxBoxMutCode() {
+    var b = StrxBox { name: "x", code: 0 }
+    for i in 0..10 {
+        b.code = b.code + 1
+    }
+    // 10
+    expect!(b.code == 10)
+}
+
+@Test
+function strxBoxNamePersist() {
+    var b = StrxBox { name: "hello", code: 0 }
+    b.code = 999
+    // "hello" = 5 (name not changed)
+    expect!(b.name.count == 5)
+}
+
+@Test
+function strxBoxCopyIndep() {
+    let b = StrxBox { name: "abc", code: 5 }
+    var c = b
+    c.code = 99
+    // original unchanged = 5
+    expect!(b.code == 5)
+}
+
+@Test
+function strxBoxLoopBuild() {
+    var total = 0
+    for i in 0..5 {
+        let nm = strxPk(i)
+        let b = StrxBox { name: move nm, code: i }
+        total = total + b.nameLen()
+    }
+    // 1 period: 5+2+5+2+1 = 15
+    expect!(total == 15)
+}
+
+@Test
+function strxBoxLoopAcc() {
+    var acc = 0
+    for i in 0..8 {
+        let nm = strxPk(i)
+        let b = StrxBox { name: move nm, code: i }
+        acc = acc + b.nameLen() + b.code
+    }
+    // i=0..7: nameLen=5,2,5,2,1,5,2,5 sum=27; code=28; total=55
+    expect!(acc == 55)
+}

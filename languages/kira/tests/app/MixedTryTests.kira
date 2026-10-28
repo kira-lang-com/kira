@@ -1,0 +1,92 @@
+import Foundation
+
+// A function can `try` calls that fail with different enums. Each failure
+// leaves through its own `from` into the function's failure.
+enum ReadFailure {
+    Missing
+}
+
+enum ParseFailure {
+    Garbled(Number)
+}
+
+enum LoadFailure {
+    Unread(ReadFailure)
+    Unparsed(ParseFailure)
+}
+
+extend LoadFailure {
+    function from(failure: ReadFailure) -> LoadFailure { return .Unread(failure) }
+    function from(failure: ParseFailure) -> LoadFailure { return .Unparsed(failure) }
+}
+
+function readText(present: Bool) -> Result<String, ReadFailure> {
+    if present { return .Ok("12") }
+    return .Error(.Missing)
+}
+
+function parseText(text: borrow String, valid: Bool) -> Result<Number, ParseFailure> {
+    if valid { return .Ok(Number(text)) }
+    return .Error(.Garbled(7))
+}
+
+function load(present: Bool, valid: Bool) -> Result<Number, LoadFailure> {
+    let text = try readText(present)
+    let value = try parseText(text, valid)
+    return .Ok(value)
+}
+
+function loadReport(present: Bool, valid: Bool) -> String {
+    match load(present, valid) {
+        Ok(value) -> return String(value)
+        Error(failure) -> {
+            match failure {
+                Unread -> return "unread"
+                Unparsed(parsed) -> {
+                    match parsed {
+                        Garbled(at) -> return "garbled " + String(at)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Test
+function mixedTryFailuresConvertEach() {
+    let got = loadReport(present: true, valid: true) + " " + loadReport(
+            present: false,
+            valid: true
+        ) + " " + loadReport(present: true, valid: false)
+    expect!(got == "12 unread garbled 7")
+}
+
+// A failure that is a struct passes up through `try` when the function fails
+// with the same struct.
+struct DetailedFailure {
+    let code: Number
+    let detail: String
+}
+
+function detailed(fails: Bool) -> Result<Number, DetailedFailure> {
+    if fails { return .Error(DetailedFailure { code: 4, detail: "denied" }) }
+    return .Ok(3)
+}
+
+function doubled(fails: Bool) -> Result<Number, DetailedFailure> {
+    let value = try detailed(fails)
+    return .Ok(value * 2)
+}
+
+function doubledReport(fails: Bool) -> String {
+    match doubled(fails) {
+        Ok(value) -> return String(value)
+        Error(failure) -> return failure.detail + " " + String(failure.code)
+    }
+}
+
+@Test
+function structFailurePassesUp() {
+    let got = doubledReport(fails: false) + " " + doubledReport(fails: true)
+    expect!(got == "6 denied 4")
+}

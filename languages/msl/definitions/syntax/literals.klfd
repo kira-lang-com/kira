@@ -1,0 +1,108 @@
+// Numeric literals: their value and kind from their text.
+//
+// An integer is decimal, `0x` hexadecimal, `0b` binary or `0` octal, with
+// `u` making it unsigned and `l` long, which the checker refuses outside
+// `#if`. A float is decimal with an optional exponent; `f` makes it a
+// `float`, `h` a `half`, and no suffix a `float`, as MSL has no `double`.
+// Its KSIR text is the written number without the suffix.
+
+struct IntegerText {
+    let value: Int
+    let unsigned: Bool
+    let long: Bool
+}
+
+struct FloatText {
+    let text: String
+    let half: Bool
+}
+
+function digitValue(byte: Int) -> Int {
+    if isDigit(byte) { return byte - asciiZero }
+    if byte >= asciiLowerA && byte <= asciiLowerF { return byte - asciiLowerA + 10 }
+    if byte >= asciiUpperA && byte <= asciiUpperF { return byte - asciiUpperA + 10 }
+    return 99
+}
+
+function lowered(byte: Int) -> Int {
+    if byte >= asciiUpperA && byte <= asciiUpperZ { return byte + 32 }
+    return byte
+}
+
+function integerValue(text: String) -> Optional<IntegerText> {
+    let none: Optional<IntegerText> = .None
+    var end = utf8Count(text)
+    var unsigned = false
+    var long = false
+    while end > 0 {
+        let suffix = lowered(utf8Byte(text, end - 1))
+        if suffix == 117 {
+            if unsigned { return none }
+            unsigned = true
+        } else if suffix == 108 {
+            long = true
+        } else {
+            break
+        }
+        end -= 1
+    }
+    var start = 0
+    var base = 10
+    if end >= 2 && utf8Byte(text, 0) == asciiZero {
+        let marker = lowered(utf8Byte(text, 1))
+        if marker == asciiLowerX {
+            base = 16
+            start = 2
+        } else if marker == 98 {
+            base = 2
+            start = 2
+        } else {
+            base = 8
+            start = 1
+        }
+    }
+    if start >= end && base != 8 { return none }
+    var value = 0
+    for index in start..end {
+        let digit = digitValue(utf8Byte(text, index))
+        if digit >= base { return none }
+        if value > (9223372036854775807 - digit) / base { return none }
+        value = value * base + digit
+    }
+    return .Some(IntegerText { value = value, unsigned = unsigned, long = long })
+}
+
+function floatValue(text: String) -> Optional<FloatText> {
+    let none: Optional<FloatText> = .None
+    if isHexText(text) { return none }
+    var end = utf8Count(text)
+    var half = false
+    let last = lowered(utf8Byte(text, end - 1))
+    if last == asciiLowerF {
+        end -= 1
+    } else if last == 104 {
+        half = true
+        end -= 1
+    }
+    var digits = 0
+    var dots = 0
+    var exponent = -1
+    for index in 0..end {
+        let byte = utf8Byte(text, index)
+        if isDigit(byte) {
+            if exponent < 0 { digits += 1 }
+        } else if byte == asciiDot && exponent < 0 {
+            dots += 1
+        } else if lowered(byte) == asciiLowerE && exponent < 0 {
+            exponent = index
+        } else if (byte == asciiPlus || byte == asciiMinus) && exponent == index - 1 {
+            continue
+        } else {
+            return none
+        }
+    }
+    if digits == 0 || dots > 1 { return none }
+    if exponent >= 0 && !isDigit(utf8Byte(text, end - 1)) { return none }
+    let written = utf8Slice(text, 0, end)
+    return .Some(FloatText { text = written, half = half })
+}

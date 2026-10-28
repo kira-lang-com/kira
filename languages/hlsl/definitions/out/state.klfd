@@ -1,0 +1,76 @@
+// The HLSL out (KLF-KSL section 19.5): one unit per entry point for shader
+// model 6.0, resources on the registers the assignment gives, and an entry
+// wrapper that carries the interface semantics.
+
+// What the HLSL out keeps beside the shared text writer.
+struct Dialect {
+    // Per type: whether a host-shared struct was padded, and its slots.
+    var padded: [Bool]
+    var slots: [[Int]]
+    // The helper functions the bodies call, by name, and their text.
+    var helperNames: [String]
+    var helperTexts: [String]
+    // The texture types with a dimension helper, the n-th named
+    // `_ksir_dimensions<n>`.
+    var dimensionTypes: [String]
+    // Whether bodies carry `#line` directives.
+    var debug: Bool
+}
+
+function writeHlsl(unit: ShaderUnit) -> Bool {
+    var out = textOut(unit, Dialect {
+        padded = [], slots = [], helperNames = [], helperTexts = [], dimensionTypes = [], debug = false
+    })
+    out.writeHlslModule()
+    return true
+}
+
+function hlslReserved() -> [String] {
+    return [
+        "AppendStructuredBuffer", "BlendState", "Buffer", "ByteAddressBuffer", "CompileShader", "ComputeShader",
+        "ConsumeStructuredBuffer", "DepthStencilState", "DepthStencilView", "DomainShader", "GeometryShader",
+        "Hullshader", "InputPatch", "LineStream", "OutputPatch", "PixelShader", "PointStream", "RWBuffer",
+        "RWByteAddressBuffer", "RWStructuredBuffer", "RWTexture1D", "RWTexture2D", "RWTexture3D", "RasterizerState",
+        "RenderTargetView", "SamplerComparisonState", "SamplerState", "StructuredBuffer", "Texture1D", "Texture2D",
+        "Texture3D", "TextureCube", "TriangleStream", "VertexShader", "asm", "bool", "break", "case", "cbuffer",
+        "centroid", "class", "column_major", "compile", "const", "continue", "default", "discard", "do", "double",
+        "else", "export", "extern", "false", "float", "for", "fxgroup", "groupshared", "half", "if", "in", "inline",
+        "inout", "int", "interface", "line", "lineadj", "linear", "matrix", "min16float", "min16int", "min16uint",
+        "namespace", "nointerpolation", "noperspective", "out", "packoffset", "pass", "point", "precise",
+        "register", "return", "row_major", "sample", "sampler", "shared", "snorm", "static", "string", "struct",
+        "switch", "tbuffer", "technique", "texture", "triangle", "triangleadj", "true", "typedef", "uint",
+        "uniform", "unorm", "unsigned", "vector", "void", "volatile", "while", "mul", "lerp", "frac", "saturate",
+        "abs", "min", "max", "clamp", "dot", "cross", "length", "normalize", "sin", "cos", "pow", "sqrt", "rsqrt",
+        "select", "and", "or", "this", "auto", "template", "using", "new", "delete", "sizeof", "union", "enum"
+    ]
+}
+
+// `value` quoted as Rust's `{:?}` quotes a string.
+function quotedText(value: String) -> String {
+    var pieces: [String] = ["\""]
+    var start = 0
+    let length = utf8Count(value)
+    for at in 0..length {
+        let byte = utf8Byte(value, at)
+        var escape = ""
+        if byte == 34 {
+            escape = "\\\""
+        } else if byte == 92 {
+            escape = "\\\\"
+        } else if byte == 10 {
+            escape = "\\n"
+        } else if byte == 13 {
+            escape = "\\r"
+        } else if byte == 9 {
+            escape = "\\t"
+        }
+        if utf8Count(escape) > 0 {
+            pieces.append(utf8Slice(value, start, at))
+            pieces.append(escape)
+            start = at + 1
+        }
+    }
+    pieces.append(utf8Slice(value, start, length))
+    pieces.append("\"")
+    return joinText(pieces)
+}

@@ -1,0 +1,37 @@
+// Shapes as an enum whose cases carry a struct, dispatched with `match`.
+
+struct Size {
+    let width: Int
+    let height: Int
+}
+
+enum Shape {
+    Square(Int)
+    Box(Size)
+    Point
+}
+
+function area(shape: borrow Shape) -> Int {
+    match shape {
+        Square(side) -> return side * side
+        Box(size) -> return size.width * size.height
+        Point -> return 0
+    }
+}
+
+function isRound(shape: borrow Shape) -> Bool {
+    match shape {
+        Square -> return false
+        Box -> return false
+        Point -> return true
+    }
+}
+
+@Main
+function main() -> Int {
+    let square: Shape = .Square(4)
+    let box: Shape = .Box(Size { width = 3, height = 5 })
+    let point: Shape = .Point
+    let total = area(square) + area(box) + area(point)
+    return isRound(point) ? total : 0 - total
+}

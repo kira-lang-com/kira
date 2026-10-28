@@ -1,0 +1,42 @@
+import Foundation
+
+// Reading a value out of a decoded tree: the fields, the list elements, and
+// the reasons a read says it failed.
+
+@Test
+function presentFieldReadsAsItsValue() {
+    expect!((traceText(sample().field("id"))) == "Ok(Kten.Number(300))")
+    expect!((traceText(sample().field("text"))) == "Ok(Kten.Text(\"é \\\"quoted\\\"\\n\"))")
+}
+
+@Test
+function absentFieldSaysItIsAbsent() {
+    expect!((traceText(sample().field("nope"))) == "Error(KtenReadFailure.Absent(\"nope\"))")
+}
+
+// A list reads by position, and a position past its end says so.
+@Test
+function listElementsReadByPosition() {
+    let list = match sample().field("parts") {
+        Ok(found) -> found
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    expect!((traceText(list.at(1))) == "Ok(Kten.Case(KtenCase { name: \"Role\", payload: [1 element] }))")
+    expect!((traceText(list.at(3))) == "Error(KtenReadFailure.OutOfRange(3))")
+}
+
+// A number read from a list says the shape was wrong, and names both shapes.
+@Test
+function readingTheWrongShapeNamesBothShapes() {
+    let list = match sample().field("parts") {
+        Ok(found) -> found
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    expect!((traceText(list.number())) == "Error(KtenReadFailure.WrongShape(KtenShapeMismatch { wanted: KtenShape.Number, found: KtenShape.List }))")
+}

@@ -1,0 +1,161 @@
+// The checked references to a family's cases, kept in place as a minted
+// instance joins the family (`construct-families.klfd`).
+//
+// The case a minted instance takes is placed in name order, so the cases
+// after it move one place on. Every body checked before it was minted names
+// those cases by their old places: a value made as `Section` would be read
+// as the case before it, and copied or dispatched as that case's payload.
+// Each such reference moves with its case.
+
+extend Checker {
+    function shiftFamilyVariants(borrow mut self, family: Int, inserted: Int) {
+        let owner = Type.enumeration(family)
+        for index in 0..program.expressions.count {
+            let operation = program.expressions[index].operation
+            match operation.tagged() {
+                Some(parts) -> {
+                    if parts.variant >= inserted && program.expressions[index].valueType.equals(owner) {
+                        program.expressions[index].operation = .Tagged(parts.variant + 1, parts.payload)
+                    }
+                }
+                None -> {}
+            }
+            match operation.choice() {
+                Some(parts) -> {
+                    if program.expressions[parts.subject].valueType.equals(owner) {
+                        program.expressions[index].operation = .Choice(parts.subject, shiftedArms(parts.arms, inserted))
+                    }
+                }
+                None -> {}
+            }
+        }
+        for index in 0..program.statements.count {
+            match program.statements[index] {
+                Dispatch(subject, arms) -> {
+                    if program.expressions[subject].valueType.equals(owner) {
+                        program.statements[index] = .Dispatch(subject, shiftedArms(arms, inserted))
+                    }
+                }
+                Declare -> {}
+                InitializeGlobal -> {}
+                Assign -> {}
+                Evaluate -> {}
+                Branch -> {}
+                Loop -> {}
+                Count -> {}
+                Iterate -> {}
+                // The arms of an `attempt` are the cases of a failure enum,
+                // which no family is.
+                Attempt -> {}
+                Return -> {}
+                Break -> {}
+                Continue -> {}
+            }
+        }
+    }
+}
+
+// Where the variant called `name` stands among `variants`.
+function variantNamed(variants: [Variant], name: String) -> Int {
+    for index in 0..variants.count {
+        if variants[index].name.text == name { return index }
+    }
+    return variants.count
+}
+
+// `arms` with every variant at or past `inserted` one place on.
+function shiftedArms(arms: [CheckedArm], inserted: Int) -> [CheckedArm] {
+    var shifted: [CheckedArm] = []
+    for arm in arms {
+        var also: [Int] = []
+        for variant in arm.also { also.append(shiftedVariant(variant, inserted)) }
+        shifted.append(CheckedArm {
+            variant = shiftedVariant(arm.variant, inserted), binding = arm.binding, body = arm.body, literal = arm.literal,
+            value = arm.value, also = also, ranges = arm.ranges, texts = arm.texts, decimals = arm.decimals, decimalRanges = arm.decimalRanges
+        })
+    }
+    return shifted
+}
+
+function shiftedVariant(variant: Int, inserted: Int) -> Int {
+    return variant >= inserted ? variant + 1 : variant
+}
+
+// An enum value's construction: its variant and payload.
+struct TaggedParts {
+    let variant: Int
+    let payload: Optional<Int>
+}
+
+extend Operation {
+    function tagged(borrow self) -> Optional<TaggedParts> {
+        match self {
+            IndirectCall -> return .None
+            Integer -> return .None
+            FloatLiteral -> return .None
+            BoxAny -> return .None
+            TypeIs -> return .None
+            UnboxAny -> return .None
+            FunctionReference -> return .None
+            MakeClosure -> return .None
+            GlobalRead -> return .None
+            TaskSpawn -> return .None
+            TaskReady -> return .None
+            TaskAwait -> return .None
+            TaskCancel -> return .None
+            TaskDetach -> return .None
+            Async -> return .None
+            RuntimeTrap -> return .None
+            StringText -> return .None
+            Sequence -> return .None
+            Try -> return .None
+            ChannelCreate -> return .None
+            ChannelReceiver -> return .None
+            ChannelSend -> return .None
+            ChannelClose -> return .None
+            ClassView -> return .None
+            ClassCall -> return .None
+            Boolean -> return .None
+            StringLiteral -> return .None
+            StringConcat -> return .None
+            TraceText -> return .None
+            HeapAllocateRaw -> return .None
+            HeapFreeRaw -> return .None
+            Print -> return .None
+            HeapRead -> return .None
+            HeapWrite -> return .None
+            Atomic -> return .None
+            HeapCopy -> return .None
+            HeapFill -> return .None
+            HeapOffset -> return .None
+            HeapLayout -> return .None
+            ArrayLiteral -> return .None
+            ArrayIndex -> return .None
+            ArrayAppend -> return .None
+            Transfer -> return .None
+            Read -> return .None
+            Member -> return .None
+            Call -> return .None
+            Construct -> return .None
+            Tagged(variant, payload) -> return .Some(TaggedParts { variant = variant, payload = payload })
+            Unary -> return .None
+            Arithmetic -> return .None
+            Wrapping -> return .None
+            Compare -> return .None
+            EnumCode -> return .None
+            EnumFromCode -> return .None
+            Order -> return .None
+            Hash -> return .None
+            Logical -> return .None
+            Select -> return .None
+            Choice -> return .None
+            Bitcast -> return .None
+            Convert -> return .None
+            ForeignImage -> return .None
+            ForeignElements -> return .None
+            ForeignCallback -> return .None
+            ForeignRead -> return .None
+            ForeignUnion -> return .None
+        }
+    }
+}

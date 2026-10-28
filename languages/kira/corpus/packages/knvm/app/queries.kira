@@ -1,0 +1,323 @@
+import KnvmCore
+
+// The questions the cases ask of a parsed command, a refusal or a source: one
+// variant answers, and `else` says no for every other.
+
+function isOverview(command: borrow Command) -> Bool {
+    match command {
+        Overview -> { return true }
+        else -> { return false }
+    }
+    return false
+}
+
+function isHelp(command: borrow Command) -> Bool {
+    match command {
+        Help -> { return true }
+        else -> { return false }
+    }
+    return false
+}
+
+function isSinstall(command: borrow Command) -> Bool {
+    match command {
+        Sinstall -> { return true }
+        else -> { return false }
+    }
+    return false
+}
+
+// The compiler a command acts on, "" for a command that acts on none.
+function compilerOf(command: borrow Command) -> String {
+    match command {
+        Install(request) -> { return request.compiler.name }
+        List(request) -> { return request.compiler.name }
+        Use(request) -> { return request.compiler.name }
+        Uninstall(request) -> { return request.compiler.name }
+        Pin(request) -> { return request.compiler.name }
+        Unpin(request) -> { return request.compiler.name }
+        Binstall(request) -> { return scopeOf(request.scope) }
+        else -> { return "" }
+    }
+    return ""
+}
+
+// The compiler one `binstall` builds, "" when it builds the whole manifest.
+function scopeOf(scope: borrow BuildScope) -> String {
+    match scope {
+        One(compiler) -> { return compiler.name }
+        Manifest -> { return "" }
+    }
+    return ""
+}
+
+// `binstall` of every language the enclosing manifest lists.
+function binstallsManifest(command: borrow Command) -> Bool {
+    match command {
+        Binstall(request) -> { return scopeOf(request.scope).isEmpty() }
+        else -> { return false }
+    }
+    return false
+}
+
+// The languages the cases treat as registered: kira as the default, ksl beside
+// it, and the framework's own compiler. Built here rather than read from the
+// machine, so no case depends on what `binstall` has registered on it.
+function kiraLanguage() -> ToolchainLanguage {
+    return ToolchainLanguage {
+        name = "kira",
+        path = "languages/kira",
+        binary = "kira",
+        isDefault = true,
+        files = [
+            ToolchainFile { from = "definitions", to = "definitions" },
+            ToolchainFile { from = "std", to = "std" }
+        ]
+    }
+}
+
+function kiraCompiler() -> Compiler {
+    return languageCompiler(kiraLanguage())
+}
+
+function kslCompiler() -> Compiler {
+    return languageCompiler(ToolchainLanguage {
+        name = "ksl",
+        path = "languages/ksl",
+        binary = "ksl",
+        isDefault = false,
+        files = [ToolchainFile { from = "library", to = "share/ksl/library" }]
+    })
+}
+
+function fixtureCompilers() -> [Compiler] {
+    let compilers: [Compiler] = [kiraCompiler(), kslCompiler(), klfCompiler()]
+    return compilers
+}
+
+// Whether a manifest read listed exactly `count` languages.
+function readsLanguages(read: borrow ManifestRead, count: Int) -> Bool {
+    match read {
+        Read(languages) -> { return languages.count == count }
+        Failed(detail) -> { return false }
+    }
+    return false
+}
+
+function isManifestFound(lookup: borrow ManifestLookup) -> Bool {
+    match lookup {
+        Found(manifest) -> { return true }
+        else -> { return false }
+    }
+    return false
+}
+
+function isNoDefault(failure: borrow UsageFailure, verb: borrow String) -> Bool {
+    match failure {
+        NoDefault(name) -> { return name == verb }
+        else -> { return false }
+    }
+    return false
+}
+
+function isUnpin(command: borrow Command) -> Bool {
+    match command {
+        Unpin(request) -> { return true }
+        else -> { return false }
+    }
+    return false
+}
+
+// `setup`.
+function isSetup(command: borrow Command) -> Bool {
+    match command {
+        Setup -> { return true }
+        else -> { return false }
+    }
+    return false
+}
+
+// `install`: whether it asked for the newest published version, for one named
+// version, and on which channel.
+function installsLatest(command: borrow Command) -> Bool {
+    match command {
+        Install(request) -> { return request.spec.latest }
+        else -> { return false }
+    }
+    return false
+}
+
+function installsVersion(command: borrow Command, version: borrow String) -> Bool {
+    match command {
+        Install(request) -> { return !request.spec.latest && request.spec.version == version }
+        else -> { return false }
+    }
+    return false
+}
+
+function installsOn(command: borrow Command, channel: borrow Channel) -> Bool {
+    match command {
+        Install(request) -> { return request.channel == channel }
+        else -> { return false }
+    }
+    return false
+}
+
+function uses(command: borrow Command, version: borrow String) -> Bool {
+    match command {
+        Use(request) -> { return request.version == version }
+        else -> { return false }
+    }
+    return false
+}
+
+function uninstalls(command: borrow Command, version: borrow String, channel: borrow Channel) -> Bool {
+    match command {
+        Uninstall(request) -> { return request.version == version && request.channel == channel }
+        else -> { return false }
+    }
+    return false
+}
+
+function pins(command: borrow Command, version: borrow String) -> Bool {
+    match command {
+        Pin(request) -> { return request.version == version }
+        else -> { return false }
+    }
+    return false
+}
+
+// `list`: whether it reports the feed or the disk.
+function lists(command: borrow Command, remote: Bool) -> Bool {
+    match command {
+        List(request) -> { return request.remote == remote }
+        else -> { return false }
+    }
+    return false
+}
+
+function isGitHubSource(source: borrow ReleaseSource) -> Bool {
+    match source {
+        GitHub(repository) -> { return true }
+        else -> { return false }
+    }
+    return false
+}
+
+function isDirectorySource(source: borrow ReleaseSource) -> Bool {
+    match source {
+        Directory(root) -> { return true }
+        else -> { return false }
+    }
+    return false
+}
+
+// Whether no feed stands behind a source, and the variable that would name one.
+function isUnpublishedSource(source: borrow ReleaseSource, variable: borrow String) -> Bool {
+    match source {
+        Unpublished(named) -> { return named == variable }
+        else -> { return false }
+    }
+    return false
+}
+
+// What a refusal was, so each case can name the one it provoked.
+function isInstallMissingVersion(failure: borrow UsageFailure) -> Bool {
+    match failure {
+        InstallMissingVersion -> { return true }
+        else -> { return false }
+    }
+    return false
+}
+
+function isUnknownCommand(failure: borrow UsageFailure, verb: borrow String) -> Bool {
+    match failure {
+        UnknownCommand(name) -> { return name == verb }
+        else -> { return false }
+    }
+    return false
+}
+
+function isMissingVersion(failure: borrow UsageFailure, verb: borrow String) -> Bool {
+    match failure {
+        MissingVersion(name) -> { return name == verb }
+        else -> { return false }
+    }
+    return false
+}
+
+function isMissingVerb(failure: borrow UsageFailure, compiler: borrow String) -> Bool {
+    match failure {
+        MissingVerb(name) -> { return name == compiler }
+        else -> { return false }
+    }
+    return false
+}
+
+function isChannelMissingValue(failure: borrow UsageFailure) -> Bool {
+    match failure {
+        ChannelMissingValue -> { return true }
+        else -> { return false }
+    }
+    return false
+}
+
+function isUnknownChannel(failure: borrow UsageFailure, name: borrow String) -> Bool {
+    match failure {
+        UnknownChannel(found) -> { return found == name }
+        else -> { return false }
+    }
+    return false
+}
+
+function isUnexpectedArgument(failure: borrow UsageFailure, argument: borrow String) -> Bool {
+    match failure {
+        UnexpectedArgument(extra) -> { return extra == argument }
+        else -> { return false }
+    }
+    return false
+}
+
+function isUnknownOption(failure: borrow UsageFailure, option: borrow String) -> Bool {
+    match failure {
+        UnknownOption(name) -> { return name == option }
+        else -> { return false }
+    }
+    return false
+}
+
+// Whether a parsed channel is one a toolchain may be installed on.
+function isChannel(value: Optional<Channel>) -> Bool {
+    match value {
+        Some(channel) -> { return true }
+        None -> { return false }
+    }
+    return false
+}
+
+// Whether an optional carries a value.
+function isSet(value: Optional<String>) -> Bool {
+    match value {
+        Some(text) -> { return true }
+        None -> { return false }
+    }
+    return false
+}
+
+// The name of the compiler an optional carries, "" for none.
+function nameOf(value: Optional<Compiler>) -> String {
+    match value {
+        Some(compiler) -> { return compiler.name }
+        None -> { return "" }
+    }
+    return ""
+}
+
+// Whether a parsed file carries a field.
+function hasField(fields: borrow TomlFields, key: borrow String) -> Bool {
+    match fields.get(key) {
+        None -> { return false }
+        Some(value) -> { return true }
+    }
+    return false
+}

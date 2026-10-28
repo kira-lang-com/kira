@@ -1,0 +1,234 @@
+// Entry wrappers: the KSIR entry is an ordinary function, and the Metal
+// entry point takes the stage input struct, the built-ins and the
+// resources, declares the workgroup and private globals, and returns the
+// output struct.
+
+function mslBuiltinInput(builtin: String) -> String {
+    match builtin {
+        "position" -> return "position"
+        "vertex_index" -> return "vertex_id"
+        "instance_index" -> return "instance_id"
+        "front_facing" -> return "front_facing"
+        "sample_index" -> return "sample_id"
+        "sample_mask" -> return "sample_mask"
+        "global_invocation_id" -> return "thread_position_in_grid"
+        "local_invocation_id" -> return "thread_position_in_threadgroup"
+        "local_invocation_index" -> return "thread_index_in_threadgroup"
+        "workgroup_id" -> return "threadgroup_position_in_grid"
+        "num_workgroups" -> return "threadgroups_per_grid"
+        else -> return typeFailure(joinText(["the ", builtin, " built-in as an input"]))
+    }
+}
+
+extend TextOut {
+    function outputAttribute(borrow self, leaf: Leaf, stage: String) -> String {
+        let builtin = leafBuiltin(leaf)
+        if builtin == "position" { return "position" }
+        if builtin == "frag_depth" { return "depth(any)" }
+        if builtin == "sample_mask" { return "sample_mask" }
+        if builtin == "clip_distances" { return "clip_distance" }
+        if utf8Count(builtin) > 0 { return typeFailure(joinText(["the ", builtin, " built-in as an output"])) }
+        let location = decimalText(leafLocation(leaf))
+        let source = leafField(leaf, "blend_src")
+        if stage == "fragment" && source >= 0 {
+            return joinText(["color(", location, "), index(", decimalText(source), ")"])
+        }
+        if stage == "fragment" { return joinText(["color(", location, ")"]) }
+        return joinText(["user(loc", location, ")"])
+    }
+
+    function interpolation(borrow self, leaf: Leaf, integer: Bool) -> String {
+        var sampling = leafText(leaf, "sampling")
+        if sampling != "centroid" && sampling != "sample" { sampling = "center" }
+        let mode = leafText(leaf, "interpolation")
+        if mode == "flat" || (utf8Count(mode) == 0 && integer) { return ", flat" }
+        if mode == "linear" { return joinText([", ", sampling, "_no_perspective"]) }
+        if !integer && sampling != "center" { return joinText([", ", sampling, "_perspective"]) }
+        return ""
+    }
+
+    function declareStruct(borrow self, name: String, members: [String]) {
+        var pieces: [String] = [joinText(["struct ", name, " {\n"])]
+        for member in members {
+            pieces.append(joinText(["    ", member, ";\n"]))
+        }
+        pieces.append("};\n\n")
+        write(joinText(pieces))
+    }
+
+    // A resource is declared at the Metal index a host binds it into, which the
+    // binding assignment gives per stage (`KLF-KSL.md` 20.6): a vertex entry's
+    // buffers sit one above a fragment's, past the attribute stream.
+    function resourceParameters(borrow self, uses: [Int], stage: String) -> [String] {
+        var parameters: [String] = []
+        let globals = count("globals", -1)
+        for global in 0..globals {
+            let space = text("globals", -1, global, "space")
+            if hasInt(uses, global) && (space == "uniform" || space == "storage" || space == "handle") {
+                let name = globalNames[global]
+                let resource = text("globals", -1, global, "resource")
+                if utf8Count(resource) == 0 {
+                    refuseAt(joinText(["resource `", text("globals", -1, global, "name"), "` has no slot"]),
+                        "globals", -1, global)
+                } else {
+                    var argument = "argument"
+                    if stage == "vertex" { argument = "vertex_argument" }
+                    let slot = decimalText(field("globals", -1, global, argument))
+                    var attribute = joinText(["sampler(", slot, ")"])
+                    if resource == "uniform" || resource == "storage" {
+                        attribute = joinText(["buffer(", slot, ")"])
+                    } else if resource == "texture" {
+                        attribute = joinText(["texture(", slot, ")"])
+                    }
+                    let written = parameter(global, name)
+                    if failedText(written) {
+                        refuseAt(failureText(written), "globals", -1, global)
+                    } else {
+                        parameters.append(joinText([written, " [[", attribute, "]]"]))
+                    }
+                    if counted(global) {
+                        let countSlot = field("globals", -1, global, "count_slot")
+                        if countSlot >= 0 && countSlot <= 30 {
+                            parameters.append(joinText(["constant uint& ", name, "_count [[buffer(",
+                                decimalText(countSlot), ")]]"]))
+                        } else {
+                            refuseAt(joinText(["the count buffer of `", text("globals", -1, global, "name"),
+                                "` is past Metal's last buffer index"]), "globals", -1, global)
+                        }
+                    }
+                }
+            }
+        }
+        return parameters
+    }
+
+    function writeEntry(borrow mut self, which: Int) {
+        let name = entryNames[entryIndex(which)]
+        let stage = text("functions", -1, which, "stage")
+        var names = copiedTexts(used)
+        let inner = availableFresh(name, names)
+        names.append(inner)
+        let hidden = reachedGlobals(which)
+        writeFunction(which, inner, hidden)
+        let inputs = inputLeaves(which)
+        var parameters: [String] = []
+        var stageMembers: [String] = []
+        var inputValues: [String] = []
+        let inputName = availableFresh(joinText([name, "_input"]), names)
+        names.append(inputName)
+        for position in 0..inputs.count {
+            let leaf = inputs[position]
+            let leafType = typeName(leaf.typeIndex)
+            let member = joinText(["_ksir_", decimalText(position)])
+            let builtin = leafBuiltin(leaf)
+            if utf8Count(builtin) > 0 {
+                let attribute = mslBuiltinInput(builtin)
+                if failedText(attribute) {
+                    refuseAt(failureText(attribute), "functions", -1, which)
+                } else {
+                    parameters.append(joinText([leafType, " ", member, " [[", attribute, "]]"]))
+                    inputValues.append(member)
+                }
+            } else {
+                var attribute = joinText(["attribute(", decimalText(leafLocation(leaf)), ")"])
+                if stage != "vertex" {
+                    let integer = integerScalar(typeText(leaf.typeIndex, "scalar"))
+                    attribute = joinText(["user(loc", decimalText(leafLocation(leaf)), ")", interpolation(leaf, integer)])
+                }
+                stageMembers.append(joinText([leafType, " ", member, " [[", attribute, "]]"]))
+                inputValues.append(joinText(["_ksir_stage.", member]))
+            }
+        }
+        if stageMembers.count > 0 {
+            declareStruct(inputName, stageMembers)
+            var withStage: [String] = [joinText([inputName, " _ksir_stage [[stage_in]]"])]
+            for parameterText in parameters {
+                withStage.append(parameterText)
+            }
+            parameters = withStage
+        }
+        for resourceParameter in resourceParameters(hidden, stage) {
+            parameters.append(resourceParameter)
+        }
+        let outputs = resultLeaves(which)
+        let outputName = availableFresh(joinText([name, "_output"]), names)
+        names.append(outputName)
+        var outputMembers: [String] = []
+        for position in 0..outputs.count {
+            let leafType = typeName(outputs[position].typeIndex)
+            let attribute = outputAttribute(outputs[position], stage)
+            if failedText(attribute) {
+                refuseAt(failureText(attribute), "functions", -1, which)
+            } else {
+                outputMembers.append(joinText([leafType, " _ksir_", decimalText(position), " [[", attribute, "]]"]))
+            }
+        }
+        let resultIndex = field("functions", -1, which, "result")
+        if resultIndex >= 0 { declareStruct(outputName, outputMembers) }
+        var qualifier = "kernel"
+        if stage == "vertex" {
+            qualifier = "vertex"
+        } else if stage == "fragment" {
+            qualifier = "fragment"
+        }
+        var result = "void"
+        if resultIndex >= 0 { result = outputName }
+        write(joinText([qualifier, " ", result, " ", name, "(", joinWith(parameters, ", "), ") {\n"]))
+        writeLocalGlobals(hidden, stage)
+        var arguments: [String] = []
+        let argumentCount = count("arguments", which)
+        for argument in 0..argumentCount {
+            let local = joinText(["_ksir_arg", decimalText(argument)])
+            let argumentType = field("arguments", which, argument, "type")
+            write(joinText(["    ", typeName(argumentType), " ", local, " = {};\n"]))
+            for position in 0..inputs.count {
+                if inputs[position].argument == argument && position < inputValues.count {
+                    var target = local
+                    if inputs[position].member >= 0 {
+                        target = joinText([local, ".", memberName(argumentType, inputs[position].member)])
+                    }
+                    write(joinText(["    ", target, " = ", inputValues[position], ";\n"]))
+                }
+            }
+            arguments.append(local)
+        }
+        for hiddenArgument in hiddenArguments(hidden) {
+            arguments.append(hiddenArgument)
+        }
+        let call = joinText([inner, "(", joinWith(arguments, ", "), ")"])
+        if resultIndex < 0 {
+            write(joinText(["    ", call, ";\n"]))
+        } else {
+            write(joinText(["    ", typeName(resultIndex), " _ksir_result = ", call, ";\n"]))
+            write(joinText(["    ", outputName, " _ksir_output;\n"]))
+            for position in 0..outputs.count {
+                var value = "_ksir_result"
+                if outputs[position].member >= 0 {
+                    value = joinText(["_ksir_result.", memberName(resultIndex, outputs[position].member)])
+                }
+                write(joinText(["    _ksir_output._ksir_", decimalText(position), " = ", value, ";\n"]))
+            }
+            write("    return _ksir_output;\n")
+        }
+        write("}\n\n")
+    }
+
+    // Workgroup and private globals live in the entry point and travel to
+    // functions by reference.
+    function writeLocalGlobals(borrow self, hidden: [Int], stage: String) {
+        for global in hidden {
+            let name = globalNames[global]
+            let globalType = typeName(field("globals", -1, global, "type"))
+            let space = text("globals", -1, global, "space")
+            if space == "workgroup" && stage == "compute" {
+                write(joinText(["    threadgroup ", globalType, " ", name, ";\n"]))
+            } else if space == "workgroup" {
+                refuseAt("workgroup memory outside a compute entry", "globals", -1, global)
+            } else if space == "private" {
+                var value = joinText([globalType, " {}"])
+                if field("globals", -1, global, "init") >= 0 { value = constantValue("globals", global) }
+                write(joinText(["    ", globalType, " ", name, " = ", value, ";\n"]))
+            }
+        }
+    }
+}

@@ -1,0 +1,259 @@
+construct Kmsl() extends ShaderLanguage<Tree, Program> {
+    let name: String = "msl"
+    let driver: String = "kmsl"
+    let version: String = "26.10.4"
+    let extensions: [String] = ["metal"]
+    let layouts: LayoutDefaults = LayoutDefaults { uniform = .Msl, storage = .Msl, immediate = .Msl }
+    let libraryRoot: String = ""
+    // What the accepted subset can spell: `half`, the image kinds of
+    // `metal_stdlib`, `[[sample_id]]` and `[[clip_distance]]`. A target
+    // that cannot express one refuses the shader that uses it.
+    let capabilities: [ShaderCapability] = [
+        .Float16, .CubeArray, .Multisampled, .SampleShading, .ClipDistances, .StorageImageReadWrite
+    ]
+    let diagnostics: [DiagnosticSpec] = [
+        DiagnosticSpec { code = 1, severity = .Error, title = "unexpected token",
+            explanation = "a token appeared where the grammar allows something else" },
+        DiagnosticSpec { code = 2, severity = .Error, title = "expected a declaration",
+            explanation = "a file holds structs, functions, templates, namespaces and program-scope constants" },
+        DiagnosticSpec { code = 3, severity = .Error, title = "unterminated comment or string",
+            explanation = "the file ends inside a block comment or a string literal" },
+        DiagnosticSpec { code = 4, severity = .Error, title = "malformed literal",
+            explanation = "the number is malformed, out of range, or a kind the subset does not accept" },
+        DiagnosticSpec { code = 5, severity = .Error, title = "unsupported directive",
+            explanation = "the subset preprocesses `#include`, object-like `#define`, `#undef`, `#if` and its kin, `#error` and `#pragma once`" },
+        DiagnosticSpec { code = 6, severity = .Error, title = "unknown header",
+            explanation = "only `<metal_stdlib>` and `<simd/simd.h>` are system headers here" },
+        DiagnosticSpec { code = 7, severity = .Error, title = "missing include",
+            explanation = "no file of that name exists beside the including file" },
+        DiagnosticSpec { code = 8, severity = .Error, title = "unbalanced conditional",
+            explanation = "an `#else`, `#elif` or `#endif` has no `#if`, or an `#if` has no `#endif`" },
+        DiagnosticSpec { code = 9, severity = .Error, title = "bad condition",
+            explanation = "an `#if` condition is an integer expression over defined names" },
+        DiagnosticSpec { code = 10, severity = .Error, title = "#error",
+            explanation = "preprocessing reached an `#error` directive" },
+        DiagnosticSpec { code = 11, severity = .Error, title = "includes nest too deep",
+            explanation = "includes nest more than 32 deep, which an include cycle does" },
+        DiagnosticSpec { code = 101, severity = .Error, title = "kernel beside graphics entries",
+            explanation = "a file is one shader, graphics or compute, so it cannot hold a `kernel` and `vertex` or `fragment` functions" },
+        DiagnosticSpec { code = 102, severity = .Error, title = "graphics entries",
+            explanation = "a graphics file holds at most one `vertex` and one `fragment` function" },
+        DiagnosticSpec { code = 103, severity = .Error, title = "compute entries",
+            explanation = "a compute file holds exactly one `kernel` function" },
+        DiagnosticSpec { code = 104, severity = .Error, title = "pointer arithmetic",
+            explanation = "pointers are indexed with `[]`; they are not added to, subtracted or compared" },
+        DiagnosticSpec { code = 105, severity = .Error, title = "stored pointer",
+            explanation = "a pointer or reference cannot be held in a variable or a struct member" },
+        DiagnosticSpec { code = 106, severity = .Error, title = "buffer not from an entry",
+            explanation = "a `device` or `constant` pointer passed to a function must be an entry point's buffer" },
+        DiagnosticSpec { code = 107, severity = .Error, title = "argument buffer",
+            explanation = "argument buffers and `[[id(n)]]` are not in the subset" },
+        DiagnosticSpec { code = 108, severity = .Error, title = "function table or ray tracing",
+            explanation = "function tables, intersection functions and ray tracing are not in the subset" },
+        DiagnosticSpec { code = 109, severity = .Error, title = "mesh or object shader",
+            explanation = "mesh and object functions are not in the subset" },
+        DiagnosticSpec { code = 110, severity = .Error, title = "tile function",
+            explanation = "imageblocks, tile functions and raster order groups are not in the subset" },
+        DiagnosticSpec { code = 111, severity = .Error, title = "SIMD-group operation",
+            explanation = "`simdgroup` matrices and `simd_*` functions are not in the subset" },
+        DiagnosticSpec { code = 112, severity = .Error, title = "function constant gates a parameter",
+            explanation = "a function constant cannot decide whether a parameter exists or whether it is defined" },
+        DiagnosticSpec { code = 113, severity = .Error, title = "class template",
+            explanation = "only function templates whose arguments are deduced are in the subset" },
+        DiagnosticSpec { code = 114, severity = .Error, title = "lambda",
+            explanation = "lambdas are not in the subset" },
+        DiagnosticSpec { code = 115, severity = .Error, title = "constexpr sampler",
+            explanation = "a sampler is an entry point argument; `constexpr sampler` is not in the subset" },
+        DiagnosticSpec { code = 116, severity = .Error, title = "printf",
+            explanation = "`printf` is not in the subset" },
+        DiagnosticSpec { code = 117, severity = .Error, title = "recursive call",
+            explanation = "a function reaches itself through its calls, which no shader target can run" },
+        DiagnosticSpec { code = 118, severity = .Error, title = "unsupported type",
+            explanation = "the type is not in the subset" },
+        DiagnosticSpec { code = 119, severity = .Error, title = "unsupported struct",
+            explanation = "a struct holds data members only: no methods, base classes, bit-fields or access specifiers" },
+        DiagnosticSpec { code = 120, severity = .Error, title = "unsupported attribute",
+            explanation = "the attribute is unknown, or not in the subset, or not allowed where it is written" },
+        DiagnosticSpec { code = 121, severity = .Error, title = "unsupported function",
+            explanation = "the library function has no counterpart in KSIR" },
+        DiagnosticSpec { code = 122, severity = .Error, title = "unsupported statement",
+            explanation = "the statement is not in the subset" },
+        DiagnosticSpec { code = 123, severity = .Error, title = "fall-through",
+            explanation = "only a `case` with an empty body may fall through to the next" },
+        DiagnosticSpec { code = 124, severity = .Error, title = "memory order",
+            explanation = "atomics take `memory_order_relaxed`" },
+        DiagnosticSpec { code = 125, severity = .Error, title = "unsupported construct",
+            explanation = "the construct is valid C++ but not in the subset" },
+        DiagnosticSpec { code = 126, severity = .Error, title = "no entry point",
+            explanation = "the file declares no `vertex`, `fragment` or `kernel` function" },
+        DiagnosticSpec { code = 201, severity = .Error, title = "unknown type",
+            explanation = "the written type names no built-in type, struct or alias" },
+        DiagnosticSpec { code = 202, severity = .Error, title = "unknown name",
+            explanation = "the name is bound to no variable, constant or function declared before it" },
+        DiagnosticSpec { code = 203, severity = .Error, title = "redeclaration",
+            explanation = "two declarations claim the same name in one scope" },
+        DiagnosticSpec { code = 204, severity = .Error, title = "type mismatch",
+            explanation = "no implicit conversion takes the value to the type its position needs" },
+        DiagnosticSpec { code = 205, severity = .Error, title = "wrong argument count",
+            explanation = "the call or construction passes a different number of values than it takes" },
+        DiagnosticSpec { code = 206, severity = .Error, title = "no such member",
+            explanation = "the member does not exist on the type it is read from" },
+        DiagnosticSpec { code = 207, severity = .Error, title = "no matching function",
+            explanation = "no function of that name accepts these arguments" },
+        DiagnosticSpec { code = 208, severity = .Error, title = "ambiguous call",
+            explanation = "two functions accept these arguments equally well" },
+        DiagnosticSpec { code = 209, severity = .Error, title = "not assignable",
+            explanation = "the target is constant, read-only memory, or not a place" },
+        DiagnosticSpec { code = 210, severity = .Error, title = "bad entry parameter",
+            explanation = "an entry parameter is a buffer, texture or sampler with its slot, `[[stage_in]]`, or a built-in its stage provides" },
+        DiagnosticSpec { code = 211, severity = .Error, title = "bad stage interface",
+            explanation = "every member of a stage input or output carries an attribute its stage and direction allow" },
+        DiagnosticSpec { code = 212, severity = .Error, title = "slot conflict",
+            explanation = "two entries use one slot for different resources" },
+        DiagnosticSpec { code = 213, severity = .Error, title = "not a constant",
+            explanation = "the value must be an integer known when the shader is compiled" },
+        DiagnosticSpec { code = 214, severity = .Error, title = "missing return",
+            explanation = "the function can finish without returning its result" },
+        DiagnosticSpec { code = 215, severity = .Error, title = "break or continue outside a loop",
+            explanation = "`break` leaves a loop or switch and `continue` a loop" },
+        DiagnosticSpec { code = 216, severity = .Error, title = "template arguments not deduced",
+            explanation = "every template parameter is deduced from the call's arguments, consistently" },
+        DiagnosticSpec { code = 217, severity = .Error, title = "operator does not apply",
+            explanation = "the operator does not accept these operand types" },
+        DiagnosticSpec { code = 218, severity = .Error, title = "duplicate case",
+            explanation = "two cases of one switch have the same value" },
+        DiagnosticSpec { code = 219, severity = .Error, title = "wrong stage",
+            explanation = "the operation is not available in the stage that reaches it" },
+        DiagnosticSpec { code = 220, severity = .Error, title = "bad threadgroup variable",
+            explanation = "a `threadgroup` variable is declared in a kernel's body, without an initializer" },
+        DiagnosticSpec { code = 230, severity = .Error, title = "target unsupported",
+            explanation = "a requested target cannot express this shader" },
+        DiagnosticSpec { code = 231, severity = .Error, title = "function constant missing",
+            explanation = "a function constant has no value: supply one with `--override`" },
+        DiagnosticSpec { code = 232, severity = .Error, title = "function constant unsupported",
+            explanation = "the target cannot specialize a function constant; bake it" },
+        DiagnosticSpec { code = 233, severity = .Error, title = "index not constant",
+            explanation = "the index must be known when the shader is compiled" },
+        DiagnosticSpec { code = 234, severity = .Error, title = "stage interface mismatch",
+            explanation = "a fragment input is not a vertex output of the same location, type and interpolation" },
+        DiagnosticSpec { code = 235, severity = .Error, title = "slot collision",
+            explanation = "two resources take the same slot" },
+        DiagnosticSpec { code = 236, severity = .Error, title = "constant not finite",
+            explanation = "a constant does not evaluate to a finite value" },
+        DiagnosticSpec { code = 237, severity = .Error, title = "capability unsupported",
+            explanation = "the shader uses a capability the target lacks" },
+        DiagnosticSpec { code = 5001, severity = .Warning, title = "non-uniform control flow",
+            explanation = "a barrier, derivative or implicit-level sample is reached under control flow that varies across invocations" }
+    ]
+    // KLF-EDITOR section 21.4. The reserved words are the lexer's
+    // (`syntax/token.klfd`); the qualifiers and address spaces the parser
+    // reads by position stay contextual.
+    let editor: EditorSpec = EditorSpec {
+        displayName = "MSL", scope = "source.metal",
+        lineComments = ["//"],
+        blockComments = [BlockComment { open = "/*", close = "*/", nests = true }],
+        docComments = ["///"],
+        strings = [StringForm { open = "\"", close = "\"", escape = .Some("\\\\."), multiline = false,
+            raw = false, interpolation = .None, class = .String }],
+        numbers = ["0[xX][0-9A-Fa-f]+", "\\d+\\.\\d+[fF]?", "\\d+[uUlL]*"],
+        identifier = "[A-Za-z_][A-Za-z0-9_]*",
+        keywords = [
+            KeywordGroup { class = .Keyword, modifiers = [.Control],
+                words = ["if", "else", "for", "while", "do", "switch", "case", "default", "break",
+                    "continue", "return", "goto"] },
+            KeywordGroup { class = .Boolean, modifiers = [],
+                words = ["true", "false", "nullptr"] },
+            KeywordGroup { class = .Keyword, modifiers = [],
+                words = ["struct", "class", "union", "enum", "typedef", "using", "namespace",
+                    "template", "typename", "static_cast", "reinterpret_cast", "const_cast",
+                    "dynamic_cast", "sizeof", "operator", "auto", "void", "this", "new", "delete"] },
+            KeywordGroup { class = .Keyword, modifiers = [.Contextual],
+                words = ["const", "constexpr", "constant", "device", "thread", "threadgroup",
+                    "static", "inline", "vertex", "fragment", "kernel", "metal", "float", "half",
+                    "int", "uint", "bool", "vec", "ivec", "uvec", "bvec", "mat", "array", "sampler",
+                    "texture", "atomic"] }
+        ],
+        operators = ["->", "==", "!=", "<=", ">=", "&&", "||", "<<", ">>", "=", "+", "-", "*", "/",
+            "%", "<", ">", "!", "&", "|", "^", "~", ".", ",", ":", "?", "#"],
+        brackets = [BracketPair { open = "{", close = "}" }, BracketPair { open = "(", close = ")" },
+            BracketPair { open = "[", close = "]" }, BracketPair { open = "[[", close = "]]" }],
+        autoClose = [AutoClosePair { open = "{", close = "}", notIn = [] },
+            AutoClosePair { open = "(", close = ")", notIn = [] },
+            AutoClosePair { open = "[", close = "]", notIn = [] },
+            AutoClosePair { open = "\"", close = "\"", notIn = [.String, .Comment] }],
+        indent = IndentRules { unit = "    ", increase = .Some("[{(\\[]\\s*$"),
+            decrease = .Some("^\\s*[})\\]]") },
+        annotation = .Some("\\[\\[[A-Za-z_][A-Za-z0-9_]*(?:\\([^)]*\\))?\\]\\]"),
+        preprocessor = .Some("^\\s*#\\s*[A-Za-z_]+")
+    }
+    let keys: [DiagnosticKey] = [
+        DiagnosticKey { key = "shader.uniformity", code = 5001 },
+        DiagnosticKey { key = "shader.const-not-finite", code = 236 },
+        DiagnosticKey { key = "shader.const-index", code = 233 },
+        DiagnosticKey { key = "shader.interface-mismatch", code = 234 },
+        DiagnosticKey { key = "shader.override-missing", code = 231 },
+        DiagnosticKey { key = "shader.override-unsupported", code = 232 },
+        DiagnosticKey { key = "shader.target-unsupported", code = 230 },
+        DiagnosticKey { key = "shader.capability", code = 237 },
+        DiagnosticKey { key = "shader.slot-collision", code = 235 }
+    ]
+
+    function units(session: Session, inputs: [SourceFile]) -> [Unit] {
+        var units: [Unit] = []
+        for input in inputs { units.append(definition_unit(session, input)) }
+        return units
+    }
+
+    function parse(session: Session, unit: Unit, program: [SourceFile]) -> Tree {
+        match loadTranslationUnit(session) {
+            Ok(tree) -> { return definition_tree(session, unit, artifactHandle(tree)) }
+            Error(failure) -> {
+                failure.report()
+                return definition_tree(session, unit, 0)
+            }
+        }
+    }
+
+    function elaborate(session: Session, unit: Unit, tree: Tree) -> Program {
+        let parsed: SyntaxTree = artifactValue(definition_tree_payload(session, tree))
+        return definition_program(session, unit, artifactHandle(check(parsed, shaderName(sourceName()))))
+    }
+
+    function lower(session: Session, unit: Unit, program: Program) -> ShaderModule {
+        let checked: CheckedProgram = artifactValue(definition_program_payload(session, program))
+        return lowerShader(session, unit, program, checked)
+    }
+
+    function emit(unit: ShaderUnit) -> Bool {
+        return writeMsl(unit)
+    }
+
+    function format(session: Session, unit: Unit, tree: Tree) -> Bool {
+        let file = readFile(session, sourceName())
+        let source = fileText(session, file as SourceFile)
+        var starts: [Int] = []
+        var ends: [Int] = []
+        match lex(source, file) {
+            Ok(tokens) -> {
+                for token in tokens {
+                    if token.kind != .End {
+                        starts.append(token.span.start)
+                        ends.append(token.span.end)
+                    }
+                }
+            }
+            Error(failure) -> return false
+        }
+        return layoutTokens(source, starts, ends, LayoutRules {
+            spacedCalls = ["if", "while", "for", "switch"],
+            keywords = ["return", "case", "if", "while", "for", "switch", "else", "do"],
+            ambiguous = ["<", ">", "*", "&", ">>"],
+            spacedArrow = false,
+            labels = ["case", "default"],
+            semicolons = true,
+            literals = false,
+            headers = [],
+            inlineBlocks = false
+        })
+    }
+}

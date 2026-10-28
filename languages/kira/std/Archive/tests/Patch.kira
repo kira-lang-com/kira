@@ -1,0 +1,57 @@
+import Foundation
+
+// Unified diffs: a hunk applies where its context sits, even when the lines
+// have moved; a hunk whose context is not in the file is refused, and the
+// file is left as it was.
+
+// Writes `notes` with `text` under a fresh directory for this test.
+function freshNotes(name: borrow String, text: borrow String) -> String {
+    let root = scratchPath(name)
+    absorb removePath(root + "/notes")
+    absorb removePath(root)
+    absorb makeDirectory(root)
+    absorb writeFileBytes(root + "/notes", text.utf8())
+    return root
+}
+
+// Applies every file of a patch; the first refusal, as its message.
+function applyEveryFile(root: borrow String, files: borrow [PatchFile]) -> String {
+    for file in files {
+        match applyPatchFile(root, file) {
+            Ok -> {}
+            Error(failure) -> return archiveFailureText(failure)
+        }
+    }
+    return ""
+}
+
+function notesText(root: borrow String) -> String {
+    return match readArchiveFile(root + "/notes") {
+        Ok(bytes) -> textFromBytes(bytes).or("?")
+        Error(failure) -> archiveFailureText(failure)
+    }
+}
+
+@Test
+function patchAppliesWhereItsContextSits() {
+    let root = freshNotes("patch-applies", "zero\none\ntwo\nthree\nfour\n")
+    let patch = "--- a/notes\n+++ b/notes\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n"
+    let outcome = match readPatch(patch.utf8(), 1) {
+        Ok(files) -> applyEveryFile(root, files)
+        Error(failure) -> archiveFailureText(failure)
+    }
+    expect!((outcome) == "")
+    expect!((notesText(root)) == "zero\none\nTWO\nthree\nfour\n")
+}
+
+@Test
+function patchWhoseContextIsMissingIsRefused() {
+    let root = freshNotes("patch-refused", "zero\none\ntwo\n")
+    let patch = "--- a/notes\n+++ b/notes\n@@ -1,3 +1,3 @@\n nine\n-two\n+TWO\n three\n"
+    let outcome = match readPatch(patch.utf8(), 1) {
+        Ok(files) -> applyEveryFile(root, files)
+        Error(failure) -> archiveFailureText(failure)
+    }
+    expect!((outcome) == "hunk 1 of the patch of notes does not apply")
+    expect!((notesText(root)) == "zero\none\ntwo\n")
+}

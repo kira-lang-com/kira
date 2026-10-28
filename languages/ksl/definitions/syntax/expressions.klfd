@@ -1,0 +1,183 @@
+// Expressions, by precedence climbing over C's ladder: `||`, `&&`, `|`,
+// `^`, `&`, equality, ordering, shifts, `+ -`, `* / %`. Binary operators
+// associate to the left; `-` and `!` prefix an operand; `.field`, `[index]`
+// and `(arguments)` follow one.
+
+extend Parser {
+    function expression(borrow mut self) -> Result<Int, Failure> {
+        return binary(0)
+    }
+
+    function binary(borrow mut self, floor: Int) -> Result<Int, Failure> {
+        var left = try unary()
+        while true {
+            match binaryOperator(token().kind) {
+                Some(operator) -> {
+                    let precedence = binaryPrecedence(operator)
+                    if precedence < floor { return .Ok(left) }
+                    advance()
+                    let right = try binary(precedence + 1)
+                    let span = Span {
+                        file = tree.expressions[left].span.file, start = tree.expressions[left].span.start,
+                        end = tree.expressions[right].span.end
+                    }
+                    left = tree.addExpression(Expression {
+                        kind = .Binary, text = "", operator = operator, left = left, right = right,
+                        arguments = [], span = span
+                    })
+                }
+                None -> return .Ok(left)
+            }
+        }
+        return .Ok(left)
+    }
+
+    function unary(borrow mut self) -> Result<Int, Failure> {
+        var operator: Operator = .Negate
+        if at(.Minus) {
+            operator = .Negate
+        } else if at(.Bang) {
+            operator = .Not
+        } else {
+            return postfix()
+        }
+        let start = advance().span
+        let operand = try unary()
+        return .Ok(tree.addExpression(Expression {
+            kind = .Unary, text = "", operator = operator, left = operand, right = -1, arguments = [],
+            span = since(start)
+        }))
+    }
+
+    function postfix(borrow mut self) -> Result<Int, Failure> {
+        let start = token().span
+        var base = try primary()
+        while true {
+            if eat(.Dot) {
+                let field = try name()
+                base = tree.addExpression(Expression {
+                    kind = .Field, text = field.text, operator = .Add, left = base, right = -1,
+                    arguments = [], span = since(start)
+                })
+            } else if eat(.LeftBracket) {
+                let index = try expression()
+                try expect(.RightBracket)
+                base = tree.addExpression(Expression {
+                    kind = .Index, text = "", operator = .Add, left = base, right = index, arguments = [],
+                    span = since(start)
+                })
+            } else if eat(.LeftParen) {
+                var arguments: [Int] = []
+                var more = !at(.RightParen) && !at(.End)
+                while more {
+                    arguments.append(try expression())
+                    more = eat(.Comma) && !at(.RightParen) && !at(.End)
+                }
+                try expect(.RightParen)
+                base = tree.addExpression(Expression {
+                    kind = .Call, text = "", operator = .Add, left = base, right = -1,
+                    arguments = arguments, span = since(start)
+                })
+            } else {
+                return .Ok(base)
+            }
+        }
+        return .Ok(base)
+    }
+
+    function leaf(borrow mut self, kind: ExpressionKind) -> Int {
+        let taken = advance()
+        return tree.addExpression(Expression {
+            kind = kind, text = text(taken.span), operator = .Add, left = -1, right = -1, arguments = [],
+            span = taken.span
+        })
+    }
+
+    function primary(borrow mut self) -> Result<Int, Failure> {
+        let current = token()
+        let kind = current.kind
+        if kind == .IntegerLiteral {
+            if !fitsUnsigned64(text(current.span)) { return .Error(fail(.LiteralRange, current.span)) }
+            return .Ok(leaf(.IntegerLiteral))
+        }
+        if kind == .FloatLiteral { return .Ok(leaf(.FloatLiteral)) }
+        if kind == .True || kind == .False { return .Ok(leaf(.BooleanLiteral)) }
+        if kind == .Identifier { return .Ok(leaf(.Name)) }
+        if eat(.LeftParen) {
+            let inner = try expression()
+            try expect(.RightParen)
+            return .Ok(inner)
+        }
+        return .Error(fail(.Unexpected, current.span))
+    }
+}
+
+function binaryOperator(kind: TokenKind) -> Optional<Operator> {
+    if kind == .Plus { return .Some(.Add) }
+    if kind == .Minus { return .Some(.Subtract) }
+    if kind == .Star { return .Some(.Multiply) }
+    if kind == .Slash { return .Some(.Divide) }
+    if kind == .Percent { return .Some(.Remainder) }
+    if kind == .EqualEqual { return .Some(.Equal) }
+    if kind == .BangEqual { return .Some(.NotEqual) }
+    if kind == .Less { return .Some(.Less) }
+    if kind == .LessEqual { return .Some(.LessEqual) }
+    if kind == .Greater { return .Some(.Greater) }
+    if kind == .GreaterEqual { return .Some(.GreaterEqual) }
+    if kind == .AmpersandAmpersand { return .Some(.LogicalAnd) }
+    if kind == .PipePipe { return .Some(.LogicalOr) }
+    if kind == .Ampersand { return .Some(.BitAnd) }
+    if kind == .Pipe { return .Some(.BitOr) }
+    if kind == .Caret { return .Some(.BitXor) }
+    if kind == .LessLess { return .Some(.ShiftLeft) }
+    if kind == .GreaterGreater { return .Some(.ShiftRight) }
+    let none: Optional<Operator> = .None
+    return none
+}
+
+function binaryPrecedence(operator: Operator) -> Int {
+    match operator {
+        LogicalOr -> return 1
+        LogicalAnd -> return 2
+        BitOr -> return 3
+        BitXor -> return 4
+        BitAnd -> return 5
+        Equal -> return 6
+        NotEqual -> return 6
+        Less -> return 7
+        LessEqual -> return 7
+        Greater -> return 7
+        GreaterEqual -> return 7
+        ShiftLeft -> return 8
+        ShiftRight -> return 8
+        Add -> return 9
+        Subtract -> return 9
+        Multiply -> return 10
+        Divide -> return 10
+        Remainder -> return 10
+        Negate -> return 11
+        Not -> return 11
+    }
+}
+
+// Whether decimal `digits` fit in 64 unsigned bits.
+function fitsUnsigned64(digits: String) -> Bool {
+    return !digitsExceed(digits, "18446744073709551615")
+}
+
+// Whether the decimal `digits` (no sign, no leading zeros beyond one) are
+// greater than `bound`.
+function digitsExceed(digits: String, bound: String) -> Bool {
+    var start = 0
+    while start + 1 < utf8Count(digits) && utf8Byte(digits, start) == asciiZero {
+        start += 1
+    }
+    let length = utf8Count(digits) - start
+    if length != utf8Count(bound) { return length > utf8Count(bound) }
+    for index in 0..length {
+        let left = utf8Byte(digits, start + index)
+        let right = utf8Byte(bound, index)
+        if left != right { return left > right }
+    }
+    return false
+}

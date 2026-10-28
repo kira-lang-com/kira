@@ -1,0 +1,134 @@
+// TLS 1.3 record protection (RFC 8446 section 5): one direction's keys, the
+// record header, and sealing and opening of TLSInnerPlaintext.
+
+namespace TlsRecordLimit {
+    let alertBytes: Number = 2
+    let fatal: Number = 2
+    // A KeyUpdate's one byte: whether the peer must update too.
+    let updateNotRequested: Number = 0
+    let updateRequested: Number = 1
+}
+
+// One direction's record keys: the secret they came from, which a key
+// update replaces, and the count of records sealed or opened under them.
+struct TlsRecordKeys {
+    let parameters: TlsSuiteParameters
+    let secret: [UN8]
+    let keys: TlsTrafficKeys
+    var sequence: Number = 0
+
+    // The keys of the next generation (RFC 8446 section 7.2).
+    function updated(borrow self) -> Result<TlsRecordKeys, TlsAlert> {
+        let next = try tlsUpdatedSecret(parameters, secret, .Record) otherwise return .Error(
+            .InternalError
+        )
+        return tlsRecordKeys(parameters, next)
+    }
+
+    // `content` of `kind` as a protected record.
+    function seal(
+        borrow mut self,
+        kind: TlsContentType,
+        content: borrow [UN8]
+    ) -> Result<[UN8], TlsAlert> {
+        var inner = copy content
+        inner.append(UN8(code(kind)))
+        let length = inner.count + CryptoService.tagBytes
+        let header = tlsRecordHeader(.ApplicationData, length)
+        let nonce = tlsSequenceNonce(keys.iv, sequence)
+        let sealed = try sealAead(keys.key, nonce, header, inner) otherwise return .Error(
+            .InternalError
+        )
+        sequence += 1
+        return .Ok(joinedBytes(header, sealed))
+    }
+
+    // A protected record's content and inner type. The padding is the zeros
+    // after the type (RFC 8446 section 5.4).
+    function open(
+        borrow mut self,
+        header: borrow [UN8],
+        sealed: borrow [UN8]
+    ) -> Result<TlsInnerRecord, TlsAlert> {
+        let nonce = tlsSequenceNonce(keys.iv, sequence)
+        let inner = try openAead(keys.key, nonce, header, sealed) otherwise return .Error(
+            .BadRecordMac
+        )
+        sequence += 1
+        var end = inner.count
+        while end > 0 && inner[end - 1] == 0 { end -= 1 }
+        if end == 0 { return .Error(.UnexpectedMessage) }
+        let kind: TlsContentType = fromCode<TlsContentType>(Number(inner[end - 1]))
+        return .Ok(TlsInnerRecord { kind: kind, content: byteRun(inner, 0, end - 1) })
+    }
+}
+
+struct TlsInnerRecord {
+    let kind: TlsContentType
+    let content: [UN8]
+}
+
+function tlsRecordKeys(
+    parameters: borrow TlsSuiteParameters,
+    secret: borrow [UN8]
+) -> Result<TlsRecordKeys, TlsAlert> {
+    let keys = try tlsTrafficKeys(parameters, secret, .Record) otherwise return .Error(
+        .InternalError
+    )
+    return .Ok(TlsRecordKeys { parameters: copy parameters, secret: copy secret, keys: keys })
+}
+
+// A record header: its type, the frozen legacy version and the length.
+function tlsRecordHeader(kind: TlsContentType, length: Number) -> [UN8] {
+    var writer = WireWriter {}
+    writer.writeByte(code(kind))
+    writer.writeInteger(Tls.legacyVersion, Tls.vector)
+    writer.writeInteger(length, Tls.vector)
+    return writer.bytes
+}
+
+// `content` as unprotected records, none longer than the limit.
+function tlsPlainRecords(kind: TlsContentType, content: borrow [UN8]) -> [UN8] {
+    var out: [UN8] = []
+    var start = 0
+    while start < content.count {
+        let end = min(start + Tls.recordPlaintextMaximum, content.count)
+        out.appendAll(tlsRecordHeader(kind, end - start))
+        out.appendAll(byteRun(content, start, end))
+        start = end
+    }
+    return out
+}
+
+function tlsAlertBody(alert: TlsAlert) -> [UN8] {
+    let level = alert == .CloseNotify ? 1 : TlsRecordLimit.fatal
+    return [UN8(level), UN8(code(alert))]
+}
+
+// A whole record cut from the front of what TCP delivered.
+struct TlsRecordFrame {
+    let kind: TlsContentType
+    let header: [UN8]
+    let body: [UN8]
+}
+
+// The next whole record in `pending`, none while it is still arriving.
+function tlsNextRecord(pending: borrow [UN8]) -> Result<TlsRecordFrame?, TlsAlert> {
+    if pending.count < Tls.recordHeaderBytes { return .Ok(.None) }
+    var reader = WireReader { bytes: copy pending }
+    let kind = try reader.readByte() otherwise return .Error(.DecodeError)
+    try reader.skip(Tls.vector) otherwise return .Error(.DecodeError)
+    let length = try reader.readInteger(Tls.vector) otherwise return .Error(.DecodeError)
+    if length > Tls.recordCiphertextMaximum { return .Error(.RecordOverflow) }
+    if reader.remaining() < length { return .Ok(.None) }
+    let end = Tls.recordHeaderBytes + length
+    return .Ok(
+        .Some(
+            TlsRecordFrame {
+                kind: fromCode<TlsContentType>(kind),
+                header: byteRun(pending, 0, Tls.recordHeaderBytes),
+                body: byteRun(pending, Tls.recordHeaderBytes, end)
+            }
+        )
+    )
+}

@@ -1,0 +1,77 @@
+extend Checker {
+    function checkTransfer(borrow mut self, mode: OwnershipMode, operand: Int, expected: Optional<Type>, span: Span) -> Int {
+        let checked = expression(operand, expected)
+        let valueType = typeOf(checked)
+        if valueType.equals(Type.void()) {
+            report(.OperatorOperand, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        if mode == .Move && valueType.isAggregate() && !isDistinctType(program, valueType) {
+            match tree.expressions[operand].kind.name() {
+                Some(name) -> {
+                    match lookup(name.text) {
+                        Some(local) -> {
+                            if locals[local].cell {
+                                report(.MoveCapturedVar, span)
+                            } else if locals[local].passingMode != .Owned {
+                                report(.MoveBorrowed, span)
+                            } else {
+                                locals[local].moved = true
+                            }
+                        }
+                        None -> {}
+                    }
+                }
+                None -> noteFieldMove(operand, valueType)
+            }
+        }
+        return add(.Transfer(mode, checked), valueType, span)
+    }
+
+    // A local named bare as the argument of an owned parameter is given away
+    // only when written `move`; one whose value owns storage is refused rather
+    // than silently copied or consumed. A `copy` parameter refuses it the same
+    // way. A temporary has no binding to lose, so it needs nothing, and nor
+    // does a closure's capture, which its environment holds rather than a
+    // binding of the closure's own.
+    function checkNamedArgument(borrow mut self, argument: Int, checked: Int, expected: Type, mode: PassingMode, copies: Bool) {
+        if mode != .Owned { return }
+        match tree.expressions[argument].kind.name() {
+            Some(name) -> {
+                match lookup(name.text) {
+                    Some(local) -> { if locals[local].captured { return } }
+                    None -> return
+                }
+            }
+            None -> return
+        }
+        if triviallyCopyable(expected) || triviallyCopyable(typeOf(checked)) { return }
+        if copies {
+            report(.CopiedArgumentNotTrivial, program.expressions[checked].span)
+        } else {
+            report(.OwnedArgumentNeedsMove, program.expressions[checked].span)
+        }
+    }
+
+    // Whether copying a value of `valueType` copies only bits: the scalars and
+    // pointers, an enum none of whose cases carries a payload, which is its
+    // tag alone (only an enum with a payload moves, KLF section 27.3), and
+    // the handles that name something owned elsewhere.
+    function triviallyCopyable(borrow self, valueType: Type) -> Bool {
+        match valueType.kind {
+            Integer -> return true
+            Decimal -> return true
+            Floating -> return true
+            Boolean -> return true
+            Pointer -> return true
+            Void -> return true
+            Invalid -> return true
+            Enumeration -> return isDistinctType(program, valueType) || !carriesPayload(program, valueType)
+            Structure -> {
+                return isDistinctType(program, valueType) || isTaskType(program, valueType) || isChannelEnd(program, valueType)
+                    || isCStringType(program, valueType) || isNativeStateType(program, declarations, valueType)
+                    || isDescriptorType(declarations, valueType) || isForeignPointerValue(program, valueType)
+            }
+        }
+    }
+}

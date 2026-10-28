@@ -1,0 +1,524 @@
+import Foundation
+
+// EnxEnumTests.kira — Deep enum test suite.
+// Covers: payload-less enums (4-variant, 3-variant, 4-variant), single-payload
+// Int enums, mixed payload/payload-less enums, enums as struct fields, arrays
+// of enums matched via borrow-param helpers, state-machine transitions, and
+// trap tests.  All top-level names use prefix enx / Enx.
+
+// ---------------------------------------------------------------------------
+// Single-payload + payload-less enum tests — EnxEvent
+// ---------------------------------------------------------------------------
+
+@Test
+function enxEventClickDirect() {
+    expect!(enxEventScore(.Click(7)) == 7)
+}
+
+@Test
+function enxEventKeyDirect() {
+    expect!(enxEventScore(.Key(3)) == 30)
+}
+
+@Test
+function enxEventScrollDirect() {
+    expect!(enxEventScore(.Scroll(2)) == 200)
+}
+
+@Test
+function enxEventIdleDirect() {
+    expect!(enxEventScore(.Idle) == 0)
+}
+
+// [Click(3),Key(2),Scroll(1),Idle,Click(5),Key(1)] -> 3+20+100+0+5+10=138
+@Test
+function enxEventArrayFold() {
+    let es: [EnxEvent] = [.Click(3), .Key(2), .Scroll(1), .Idle, .Click(5), .Key(1)]
+    var s = 0
+    for ev in es {
+        s = s + enxEventScore(ev)
+    }
+    expect!(s == 138)
+}
+
+// Indexed access via borrow helper
+// events[j] via enxEventScore(events[j])
+// [Click(10), Idle, Key(3), Scroll(1)] -> 10+0+30+100=140
+@Test
+function enxEventIndexedFold() {
+    var events: [EnxEvent] = []
+    events.append(.Click(10))
+    events.append(.Idle)
+    events.append(.Key(3))
+    events.append(.Scroll(1))
+    var acc = 0
+    for j in 0..events.count {
+        acc = acc + enxEventScore(events[j])
+    }
+    expect!(acc == 140)
+}
+
+// Count non-Idle events in [Click(1),Idle,Key(2),Scroll(3),Idle,Click(4)] -> 4
+@Test
+function enxEventCountNonIdle() {
+    let es: [EnxEvent] = [.Click(1), .Idle, .Key(2), .Scroll(3), .Idle, .Click(4)]
+    var count = 0
+    for ev in es {
+        if enxIsIdleEvent(ev) == 0 {
+            count = count + 1
+        }
+    }
+    expect!(count == 4)
+}
+
+// Sum only Click payloads in [Click(5),Key(2),Click(8),Idle,Click(1)]: 5+8+1=14
+@Test
+function enxEventSumClicksOnly() {
+    let es: [EnxEvent] = [.Click(5), .Key(2), .Click(8), .Idle, .Click(1)]
+    var acc = 0
+    for ev in es {
+        acc = acc + enxClickPayload(ev)
+    }
+    expect!(acc == 14)
+}
+
+// ---------------------------------------------------------------------------
+// Mixed payload/payload-less enum tests — EnxStatus
+// ---------------------------------------------------------------------------
+
+@Test
+function enxStatusDormantDirect() {
+    expect!(enxStatusCode(.Dormant) == 0)
+}
+
+@Test
+function enxStatusRunningDirect() {
+    expect!(enxStatusCode(.Running(42)) == 42)
+}
+
+// Done(15) -> 15+100=115
+@Test
+function enxStatusDoneDirect() {
+    expect!(enxStatusCode(.Done(15)) == 115)
+}
+
+// Failed(8) -> 0-8 = -8
+@Test
+function enxStatusFailedDirect() {
+    expect!(enxStatusCode(.Failed(8)) == 0 - 8)
+}
+
+// i=0..11: enxStatusFor(i) then code:
+// Dormant: i=0,4,8 -> codes 0,0,0 = 0
+// Running: i=1,5,9 -> codes 1,5,9 = 15
+// Done: i=2,6,10 -> codes 102,106,110 = 318
+// Failed: i=3,7,11 -> codes -3,-7,-11 = -21
+// total = 0+15+318-21 = 312
+@Test
+function enxStatusFold12() {
+    var acc = 0
+    for i in 0..12 {
+        let s = enxStatusFor(i)
+        acc = acc + enxStatusCode(s)
+    }
+    expect!(acc == 312)
+}
+
+// Count Running+Done (active) in i=0..11: Running=3, Done=3 -> 6
+@Test
+function enxStatusCountActive() {
+    var count = 0
+    for i in 0..12 {
+        let s = enxStatusFor(i)
+        var active = 0
+        match s {
+            Dormant -> { active = 0 }
+            Running(n) -> { active = 1 }
+            Done(n) -> { active = 1 }
+            Failed(n) -> { active = 0 }
+        }
+        count = count + active
+    }
+    expect!(count == 6)
+}
+
+// Sum Running payload values in i=0..11: Running at i=1,5,9 -> 1+5+9=15
+@Test
+function enxStatusRunningSum() {
+    var acc = 0
+    for i in 0..12 {
+        let s = enxStatusFor(i)
+        var v = 0
+        match s {
+            Running(n) -> { v = n }
+            Dormant -> { v = 0 }
+            Done(n) -> { v = 0 }
+            Failed(n) -> { v = 0 }
+        }
+        acc = acc + v
+    }
+    expect!(acc == 15)
+}
+
+// Indexed access via borrow helper: statusFor is called, result passed to enxStatusCode(statuses[j])
+// Build [Dormant, Running(10), Done(5), Failed(3), Running(20)]
+// codes: 0+10+105-3+20=132
+@Test
+function enxStatusIndexedFold() {
+    var statuses: [EnxStatus] = []
+    statuses.append(.Dormant)
+    statuses.append(.Running(10))
+    statuses.append(.Done(5))
+    statuses.append(.Failed(3))
+    statuses.append(.Running(20))
+    var acc = 0
+    for j in 0..statuses.count {
+        acc = acc + enxStatusCode(statuses[j])
+    }
+    expect!(acc == 132)
+}
+
+// ---------------------------------------------------------------------------
+// EnxNode — mixed payload/payload-less (Leaf, Tagged, Empty)
+// ---------------------------------------------------------------------------
+
+@Test
+function enxNodeLeafDirect() {
+    expect!(enxNodeVal(.Leaf(7)) == 7)
+}
+
+@Test
+function enxNodeTaggedDirect() {
+    expect!(enxNodeVal(.Tagged(4)) == 40)
+}
+
+@Test
+function enxNodeEmptyDirect() {
+    expect!(enxNodeVal(.Empty) == 0)
+}
+
+// [Leaf(5),Tagged(3),Empty,Leaf(7),Tagged(1),Empty,Leaf(2)] -> 5+30+0+7+10+0+2=54
+@Test
+function enxNodeArrayFold() {
+    let ns: [EnxNode] = [.Leaf(5), .Tagged(3), .Empty, .Leaf(7), .Tagged(1), .Empty, .Leaf(2)]
+    var s = 0
+    for n in ns {
+        s = s + enxNodeVal(n)
+    }
+    expect!(s == 54)
+}
+
+// Indexed access via borrow helper
+// [Leaf(3), Tagged(2), Empty, Leaf(10)] via enxNodeVal(nodes[j])
+// 3+20+0+10=33
+@Test
+function enxNodeIndexedFold() {
+    var nodes: [EnxNode] = []
+    nodes.append(.Leaf(3))
+    nodes.append(.Tagged(2))
+    nodes.append(.Empty)
+    nodes.append(.Leaf(10))
+    var acc = 0
+    for j in 0..nodes.count {
+        acc = acc + enxNodeVal(nodes[j])
+    }
+    expect!(acc == 33)
+}
+
+// Count Leaf nodes in [Leaf(1),Empty,Leaf(2),Tagged(3),Leaf(4),Empty] -> 3
+@Test
+function enxNodeCountLeaves() {
+    let ns: [EnxNode] = [.Leaf(1), .Empty, .Leaf(2), .Tagged(3), .Leaf(4), .Empty]
+    var count = 0
+    for n in ns {
+        count = count + enxIsLeaf(n)
+    }
+    expect!(count == 3)
+}
+
+// ---------------------------------------------------------------------------
+// Enum as struct field — EnxItem
+// ---------------------------------------------------------------------------
+
+// EnxItem{Low, 4} -> 4
+@Test
+function enxItemScoreLow() {
+    let item = EnxItem { priority: .Low, value: 4 }
+    expect!(enxItemScore(item) == 4)
+}
+
+// EnxItem{Medium, 3} -> 15
+@Test
+function enxItemScoreMedium() {
+    let item = EnxItem { priority: .Medium, value: 3 }
+    expect!(enxItemScore(item) == 15)
+}
+
+// EnxItem{High, 2} -> 20
+@Test
+function enxItemScoreHigh() {
+    let item = EnxItem { priority: .High, value: 2 }
+    expect!(enxItemScore(item) == 20)
+}
+
+// [L(2),M(3),H(1),L(4),H(2),M(1)] -> 2+15+10+4+20+5=56
+@Test
+function enxItemLiteralArrayFold() {
+    let items: [EnxItem] = [
+        EnxItem { priority: .Low, value: 2 },
+        EnxItem { priority: .Medium, value: 3 },
+        EnxItem { priority: .High, value: 1 },
+        EnxItem { priority: .Low, value: 4 },
+        EnxItem { priority: .High, value: 2 },
+        EnxItem { priority: .Medium, value: 1 }
+    ]
+    var s = 0
+    for item in items {
+        s = s + enxItemScore(item)
+    }
+    expect!(s == 56)
+}
+
+// Dynamic build: i=0..5, item{priorityFor(i%3), value: i+1}
+// i=0:L,v=1->1; i=1:M,v=2->10; i=2:H,v=3->30; i=3:L,v=4->4; i=4:M,v=5->25; i=5:H,v=6->60
+// sum=130
+@Test
+function enxItemDynFold() {
+    var acc = 0
+    for i in 0..6 {
+        let item = EnxItem { priority: enxPriorityFor(i), value: i + 1 }
+        acc = acc + enxItemScore(item)
+    }
+    expect!(acc == 130)
+}
+
+// ---------------------------------------------------------------------------
+// Combined / cross-enum tests
+// ---------------------------------------------------------------------------
+
+// sum (enxDirWeight(enxDirFor(i)) + enxSeasonCode(enxSeasonFor(i))) for i=0..7:
+// i=0: N(1)+Spr(10)=11, i=1: S(2)+Sum(20)=22, i=2: E(3)+Aut(30)=33, i=3: W(4)+Win(40)=44
+// i=4: N(1)+Spr(10)=11, i=5: S(2)+Sum(20)=22, i=6: E(3)+Aut(30)=33, i=7: W(4)+Win(40)=44
+// sum=220
+@Test
+function enxDirSeasonCombinedFold() {
+    var acc = 0
+    for i in 0..8 {
+        let dw = enxDirWeight(enxDirFor(i))
+        let sc = enxSeasonCode(enxSeasonFor(i))
+        acc = acc + dw + sc
+    }
+    expect!(acc == 220)
+}
+
+// sum (enxTokenVal(enxTokenFor(i)) + enxPriorityScore(enxPriorityFor(i))) for i=0..5:
+// i=0:Num(0)->0+Low->1=1
+// i=1:Paren(1)->2+Med->5=7
+// i=2:Op(2)->6+High->10=16
+// i=3:Num(3)->3+Low->1=4
+// i=4:Paren(4)->8+Med->5=13
+// i=5:Op(5)->15+High->10=25
+// sum=66
+@Test
+function enxTokenPriorityPairFold() {
+    var acc = 0
+    for i in 0..6 {
+        let tv = enxTokenVal(enxTokenFor(i))
+        let pv = enxPriorityScore(enxPriorityFor(i))
+        acc = acc + tv + pv
+    }
+    expect!(acc == 66)
+}
+
+// Dirs 0..11 + Seasons 0..11:
+// dirs: 3*(1+2+3+4)=30, seasons: 3*(10+20+30+40)=300 -> 330
+@Test
+function enxDirPlusSeasonFolds() {
+    var dirAcc = 0
+    var seaAcc = 0
+    for i in 0..12 {
+        dirAcc = dirAcc + enxDirWeight(enxDirFor(i))
+        seaAcc = seaAcc + enxSeasonCode(enxSeasonFor(i))
+    }
+    expect!(dirAcc + seaAcc == 330)
+}
+
+// Nested: for each priority band, sum token values with that priority weight as multiplier.
+// i=0..8: token(i) value * priorityScore(priorityFor(i))
+// i=0:Num(0)*L(1)=0, i=1:Paren(1)*M(5)=10, i=2:Op(2)*H(10)=60
+// i=3:Num(3)*L(1)=3, i=4:Paren(4)*M(5)=40, i=5:Op(5)*H(10)=150
+// i=6:Num(6)*L(1)=6, i=7:Paren(7)*M(5)=70, i=8:Op(8)*H(10)=240
+// sum=0+10+60+3+40+150+6+70+240=579
+@Test
+function enxTokenPriorityMultiplyFold() {
+    var acc = 0
+    for i in 0..9 {
+        let tv = enxTokenVal(enxTokenFor(i))
+        let ps = enxPriorityScore(enxPriorityFor(i))
+        acc = acc + tv * ps
+    }
+    expect!(acc == 579)
+}
+
+// Event scores + dir weights for same index i=0..5:
+// i=0: Click(0)=0+North=1=1... wait, EnxEvent doesn't have a For function.
+// Let me just do [Click(1),Key(1),Scroll(1),Idle,Click(2),Key(2)] scores=1+10+100+0+2+20=133
+// plus Dir 0..5 weights: 1+2+3+4+1+2=13
+// total=146
+@Test
+function enxEventPlusDirFold() {
+    let es: [EnxEvent] = [.Click(1), .Key(1), .Scroll(1), .Idle, .Click(2), .Key(2)]
+    var eAcc = 0
+    for ev in es {
+        eAcc = eAcc + enxEventScore(ev)
+    }
+    var dAcc = 0
+    for i in 0..6 {
+        dAcc = dAcc + enxDirWeight(enxDirFor(i))
+    }
+    expect!(eAcc + dAcc == 146)
+}
+
+// ---------------------------------------------------------------------------
+// State-machine-style tests (Status transitions as scalar sequence)
+// ---------------------------------------------------------------------------
+
+// Simulate: 3 steps of Running(n) advancing n by 5 each step, check final code
+// n0=7, n1=12, n2=17: code of Running(17)=17
+@Test
+function enxStatusRunningProgress() {
+    var n = 7
+    for steps in 0..3 {
+        n = n + 5
+    }
+    expect!(enxStatusCode(.Running(n)) == 22)
+}
+
+// Status code sum for a specific sequence:
+// [Dormant, Running(3), Running(6), Done(3), Failed(1), Done(10)]
+// codes: 0+3+6+103+(-1)+110=221
+@Test
+function enxStatusSequenceFold() {
+    let ss: [EnxStatus] = [
+        .Dormant,
+        .Running(3),
+        .Running(6),
+        .Done(3),
+        .Failed(1),
+        .Done(10)
+    ]
+    var acc = 0
+    for s in ss {
+        acc = acc + enxStatusCode(s)
+    }
+    expect!(acc == 221)
+}
+
+// Max status code in [Running(5), Done(2), Running(8), Failed(3)]:
+// codes: 5, 102, 8, -3 -> max=102
+@Test
+function enxStatusMaxCode() {
+    let ss: [EnxStatus] = [.Running(5), .Done(2), .Running(8), .Failed(3)]
+    var mx = 0 - 99999
+    for s in ss {
+        let c = enxStatusCode(s)
+        if c > mx {
+            mx = c
+        }
+    }
+    expect!(mx == 102)
+}
+
+// A trap test: `expectTrap!` names the trap it expects, and the body runs in a child that traps.
+
+// OOB on array of EnxDir
+@Test
+function enxTrapDirArrayOOB() {
+    expectTrap!("")
+    let ds: [EnxDir] = [.North, .South, .East]
+    let _ = enxDirWeight(ds[10])
+}
+
+// OOB on array of EnxToken
+@Test
+function enxTrapTokenArrayOOB() {
+    expectTrap!("")
+    let ts: [EnxToken] = [.Num(1), .Paren(2)]
+    let _ = enxTokenVal(ts[5])
+}
+
+// OOB on array of EnxStatus
+@Test
+function enxTrapStatusArrayOOB() {
+    expectTrap!("")
+    var ss: [EnxStatus] = []
+    ss.append(.Dormant)
+    ss.append(.Running(1))
+    let _ = enxStatusCode(ss[100])
+}
+
+// Div by zero derived from enum payload: Token.Num(0) -> val=0, then 10/val
+@Test
+function enxTrapDivByTokenPayload() {
+    expectTrap!("")
+        let t: EnxToken = .Num(0)
+        let val = enxTokenVal(t)
+        let _ = 10 / val
+}
+
+// Mod by zero derived from enum payload
+@Test
+function enxTrapModByTokenPayload() {
+    expectTrap!("")
+        let t: EnxToken = .Op(0)
+        let val = enxTokenVal(t)
+        let _ = 42 % val
+}
+
+// OOB on empty EnxNode array
+@Test
+function enxTrapNodeEmptyArrayOOB() {
+    expectTrap!("")
+    let ns: [EnxNode] = []
+    let _ = enxNodeVal(ns[0])
+}
+
+// Div zero via status payload: Failed(0) -> code = 0-0 = 0, then 5/0
+@Test
+function enxTrapDivByStatusCode() {
+    expectTrap!("")
+        let s: EnxStatus = .Failed(0)
+        let code = enxStatusCode(s)
+        let _ = 5 / code
+}
+
+// OOB via computed index from enum: Leaf(100) -> val=100, index into 3-elem array
+@Test
+function enxTrapOOBFromLeafPayload() {
+    expectTrap!("")
+    let n: EnxNode = .Leaf(100)
+    let idx = enxNodeVal(n)
+    let xs: [Int] = [1, 2, 3]
+    let _ = xs[idx]
+}
+
+// OOB in loop that scans an array of EnxEvent with wrong count
+@Test
+function enxTrapEventOOBInLoop() {
+    expectTrap!("")
+    let events: [EnxEvent] = [.Click(1), .Idle]
+    var acc = 0
+    for i in 0..10 {
+        acc = acc + enxEventScore(events[i])
+    }
+}
+
+// Div zero from direction weight difference: North(1)-North(1)=0, then 7/(w1-w2)
+@Test
+function enxTrapDivByDirDiff() {
+    expectTrap!("")
+        let d1: EnxDir = .North
+        let d2: EnxDir = .North
+        let diff = enxDirWeight(d1) - enxDirWeight(d2)
+        let _ = 7 / diff
+}

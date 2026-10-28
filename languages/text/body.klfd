@@ -1,0 +1,227 @@
+// Function bodies (section 19.1 rule 5): statements, structured control
+// flow, and the binding of expressions to temporaries where their `emit`
+// evaluates them. Every other expression is written where it is used.
+//
+// The out defines, in `extend TextOut`:
+//   dialectExpression(expression) -> String: an expression written in place;
+//   dialectTemporary(name, expression, value) -> String: a temporary's
+//     declaration;
+//   dialectStatement(block, position, which, depth) -> Bool: writes a
+//     statement the target spells its own way, and answers whether it did;
+//   dialectNativeLoop() -> Bool: whether loops keep their `continuing`;
+//   dialectCaseBreak() -> Bool: whether a case that does not fall through
+//     ends with `break`;
+//   dialectCaseLabel(value) -> String: the label of a case, from its KSIR
+//     value (`3i32`, `3u32` or `default`);
+//   dialectKeepsArgument(expression) -> Bool and dialectArgument(expression)
+//     -> String: whether and how a call passes an argument;
+//   dialectCallArguments(callee) -> [String]: what a call passes after the
+//     written arguments;
+//   dialectBakeAlways(expression) -> Bool: whether an expression used once
+//     is bound to a temporary all the same;
+//   dialectLineDirective(file, line) -> String: what places the lines that
+//     follow in their source, or empty.
+
+extend TextOut {
+    // An operand: its temporary, or the expression in place.
+    function operand(borrow self, expression: Int) -> String {
+        let name = baked[expression]
+        if utf8Count(name) > 0 { return name }
+        return dialectExpression(expression)
+    }
+
+    // Names a temporary for `expression` holding `value` and declares it.
+    function bake(borrow mut self, expression: Int, value: String, depth: Int) -> String {
+        var name = ""
+        if textCount("expressions", current, expression, "named") > 0 {
+            name = scopeName(text("expressions", current, expression, "named"))
+        } else {
+            name = scopeName(joinText(["_e", decimalText(expression)]))
+        }
+        line(depth, dialectTemporary(name, expression, value))
+        baked[expression] = name
+        return name
+    }
+
+    // An expression the source named is bound; so is one used twice, or
+    // once when it reads memory or a texture, which must happen where the
+    // source put it. A pointer, image or sampler is a place, never a value.
+    function shouldBake(borrow self, expression: Int) -> Bool {
+        let shape = typeKindOf(expression)
+        if shape == "pointer" || shape == "image" || shape == "sampler" { return false }
+        if textCount("expressions", current, expression, "named") > 0 { return true }
+        let uses = operandOf(expression, "ref_count")
+        let which = expressionKind(expression)
+        var threshold = 2
+        if which == "load" || which == "image_sample" || which == "image_load" || which == "image_query"
+            || which == "derivative" || which == "array_length" {
+            threshold = 1
+        } else if dialectBakeAlways(expression) {
+            threshold = 1
+        }
+        return uses >= threshold
+    }
+
+    function writeBlock(borrow mut self, block: Int, depth: Int) {
+        let statements = count("statements", block)
+        for position in 0..statements {
+            writeStatement(block, position, depth)
+        }
+    }
+
+    function writeEmit(borrow mut self, first: Int, last: Int, depth: Int) {
+        let end = last + 1
+        for expression in first..end {
+            if shouldBake(expression) {
+                let value = dialectExpression(expression)
+                bake(expression, value, depth)
+            }
+        }
+    }
+
+    function writeStatement(borrow mut self, block: Int, position: Int, depth: Int) {
+        let file = statementField(block, position, "file")
+        let lineNumber = statementField(block, position, "line")
+        if file != lastFile || lineNumber != lastLine {
+            let directive = dialectLineDirective(file, lineNumber)
+            if utf8Count(directive) > 0 {
+                writeLine(directive)
+                lastFile = file
+                lastLine = lineNumber
+            }
+        }
+        let which = statementKind(block, position)
+        if dialectStatement(block, position, which, depth) { return }
+        match which {
+            "emit" -> writeEmit(statementField(block, position, "first"), statementField(block, position, "last"), depth)
+            "block" -> {
+                line(depth, "{")
+                writeBlock(statementField(block, position, "body"), depth + 1)
+                line(depth, "}")
+            }
+            "if" -> {
+                let condition = operand(statementField(block, position, "condition"))
+                line(depth, joinText(["if (", condition, ") {"]))
+                writeBlock(statementField(block, position, "accept"), depth + 1)
+                let reject = statementField(block, position, "reject")
+                if count("statements", reject) > 0 {
+                    line(depth, "} else {")
+                    writeBlock(reject, depth + 1)
+                }
+                line(depth, "}")
+            }
+            "switch" -> writeSwitch(block, position, depth)
+            "loop" -> writeLoop(block, position, depth)
+            "break" -> line(depth, "break;")
+            "continue" -> line(depth, "continue;")
+            "return" -> {
+                let value = statementField(block, position, "value")
+                if value >= 0 {
+                    let text = operand(value)
+                    line(depth, joinText(["return ", text, ";"]))
+                } else {
+                    line(depth, "return;")
+                }
+            }
+            "store" -> {
+                let target = operand(statementField(block, position, "pointer"))
+                let value = operand(statementField(block, position, "value"))
+                line(depth, joinText([target, " = ", value, ";"]))
+            }
+            "call" -> writeCall(block, position, depth)
+            else -> refuseAt(joinText(["the target has no form for `", which, "`"]), "statements", block, position)
+        }
+    }
+
+    function writeCall(borrow mut self, block: Int, position: Int, depth: Int) {
+        let callee = statementField(block, position, "function")
+        var texts: [String] = []
+        let arguments = fieldCount("statements", block, position, "arguments")
+        for at in 0..arguments {
+            let argument = fieldItem("statements", block, position, "arguments", at)
+            if dialectKeepsArgument(argument) { texts.append(dialectArgument(argument)) }
+        }
+        for extra in dialectCallArguments(callee) {
+            texts.append(extra)
+        }
+        let call = joinText([functionNames[callee], "(", joinWith(texts, ", "), ")"])
+        let result = statementField(block, position, "result")
+        if result >= 0 {
+            bake(result, call, depth)
+        } else {
+            line(depth, joinText([call, ";"]))
+        }
+    }
+
+    function writeSwitch(borrow mut self, block: Int, position: Int, depth: Int) {
+        let selector = operand(statementField(block, position, "selector"))
+        line(depth, joinText(["switch (", selector, ") {"]))
+        let cases = fieldCount("statements", block, position, "case_block")
+        for at in 0..cases {
+            let label = dialectCaseLabel(textItem("statements", block, position, "case_value", at))
+            line(depth + 1, joinText([label, " {"]))
+            writeBlock(fieldItem("statements", block, position, "case_block", at), depth + 2)
+            if dialectCaseBreak() && fieldItem("statements", block, position, "case_fall", at) == 0
+                && fieldItem("statements", block, position, "case_ends", at) == 0 {
+                line(depth + 2, "break;")
+            }
+            line(depth + 1, "}")
+        }
+        line(depth, "}")
+    }
+
+    // A loop without `continuing` is `while (true)`. One with it runs the
+    // continuing at the top of every pass but the first, under a flag.
+    function writeLoop(borrow mut self, block: Int, position: Int, depth: Int) {
+        let body = statementField(block, position, "body")
+        let continuing = statementField(block, position, "continuing")
+        let breakIf = statementField(block, position, "break_if")
+        let plain = count("statements", continuing) == 0 && breakIf < 0
+        if dialectNativeLoop() {
+            line(depth, "loop {")
+            writeBlock(body, depth + 1)
+            if !plain {
+                line(depth + 1, "continuing {")
+                writeBlock(continuing, depth + 2)
+                if breakIf >= 0 {
+                    let condition = operand(breakIf)
+                    line(depth + 2, joinText(["break if ", condition, ";"]))
+                }
+                line(depth + 1, "}")
+            }
+            line(depth, "}")
+            return
+        }
+        if plain {
+            line(depth, "while (true) {")
+            writeBlock(body, depth + 1)
+            line(depth, "}")
+            return
+        }
+        let flagName = scopeFresh("loop_init")
+        line(depth, joinText(["bool ", flagName, " = true;"]))
+        line(depth, "while (true) {")
+        line(depth + 1, joinText(["if (!", flagName, ") {"]))
+        writeBlock(continuing, depth + 2)
+        if breakIf >= 0 {
+            let condition = operand(breakIf)
+            line(depth + 2, joinText(["if (", condition, ") { break; }"]))
+        }
+        line(depth + 1, "}")
+        line(depth + 1, joinText([flagName, " = false;"]))
+        writeBlock(body, depth + 1)
+        line(depth, "}")
+    }
+}
+
+// A case value without its KSIR suffix.
+function caseNumber(value: String) -> String {
+    return utf8Slice(value, 0, utf8Count(value) - 3)
+}
+
+// The C-like label of a case.
+function cLabel(value: String) -> String {
+    if value == "default" { return "default:" }
+    if endsWithText(value, "u32") { return joinText(["case ", caseNumber(value), "u:"]) }
+    return joinText(["case ", caseNumber(value), ":"])
+}

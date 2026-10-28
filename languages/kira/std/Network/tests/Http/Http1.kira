@@ -1,0 +1,152 @@
+import Foundation
+
+function describeHttp1(reader: borrow mut Http1Reader) -> String {
+    var parts: [String] = []
+    while true {
+        let next = reader.event()
+        let event = match next {
+            Some(value) -> value
+            None -> return joined(parts, "; ")
+        }
+        let text = match event {
+            Head(head) -> match head {
+                RequestHead(
+                    request
+                ) -> "request \(traceText(request.method)) \(request.target.scheme)://\(request.target.authority)\(request.target.path) \(describeFields(request.fields))"
+                ResponseHead(
+                    response
+                ) -> "response \(code(response.status)) \(describeFields(response.fields))"
+            }
+            Body(bytes) -> match textFromBytes(bytes) {
+                Some(body) -> "body \(body)"
+                None -> "body ?"
+            }
+            Ended(trailers) -> "ended \(describeFields(trailers))"
+        }
+        parts.append(text)
+    }
+    return joined(parts, "; ")
+}
+
+// `bytes` fed a few at a time, as a socket might deliver them.
+function feedPieces(reader: borrow mut Http1Reader, bytes: borrow [UN8], piece: Number) -> String {
+    var at = 0
+    while at < bytes.count {
+        let end = min(at + piece, bytes.count)
+        match reader.feed(byteRun(bytes, at, end)) {
+            Ok -> {}
+            Error(failure) -> return traceText(failure)
+        }
+        at = end
+    }
+    return describeHttp1(reader)
+}
+
+function http1Refusal(text: borrow String) -> String {
+    var reader = http1Reader(.Request, "https")
+    return match reader.feed(text.utf8()) {
+        Ok -> "accepted"
+        Error(failure) -> traceText(failure)
+    }
+}
+
+@Test
+function http1ChunkedRequestRoundTrips() {
+    let expected: String = "request Method.Post https://api.example.com/v1/messages host=api.example.com,content-type=application/json,transfer-encoding=chunked; body {\"a; body \":; body 1}; ended x-sum=7"
+    var fields = Fields {}
+    fields.add("Content-Type", "application/json")
+    let head = RequestHead {
+        method: .Post,
+        target: Target { scheme: "https", authority: "api.example.com", path: "/v1/messages" },
+        fields: fields
+    }
+    var wire = match http1RequestHead(head, .Chunked) {
+        Ok(value) -> value
+        Error(failure) -> {
+            expect!((traceText(failure)) == expected)
+            return
+        }
+    }
+    wire.appendAll(http1Chunk("{\"a\":".utf8()))
+    wire.appendAll(http1Chunk("1}".utf8()))
+    var trailers = Fields {}
+    trailers.add("x-sum", "7")
+    match http1LastChunk(trailers) {
+        Ok(last) -> wire.appendAll(last)
+        Error(failure) -> {
+            expect!((traceText(failure)) == expected)
+            return
+        }
+    }
+    var reader = http1Reader(.Request, "https")
+    expect!((feedPieces(reader, wire, 7)) == expected)
+}
+
+
+@Test
+function http1ResponsesFrameEachWay() {
+    var reader = http1Reader(.Response, "https")
+    let pipelined = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloHTTP/1.1 204 No Content\r\n\r\n"
+    let first = feedPieces(reader, pipelined.utf8(), 5)
+    var closing = http1Reader(.Response, "https")
+    let open = feedPieces(closing, "HTTP/1.1 200 OK\r\n\r\nstreamed".utf8(), 64)
+    let ended = match closing.finish() {
+        Ok -> describeHttp1(closing)
+        Error(failure) -> traceText(failure)
+    }
+    expect!((first) == ("response 100 ; response 200 content-length=5; body he; body llo; ended ; response 204 ; ended "))
+    expect!((open) == ("response 200 ; body streamed"))
+    expect!((ended) == ("ended "))
+}
+
+
+// Framings two readers could disagree on are refused.
+@Test
+function http1RefusesAmbiguousFraming() {
+    let both = http1Refusal(
+        "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n"
+    )
+    let gzip = http1Refusal(
+        "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip, chunked\r\n\r\n"
+    )
+    let twice = http1Refusal(
+        "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\n"
+    )
+    let folded = http1Refusal("GET / HTTP/1.1\r\nHost: a\r\nX-A: 1\r\n  2\r\n\r\n")
+    let spaced = http1Refusal("GET / HTTP/1.1\r\nHost : a\r\n\r\n")
+    let hostless = http1Refusal("GET / HTTP/1.1\r\nX-A: 1\r\n\r\n")
+    let bareReturn = http1Refusal("GET / HTTP/1.1\r\nHost: a\rX: b\r\n\r\n")
+    expect!((both) == ("Http1Failure.Malformed"))
+    expect!((gzip) == ("Http1Failure.Malformed"))
+    expect!((twice) == ("Http1Failure.Malformed"))
+    expect!((folded) == ("Http1Failure.Malformed"))
+    expect!((spaced) == ("Http1Failure.Malformed"))
+    expect!((hostless) == ("Http1Failure.Malformed"))
+    expect!((bareReturn) == ("Http1Failure.Malformed"))
+}
+
+
+// A URL becomes a target; one that is not an absolute http(s) URL, or that
+// carries credentials, does not.
+@Test
+function urlsBecomeTargets() {
+    var parts: [String] = []
+    for url in [
+        "https://api.anthropic.com/v1/messages",
+        "HTTP://127.0.0.1:8080?q=1#top",
+        "https://[::1]:4433",
+        "https://user:secret@example.com/",
+        "ftp://example.com/",
+        "https://example.com:99999/",
+        "https://example.com/a b"
+    ] {
+        parts.append(
+            match targetOf(url) {
+                Some(target) -> "\(target.scheme) \(target.authority) \(target.path)"
+                None -> "none"
+            }
+        )
+    }
+    expect!(joined(parts, "; ") == "https api.anthropic.com /v1/messages; http 127.0.0.1:8080 /?q=1; https [::1]:4433 /; none; none; none; none")
+}
+

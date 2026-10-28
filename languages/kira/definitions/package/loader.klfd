@@ -1,0 +1,710 @@
+// Loading a program: the package the compiled file belongs to, every source
+// in its `app/` directory, and the libraries those sources import.
+//
+// A package is the directory holding `package.kira`, found by walking up from
+// the file the driver was given. Every `.kira` file under its `app/` is one
+// module: the files see each other's declarations with no import. `import
+// Name` reaches a library, the package among the manifest's dependencies whose
+// module name is `Name`; with `--sdk`, a dependency whose name is a framework
+// of the SDK is that framework instead. A dependency is loaded the same way, with its own
+// dependencies, once however many packages depend on it. A name no
+// dependency answers may name a package the toolchain bundles: the std's
+// `<stdRoot>/Name/package.kira` whose module name is `Name`, which is how
+// `import Foundation` resolves anywhere. A name neither answers may name a
+// framework of the SDK the driver was given with `--sdk` (KLF-RIDL section
+// 27.7): `<sdk>/System/Library/Frameworks/Name.framework`, else the same in
+// `PrivateFrameworks`, read from the `.ridl` contract under its `Resources/`
+// and linked dynamically. A lone file with no package above it is a program
+// of its own and imports only bundled packages and frameworks.
+
+struct PackageRoot {
+    let directory: String
+    let manifest: Int
+}
+
+// The nearest `package.kira` at or above `directory`.
+function findPackage(session: Session, directory: String) -> Optional<PackageRoot> {
+    var current = directory
+    while true {
+        let manifest = readFile(session, joinPath(current, "package.kira"))
+        if manifest >= 0 { return .Some(PackageRoot { directory = current, manifest = manifest }) }
+        let parent = directoryOf(current)
+        if parent == current { break }
+        current = parent
+    }
+    return .None
+}
+
+// `program` is the file of every unit the `units` phase returned: the packages
+// this unit's program is built of (`docs/conformers.md`).
+function loadProgram(session: Session, unit: Unit, entry: String, program: [SourceFile]) -> Result<SyntaxTree, Failure> {
+    var loader = Loader { session = session, tree = SyntaxTree.empty(), separate = [], compileTime = ["Foundation"] }
+    loader.tree.testing = testBuild(session)
+    loader.tree.buildTarget = targetTriple(session)
+    loader.tree.release = releaseBuild(session)
+    loader.tree.framework = frameworkBuild(session)
+    // A format run lays out the file's own tokens, so the file is parsed
+    // alone, without its package and imports.
+    let formatting = formatRun(session)
+    match findPackage(session, directoryOf(entry)) {
+        Some(package) -> {
+            if !formatting {
+                if splitsPackages(session) {
+                    for separate in separatePackages(session, package) { loader.separate.append(normalizedPath(separate.directory)) }
+                    // A unit named by a manifest builds a package for the
+                    // program that depends on it.
+                    loader.tree.dependencyUnit = normalizedPath(entry) == normalizedPath(joinPath(package.directory, "package.kira"))
+                    loader.readApart = true
+                }
+                let started = loader
+                // The packages built apart are read without their bodies:
+                // compile-time code runs them only for a macro no earlier
+                // build answered.
+                loader.tree.compileTimeBodies = false
+                try loader.loadPackage(package.directory, package.manifest)
+                try loader.loadSplitFoundation(package.manifest)
+                try loader.loadProgramPackages(program, package)
+                let extensionBodies = loader.extendsTemplateElsewhere()
+                if !extensionBodies {
+                    if !loader.readWithoutCompileTimeBodies() {
+                        loader.tree.compileTimeBodies = true
+                        return loader.expandAndPlaceTrailSites(unit)
+                    }
+                    match loader.expandAndPlaceTrailSites(unit) {
+                        Ok(expanded) -> return .Ok(expanded)
+                        Error -> {}
+                    }
+                }
+                // A macro had to run, expanding failed, or a block on a
+                // generic template was read without its bodies: the program
+                // is read again with the bodies compile-time code imports,
+                // and the blocks' when one needs them, and what expanding it
+                // says is the build's answer.
+                let known = loader.compileTime
+                loader = started
+                loader.tree.compileTimeBodies = true
+                loader.tree.extensionBodies = extensionBodies
+                loader.compileTime = known
+                try loader.loadPackage(package.directory, package.manifest)
+                try loader.loadSplitFoundation(package.manifest)
+                try loader.loadProgramPackages(program, package)
+                return loader.expandAndPlaceTrailSites(unit)
+            }
+        }
+        None -> {}
+    }
+    let file = readFile(session, entry)
+    loader.tree.modules.append(Module {
+        name = "", root = directoryOf(entry), manifest = .None, package = "", library = false, loading = false, libraries = []
+    })
+    loader.tree = try parseFile(move loader.tree, fileText(session, file as SourceFile), file, 0)
+    if formatting { return .Ok(loader.tree) }
+    var imports: [Import] = []
+    for imported in loader.tree.sources[0].imports {
+        imports.append(Import {
+            name = imported.name, alias = imported.alias,
+            module = .Some(try loader.resolveImport(imported, []))
+        })
+    }
+    loader.tree.sources[0].imports = imports
+    return loader.expandAndPlaceTrailSites(unit)
+}
+
+// The packages of the program's files, each once.
+function programPackages(session: Session, program: [SourceFile]) -> [PackageRoot] {
+    var packages: [PackageRoot] = []
+    for entry in program {
+        match findPackage(session, directoryOf(fileName(session, entry))) {
+            Some(package) -> {
+                if !listsPackage(packages, normalizedPath(package.directory)) { packages.append(package) }
+            }
+            None -> {}
+        }
+    }
+    return packages
+}
+
+// `own`, the packages it depends on, and every package of `packages` that
+// depends on one of those, until no more join. A bundled library joins
+// nothing: every program shares it, so its unit reads no consumers, and a
+// package related to another only through one is another program's.
+function relatedPackages(session: Session, packages: [PackageRoot], own: PackageRoot) -> [PackageRoot] {
+    var related: [PackageRoot] = [own]
+    for dependency in separatePackages(session, own) { related.append(dependency) }
+    if bundledRoot(session, own.directory) { return related }
+    return withConsumers(session, packages, related)
+}
+
+// `related` with every package of `packages` that depends on one of them,
+// and on those in turn.
+function withConsumers(session: Session, packages: [PackageRoot], related: [PackageRoot]) -> [PackageRoot] {
+    for package in packages {
+        if listsPackage(related, normalizedPath(package.directory)) { continue }
+        if dependsOnAny(session, package, related) {
+            var grown = related
+            grown.append(package)
+            return withConsumers(session, packages, grown)
+        }
+    }
+    return related
+}
+
+// Whether `package` depends on a package of `related` that the toolchain does
+// not bundle.
+function dependsOnAny(session: Session, package: PackageRoot, related: [PackageRoot]) -> Bool {
+    for dependency in separatePackages(session, package) {
+        if bundledRoot(session, dependency.directory) { continue }
+        if listsPackage(related, normalizedPath(dependency.directory)) { return true }
+    }
+    return false
+}
+
+// Whether `directory` is a library the toolchain bundles.
+function bundledRoot(session: Session, directory: String) -> Bool {
+    let std = stdRoot(session)
+    if utf8Count(std) == 0 { return false }
+    return directoryOf(normalizedPath(directory)) == normalizedPath(std)
+}
+
+// Whether the driver runs the `format` hook (framework KLF-FORMAT.md section 3).
+function formatRun(session: Session) -> Bool {
+    match session.flag("emit") {
+        Boolean(value) -> return false
+        Integer(value) -> return false
+        String(value) -> return value == "format"
+    }
+}
+
+// Whether the program is built as a framework: `--framework`, `--emit
+// shared`, or its contract with `--emit ridl`.
+function frameworkBuild(session: Session) -> Bool {
+    match session.flag("framework") {
+        Boolean(value) -> if value { return true }
+        Integer(value) -> {}
+        String(value) -> {}
+    }
+    match session.flag("emit") {
+        Boolean(value) -> return false
+        Integer(value) -> return false
+        String(value) -> return value == "shared" || value == "ridl"
+    }
+}
+
+// Whether the driver was asked for the test build: `--test`.
+function releaseBuild(session: Session) -> Bool {
+    match session.flag("release") {
+        Boolean(value) -> return value
+        Integer(value) -> return false
+        String(value) -> return false
+    }
+}
+
+// The `.kira` files under the `tests/` directory when the directory is read
+// (a test build of the package at the root), else nothing read.
+function testDirectoryCount(session: Session, directory: String, enabled: Bool) -> Int {
+    if !enabled { return 0 }
+    return readDirectory(session, directory, "kira")
+}
+
+function testBuild(session: Session) -> Bool {
+    match session.flag("test") {
+        Boolean(value) -> return value
+        Integer(value) -> return false
+        String(value) -> return false
+    }
+}
+
+extend Loader {
+    // Whether a package built apart that compile-time code imports was read
+    // without its bodies.
+    function readWithoutCompileTimeBodies(borrow self) -> Bool {
+        for module in tree.modules {
+            if module.separate && listsText(compileTime, module.name) && !(module.compileTime && tree.compileTimeBodies) { return true }
+        }
+        return false
+    }
+
+    // Whether an `extend` block read without its methods' bodies names a
+    // generic template, or an alias that can name an instance, which take
+    // them.
+    function extendsTemplateElsewhere(borrow self) -> Bool {
+        for extension in tree.extensions {
+            if !extension.bodiesElsewhere { continue }
+            if namesTemplate(tree, extension.owner) { return true }
+            for alias in tree.aliases {
+                if alias.name.text == extension.owner.name.text { return true }
+            }
+        }
+        return false
+    }
+
+    function expandAndPlaceTrailSites(borrow mut self, unit: Unit) -> Result<SyntaxTree, Failure> {
+        tree = try expandProceduralMacros(session, unit, tree)
+        try placeTrailSites()
+        return .Ok(tree)
+    }
+}
+
+struct Loader {
+    let session: Session
+    var tree: SyntaxTree
+    // The roots of the packages units of their own build, normalized.
+    var separate: [String]
+    // The names of the modules compile-time code may import, as far as the
+    // sources read so far tell: Foundation, which carries the macro ABI,
+    // what a file declaring a macro or a compile-time function imports, and
+    // what those modules import in turn (`macroEvaluationLibraries`). A
+    // package is read after the packages depending on it, so its own name is
+    // known by the time it is.
+    var compileTime: [String]
+    // Whether the program's other units read this unit's package apart
+    // (`loadProgramPackages`), so its types carry its name as theirs do.
+    var readApart: Bool = false
+
+    // Parses the package at `root` as a new module and loads what it
+    // imports. The module's index.
+    function loadPackage(borrow mut self, root: String, manifestFile: Int) -> Result<Int, Failure> {
+        let manifest = try readManifest(fileText(session, manifestFile as SourceFile), manifestFile)
+        let module = tree.modules.count
+        var package = ""
+        if module > 0 { package = joinText([manifest.name.text, "@", manifest.version, "#", normalizedPath(root)]) }
+        var position = -1
+        if module > 0 { position = textPosition(separate, normalizedPath(root)) }
+        let apart = position >= 0
+        tree.modules.append(Module {
+            name = manifest.moduleRoot, root = root, manifest = .Some(manifestFile),
+            package = package, library = manifest.library, loading = true, libraries = [],
+            separate = apart, apartPosition = position,
+            namedApart = (apart || (module == 0 && readApart)) && !bundledPackage(session, root, manifest.moduleRoot, manifestFile),
+            compileTime = listsText(compileTime, manifest.moduleRoot),
+            systemCalls = manifest.systemCalls
+        })
+        try addNativeLibraries(root, manifest)
+        addAssets(root, manifest)
+        let first = tree.sources.count
+        let count = readDirectory(session, joinPath(root, "app"), "kira")
+        var files: [Int] = []
+        if count > 0 {
+            for index in 0..count {
+                files.append(source_directory_file(session, index))
+            }
+        }
+        let testCount = testDirectoryCount(session, joinPath(root, "tests"), tree.testing && module == 0)
+        // The `tests/` tree of the package under test joins its own namespace
+        // in a test build only (languages/kira/docs/testing.md section 3). A
+        // dependency's tests are never read, and a package without the
+        // directory has none. A test-only package, whose `app/` is empty, is
+        // sourced by its tests alone.
+        if testCount > 0 {
+            for index in 0..testCount {
+                files.append(source_directory_file(session, index))
+            }
+        }
+        if count <= 0 && testCount <= 0 { return .Error(Failure { diagnostic = .NoSources, span = manifest.name.span }) }
+        for library in manifest.nativeLibraries {
+            if utf8Count(library.klffi) > 0 {
+                let file = readFile(session, joinPath(root, library.klffi))
+                if file < 0 {
+                    return .Error(Failure { diagnostic = .NativeDeclarationsUnreadable, span = library.klffiSpan })
+                }
+                files.append(file)
+            }
+            for file in try autobound(root, manifestFile, library) { files.append(file) }
+        }
+        for file in files {
+            let macros = tree.proceduralMacros.count
+            let functions = tree.functions.count
+            let sources = tree.sources.count
+            tree = try parseFile(move tree, fileText(session, file as SourceFile), file, module)
+            if tree.sources.count > sources && (tree.modules[module].compileTime || declaresCompileTime(tree, macros, functions)) {
+                for imported in tree.sources[sources].imports {
+                    if !listsText(compileTime, imported.name.text) { compileTime.append(imported.name.text) }
+                }
+            }
+        }
+        let last = tree.sources.count
+        let libraries = try loadDependencies(root, manifest, first, last)
+        tree.modules[module].libraries = libraries
+        for index in first..last {
+            var imports: [Import] = []
+            for imported in tree.sources[index].imports {
+                imports.append(Import {
+                    name = imported.name, alias = imported.alias,
+                    module = .Some(try resolveImport(imported, libraries))
+                })
+            }
+            tree.sources[index].imports = imports
+        }
+        tree.modules[module].loading = false
+        return .Ok(module)
+    }
+
+    // The sources `library`'s `autobind` makes from its C headers, none when
+    // the package keeps the bindings in `app/bindings/<module>.kira`. A header
+    // is found under the package, else under one of the library's include
+    // directories; one that is in neither is 4036.
+    function autobound(borrow mut self, root: String, manifestFile: Int, library: NativeLibrary) -> Result<[Int], Failure> {
+        var files: [Int] = []
+        match library.autobind {
+            None -> return .Ok(files)
+            Some(autobind) -> {
+                if pathExists(session, joinPath(root, joinText(["app/bindings/", autobind.module, ".kira"]))) {
+                    return .Ok(files)
+                }
+                var selection = ""
+                for named in autobind.functions {
+                    if utf8Count(selection) > 0 { selection = joinText([selection, ","]) }
+                    selection = joinText([selection, named])
+                }
+                var shared = ""
+                for name in autobind.sharedPointerAliases {
+                    if utf8Count(shared) > 0 { shared = joinText([shared, "\n"]) }
+                    shared = joinText([shared, name])
+                }
+                var includes = ""
+                for directory in library.includeDirs {
+                    if utf8Count(includes) > 0 { includes = joinText([includes, "\n"]) }
+                    includes = joinText([includes, joinPath(root, directory)])
+                }
+                for header in autobind.headers {
+                    var path = joinPath(root, header)
+                    for directory in library.includeDirs {
+                        let included = joinPath(joinPath(root, directory), header)
+                        if !pathExists(session, path) && pathExists(session, included) { path = included }
+                    }
+                    let file = readHeader(session, manifestFile, path, library.name.text, selection, includes, shared)
+                    if file < 0 {
+                        return .Error(Failure { diagnostic = .NativeDeclarationsUnreadable, span = library.headerSpan })
+                    }
+                    files.append(file)
+                }
+                return .Ok(files)
+            }
+        }
+    }
+
+    // The native libraries `manifest` declares, as a program built for the
+    // session's target links them. Every package's share one namespace, as
+    // the `@FFI` declarations naming them do.
+    // A program asks for an asset by the path its package declares, and
+    // finds it under `.kira-build/<package>.klbundle/resources/` beside the
+    // entry package, as a Kira build lays it out. A declared file that is not
+    // there is left out, as Kira leaves it.
+    function addAssets(borrow mut self, root: String, manifest: Manifest) {
+        let bundle = joinPath(tree.modules[0].root, joinText([".kira-build/", manifest.name.text, ".klbundle/resources"]))
+        for asset in manifest.assets {
+            let source = joinPath(root, asset)
+            if utf8Count(asset) > 0 && pathExists(session, source) {
+                tree.resources.append(joinText([source, "\t", joinPath(bundle, asset)]))
+            }
+        }
+    }
+
+    // A row naming a library twice, or a declarations file that is not
+    // there, is what is wrong with it before any file it links is looked for.
+    function addNativeLibraries(borrow mut self, root: String, manifest: Manifest) -> Result<Bool, Failure> {
+        var names: [String] = []
+        for earlier in tree.nativeLibraries { names.append(earlier.name.text) }
+        for library in manifest.nativeLibraries {
+            for name in names {
+                if name == library.name.text {
+                    return .Error(Failure { diagnostic = .DuplicateNativeLibrary, span = library.name.span })
+                }
+            }
+            names.append(library.name.text)
+            if utf8Count(library.klffi) > 0 && !pathExists(session, joinPath(root, library.klffi)) {
+                return .Error(Failure { diagnostic = .NativeDeclarationsUnreadable, span = library.klffiSpan })
+            }
+        }
+        for library in manifest.nativeLibraries {
+            tree.nativeLibraries.append(try linkNativeLibrary(root, library))
+        }
+        return .Ok(true)
+    }
+
+    // The module each dependency of `manifest` loads as, in manifest order.
+    function loadDependencies(borrow mut self, root: String, manifest: Manifest, first: Int, last: Int) -> Result<[Int], Failure> {
+        var modules: [Int] = []
+        for index in 0..manifest.dependencies.count {
+            let dependency = manifest.dependencies[index]
+            for earlier in 0..index {
+                if manifest.dependencies[earlier].name.text == dependency.name.text {
+                    return .Error(Failure { diagnostic = .DuplicateDependency, span = dependency.name.span })
+                }
+            }
+            if !sourcesImportDependency(session, root, tree, first, last, dependency) { continue }
+            // A checkout the launcher fetched for this dependency, which stands
+            // in for its manifest source (`--dependency`, knvm-core `Sdk.kira`).
+            let fetched = dependencyOverride(session, dependency.name.text)
+            if utf8Count(fetched) == 0 && dependency.source == .Registry {
+                return .Error(Failure { diagnostic = .RegistryDependency, span = dependency.name.span })
+            }
+            if utf8Count(fetched) == 0 && dependency.source == .Git {
+                return .Error(Failure { diagnostic = .GitDependency, span = dependency.name.span })
+            }
+            // A framework the SDK holds answers before the package the
+            // dependency names (KLF-RIDL section 27.7 rule 3): the system's
+            // copy of a library is the one every program on it links, and
+            // the package is never compiled in beside it.
+            match try loadFramework(Import { name = dependency.name, alias = dependency.name, module = .None }) {
+                Some(framework) -> {
+                    if !contains(modules, framework) { modules.append(framework) }
+                    for transitive in tree.modules[framework].libraries {
+                        if !contains(modules, transitive) { modules.append(transitive) }
+                    }
+                    continue
+                }
+                None -> {}
+            }
+            var named = joinPath(root, dependency.path)
+            if utf8Count(fetched) > 0 { named = fetched }
+            let manifestFile = readFile(session, joinPath(named, "package.kira"))
+            if manifestFile < 0 {
+                return .Error(Failure { diagnostic = .DependencyUnreadable, span = dependency.pathSpan })
+            }
+            let directory = bundledDirectory(session, named, manifestFile)
+            let file = readFile(session, joinPath(directory, "package.kira"))
+            let loaded = try loadModule(directory, file, dependency.name.span)
+            if !contains(modules, loaded) { modules.append(loaded) }
+            for transitive in tree.modules[loaded].libraries {
+                if !contains(modules, transitive) { modules.append(transitive) }
+            }
+        }
+        return .Ok(modules)
+    }
+
+    // The packages of the program related to this unit's that it does not
+    // hold yet are read as declarations only: each is built apart as a unit
+    // of its own (`separate`), so none of its bodies is compiled here, while
+    // its constructs and conformers join this unit's tree, so every unit of
+    // the program sees the same conformers of a trait (`docs/conformers.md`).
+    // Every package of the program is marked apart before any is loaded, so
+    // a package one of them depends on is apart too. Only a split build has
+    // units of its own to be apart.
+    function loadProgramPackages(borrow mut self, program: [SourceFile], own: PackageRoot) -> Result<Bool, Failure> {
+        if !splitsPackages(session) { return .Ok(false) }
+        // The program's packages related to this one are read: those it
+        // depends on, and its consumers, since a consumer may conform one of
+        // its traits and a trait's existential has a case per conformer. A
+        // package that shares only a bundled library is another program's.
+        let packages = programPackages(session, program)
+        let related = relatedPackages(session, packages, own)
+        // A related package may import one that is not related; that one is
+        // still another unit's, so every package of the program is apart.
+        for package in packages {
+            let directory = normalizedPath(package.directory)
+            if directory != normalizedPath(own.directory) && !listsText(separate, directory) { separate.append(directory) }
+        }
+        // Each is loaded from where the program names it, the path its own
+        // unit reads, so a package this one already reached by an import is
+        // known by that path and never read twice.
+        var missing: [PackageRoot] = []
+        for sibling in packages {
+            let directory = normalizedPath(sibling.directory)
+            if !listsPackage(related, directory) { continue }
+            if directory == normalizedPath(own.directory) { continue }
+            if rootRead(directory) || packageQueued(missing, directory) { continue }
+            missing.append(sibling)
+        }
+        for sibling in missing {
+            if !listsText(separate, normalizedPath(sibling.directory)) { separate.append(normalizedPath(sibling.directory)) }
+        }
+        for sibling in missing { try loadPackage(sibling.directory, sibling.manifest) }
+        return .Ok(missing.count > 0)
+    }
+
+    // Whether a module of this tree was read from the package root `directory`
+    // (a normalized path). Compared by root, since one package has one root
+    // however its manifest file was reached.
+    function rootRead(borrow self, directory: String) -> Bool {
+        for index in 0..tree.modules.count {
+            if normalizedPath(tree.modules[index].root) == directory { return true }
+        }
+        return false
+    }
+
+    // Whether `queued` already holds the package root `directory`, so a package
+    // with several files in the program is queued once.
+    function packageQueued(borrow self, queued: [PackageRoot], directory: String) -> Bool {
+        for sibling in queued {
+            if normalizedPath(sibling.directory) == directory { return true }
+        }
+        return false
+    }
+
+    // The package whose manifest is `file`, loaded once. Reaching a package
+    // that is still loading its dependencies is a cycle.
+    function loadModule(borrow mut self, directory: String, file: Int, span: Span) -> Result<Int, Failure> {
+        for index in 0..tree.modules.count {
+            match tree.modules[index].manifest {
+                Some(manifest) -> {
+                    if manifest == file {
+                        if tree.modules[index].loading {
+                            return .Error(Failure { diagnostic = .DependencyCycle, span = span })
+                        }
+                        return .Ok(index)
+                    }
+                }
+                None -> {}
+            }
+        }
+        return loadPackage(directory, file)
+    }
+
+    function resolveImport(borrow mut self, imported: Import, libraries: [Int]) -> Result<Int, Failure> {
+        for module in libraries {
+            if tree.modules[module].name == imported.name.text { return .Ok(module) }
+        }
+        match try loadBundled(imported) {
+            Some(module) -> return .Ok(module)
+            None -> {}
+        }
+        match try loadFramework(imported) {
+            Some(module) -> return .Ok(module)
+            None -> return .Error(Failure { diagnostic = .UnknownImport, span = imported.name.span })
+        }
+    }
+
+    // Foundation's declarations, when the build is split into units and no
+    // file imported it. Foundation is always a unit of a split build
+    // (`separate-packages.klfd`), and the program unit defines `Any`'s
+    // helpers for every unit, Foundation's own `Optional<Any>`s included, so
+    // it has to know `Any`. A package's own unit needs it as much, for the
+    // descriptors its boxes carry (`TypeDescriptor`), unless the package is
+    // one the toolchain bundles, which Foundation is built from. No source
+    // sees the module without the import.
+    function loadSplitFoundation(borrow mut self, manifest: Int) -> Result<Bool, Failure> {
+        if separate.count == 0 { return .Ok(false) }
+        if tree.dependencyUnit {
+            let std = stdRoot(session)
+            if utf8Count(std) == 0 || tree.modules.count == 0 { return .Ok(false) }
+            if startsWithText(normalizedPath(tree.modules[0].root), normalizedPath(std)) { return .Ok(false) }
+        }
+        for module in tree.modules {
+            if module.name == "Foundation" { return .Ok(false) }
+        }
+        let name = Identifier { text = "Foundation", span = Span { file = manifest, start = 0, end = 0 } }
+        match try loadBundled(Import { name = name, alias = name, module = .None }) {
+            Some(module) -> return .Ok(true)
+            None -> return .Ok(false)
+        }
+    }
+
+    // The package the toolchain bundles under the name `imported` gives,
+    // loaded once, or none when the toolchain bundles no such package.
+    function loadBundled(borrow mut self, imported: Import) -> Result<Optional<Int>, Failure> {
+        let std = stdRoot(session)
+        if utf8Count(std) == 0 { return .Ok(.None) }
+        let directory = joinPath(std, imported.name.text)
+        let file = readFile(session, joinPath(directory, "package.kira"))
+        if file < 0 { return .Ok(.None) }
+        let manifest = try readManifest(fileText(session, file as SourceFile), file)
+        if manifest.moduleRoot != imported.name.text { return .Ok(.None) }
+        return .Ok(.Some(try loadModule(directory, file, imported.name.span)))
+    }
+
+    // The SDK framework `imported` names, loaded once as a module of the
+    // declarations its contract makes, or none when the SDK has no such
+    // framework. The contract's own imports reach the packages the toolchain
+    // bundles and the frameworks, never a manifest's dependencies.
+    function loadFramework(borrow mut self, imported: Import) -> Result<Optional<Int>, Failure> {
+        let sdk = sdkRoot(session)
+        if utf8Count(sdk) == 0 { return .Ok(.None) }
+        let name = imported.name.text
+        for index in 0..tree.modules.count {
+            if tree.modules[index].framework && tree.modules[index].name == name {
+                if tree.modules[index].loading {
+                    return .Error(Failure { diagnostic = .DependencyCycle, span = imported.name.span })
+                }
+                return .Ok(.Some(index))
+            }
+        }
+        var placement = ""
+        for candidate in ["System/Library/Frameworks", "System/Library/PrivateFrameworks"] {
+            if utf8Count(placement) == 0 && pathExists(session, joinPath(sdk, joinText([candidate, "/", name, ".framework"]))) {
+                placement = candidate
+            }
+        }
+        if utf8Count(placement) == 0 { return .Ok(.None) }
+        // Where the framework is installed: its path in the SDK without the
+        // SDK's own prefix, which the program finds it through as it runs.
+        let installed = joinText(["/", placement, "/", name, ".framework"])
+        let directory = joinPath(sdk, joinText([placement, "/", name, ".framework"]))
+        let module = tree.modules.count
+        tree.modules.append(Module {
+            name = name, root = directory, manifest = .None, package = joinText([name, ".framework#", normalizedPath(directory)]),
+            library = true, loading = true, libraries = [], framework = true
+        })
+        let file = readRidl(session, imported.name.span.file, joinPath(directory, "Resources"), name)
+        if file < 0 { return .Error(Failure { diagnostic = .FrameworkContractUnreadable, span = imported.name.span }) }
+        let first = tree.sources.count
+        tree = try parseFile(tree, fileText(session, file as SourceFile), file, module)
+        var libraries: [Int] = []
+        for index in first..tree.sources.count {
+            var imports: [Import] = []
+            for contracted in tree.sources[index].imports {
+                match try loadContracted(contracted) {
+                    Some(provider) -> {
+                        if !contains(libraries, provider) { libraries.append(provider) }
+                        imports.append(Import { name = contracted.name, alias = contracted.alias, module = .Some(provider) })
+                    }
+                    None -> return .Error(Failure { diagnostic = .FrameworkContractUnreadable, span = imported.name.span })
+                }
+            }
+            tree.sources[index].imports = imports
+        }
+        tree.modules[module].libraries = libraries
+        tree.nativeLibraries.append(NativeLink {
+            name = imported.name, header = "", artifact = "",
+            linkerFlags = [joinText(["-L", directory]), joinText(["-l:", name]), joinText(["-Wl,-rpath,", installed])],
+            sources = [], excluded = false, runtime = false
+        })
+        tree.modules[module].loading = false
+        return .Ok(.Some(module))
+    }
+
+    // What an import in a framework's contract names: a package the toolchain
+    // bundles, else a framework of the SDK (KLF-RIDL section 27.7 rule 4).
+    function loadContracted(borrow mut self, contracted: Import) -> Result<Optional<Int>, Failure> {
+        match try loadBundled(contracted) {
+            Some(provider) -> return .Ok(.Some(provider))
+            None -> return loadFramework(contracted)
+        }
+    }
+}
+
+// The checkout the launcher fetched for the dependency `name`, from the
+// driver's `--dependency Name=<directory>;...`, or empty.
+function dependencyOverride(session: Session, name: borrow String) -> String {
+    var given = ""
+    match session.flag("dependency") {
+        Boolean(value) -> return ""
+        Integer(value) -> return ""
+        String(value) -> given = value
+    }
+    let entries = splitText(given, 59)
+    for index in 0..entries.count {
+        let pair = splitText(entries[index], 61)
+        if pair.count == 2 && pair[0] == name { return pair[1] }
+    }
+    return ""
+}
+
+// The SDK the driver was given with `--sdk`, or empty.
+function sdkRoot(session: Session) -> String {
+    match session.flag("sdk") {
+        Boolean(value) -> return ""
+        Integer(value) -> return ""
+        String(value) -> return value
+    }
+}
+
+// Whether the declarations read since `macros` procedural macros and
+// `functions` functions declare a macro or a compile-time function.
+function declaresCompileTime(tree: borrow SyntaxTree, macros: Int, functions: Int) -> Bool {
+    if tree.proceduralMacros.count > macros { return true }
+    for index in functions..tree.functions.count {
+        if hasAttribute(tree.functions[index].annotations, .Comptime) { return true }
+    }
+    return false
+}

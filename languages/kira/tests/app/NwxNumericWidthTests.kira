@@ -1,0 +1,219 @@
+import Foundation
+
+// NwxNumericWidthTests.kira — what a written integer width means at run time:
+// arithmetic is exact within the width, values convert between spellings
+// unchanged while they fit, shifts are measured against the width, and the
+// wrapping builtins wrap at it. (Overflow traps end the process, so they are
+// proven by the backend-parity fixtures rather than here.)
+// PREFIX: nwx / Nwx  (all top-level names use this prefix).
+
+function nwxNarrow(x: Int) -> U8 {
+    return x
+}
+
+function nwxWide(x: U8) -> Int {
+    return x
+}
+@Test
+function nwxNarrowSumStaysExact() {
+    let a: U8 = 200
+    let b: U8 = 55
+    expect!(nwxWide(a + b) == 255)
+}
+
+@Test
+function nwxSignedNarrowArithmetic() {
+    let c: I8 = -100
+    let d: I8 = c - 27
+    let wide: Int = d
+    expect!(wide == -127)
+}
+
+@Test
+function nwxUnsignedSixtyFourReadsWhole() {
+    let d: U64 = 0xffffffffffffffff
+    let half: U64 = d / 2
+    let sign: Int = half
+    expect!(sign == 9223372036854775807)
+}
+
+@Test
+function nwxUnsignedOrderingIsUnsigned() {
+    let d: U64 = 0xffffffffffffffff
+    let one: U64 = 1
+    expect!((d > one ? 1 : 0) == 1)
+}
+
+@Test
+function nwxConversionKeepsAFittingValue() {
+    let wide: Int = 200
+    let byte: U8 = wide
+    expect!(nwxWide(byte) + nwxWide(nwxNarrow(55)) == 255)
+}
+
+@Test
+function nwxWideningKeepsTheSign() {
+    let small: I8 = -5
+    let bigger: I32 = I32(small)
+    let widest: Int = bigger
+    expect!(widest == -5)
+}
+
+@Test
+function nwxUnsignedThirtyTwoIntoInt() {
+    let unsigned: U32 = 4294967295
+    let back: Int = unsigned
+    expect!(back == 4294967295)
+}
+
+@Test
+function nwxWrappingAddWrapsAtTheWidth() {
+    let byte: U8 = 255
+    let signed: I8 = 127
+    let wrapped: Int = wrappingAdd(signed, 1)
+    expect!(nwxWide(wrappingAdd(byte, 1)) * 1000 + wrapped == -128)
+}
+
+@Test
+function nwxWrappingMulWrapsAtTheWidth() {
+    let half: U16 = 65535
+    let doubled: U16 = wrappingMul(half, 2)
+    let wide: Int = doubled
+    expect!(wide == 65534)
+}
+
+@Test
+function nwxWrappingAtSixtyFourBits() {
+    let max = 9223372036854775807
+    expect!(wrappingAdd(max, 1) + 2 + wrappingMul(max, 2) + 1 == -9223372036854775807)
+}
+
+@Test
+function nwxLeftShiftDropsBitsPastTheWidth() {
+    let byte: U8 = 129
+    let shifted: U8 = byte << 1
+    expect!(nwxWide(shifted) * 1000 + nwxWide(byte >> 1) == 2064)
+}
+
+@Test
+function nwxRightShiftFollowsSignedness() {
+    let signed: I8 = -128
+    let arithmetic: I8 = signed >> 7
+    let wide: U64 = 0xffffffffffffffff
+    let logical: U64 = wide >> 63
+    let a: Int = arithmetic
+    let l: Int = logical
+    expect!(a * 10 + l == -9)
+}
+
+@Test
+function nwxFloatToIntTruncatesTowardZero() {
+    expect!(Int(2.9) * 10 + Int(-2.9) == 18)
+}
+
+@Test
+function nwxUnsignedToFloatReadsUnsigned() {
+    let big: U64 = 0xffffffffffffffff
+    expect!((Float(big) > 18000000000000000000.0 ? 1 : 0) == 1)
+}
+
+@Test
+function nwxLiteralAdaptsToEitherSide() {
+    let byte: U8 = 3
+    let left: U8 = 250 + byte
+    let right: U8 = byte + 2
+    expect!(nwxWide(left) * 1000 + nwxWide(right) == 253005)
+}
+
+// --- Bitwise complement at a written width ----------------------------------
+// `~` acts on the raw 64 bits and answers `Int`, whatever width it was handed,
+// so there is no narrower range for its result to leave. Range-checking it at
+// the operand's width is what made `~U8(0)` a trap on the VM while native
+// answered -1; nothing here may differ between engines.
+
+@Test
+function nwxComplementOfAUnsignedByteIsMinusOne() {
+    let byte: U8 = 0
+    expect!(~byte == 0 - 1)
+}
+
+@Test
+function nwxComplementOfAUnsignedHalfIsMinusOne() {
+    let half: U16 = 0
+    expect!(~half == 0 - 1)
+}
+
+@Test
+function nwxComplementOfAUnsignedWordIsMinusOne() {
+    let word: U32 = 0
+    expect!(~word == 0 - 1)
+}
+
+@Test
+function nwxComplementOfAUnsignedLongIsMinusOne() {
+    let long: U64 = 0
+    let allOnes: U64 = 18446744073709551615
+    expect!(~long == allOnes)
+}
+
+@Test
+function nwxComplementOfAFullByteIsMinusTwoFiftySix() {
+    let byte: U8 = 255
+    expect!(~byte == 0 - 256)
+}
+
+@Test
+function nwxComplementOfAPlainIntIsItsOwnInverse() {
+    let n: Int = 5
+    expect!(~(~n) == 5)
+}
+
+// --- Float to U64 across the whole unsigned range ---------------------------
+// `U64` is the one integer destination whose range is not a subrange of
+// `Int`'s. Reading the float as signed first refused everything above 2^63,
+// which is half of what a `U64` holds — and both engines agreed on that wrong
+// answer, so a parity case alone would never have caught it.
+
+@Test
+function nwxFloatToUnsignedLongAboveTheSignedTop() {
+    let f: Float = 10000000000000000000.0
+    let u: U64 = U64(f)
+    expect!((u > 9223372036854775807 ? 1 : 0) == 1)
+}
+
+// A value in the top half round-trips: the float names it exactly, and the
+// conversion back answers the float that went in.
+@Test
+function nwxFloatToUnsignedLongRoundTripsAboveTheSignedTop() {
+    let f: Float = 18000000000000000000.0
+    let u: U64 = U64(f)
+    expect!((Float(u) == f ? 1 : 0) == 1)
+}
+
+@Test
+function nwxFloatToUnsignedLongTruncatesTowardZero() {
+    let f: Float = 42.9
+    let u: U64 = U64(f)
+    expect!(Int(u) == 42)
+}
+
+@Test
+function nwxFloatToUnsignedLongRefusesANegative() {
+    expectTrap!("")
+    let f: Float = 0.0 - 1.0
+    let u: U64 = U64(f)
+}
+
+@Test
+function nwxFloatToUnsignedLongRefusesAFractionBelowZero() {
+    expectTrap!("")
+    let f: Float = 0.0 - 0.5
+    let u: U64 = U64(f)
+}
+
+@Test
+function nwxFloatToUnsignedLongRefusesPastTheTop() {
+    expectTrap!("")
+    let f: Float = 20000000000000000000.0
+    let u: U64 = U64(f)
+}

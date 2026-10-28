@@ -1,0 +1,276 @@
+// Lowering: the checked program to one KSIR module through the shader
+// builder services.
+//
+// Every resource of an entry is a global in the one group `Default`,
+// buffers, then textures, then samplers, each by ascending Metal index,
+// and keeps its Metal slot. Function constants are overrides with their
+// ids; a kernel's workgroup is sized by three overrides the host sets. A
+// function is lowered once per list of globals its calls bind to its
+// bound parameters, callees before callers.
+
+struct Specialization {
+    let routine: Int
+    let bound: [Int]
+    let handle: Int
+}
+
+struct Lowering {
+    let module: Int
+    let program: CheckedProgram
+    var structHandles: [Int]
+    var userLocations: [String]
+    var takenLocations: [Int]
+    var globals: [Int]
+    // Per global: whether it is a KSIR override, and whether it is a
+    // constant read from a function constant, lowered where it is used.
+    var overridden: [Bool]
+    var inlined: [Bool]
+    var workgroup: [Int]
+    var specializations: [Specialization]
+    var functionNames: [String]
+    // The function being built: its checked index, builder, the global
+    // each bound parameter stands for, each local's pointer, and the
+    // names its locals have taken.
+    var current: Int
+    var builder: Int
+    var bound: [Int]
+    var places: [Int]
+    var localNames: [String]
+}
+
+function lowerShader(session: Session, unit: Unit, program: Program, checked: CheckedProgram) -> ShaderModule {
+    let module = shader_module_new(session, unit, program, checked.shaderName)
+    var lowering = Lowering {
+        module = module, program = checked, structHandles = [], userLocations = [], takenLocations = [],
+        globals = [], overridden = [], inlined = [], workgroup = [], specializations = [], functionNames = [], current = -1,
+        builder = -1, bound = [], places = [], localNames = []
+    }
+    lowering.prepare()
+    lowering.declareGlobals()
+    lowering.declareShader()
+    return shader_module_finish(module)
+}
+
+// The text of the Metal slot a resource keeps.
+function slotText(kind: GlobalKind, slot: Int) -> String {
+    var word = "buffer"
+    if kind == .Texture { word = "texture" }
+    if kind == .SamplerGlobal { word = "sampler" }
+    return joinText(["msl.", word, " ", decimalText(slot)])
+}
+
+// The resource kinds in the order their neutral bindings follow.
+function resourceKind(order: Int) -> GlobalKind {
+    if order == 0 { return .Buffer }
+    if order == 1 { return .Texture }
+    return .SamplerGlobal
+}
+
+extend Lowering {
+    function prepare(borrow mut self) {
+        for index in 0..program.structs.count {
+            structHandles.append(-1)
+        }
+        for index in 0..program.globals.count {
+            globals.append(-1)
+            overridden.append(false)
+            inlined.append(false)
+        }
+        for structure in program.structs {
+            if !structure.interface { continue }
+            for member in structure.members {
+                if member.binding.kind == .User && member.binding.index >= 0 {
+                    takenLocations.append(member.binding.index)
+                }
+            }
+        }
+    }
+
+    // The location of a `[[user(name)]]` member not named `locN`: the
+    // first free one, in the order names first appear, so a vertex output
+    // and a fragment input of one name meet.
+    function userLocation(borrow mut self, name: String) -> Int {
+        var free = 0
+        for at in 0..userLocations.count {
+            while containsInt(takenLocations, free) {
+                free += 1
+            }
+            if userLocations[at] == name { return free }
+            free += 1
+        }
+        while containsInt(takenLocations, free) {
+            free += 1
+        }
+        userLocations.append(name)
+        return free
+    }
+
+    function literal(borrow mut self, value: ConstValue) -> Int {
+        return shader_expr_literal(module, builder, value.scalar.ksir(), value.text)
+    }
+
+    function declareGlobals(borrow mut self) {
+        for index in 0..program.globals.count {
+            let global = program.globals[index]
+            match global.kind {
+                Buffer -> {}
+                Texture -> {}
+                SamplerGlobal -> {}
+                Threadgroup -> globals[index] = shader_global(module, global.name, "workgroup", typeHandle(global.globalType), -1, -1)
+                ConstantGlobal -> declareConstant(index)
+                FunctionConstant -> {
+                    overridden[index] = true
+                    globals[index] = shader_override(module, global.name, global.id, typeHandle(global.globalType), -1)
+                }
+            }
+        }
+        for order in 0..3 {
+            for index in resourcesOf(resourceKind(order)) {
+                declareResource(index)
+            }
+        }
+        if isCompute() {
+            for axis in 0..3 {
+                let one = shader_expr_literal(module, -1, "u32", "1")
+                let id = workgroupOverrideId + axis
+                workgroup.append(shader_override(module, workgroupOverride(axis), id, shader_type(module, "u32"), one))
+            }
+        }
+    }
+
+    // A program-scope constant. One whose value reads a function constant
+    // is no KSIR declaration: its value is lowered where it is read, as
+    // KSIR has no override without an id a target could keep.
+    function declareConstant(borrow mut self, index: Int) {
+        let global = program.globals[index]
+        if readsOverride(global.value) {
+            inlined[index] = true
+            return
+        }
+        builder = -1
+        let initial = value(global.value)
+        globals[index] = shader_constant(module, global.name, typeHandle(global.globalType), initial)
+    }
+
+    function readsOverride(borrow self, expression: Int) -> Bool {
+        if expression < 0 { return false }
+        let checked = program.expressions[expression]
+        if checked.kind == .Global && (overridden[checked.target] || inlined[checked.target]) { return true }
+        if readsOverride(checked.left) || readsOverride(checked.right) || readsOverride(checked.third) { return true }
+        for argument in checked.arguments {
+            if readsOverride(argument) { return true }
+        }
+        return false
+    }
+
+    // The resources of `kind`, by ascending slot.
+    function resourcesOf(borrow self, kind: GlobalKind) -> [Int] {
+        var ordered: [Int] = []
+        var last = -1
+        while true {
+            var next = -1
+            for index in 0..program.globals.count {
+                let global = program.globals[index]
+                if global.kind != kind || global.slot <= last { continue }
+                if next < 0 || global.slot < program.globals[next].slot { next = index }
+            }
+            if next < 0 { return ordered }
+            ordered.append(next)
+            last = program.globals[next].slot
+        }
+        return ordered
+    }
+
+    function declareResource(borrow mut self, index: Int) {
+        let global = program.globals[index]
+        var space = "handle"
+        var resourceType = -1
+        match global.kind {
+            Buffer -> {
+                let found = program.types[global.globalType]
+                let runtime = found.shape == .Array && found.length < 0
+                space = "uniform"
+                if runtime || global.device {
+                    space = "storage<load>"
+                    if !global.readOnly { space = "storage<load store>" }
+                    if containsAtomic(global.globalType) { space = "storage<load store atomic>" }
+                }
+                resourceType = typeHandle(global.globalType)
+            }
+            Texture -> resourceType = typeHandle(global.globalType)
+            SamplerGlobal -> {
+                resourceType = shader_type(module, "sampler")
+                if global.comparison { resourceType = shader_type(module, "sampler<comparison>") }
+            }
+            Threadgroup -> {}
+            ConstantGlobal -> {}
+            FunctionConstant -> {}
+        }
+        shader_span(module, global.span.file, global.span.start, global.span.end)
+        globals[index] = shader_global(module, global.name, space, resourceType, -1, -1)
+        shader_slot(module, globals[index], slotText(global.kind, global.slot))
+    }
+
+    function isCompute(borrow self) -> Bool {
+        for entry in program.entries {
+            if program.functions[entry.routine].stage == .KernelStage { return true }
+        }
+        return false
+    }
+
+    function declareShader(borrow mut self) {
+        var entries: [Int] = []
+        for entry in program.entries {
+            entries.append(lowerEntry(entry))
+        }
+        shader_group(module, "Default", "custom")
+        for order in 0..3 {
+            for index in resourcesOf(resourceKind(order)) {
+                shader_group_add(module, globals[index])
+            }
+        }
+        for index in 0..program.globals.count {
+            if program.globals[index].kind == .FunctionConstant { shader_option(module, globals[index]) }
+        }
+        for override in workgroup {
+            shader_option(module, override)
+        }
+        for entry in entries {
+            shader_push(module, entry)
+        }
+        var kind = "graphics"
+        if isCompute() { kind = "compute" }
+        shader_shader(module, program.shaderName, kind)
+    }
+
+    // A KSIR function name not yet taken.
+    function freshFunctionName(borrow mut self, name: String) -> String {
+        var candidate = name
+        var suffix = 1
+        while contains(functionNames, candidate) {
+            candidate = joinText([name, "_", decimalText(suffix)])
+            suffix += 1
+        }
+        functionNames.append(candidate)
+        return candidate
+    }
+
+    function containsAtomic(borrow self, index: Int) -> Bool {
+        let found = program.types[index]
+        if found.shape == .Atomic { return true }
+        if found.shape == .Array { return containsAtomic(found.element) }
+        if found.shape == .Struct {
+            for member in program.structs[found.structure].members {
+                if containsAtomic(member.memberType) { return true }
+            }
+        }
+        return false
+    }
+}
+
+function containsInt(values: [Int], wanted: Int) -> Bool {
+    for value in values {
+        if value == wanted { return true }
+    }
+    return false
+}

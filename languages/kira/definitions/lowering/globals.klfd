@@ -1,0 +1,204 @@
+extend KirTypes {
+    function declareGlobals(borrow mut self, builder: KirModuleBuilder, program: CheckedProgram) {
+        for index in 0..program.globals.count {
+            let declared = program.globals[index]
+            let name = program.named(declared.name.span)
+            let key = joinText([declared.name.text, "#", spanModule(program, declared.name.span)])
+            var mutability = 1
+            if declared.threadLocal { mutability = 2 }
+            let global = kir_global_new_named(builder, name.start, name.end, of(declared.valueType), mutability, generatedSuffix(builder, "global", key))
+            for byte in 0..byteSize(declared.valueType) { kir_global_byte(global, 0) }
+            globals.append(global)
+            let flag = kir_global_new_named(builder, name.start, name.end, boolean, mutability, generatedSuffix(builder, "global flag", key))
+            kir_global_byte(flag, 0)
+            globalFlags.append(flag)
+        }
+        if program.globals.count > 0 {
+            let name = program.named(program.globals[0].name.span)
+            let teardown = kir_signature_new_named(builder, name.start, name.end, unit, generatedSuffix(builder, "teardown", program.moduleName))
+            globalTeardown = .Some(kir_signature_declare(teardown))
+        }
+    }
+}
+
+// A module initializes its own globals. A library imported as source is
+// lowered into the importing program, which initializes them there; one built
+// on its own is a binary other programs call into over RIDL, and runs this
+// when it loads. A package built apart initializes its globals in its own
+// unit, and the program runs those initializers before its own globals.
+function declareGlobalBootstrap(builder: KirModuleBuilder, program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder]) {
+    if program.dependencyUnit { return }
+    match program.globalInitializer {
+        Some(target) -> {
+            let name = program.named(program.globals[0].name.span)
+            let signature = kir_signature_new_named(builder, name.start, name.end, types.unit, generatedSuffix(builder, "bootstrap", program.moduleName))
+            let initializer = kir_signature_define(signature)
+            kir_function_initializer(initializer)
+            initializer.switchTo(initializer.entryBlock())
+            for symbol in program.apartInitializers {
+                initializer.callVoid(declareApartInitializer(builder, types, name, symbol))
+            }
+            initializer.callVoid(functions[target])
+            initializer.returnVoid()
+        }
+        None -> {}
+    }
+}
+
+// The initializer `symbol` of a package built apart, which its unit defines.
+function declareApartInitializer(builder: KirModuleBuilder, types: KirTypes, name: Span, symbol: String) -> KirFunctionBuilder {
+    let signature = kir_signature_new(builder, name.start, name.end, types.unit)
+    for index in 0..utf8Count(symbol) { kir_signature_name_byte(signature, utf8Byte(symbol, index)) }
+    return kir_signature_declare(signature)
+}
+
+extend KirTypes {
+    // The program's `@AtExit` functions are registered by its entry, not by
+    // a module initializer: a call evaluated at compile time runs the
+    // initializers, and calls no kernel service. One function calls every
+    // `@AtExit` function in order, and `klf.runtime.at_exit` is handed its
+    // code address.
+    //
+    // A library built on its own is a framework a program loads (KLF-RIDL
+    // section 27.7), and its contract carries no `@AtExit` (section 20.7), so
+    // it registers its own functions as it loads. The runtime keeps one
+    // function and answers the one it replaces: each dispatcher keeps that
+    // one and calls it after its own, so the program's run first and then
+    // each framework's, the last loaded first.
+    function declareExitRegistration(borrow mut self, builder: KirModuleBuilder, program: CheckedProgram, functions: [KirFunctionBuilder], evaluated: Bool) {
+        if program.dependencyUnit || evaluated || program.exitFunctions.count == 0 { return }
+        let name = program.named(program.functions[program.exitFunctions[0]].name)
+        let replaced = kir_global_new_named(builder, name.start, name.end, integer64, 1, generatedSuffix(builder, "exit replaced", program.moduleName))
+        for byte in 0..8 { kir_global_byte(replaced, 0) }
+        let dispatch = kir_signature_new_named(builder, name.start, name.end, unit, generatedSuffix(builder, "exit dispatch", program.moduleName))
+        kir_signature_parameter(dispatch, integer64)
+        kir_signature_parameter(dispatch, integer64)
+        let dispatcher = kir_signature_define(dispatch)
+        dispatcher.switchTo(dispatcher.entryBlock())
+        for exit in program.exitFunctions {
+            dispatcher.argument(dispatcher.parameter(0))
+            dispatcher.argument(dispatcher.parameter(1))
+            dispatcher.callVoid(functions[exit])
+        }
+        let previous = dispatcher.load(kir_value_global_address(dispatcher, replaced))
+        let chained = dispatcher.block()
+        let done = dispatcher.block()
+        dispatcher.branchIf(dispatcher.compare(kirPredicate(.NotEqual, true), previous, dispatcher.integer(integer64, 0)), chained, done)
+        dispatcher.switchTo(chained)
+        kir_type_parameter(integer64)
+        kir_type_parameter(integer64)
+        let previousType = kir_type_function(unit)
+        let code = dispatcher.convert(convertBitcast, dispatcher.convert(convertBitcast, previous, pointer), previousType)
+        kir_value_indirect_parameter(dispatcher, integer64)
+        kir_value_indirect_parameter(dispatcher, integer64)
+        dispatcher.argument(dispatcher.parameter(0))
+        dispatcher.argument(dispatcher.parameter(1))
+        kir_value_call_indirect_void(dispatcher, code)
+        dispatcher.branch(done)
+        dispatcher.switchTo(done)
+        dispatcher.returnVoid()
+        let service = kir_signature_new_named(builder, name.start, name.end, integer64, generatedSuffix(builder, "exit service", program.moduleName))
+        let symbol = "klfsvc_runtime_at_exit"
+        for index in 0..utf8Count(symbol) { kir_signature_name_byte(service, utf8Byte(symbol, index)) }
+        kir_signature_parameter(service, pointer)
+        let atExit = kir_signature_declare(service)
+        let registering = kir_signature_new_named(builder, name.start, name.end, unit, generatedSuffix(builder, "exit registration", program.moduleName))
+        let registration = kir_signature_define(registering)
+        if program.library { kir_function_initializer(registration) }
+        registration.switchTo(registration.entryBlock())
+        let address = registration.convert(convertBitcast, kir_value_function_reference(registration, dispatcher), pointer)
+        registration.argument(address)
+        registration.store(registration.call(atExit, integer64), kir_value_global_address(registration, replaced))
+        registration.returnVoid()
+        if !program.library { exitRegistration = .Some(registration) }
+    }
+}
+
+// The functions making thread-local globals' copies, which every read of
+// one may call.
+function lazyGlobalInitializers(program: CheckedProgram) -> [Int] {
+    var found: [Int] = []
+    for global in program.globals {
+        match global.lazyInitializer {
+            Some(initializer) -> found.append(initializer)
+            None -> {}
+        }
+    }
+    return found
+}
+
+extend FunctionLowering {
+    // A thread-local global is made on its thread's first read: its flag,
+    // thread-local too, says whether this thread's copy is.
+    function globalAddress(borrow mut self, index: Int) -> KirAddress {
+        match program.globals[index].lazyInitializer {
+            Some(initializer) -> {
+                let flag = kir_value_global_address(kir, types.globalFlags[index])
+                let make = kir.block()
+                let made = kir.block()
+                kir.branchIf(kir.load(flag), made, make)
+                enter(make)
+                kir.callVoid(functions[initializer])
+                flowInto(made)
+                enter(made)
+            }
+            None -> {}
+        }
+        return storedGlobal(index)
+    }
+
+    function storedGlobal(borrow self, index: Int) -> KirAddress {
+        return kir_value_global_address(kir, types.globals[index])
+    }
+
+    function initializeGlobal(borrow mut self, index: Int, value: Int) {
+        write(value, storedGlobal(index))
+        let flag = kir_value_global_address(kir, types.globalFlags[index])
+        kir.store(kir.integer(types.boolean, 1), flag)
+    }
+
+    // Every return of the entry calls one teardown rather than repeating it.
+    function cleanupGlobals(borrow mut self) {
+        if !checked.entry { return }
+        match types.globalTeardown {
+            Some(teardown) -> kir.callVoid(teardown)
+            None -> {}
+        }
+    }
+
+    function destroyGlobals(borrow mut self) {
+        for offset in 0..program.globalInitOrder.count {
+            let index = program.globalInitOrder[program.globalInitOrder.count - 1 - offset]
+            let flag = kir_value_global_address(kir, types.globalFlags[index])
+            let destroy = kir.block()
+            let done = kir.block()
+            kir.branchIf(kir.load(flag), destroy, done)
+            enter(destroy)
+            destroyValue(storedGlobal(index), program.globals[index].valueType)
+            kir.store(kir.integer(types.boolean, 0), flag)
+            flowInto(done)
+            enter(done)
+        }
+    }
+}
+
+// The teardown's body, in reverse order of initialization, when an entry
+// calls it.
+function lowerGlobalTeardown(program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder]) {
+    match types.globalTeardown {
+        Some(teardown) -> {
+            if kir_function_referenced(teardown) != 1 {
+                kir_function_discard(teardown)
+                return
+            }
+            var lowering = FunctionLowering.startChecked(program, types, functions, helperChecked(program.globals[0].name.span, Type.void()), teardown)
+            let body = lowering.kir.block()
+            lowering.enter(body)
+            lowering.destroyGlobals()
+            lowering.kir.returnVoid()
+            lowering.kir.switchTo(lowering.entry)
+            lowering.kir.branch(body)
+        }
+        None -> {}
+    }
+}

@@ -1,0 +1,34 @@
+enum QuotePart {
+    Text(String)
+    Splice(Int)
+}
+
+extend Parser {
+    function quoteExpression(borrow mut self) -> Result<Int, Failure> {
+        let start = advance().span
+        let opening = try expect(.LeftBrace)
+        var cursor = opening.span.end
+        var depth = 1
+        var parts: [QuotePart] = []
+        while depth > 0 {
+            let token = advance()
+            match token.kind.delimiter() {
+                Open -> depth += 1
+                Close -> {
+                    depth -= 1
+                    if depth == 0 { parts.append(.Text(utf8Slice(source, cursor, token.span.start))) }
+                }
+                Hole -> {
+                    parts.append(.Text(utf8Slice(source, cursor, token.span.start)))
+                    try expect(.LeftBrace)
+                    parts.append(.Splice(try expression()))
+                    let closing = try expect(.RightBrace)
+                    cursor = closing.span.end
+                }
+                End -> return .Error(Failure { diagnostic = .Expected, span = token.span })
+                Other -> {}
+            }
+        }
+        return .Ok(tree.addExpression(.Quote(parts), spanFrom(start)))
+    }
+}

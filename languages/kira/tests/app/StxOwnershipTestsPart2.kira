@@ -1,0 +1,400 @@
+import Foundation
+
+// StxOwnershipTests: deep ownership tests — move into consuming functions,
+// owned aggregates, borrow (shared and mut) writeback, pipeline of moves,
+// copy vs. move semantics, and runtime traps.
+//
+// All top-level names use the Stxo/stxo prefix to avoid harness namespace
+// collisions. This file imports Foundation explicitly (imports are file-scoped).
+
+// ---------------------------------------------------------------------------
+// Group 4: Owned arrays build + move
+// ---------------------------------------------------------------------------
+@Test
+function stxoArrBuildMove() {
+    // xs=[1..5], consume→15
+    var xs: [Int] = []
+    for i in 0..5 {
+        xs.append(i + 1)
+    }
+    expect!(stxoConsumeArr(move xs) == 15)
+}
+
+@Test
+function stxoArrBuildMoveBag() {
+    // stxoBuildBag(7): label=7, items=[1..7], consume=7+28=35
+    let b = stxoBuildBag(7)
+    expect!(stxoConsumeBag(move b) == 35)
+}
+
+@Test
+function stxoArrBuildMoveLoop() {
+    // n=1..5: xs=[1..n], consume→n*(n+1)/2; total=1+3+6+10+15=35
+    var acc = 0
+    for n in 1..6 {
+        var xs: [Int] = []
+        for i in 1..(n + 1) {
+            xs.append(i)
+        }
+        acc = acc + stxoConsumeArr(move xs)
+    }
+    expect!(acc == 35)
+}
+
+@Test
+function stxoArrKeepBorrow() {
+    // xs=[100,200], access xs[0]+xs[1]=300; keep array (no move)
+    var xs: [Int] = []
+    xs.append(100)
+    xs.append(200)
+    expect!(xs[0] + xs[1] == 300)
+}
+
+@Test
+function stxoArrCountAfterBuild() {
+    // 8 appends → count=8
+    var xs: [Int] = []
+    for i in 0..8 {
+        xs.append(0)
+    }
+    expect!(xs.count == 8)
+}
+
+@Test
+function stxoArrBorrowAndMove() {
+    // xs=[10,20], count=2 (borrow), then consume=30; 2+30=32
+    var xs: [Int] = []
+    xs.append(10)
+    xs.append(20)
+    let c = xs.count
+    expect!(c + stxoConsumeArr(move xs) == 32)
+}
+
+@Test
+function stxoBagBorrowItems() {
+    // stxoBuildBag(5): items=[1,2,3,4,5]; [0]+[4]=1+5=6
+    var b = stxoBuildBag(5)
+    expect!(b.items[0] + b.items[4] == 6)
+}
+
+@Test
+function stxoBagBorrowCount() {
+    // stxoBuildBag(7): items.count=7
+    var b = stxoBuildBag(7)
+    expect!(b.items.count == 7)
+}
+
+@Test
+function stxoBagBorrowLabel() {
+    // stxoBuildBag(3): label=3
+    var b = stxoBuildBag(3)
+    expect!(b.label == 3)
+}
+
+@Test
+function stxoArrAppendLoop() {
+    // xs=[0,2,4,...,38] (20 elements of 2*i); consume=2*(0+1+..+19)=380
+    var xs: [Int] = []
+    for i in 0..20 {
+        xs.append(i * 2)
+    }
+    expect!(stxoConsumeArr(move xs) == 380)
+}
+
+@Test
+function stxoArrGrow() {
+    // loop i=0..9: append, acc += xs.count; acc=1+2+..+10=55
+    var xs: [Int] = []
+    var acc = 0
+    for i in 0..10 {
+        xs.append(i)
+        acc = acc + xs.count
+    }
+    expect!(acc == 55)
+}
+
+@Test
+function stxoBagLoopBuildConsume() {
+    // n=1..10: consumeBag=n+n*(n+1)/2; total=275
+    var acc = 0
+    for n in 1..11 {
+        let b = stxoBuildBag(n)
+        acc = acc + stxoConsumeBag(move b)
+    }
+    expect!(acc == 275)
+}
+
+// ---------------------------------------------------------------------------
+// Group 5: Move into struct fields
+// ---------------------------------------------------------------------------
+
+@Test
+function stxoWrapInnerX() {
+    // v={3,4,5}, wrap(v,10), inner.x=3
+    let v = StxoVec { x: 3, y: 4, z: 5 }
+    let c = stxoWrap(move v, 10)
+    expect!(c.inner.x == 3)
+}
+
+@Test
+function stxoWrapWeight() {
+    let v = StxoVec { x: 3, y: 4, z: 5 }
+    let c = stxoWrap(move v, 10)
+    expect!(c.weight == 10)
+}
+
+@Test
+function stxoWrapUnwrap() {
+    // v={3,4,5}, wrap(10), unwrap=3+4+5+10=22
+    let v = StxoVec { x: 3, y: 4, z: 5 }
+    let c = stxoWrap(move v, 10)
+    expect!(stxoUnwrap(move c) == 22)
+}
+
+@Test
+function stxoWrapUnwrapLoop() {
+    // i=0..4: v={i,i,i}, wrap(i), unwrap=4i; total=0+4+8+12+16=40
+    var acc = 0
+    for i in 0..5 {
+        let v = StxoVec { x: i, y: i, z: i }
+        let c = stxoWrap(move v, i)
+        acc = acc + stxoUnwrap(move c)
+    }
+    expect!(acc == 40)
+}
+
+@Test
+function stxoWrapInnerSum() {
+    // v={7,8,9}, wrap(0), inner.x+inner.y+inner.z=24
+    let v = StxoVec { x: 7, y: 8, z: 9 }
+    let c = stxoWrap(move v, 0)
+    expect!(c.inner.x + c.inner.y + c.inner.z == 24)
+}
+
+@Test
+function stxoWrapNested() {
+    // v={1,2,3}, wrap(100), inner.z + weight = 3+100=103
+    let v = StxoVec { x: 1, y: 2, z: 3 }
+    let c = stxoWrap(move v, 100)
+    expect!(c.inner.z + c.weight == 103)
+}
+
+@Test
+function stxoWrapChain() {
+    // c1: v1={1,1,1}+w=5 → unwrap=8; c2: v2={2,2,2}+w=10 → unwrap=16; total=24
+    let v1 = StxoVec { x: 1, y: 1, z: 1 }
+    let c1 = stxoWrap(move v1, 5)
+    let s1 = stxoUnwrap(move c1)
+    let v2 = StxoVec { x: 2, y: 2, z: 2 }
+    let c2 = stxoWrap(move v2, 10)
+    let s2 = stxoUnwrap(move c2)
+    expect!(s1 + s2 == 24)
+}
+
+@Test
+function stxoWrapAndConsume() {
+    // v={5,5,5}, wrap(15), unwrap=5+5+5+15=30
+    let v = StxoVec { x: 5, y: 5, z: 5 }
+    let w = stxoWrap(move v, 15)
+    expect!(stxoUnwrap(move w) == 30)
+}
+
+// ---------------------------------------------------------------------------
+// Group 6: Pipeline of moves
+// ---------------------------------------------------------------------------
+
+@Test
+function stxoPipeAddMul() {
+    // v={2,3,4}, add10→{12,13,14}, mul2→{24,26,28}, consume→78
+    let v = StxoVec { x: 2, y: 3, z: 4 }
+    let w = stxoPipeAdd(move v, 10)
+    let x = stxoPipeMul(move w, 2)
+    expect!(stxoConsumeVec(move x) == 78)
+}
+
+@Test
+function stxoPipeMulAdd() {
+    // v={1,2,3}, mul5→{5,10,15}, add1→{6,11,16}, consume→33
+    let v = StxoVec { x: 1, y: 2, z: 3 }
+    let w = stxoPipeMul(move v, 5)
+    let x = stxoPipeAdd(move w, 1)
+    expect!(stxoConsumeVec(move x) == 33)
+}
+
+@Test
+function stxoPipeAddAddMul() {
+    // v={0,0,0}, add3→{3,3,3}, add2→{5,5,5}, mul4→{20,20,20}, consume→60
+    let v = StxoVec { x: 0, y: 0, z: 0 }
+    let w = stxoPipeAdd(move v, 3)
+    let x = stxoPipeAdd(move w, 2)
+    let y = stxoPipeMul(move x, 4)
+    expect!(stxoConsumeVec(move y) == 60)
+}
+
+@Test
+function stxoPipeNeg() {
+    // v={5,3,2}, neg→{-5,-3,-2}, consume→-10 = 0-10
+    let v = StxoVec { x: 5, y: 3, z: 2 }
+    let w = stxoPipeNeg(move v)
+    expect!(stxoConsumeVec(move w) == 0 - 10)
+}
+
+@Test
+function stxoPipeLong() {
+    // v={1,1,1}, add1→{2,2,2}, add1→{3,3,3}, mul3→{9,9,9}, consume→27
+    let v = StxoVec { x: 1, y: 1, z: 1 }
+    let w = stxoPipeAdd(move v, 1)
+    let x = stxoPipeAdd(move w, 1)
+    let y = stxoPipeMul(move x, 3)
+    expect!(stxoConsumeVec(move y) == 27)
+}
+
+@Test
+function stxoPipeAddLoop() {
+    // i=0..4: v={i,i,i}, add(i)→{2i,2i,2i}, consume→6i; total=60
+    var acc = 0
+    for i in 0..5 {
+        let v = StxoVec { x: i, y: i, z: i }
+        let w = stxoPipeAdd(move v, i)
+        acc = acc + stxoConsumeVec(move w)
+    }
+    expect!(acc == 60)
+}
+
+@Test
+function stxoPipeMulLoop() {
+    // i=1..5: v={1,1,1}, mul(i)→{i,i,i}, consume→3i; total=3+6+9+12+15=45
+    var acc = 0
+    for i in 1..6 {
+        let v = StxoVec { x: 1, y: 1, z: 1 }
+        let w = stxoPipeMul(move v, i)
+        acc = acc + stxoConsumeVec(move w)
+    }
+    expect!(acc == 45)
+}
+
+@Test
+function stxoBumpConsume() {
+    // v={1,2,3}, bump→{2,3,4}, consume→9
+    var v = StxoVec { x: 1, y: 2, z: 3 }
+    stxoBumpVec(v)
+    expect!(stxoConsumeVec(move v) == 9)
+}
+
+// ---------------------------------------------------------------------------
+// Group 7: Copy semantics vs move semantics
+// ---------------------------------------------------------------------------
+
+@Test
+function stxoCopyIndepX() {
+    // copy v; mutate copy.x; original unchanged
+    let v = StxoVec { x: 5, y: 6, z: 7 }
+    var w = v
+    w.x = 100
+    expect!(v.x == 5)
+}
+
+@Test
+function stxoCopyIndepY() {
+    let v = StxoVec { x: 5, y: 6, z: 7 }
+    var w = v
+    w.y = 200
+    expect!(v.y == 6)
+}
+
+@Test
+function stxoCopyIndepZ() {
+    let v = StxoVec { x: 5, y: 6, z: 7 }
+    var w = v
+    w.z = 300
+    expect!(v.z == 7)
+}
+
+@Test
+function stxoCopyBothValues() {
+    // copy.x=100, original.x=5; sum=105
+    let v = StxoVec { x: 5, y: 6, z: 7 }
+    var w = v
+    w.x = 100
+    expect!(w.x + v.x == 105)
+}
+
+@Test
+function stxoCopyLoopIndep() {
+    // i=0..4: copy v={i,i,i}, zero copy.x, acc += v.x=i; sum=10
+    var acc = 0
+    for i in 0..5 {
+        let v = StxoVec { x: i, y: i, z: i }
+        var w = v
+        w.x = 0
+        acc = acc + v.x
+    }
+    expect!(acc == 10)
+}
+
+@Test
+function stxoCopyBoxField() {
+    // copy box, mutate copy.id, original unchanged
+    let b = StxoBox { min: StxoVec { x: 1, y: 2, z: 3 }, max: StxoVec { x: 4, y: 5, z: 6 }, id: 7 }
+    var b2 = b
+    b2.id = 99
+    expect!(b.id == 7)
+}
+
+@Test
+function stxoCopyThenMoveConsumer() {
+    // v={3,4,5}; copy w=v; move w into consumer=12; access v.x=3; total=15
+    let v = StxoVec { x: 3, y: 4, z: 5 }
+    let w = v
+    expect!(stxoConsumeVec(move w) + v.x == 15)
+}
+
+@Test
+function stxoCopyMutateOrigKept() {
+    // copy v, zero all copy fields, original sum unchanged=60
+    var v = StxoVec { x: 10, y: 20, z: 30 }
+    var w = v
+    w.x = 0
+    w.y = 0
+    w.z = 0
+    expect!(v.x + v.y + v.z == 60)
+}
+
+// ---------------------------------------------------------------------------
+// Group 8: Trap tests
+// ---------------------------------------------------------------------------
+
+@Test
+function stxoTrapDivZero() {
+    expectTrap!("")
+        let v = StxoVec { x: 5, y: 0, z: 3 }
+        let _ = stxoConsumeVec(move v) / 0
+}
+
+@Test
+function stxoTrapModZero() {
+    expectTrap!("")
+    let _ = 5 % 0
+}
+
+@Test
+function stxoTrapBagEmpty() {
+    expectTrap!("")
+        var b = stxoBuildBag(0)
+        let _ = b.items[5]
+}
+
+@Test
+function stxoTrapBagOOB() {
+    expectTrap!("")
+        var b = stxoBuildBag(3)
+        let _ = b.items[99]
+}
+
+@Test
+function stxoTrapArrOOB() {
+    expectTrap!("")
+        var xs: [Int] = []
+        xs.append(1)
+        let _ = xs[99]
+}

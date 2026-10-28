@@ -1,0 +1,331 @@
+import Foundation
+
+// HTTP/3 on one QUIC connection (RFC 9114). The session holds HTTP/3's own
+// state, and each call takes the connection it runs on, so an endpoint
+// keeps owning its connections. After the connection takes datagrams or
+// timers, `pump` turns its events into HTTP/3 events.
+
+enum Http3Event {
+    Connected(TlsAgreement)
+    Head(StreamHead)
+    Body(StreamBody)
+    Ended(StreamEnded)
+    // The peer reset a message stream, or asked this side to stop sending.
+    Reset(QuicStreamFailure)
+    Stopped(QuicStreamFailure)
+    // The peer is going away: no stream from this ID on will be served.
+    Goaway(Number)
+    Closed(QuicConnectionEnd)
+    // WebTransport sessions (draft-ietf-webtrans-http3).
+    TransportStream(TransportStreamOpened)
+    TransportData(TransportBytes)
+    TransportReset(TransportFailure)
+    TransportStopped(TransportFailure)
+    TransportDatagram(TransportDatagram)
+    // The peer asks for the session to wind down (section 4.7).
+    TransportDraining(QuicStreamNumber)
+    TransportClosed(TransportClose)
+}
+
+struct StreamHead {
+    let stream: QuicStreamNumber
+    let head: MessageHead
+}
+
+struct StreamBody {
+    let stream: QuicStreamNumber
+    let bytes: [UN8]
+}
+
+struct StreamEnded {
+    let stream: QuicStreamNumber
+    let trailers: Fields
+}
+
+// Why an HTTP/3 call was refused.
+enum Http3Problem {
+    Stream(QuicStreamProblem)
+    Invalid(Http3Error)
+    // The call belongs to the other role.
+    WrongRole
+}
+
+enum UniRole {
+    Unknown
+    Control
+    // A QPACK stream, which with no dynamic table carries nothing this side
+    // needs, or a type this side does not know.
+    Ignored
+    // A WebTransport stream, handed to its session once its type is read.
+    Transport
+}
+
+struct UniStream {
+    let id: QuicStreamNumber
+    var role: UniRole = .Unknown
+    var buffer: [UN8] = []
+}
+
+struct Http3Session {
+    let role: TlsRole
+    let limits: FieldLimits = FieldLimits {}
+    var control: QuicStreamNumber? = .None
+    var peerControl: Bool = false
+    var peerSettings: Http3Settings? = .None
+    var messages: [MessageStream] = []
+    var uni: [UniStream] = []
+    var events: [Http3Event] = []
+    var delivered: Number = 0
+    var transports: [TransportSession] = []
+    var transportStreams: [TransportStream] = []
+    var heldDatagrams: [TransportDatagram] = []
+
+    function event(borrow mut self) -> Http3Event? {
+        if delivered == events.count {
+            if delivered > 0 {
+                events = []
+                delivered = 0
+            }
+            return .None
+        }
+        let next = copy events[delivered]
+        delivered += 1
+        return .Some(next)
+    }
+
+    function pump(borrow mut self, quic: borrow mut QuicConnection) {
+        while true {
+            let next = quic.event()
+            let event = match next {
+                Some(value) -> value
+                None -> break
+            }
+            take(quic, event)
+        }
+        // A session established by what came may take what waited for it.
+        releaseHeld(quic)
+    }
+
+    function take(borrow mut self, quic: borrow mut QuicConnection, event: borrow QuicEvent) {
+        match event {
+            Connected(agreement) -> {
+                openControl(quic)
+                events.append(.Connected(copy agreement))
+            }
+            StreamOpened(id) -> peerOpened(quic, id)
+            StreamReadable(id) -> {
+                match transportStreamIndex(id) {
+                    Some(index) -> return readTransport(quic, index)
+                    None -> {}
+                }
+                if id.kind() == .Bidirectional {
+                    readMessage(quic, id)
+                } else {
+                    readUni(quic, id)
+                }
+            }
+            StreamReset(failure) -> {
+                if transportFailure(quic, failure, false) { return }
+                forgetMessage(failure.id)
+                events.append(.Reset(copy failure))
+            }
+            StreamStopped(failure) -> {
+                if transportFailure(quic, failure, true) { return }
+                events.append(.Stopped(copy failure))
+            }
+            // HTTP datagrams belong to WebTransport sessions.
+            Datagram(data) -> takeDatagram(quic, data)
+            Closed(end) -> events.append(.Closed(copy end))
+        }
+    }
+
+    // The control stream, opened first, with SETTINGS as its first frame
+    // (RFC 9114 section 6.2.1).
+    function openControl(borrow mut self, quic: borrow mut QuicConnection) {
+        let id = match quic.openStream(.Unidirectional) {
+            Ok(value) -> value
+            Error(problem) -> {
+                absorb problem
+                return fail(quic, .InternalError)
+            }
+        }
+        var writer = WireWriter {}
+        writer.writeVarint(code(Http3StreamType.Control))
+        writeHttp3Frame(writer, .Settings, settingsPayload(limits, role == .Server))
+        match quic.write(id, writer.bytes, false) {
+            Ok -> control = .Some(id)
+            Error(problem) -> {
+                absorb problem
+                fail(quic, .InternalError)
+            }
+        }
+    }
+
+    function peerOpened(borrow mut self, quic: borrow mut QuicConnection, id: QuicStreamNumber) {
+        if id.kind() == .Unidirectional {
+            uni.append(UniStream { id: id })
+            return
+        }
+        // A server's bidirectional stream is WebTransport's or an error
+        // (RFC 9114 section 6.1, draft-ietf-webtrans-http3 section 4.3).
+        if role == .Client {
+            return messages.append(MessageStream { id: id, incoming: .Response, signalOnly: true })
+        }
+        messages.append(MessageStream { id: id, incoming: .Request })
+    }
+
+    function fail(borrow mut self, quic: borrow mut QuicConnection, error: Http3Error) {
+        quic.close(code(error), traceText(error), true)
+    }
+
+    function uniIndex(borrow self, id: QuicStreamNumber) -> Number? {
+        for (index, stream) in uni.enumerated() {
+            if stream.id == id { return .Some(index) }
+        }
+        return .None
+    }
+
+    function readUni(borrow mut self, quic: borrow mut QuicConnection, id: QuicStreamNumber) {
+        let index = match uniIndex(id) {
+            Some(value) -> value
+            None -> return
+        }
+        let read = match quic.read(id) {
+            Ok(value) -> value
+            Error(problem) -> {
+                absorb problem
+                return
+            }
+        }
+        var stream = copy uni[index]
+        stream.buffer.appendAll(read.data)
+        let outcome = takeUni(quic, stream)
+        uni[index] = stream
+        match outcome {
+            Ok -> {}
+            Error(error) -> return fail(quic, error)
+        }
+        // The control stream is never closed (RFC 9114 section 6.2.1).
+        if read.finished && uni[index].role == .Control { fail(quic, .ClosedCriticalStream) }
+        if uni[index].role == .Transport {
+            let rest = copy uni[index].buffer
+            forgetUni(id)
+            adoptStream(quic, id, .None, rest, read.finished)
+        }
+    }
+
+    function forgetUni(borrow mut self, id: QuicStreamNumber) {
+        var kept: [UniStream] = []
+        for stream in uni {
+            if stream.id != id { kept.append(copy stream) }
+        }
+        uni = kept
+    }
+
+    function takeUni(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        stream: borrow mut UniStream
+    ) -> Result<Void, Http3Error> {
+        if stream.role == .Unknown {
+            var reader = WireReader { bytes: copy stream.buffer }
+            let kind = try reader.readVarint() otherwise return .Ok
+            stream.buffer = reader.readRest()
+            stream.role = try uniRole(quic, stream.id, fromCode<Http3StreamType>(kind))
+        }
+        match stream.role {
+            Control -> return takeControl(stream)
+            Ignored -> stream.buffer = []
+            Transport -> {}
+            Unknown -> {}
+        }
+        return .Ok
+    }
+
+    function uniRole(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        id: QuicStreamNumber,
+        kind: Http3StreamType
+    ) -> Result<UniRole, Http3Error> {
+        match kind {
+            Control -> {
+                if peerControl { return .Error(.StreamCreationError) }
+                peerControl = true
+                return .Ok(.Control)
+            }
+            // This client never allows a push (RFC 9114 section 4.6).
+            Push -> return .Error(
+                role == .Client ? Http3Error.IdError : Http3Error.StreamCreationError
+            )
+            QpackEncoder -> return .Ok(.Ignored)
+            QpackDecoder -> return .Ok(.Ignored)
+            WebTransport -> return .Ok(.Transport)
+            else -> {
+                // Unknown stream types are read no further (RFC 9114
+                // section 6.2).
+                match quic.stopSending(id, code(Http3Error.StreamCreationError)) {
+                    Ok -> {}
+                    Error(failure) -> absorb failure
+                }
+                return .Ok(.Ignored)
+            }
+        }
+    }
+
+    // Whole frames of the peer's control stream.
+    function takeControl(
+        borrow mut self,
+        stream: borrow mut UniStream
+    ) -> Result<Void, Http3Error> {
+        while true {
+            let start = match readFrameStart(stream.buffer) {
+                Some(value) -> value
+                None -> return .Ok
+            }
+            if start.length > limits.sectionSize { return .Error(.ExcessiveLoad) }
+            let end = start.payloadAt + start.length
+            if stream.buffer.count < end { return .Ok }
+            let payload = byteRun(stream.buffer, start.payloadAt, end)
+            stream.buffer = byteRun(stream.buffer, end, stream.buffer.count)
+            try takeControlFrame(start.kind, payload)
+        }
+        return .Ok
+    }
+
+    function takeControlFrame(
+        borrow mut self,
+        kind: Http3FrameType,
+        payload: borrow [UN8]
+    ) -> Result<Void, Http3Error> {
+        // WT_STREAM belongs only at a request stream's start
+        // (draft-ietf-webtrans-http3 section 4.3).
+        if kind == .WtStream { return .Error(.FrameError) }
+        if !controlFrameAllowed(kind) { return .Error(.FrameUnexpected) }
+        if peerSettings.isNone() {
+            if kind != .Settings { return .Error(.MissingSettings) }
+            let settings = try readSettings(payload)
+            peerSettings = .Some(settings)
+            return .Ok
+        }
+        match kind {
+            Settings -> return .Error(.FrameUnexpected)
+            Goaway -> {
+                var reader = WireReader { bytes: copy payload }
+                let id = try reader.readVarint() otherwise return .Error(.FrameError)
+                events.append(.Goaway(id))
+            }
+            // Pushes are never allowed, so there is none to cancel.
+            CancelPush -> {}
+            MaxPushId -> {
+                if role == .Client { return .Error(.FrameUnexpected) }
+            }
+            else -> {}
+        }
+        return .Ok
+    }
+}
+
+function http3Session(role: TlsRole) -> Http3Session {
+    return Http3Session { role: role }
+}

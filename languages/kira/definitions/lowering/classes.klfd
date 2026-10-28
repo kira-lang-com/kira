@@ -1,0 +1,106 @@
+extend KirTypes {
+    function declareClassDescriptions(borrow mut self, builder: KirModuleBuilder, program: CheckedProgram) {
+        markWitnessMembers(program)
+        var found = false
+        for index in 0..program.structs.count {
+            let absent: Optional<PayloadDescription> = .None
+            classDescriptions.append(absent)
+            if !opaqueClasses[index] && !witnessMembers[index] { continue }
+            let declared = program.structs[index]
+            classDescriptions[index] = .Some(declarePayloadDescription(builder, program, declared.baseNameSpan, structs[index], typeKey(program, Type.structure(index))))
+            found = true
+        }
+        if !found { return }
+        let span = program.named(program.structs[0].baseNameSpan)
+        let signature = kir_signature_new_named(builder, span.start, span.end, unit, generatedSuffix(builder, "class descriptions", program.moduleName))
+        let initializer = kir_signature_define(signature)
+        kir_function_initializer(initializer)
+        initializer.switchTo(initializer.entryBlock())
+        for index in 0..classDescriptions.count {
+            match classDescriptions[index] {
+                Some(value) -> {
+                    initializePayloadDescription(initializer, value)
+                    let descriptor = kir_value_global_address(initializer, value.global)
+                    initializer.store(initializer.integer(integer64, classTypeId(program, index)), initializer.field(descriptor, 7, integer64))
+                }
+                None -> {}
+            }
+        }
+        initializer.returnVoid()
+    }
+
+    function classDescription(borrow self, index: Int) -> PayloadDescription {
+        return classDescriptions[index].unwrap()
+    }
+}
+
+function lowerClassPayloadHelpers(program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder]) {
+    for index in 0..program.structs.count {
+        if !types.opaqueClasses[index] && !types.witnessMembers[index] { continue }
+        let declared = program.structs[index]
+        let description = types.classDescription(index)
+        let drop = description.destructor
+        var destructor = FunctionLowering.startChecked(program, types, functions, helperChecked(declared.baseNameSpan, Type.void()), drop)
+        let body = drop.block()
+        destructor.enter(body)
+        let payload = drop.typedMemory(drop.parameter(0), description.payloadType)
+        // The class's own `drop` runs first, while every field still holds.
+        // Its `self` is the handle: the box the payload sits in, as many
+        // bytes before it as `destroyContext` counts past the box's header.
+        let classDrop = program.dropFunctions[index]
+        if classDrop >= 0 {
+            let offset = (15 + description.alignment) / description.alignment * description.alignment
+            let handle = drop.offsetBytes(drop.parameter(0), drop.integer(types.integer64, 0 - offset))
+            let held = drop.slot(types.of(Type.structure(index)))
+            drop.store(handle, held)
+            drop.argument(drop.pointer(held))
+            drop.callVoid(functions[classDrop])
+        }
+        for field in 0..declared.fields.count {
+            let fieldType = declared.fields[field].valueType
+            destructor.destroyValue(drop.field(payload, field, types.of(fieldType)), fieldType)
+        }
+        drop.returnVoid()
+        drop.switchTo(destructor.entry)
+        drop.branch(body)
+        let copier = description.copier
+        var copying = FunctionLowering.startChecked(program, types, functions, helperChecked(declared.baseNameSpan, Type.void()), copier)
+        let copyBody = copier.block()
+        copying.enter(copyBody)
+        let destination = copier.typedMemory(copier.parameter(0), description.payloadType)
+        let source = copier.typedMemory(copier.parameter(1), description.payloadType)
+        for field in 0..declared.fields.count {
+            let fieldType = declared.fields[field].valueType
+            copying.copyValue(copier.field(source, field, types.of(fieldType)), copier.field(destination, field, types.of(fieldType)), fieldType)
+        }
+        copier.returnVoid()
+        copier.switchTo(copying.entry)
+        copier.branch(copyBody)
+    }
+}
+
+extend FunctionLowering {
+    function constructClass(borrow mut self, fields: [Int], valueType: Type) -> KirAddress {
+        let description = types.classDescription(valueType.declaration)
+        let slot = temporary(valueType)
+        let object = allocatePayloadBox(description)
+        let box = kir.typedMemory(object, description.boxType)
+        let payload = kir.field(box, 2, description.payloadType)
+        let declared = program.structs[valueType.declaration]
+        for index in 0..fields.count {
+            write(fields[index], kir.field(payload, index, types.of(declared.fields[index].valueType)))
+        }
+        kir.store(object, slot)
+        markInitialized(slot)
+        return slot
+    }
+
+    function classField(borrow mut self, owner: Int, field: Int) -> KirAddress {
+        return dynamicClassField(owner, field)
+    }
+
+    function copyClass(borrow mut self, from: KirAddress, to: KirAddress) {
+        let object = kir.load(from)
+        kir.store(arrayRuntimePointer(2, [object]), to)
+    }
+}

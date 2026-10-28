@@ -1,0 +1,958 @@
+// Declarations: functions, structs with their fields and methods, and enums.
+
+extend Parser {
+    // A top-level declaration. Types and functions record the site a
+    // collector reads them at; any other declaration is recorded here as
+    // `.Other`.
+    function declaration(borrow mut self) -> Result<Span, Failure> {
+        let claimed = try claimDocs()
+        let recorded = tree.declarationSites.count
+        let globals = tree.globals.count
+        // Traits and extensions record no site; their docs name them here.
+        var keywordAt = 0
+        if atWord("public") { keywordAt = 1 }
+        let keyword = text(peek(keywordAt).span)
+        let headName = text(peek(keywordAt + 1).span)
+        // A namespace takes these comments for itself (namespaceDeclaration),
+        // so they are not left for its first member.
+        pendingDocs = claimed
+        let span = try declarationItem()
+        let remaining = pendingDocs
+        pendingDocs = []
+        var docKind = "other"
+        var docName = ""
+        if tree.declarationSites.count == recorded {
+            let unnamed = Identifier { text = "", span = Span { file = span.file, start = span.start, end = span.start } }
+            tree.declarationSites.append(DeclarationSite { name = unnamed, kind = "other", span = span, family = "" })
+            if keyword == "trait" {
+                docKind = "trait"
+                docName = headName
+            } else if keyword == "extend" {
+                docKind = "extension"
+                docName = headName
+            }
+        } else {
+            let site = tree.declarationSites[recorded]
+            docKind = site.kind
+            docName = site.name.text
+        }
+        if tree.globals.count > globals {
+            recordDocs(remaining, "let", tree.globals[globals].binding.name.text, "")
+        } else {
+            recordDocs(remaining, docKind, docName, "")
+        }
+        return .Ok(span)
+    }
+
+    // `public` exports the declaration it fronts from its package, written
+    // before its annotations or after them.
+    function declarationItem(borrow mut self) -> Result<Span, Failure> {
+        var keyword = current().span
+        var exported = atWord("public")
+        if exported { advance() }
+        if atWord("comptime") && text(peek(1).span) == "macro" || atWord("extend") || atWord("macro") {
+            if exported { return .Error(Failure { diagnostic = .PublicNotTopLevel, span = keyword }) }
+        }
+        if atWord("comptime") && text(peek(1).span) == "macro" { return proceduralMacroDeclaration() }
+        if atWord("extend") { return extensionDeclaration() }
+        if atWord("macro") { return macroDeclaration() }
+        let annotations = try annotations()
+        if !exported && atWord("public") {
+            keyword = current().span
+            exported = true
+            advance()
+        }
+        if !exported { return exportableItem(annotations) }
+        if at(.Import) || atWord("comptime") && text(peek(1).span) == "macro" || at(.Identifier) && peek(1).kind == .Bang {
+            return .Error(Failure { diagnostic = .PublicNotTopLevel, span = keyword })
+        }
+        let sites = tree.declarationSites.count
+        let globals = tree.globals.count
+        let aliases = tree.aliases.count
+        let traits = tree.traits.count
+        // `public namespace A { ... }` exports every member it declares.
+        let namespace = atWord("namespace") && namespacePathAhead()
+        let parsed = exportableItem(annotations)
+        match parsed {
+            Ok(span) -> {
+                if namespace {
+                    for site in sites..tree.declarationSites.count { tree.exports.append(tree.declarationSites[site].name) }
+                    for global in globals..tree.globals.count { tree.exports.append(tree.globals[global].binding.name) }
+                } else if tree.declarationSites.count > sites {
+                    tree.exports.append(tree.declarationSites[sites].name)
+                } else if tree.globals.count > globals {
+                    tree.exports.append(tree.globals[globals].binding.name)
+                } else if tree.aliases.count > aliases {
+                    tree.exports.append(tree.aliases[aliases].name)
+                } else if tree.traits.count > traits {
+                    tree.exports.append(tree.traits[traits].name)
+                }
+                return .Ok(span)
+            }
+            Error(failed) -> {
+                if failed.diagnostic.code() == 2002 {
+                    return .Error(Failure { diagnostic = .PublicWithoutDeclaration, span = keyword })
+                }
+                return parsed
+            }
+        }
+    }
+
+    function exportableItem(borrow mut self, declared: [Annotation]) -> Result<Span, Failure> {
+        var annotations = declared
+        if atWord("comptime") && text(peek(1).span) == "macro" { return proceduralMacroDeclaration() }
+        if atTypeDeclaration() { return typeDeclaration(annotations) }
+        var comptime = false
+        if atWord("comptime") {
+            let token = advance()
+            annotations.append(implicitAnnotation(.Comptime, token.span))
+            comptime = true
+        }
+        var isAsync = false
+        if atWord("async") {
+            let token = advance()
+            annotations.append(implicitAnnotation(.Async, token.span))
+            isAsync = true
+        }
+        if at(.Function) {
+            quotes = comptime
+            skipsBody = bodiesElsewhere
+            let parsed = functionDeclaration(builtInAnnotations(annotations))
+            skipsBody = false
+            quotes = false
+            var declared = try parsed
+            if isAsync { declared = asyncDeclaration(declared) }
+            if declared.typeParameters.count > 0 {
+                tree.genericFunctions.append(declared)
+            } else {
+                tree.functions.append(declared)
+            }
+            let site = DeclarationSite { name = declared.name, kind = "function", span = declared.span, family = "" }
+            tree.declarationSites.append(site)
+            annotatedFunction(annotations, site)
+            return .Ok(declared.span)
+        }
+        if annotations.count > 0 && !at(.Let) && !at(.Var) {
+            return .Error(failure(.ExpectedDeclaration))
+        }
+        if at(.Import) { return importDeclaration() }
+        if atWord("namespace") && namespacePathAhead() { return namespaceDeclaration("") }
+        if atWord("extern") && text(peek(1).span) == "library" { return externLibraryBlock() }
+        if at(.Let) || at(.Var) {
+            let start = current().span
+            let binding = try readBinding()
+            match binding.name.text {
+                "code", "compare", "hash", "print", "traceText" -> return .Error(Failure { diagnostic = .BuiltinShadow, span = binding.name.span })
+                else -> {}
+            }
+            let span = spanFrom(start)
+            keepLiteralText(binding.value)
+            tree.globals.append(GlobalDeclaration { binding = binding, span = span, annotations = annotations })
+            return .Ok(span)
+        }
+        if at(.Type) { return aliasDeclaration() }
+        if at(.Trait) { return traitDeclaration() }
+        if at(.Identifier) && peek(1).kind == .Bang { return sourceMacroInvocation() }
+        return .Error(failure(.ExpectedDeclaration))
+    }
+
+    // An `async function` returns `Async<Output>`, the future its body runs
+    // in, `Output` being what it was written to return; one written to return
+    // nothing finishes with `Int` 0, as a joined task does.
+    function asyncDeclaration(borrow self, declared: FunctionDeclaration) -> FunctionDeclaration {
+        var output = TypeReference {
+            qualifier = .None, name = Identifier { text = "Int", span = declared.name.span },
+            arguments = [], modes = [], instanceName = "Int"
+        }
+        match declared.result {
+            Some(written) -> output = written
+            None -> {}
+        }
+        let arguments = [output]
+        let wrapped = TypeReference {
+            qualifier = .None,
+            name = Identifier { text = "Async", span = output.name.span },
+            arguments = arguments,
+            modes = [],
+            instanceName = genericInstanceName("Async", arguments)
+        }
+        return FunctionDeclaration {
+            name = declared.name, annotations = declared.annotations, receiver = declared.receiver,
+            parameters = declared.parameters, result = .Some(wrapped), body = declared.body, span = declared.span,
+            typeParameters = declared.typeParameters, scope = declared.scope
+        }
+    }
+
+    // `import Library` or `import Library as Alias`: a library the program
+    // depends on, visible in this file. The files of one module see each
+    // other without importing anything.
+    function importDeclaration(borrow mut self) -> Result<Span, Failure> {
+        let start = try expect(.Import)
+        let name = try identifier(.ExpectedModuleName)
+        if at(.Dot) { return .Error(failure(.OutsideSubset)) }
+        var alias = name
+        if eat(.As) {
+            alias = try identifier(.ExpectedModuleName)
+        }
+        if atWord("on") { try importPlatforms() }
+        imports.append(Import { name = name, alias = alias, module = .None })
+        return .Ok(spanFrom(start.span))
+    }
+
+    // `on tessera` or `on macos, ios` after an import: the platforms the file
+    // takes part on, which are every name `Build.platform()` answers but
+    // `unknown` (KLF-RIDL 27.8). The file is left out of a build for any other.
+    function importPlatforms(borrow mut self) -> Result<Bool, Failure> {
+        let on = advance()
+        if declared { return .Error(Failure { diagnostic = .PlatformImportAfterDeclaration, span = on.span }) }
+        let building = buildPlatform(tree.buildTarget)
+        var named = false
+        while true {
+            let platform = try identifier(.UnknownPlatform)
+            match platform.text {
+                "tessera", "ios", "macos", "windows", "android", "linux", "web", "unknown" -> {}
+                else -> return .Error(Failure { diagnostic = .UnknownPlatform, span = platform.span })
+            }
+            if platform.text == building { named = true }
+            if !eat(.Comma) { break }
+        }
+        if !named { excluded = true }
+        return .Ok(true)
+    }
+
+    function aliasDeclaration(borrow mut self) -> Result<Span, Failure> {
+        let start = try expect(.Type)
+        let name = try identifier(.ExpectedAliasName)
+        let parameters = try genericParameters(name)
+        try expect(.Equals)
+        let target = try typeReference()
+        tree.aliases.append(AliasDeclaration { name = name, genericParameters = parameters, target = target })
+        return .Ok(spanFrom(start.span))
+    }
+
+    // `@Name`, `@Name(arguments)` with a call's arguments, and the `@FFI.*`
+    // family. A built-in attribute is resolved here and its arguments held
+    // to what it takes; any other name is kept with its arguments for the
+    // macro or property wrapper it names. `@Name { ... }` is outside the
+    // subset.
+    function annotations(borrow mut self) -> Result<[Annotation], Failure> {
+        var written: [Annotation] = []
+        while eat(.At) {
+            let name = try identifier(.ExpectedAnnotationName)
+            if at(.Dot) {
+                written.append(try foreignAnnotation(name))
+                continue
+            }
+            if at(.LeftBrace) { return .Error(failure(.OutsideSubset)) }
+            var values: [Int] = []
+            if at(.LeftParen) {
+                let open = current().span
+                values = try arguments()
+                for value in values { spellStrings(value) }
+                if values.count == 0 { return .Error(Failure { diagnostic = .ExpectedAnnotationName, span = open }) }
+            }
+            let attribute = attributeNamed(name.text)
+            match attribute {
+                Some(found) -> try attributeArguments(found, name, values)
+                None -> {}
+            }
+            written.append(Annotation { name = name, attribute = attribute, arguments = values })
+        }
+        return .Ok(written)
+    }
+
+    // What a built-in attribute is written with: `@Service` and `@Ridl` a
+    // string, `@Derive` the names of its macros, any other nothing.
+    function attributeArguments(borrow self, attribute: Attribute, name: Identifier, arguments: [Int]) -> Result<Bool, Failure> {
+        match attribute {
+            Service -> return textArgument(name, arguments)
+            Ridl -> return textArgument(name, arguments)
+            Derive -> {
+                for argument in arguments {
+                    if tree.expressions[argument].kind.name().isNone() {
+                        return .Error(Failure { diagnostic = .ExpectedAnnotationName, span = tree.expressions[argument].span })
+                    }
+                }
+                if arguments.count == 0 { return .Error(Failure { diagnostic = .ExpectedAnnotationName, span = name.span }) }
+                return .Ok(true)
+            }
+            Instance -> return namedTypeArguments(name, arguments)
+            Main -> return bareAttribute(arguments)
+            MainThread -> return bareAttribute(arguments)
+            AtExit -> return bareAttribute(arguments)
+            Runtime -> return bareAttribute(arguments)
+            Native -> return bareAttribute(arguments)
+            Export -> return bareAttribute(arguments)
+            Required -> return bareAttribute(arguments)
+            TypeTable -> return bareAttribute(arguments)
+            Open -> return bareAttribute(arguments)
+            Content -> return bareAttribute(arguments)
+            Foreign -> return bareAttribute(arguments)
+            ThreadLocal -> return bareAttribute(arguments)
+            Comptime -> return bareAttribute(arguments)
+            Async -> return bareAttribute(arguments)
+            Trait -> return bareAttribute(arguments)
+            Computed -> return bareAttribute(arguments)
+            ComputedSetter -> return bareAttribute(arguments)
+            Witness -> return bareAttribute(arguments)
+            Dispatch -> return bareAttribute(arguments)
+            Elsewhere -> return bareAttribute(arguments)
+        }
+    }
+
+    // `@Instance(A, B)`: the type each argument of the instance is, written
+    // by its name.
+    function namedTypeArguments(borrow self, name: Identifier, arguments: [Int]) -> Result<Bool, Failure> {
+        if arguments.count == 0 { return .Error(Failure { diagnostic = .ExpectedAnnotationName, span = name.span }) }
+        for argument in arguments {
+            if tree.expressions[argument].kind.name().isNone() {
+                return .Error(Failure { diagnostic = .ExpectedAnnotationName, span = tree.expressions[argument].span })
+            }
+        }
+        return .Ok(true)
+    }
+
+    function textArgument(borrow self, name: Identifier, arguments: [Int]) -> Result<Bool, Failure> {
+        if arguments.count != 1 || tree.expressions[arguments[0]].kind.spelledText().isNone() {
+            return .Error(Failure { diagnostic = .OutsideSubset, span = name.span })
+        }
+        return .Ok(true)
+    }
+
+    function bareAttribute(borrow self, arguments: [Int]) -> Result<Bool, Failure> {
+        if arguments.count > 0 { return .Error(Failure { diagnostic = .OutsideSubset, span = tree.expressions[arguments[0]].span }) }
+        return .Ok(true)
+    }
+
+    function functionDeclaration(borrow mut self, annotations: [Annotation]) -> Result<FunctionDeclaration, Failure> {
+        let start = try expect(.Function)
+        let name = try identifier(.ExpectedFunctionName)
+        // A function, method or foreign declaration with a builtin's name
+        // would take its calls over without a word.
+        match name.text {
+            "code", "compare", "hash", "print", "traceText" -> return .Error(Failure { diagnostic = .BuiltinShadow, span = name.span })
+            else -> {}
+        }
+        return functionDefinition(name, annotations, start.span)
+    }
+
+    // A function inside a type, trait or extension, which declares no type
+    // parameters of its own.
+    // What a member is written with before `let`, `var` or `function`: its
+    // annotations, and `private` before or after them, as `public` is
+    // written on a declaration.
+    function memberPrefix(borrow mut self) -> Result<MemberPrefix, Failure> {
+        var hidden = eatPrivate()
+        let annotations = try annotations()
+        if !hidden { hidden = eatPrivate() }
+        return .Ok(MemberPrefix { annotations = annotations, hidden = hidden })
+    }
+
+    // `private` is a word of its own only before what it keeps private, so a
+    // case or a field may still be called `private`.
+    function atPrivate(borrow self) -> Bool {
+        if !atWord("private") { return false }
+        let next = peek(1).kind
+        return next == .Let || next == .Var || next == .Function || next == .At
+    }
+
+    function eatPrivate(borrow mut self) -> Bool {
+        if !atPrivate() { return false }
+        advance()
+        return true
+    }
+
+    // A member written `private` is kept to its declaration (`checkPrivateAccess`).
+    function keepPrivate(borrow mut self, prefix: borrow MemberPrefix, name: Identifier) {
+        if prefix.hidden { tree.privateMembers.append(name) }
+    }
+
+    // A method and what it is written with.
+    function prefixedMethod(borrow mut self) -> Result<FunctionDeclaration, Failure> {
+        let prefix = try memberPrefix()
+        let method = try memberFunction(prefix.annotations)
+        keepPrivate(prefix, method.name)
+        return .Ok(method)
+    }
+
+    // `from` and `init` make a value rather than answer for one, so neither
+    // takes a receiver: `function init(...) -> T` in an `extend` is another
+    // way to construct `T`, as an `init` in its construct is.
+    function memberFunction(borrow mut self, annotations: [Annotation]) -> Result<FunctionDeclaration, Failure> {
+        let declared = try functionDeclaration(annotations)
+        if (declared.name.text == "from" || declared.name.text == "init") && declared.receiver == .Free {
+            return .Ok(FunctionDeclaration {
+                name = declared.name, annotations = declared.annotations, receiver = .Static,
+                parameters = declared.parameters, result = declared.result, body = declared.body,
+                span = declared.span, typeParameters = declared.typeParameters, scope = declared.scope
+            })
+        }
+        return .Ok(declared)
+    }
+
+    function functionDefinition(borrow mut self, name: Identifier, annotations: [Annotation], start: Span) -> Result<FunctionDeclaration, Failure> {
+        if hasAttribute(annotations, .Native) {
+            return .Error(Failure { diagnostic = .NativeOnFunction, span = start })
+        }
+        // The functions a body declares are read with it.
+        let skipping = skipsBody
+        skipsBody = false
+        let typeParameters = try genericParameters(name)
+        try expect(.LeftParen)
+        let receiver = try receiver()
+        var parameters: [Parameter] = []
+        while !at(.RightParen) {
+            parameters.append(try parameter())
+            if !eat(.Comma) { break }
+        }
+        try expect(.RightParen)
+        var result: Optional<TypeReference> = .None
+        // Kira writes the result `-> Type` or `): Type`.
+        if eat(.Arrow) || eat(.Colon) {
+            result = .Some(try typeReference())
+        }
+        var body: [Int] = []
+        var written = annotations
+        if at(.LeftBrace) && skipping && typeParameters.count == 0 && !hasAttribute(annotations, .Comptime) {
+            try skipBody()
+            written.append(implicitAnnotation(.Elsewhere, name.span))
+        } else if at(.LeftBrace) {
+            body = try block()
+        } else if hasAttribute(annotations, .Trait) {
+            written.append(implicitAnnotation(.Required, name.span))
+        } else if !hasAttribute(annotations, .Required) && !hasAttribute(annotations, .TypeTable) && !hasAttribute(annotations, .Service) && !hasAttribute(annotations, .Ridl) && !hasAttribute(annotations, .Foreign) {
+            return .Error(failure(.Expected))
+        }
+        return .Ok(FunctionDeclaration {
+            name = name,
+            annotations = written,
+            receiver = receiver,
+            parameters = parameters,
+            result = result,
+            body = body,
+            span = spanFrom(start),
+            typeParameters = typeParameters,
+            scope = GenericScope.none()
+        })
+    }
+
+    // A body another unit reads, passed over to the brace that closes it.
+    function skipBody(borrow mut self) -> Result<Bool, Failure> {
+        try expect(.LeftBrace)
+        var depth = 1
+        while depth > 0 {
+            if at(.End) { return .Error(failure(.Expected)) }
+            if at(.LeftBrace) { depth += 1 }
+            if at(.RightBrace) { depth -= 1 }
+            advance()
+        }
+        return .Ok(true)
+    }
+
+    // A leading `borrow self` or `borrow mut self`, with the comma after it. A
+    // bare `self` would read as a consuming receiver, which Kira does not
+    // have.
+    function receiver(borrow mut self) -> Result<Receiver, Failure> {
+        if atWord("self") {
+            return .Error(failure(.BareSelf))
+        }
+        if !atWord("borrow") { return .Ok(.Free) }
+        var receiver: Receiver = .Borrowed
+        var ahead = 1
+        if text(peek(1).span) == "mut" {
+            receiver = .MutablyBorrowed
+            ahead = 2
+        }
+        if text(peek(ahead).span) != "self" { return .Ok(.Free) }
+        position += ahead + 1
+        if !at(.RightParen) {
+            try expect(.Comma)
+        }
+        return .Ok(receiver)
+    }
+
+    function parameter(borrow mut self) -> Result<Parameter, Failure> {
+        let name = try identifier(.ExpectedParameterName)
+        try expect(.Colon)
+        var mode: PassingMode = .Owned
+        var copies = false
+        if atWord("move") { advance() }
+        else if atWord("copy") {
+            advance()
+            copies = true
+        }
+        if atWord("borrow") {
+            advance()
+            mode = .Borrowed
+            if atWord("mut") {
+                advance()
+                mode = .MutablyBorrowed
+            }
+        }
+        let annotation = try typeReference()
+        var initial: Optional<Int> = .None
+        if eat(.Equals) { initial = .Some(try expression()) }
+        return .Ok(Parameter { name = name, mode = mode, annotation = annotation, copies = copies, initial = initial })
+    }
+
+    function typeReference(borrow mut self) -> Result<TypeReference, Failure> {
+        let reference = try primaryTypeReference()
+        if !eat(.Question) { return .Ok(reference) }
+        let arguments = [reference]
+        return .Ok(TypeReference {
+            qualifier = .None,
+            name = Identifier { text = "Optional", span = spanFrom(reference.name.span) },
+            arguments = arguments,
+            modes = [],
+            instanceName = genericInstanceName("Optional", arguments)
+        })
+    }
+
+    function primaryTypeReference(borrow mut self) -> Result<TypeReference, Failure> {
+        if eat(.LeftBracket) {
+            let start = tokens[position - 1].span
+            let element = try typeReference()
+            try expect(.RightBracket)
+            let arguments: [TypeReference] = [element]
+            return .Ok(TypeReference {
+                qualifier = .None,
+                name = Identifier { text = "Array", span = spanFrom(start) },
+                arguments = arguments,
+                modes = [],
+                instanceName = genericInstanceName("Array", arguments)
+            })
+        }
+        if at(.LeftParen) {
+            return callableTypeReference()
+        }
+        var qualifier: Optional<Identifier> = .None
+        var name = try identifier(.ExpectedTypeName)
+        match name.text {
+            "Any", "some" -> {
+                if at(.Identifier) && continuesLine() {
+                    let family = try identifier(.ExpectedTypeName)
+                    var arguments: [TypeReference] = []
+                    if eat(.Less) {
+                        while !atAngleClose() {
+                            arguments.append(try typeReference())
+                            if !eat(.Comma) { break }
+                        }
+                        try closeAngle()
+                    }
+                    // Keyed by the reference's own span, which the slot's
+                    // annotation keeps through specialization.
+                    let span = spanFrom(name.span)
+                    if arguments.count > 0 {
+                        tree.familyArguments.append(FamilyArguments { owner = "", ownerSpan = span, family = family.text, span = span, arguments = arguments })
+                    }
+                    return .Ok(familyReference(name.text, family, span))
+                }
+            }
+            else -> {}
+        }
+        if eat(.Dot) {
+            qualifier = .Some(name)
+            name = try identifier(.ExpectedTypeName)
+        }
+        var arguments: [TypeReference] = []
+        if eat(.Less) {
+            while !atAngleClose() {
+                arguments.append(try typeReference())
+                if !eat(.Comma) { break }
+            }
+            try closeAngle()
+        }
+        return .Ok(TypeReference {
+            qualifier = qualifier,
+            name = name,
+            arguments = arguments,
+            modes = [],
+            instanceName = genericInstanceName(name.text, arguments)
+        })
+    }
+
+    // `<A, B: Trait + Other>`. A bound is kept beside the template it
+    // constrains.
+    function genericParameters(borrow mut self, template: Identifier) -> Result<[Identifier], Failure> {
+        var parameters: [Identifier] = []
+        if !eat(.Less) { return .Ok(parameters) }
+        while !atAngleClose() {
+            let parameter = try identifier(.ExpectedTypeName)
+            if eat(.Colon) {
+                tree.bounds.append(GenericBound { template = template.text, parameter = parameters.count, traitName = try typeReference() })
+                while eat(.Plus) {
+                    tree.bounds.append(GenericBound { template = template.text, parameter = parameters.count, traitName = try typeReference() })
+                }
+            }
+            parameters.append(parameter)
+            if !eat(.Comma) { break }
+        }
+        try closeAngle()
+        return .Ok(parameters)
+    }
+
+    function block(borrow mut self) -> Result<[Int], Failure> {
+        try expect(.LeftBrace)
+        let saved = structLiterals
+        structLiterals = true
+        var statements: [Int] = []
+        while !at(.RightBrace) && !at(.End) {
+            for entry in try self.statements() { statements.append(entry) }
+        }
+        structLiterals = saved
+        try expect(.RightBrace)
+        return .Ok(statements)
+    }
+
+    // A struct. One that declares a C type (`@FFI.Pointer { ... } struct
+    // Name`) may leave its body out, as a `.klffi` file does.
+    function structDeclaration(borrow mut self, mark: Optional<Int>) -> Result<Span, Failure> {
+        let start = try expect(.Struct)
+        let name = try identifier(.ExpectedStructName)
+        let genericParameters = try genericParameters(name)
+        try conformances(templateReference(name, genericParameters))
+        var fields: [FieldDeclaration] = []
+        var methods: [FunctionDeclaration] = []
+        let bodied = mark.isNone() || at(.LeftBrace)
+        if bodied { try expect(.LeftBrace) }
+        while bodied && !at(.RightBrace) {
+            let memberDocs = try claimDocs()
+            let memberStart = current().span
+            let prefix = try memberPrefix()
+            if (at(.Let) || at(.Var)) && computedMemberAhead() {
+                let member = try computedStructMember(methods, memberStart)
+                keepPrivate(prefix, member)
+                recordDocs(memberDocs, "field", member.text, name.text)
+            } else if at(.Let) || at(.Var) {
+                let field = try fieldDeclaration(prefix.annotations, memberStart)
+                keepPrivate(prefix, field.name)
+                recordDocs(memberDocs, "field", field.name.text, name.text)
+                fields.append(field)
+            } else if at(.Function) {
+                skipsBody = bodiesElsewhere && genericParameters.count == 0
+                let method = memberFunction(prefix.annotations)
+                skipsBody = false
+                let declared = try method
+                keepPrivate(prefix, declared.name)
+                recordDocs(memberDocs, "method", declared.name.text, name.text)
+                methods.append(declared)
+            } else {
+                return .Error(failure(.ExpectedMember))
+            }
+        }
+        if bodied { try expect(.RightBrace) }
+        match mark {
+            Some(index) -> {
+                if fields.count == 0 && methods.count == 0 && genericParameters.count == 0 {
+                    match foreignAliasTarget(tree.foreignMarks[index]) {
+                        Some(target) -> {
+                            // Autobinding represents an incomplete C tag as
+                            // a self-named alias. It has identity, no members.
+                            if target.name.text != name.text || target.qualifier.isSome() || target.arguments.count > 0 {
+                                tree.aliases.append(AliasDeclaration { name = name, genericParameters = [], target = target })
+                                return .Ok(spanFrom(start.span))
+                            }
+                        }
+                        None -> {}
+                    }
+                }
+                fields = foreignStorage(tree.foreignMarks[index], name, fields)
+            }
+            None -> {}
+        }
+        let declared = StructDeclaration {
+            name = name,
+            genericParameters = genericParameters,
+            typeArguments = [],
+            callableModes = [],
+            ancestors = [],
+            genericBase = "",
+            baseNameSpan = name.span,
+            specialized = false,
+            typeSuffix = 0,
+            fields = fields,
+            methods = methods
+        }
+        if genericParameters.count > 0 {
+            tree.genericStructs.append(declared)
+        } else {
+            tree.structs.append(declared)
+        }
+        return .Ok(spanFrom(start.span))
+    }
+
+    // A field, `start` where its annotations begin.
+    function fieldDeclaration(borrow mut self, annotations: [Annotation], start: Span) -> Result<FieldDeclaration, Failure> {
+        let mutable = advance().kind == .Var
+        let name = try identifier(.ExpectedMemberName)
+        try expect(.Colon)
+        let annotation = try typeReference()
+        if at(.At) && peek(1).kind == .Identifier && text(peek(1).span) == "Bits" && peek(2).kind == .LeftParen {
+            advance()
+            let bits = advance()
+            advance()
+            if !at(.IntegerLiteral) { return .Error(failure(.ExpectedForeignValue)) }
+            let width = try integerValue(advance().span)
+            try expect(.RightParen)
+            tree.fieldBits.append(FieldBits { field = name.span, width = width, span = bits.span })
+        }
+        var initial: Optional<Int> = .None
+        if eat(.Equals) {
+            let value = try expression()
+            spellStrings(value)
+            initial = .Some(value)
+        }
+        return .Ok(FieldDeclaration {
+            name = name, mutable = mutable, annotation = annotation, initial = initial, annotations = annotations,
+            inferred = false, span = spanFrom(start)
+        })
+    }
+
+    // Gives each plain string literal of a field's default the text it
+    // spells, which a literal keeps only as its span: a module's contract
+    // writes the default out (KLF-RIDL section 20.3), and the checker that
+    // prints it has no source to read.
+    function spellStrings(borrow mut self, index: Int) {
+        let span = tree.expressions[index].span
+        match tree.expressions[index].kind {
+            StringLiteral(text) -> {
+                if text.isNone() {
+                    tree.expressions[index] = Expression { kind = .StringLiteral(.Some(utf8Slice(source, span.start + 1, span.end - 1))), span = span }
+                }
+            }
+            Unary(operator, operand) -> spellStrings(operand)
+            Variant(name, payload) -> {
+                match payload {
+                    Some(value) -> spellStrings(value)
+                    None -> {}
+                }
+            }
+            ArrayLiteral(items) -> { for item in items { spellStrings(item) } }
+            Call(name, arguments) -> { for argument in arguments { spellStrings(argument) } }
+            StructLiteral(name, typeArguments, fields) -> { for field in fields { spellStrings(field.value) } }
+            Quote -> {}
+            IntegerLiteral -> {}
+            FloatLiteral -> {}
+            BooleanLiteral -> {}
+            Index -> {}
+            Transfer -> {}
+            Labelled -> {}
+            TypeQuery -> {}
+            Name -> {}
+            Member -> {}
+            ExpandedMacro -> {}
+            MacroCall -> {}
+            GenericCall -> {}
+            MethodCall -> {}
+            IndirectCall -> {}
+            Lambda -> {}
+            KeyPath -> {}
+            Task -> {}
+            Try -> {}
+            Binary -> {}
+            Conditional -> {}
+            MatchValue -> {}
+            Content -> {}
+        }
+    }
+
+    // Cases are separated by whitespace, never commas. A case carries at most
+    // one payload, written in parentheses.
+    function enumDeclaration(borrow mut self, annotations: [Annotation]) -> Result<Span, Failure> {
+        let start = try expect(.Enum)
+        let name = try identifier(.ExpectedEnumName)
+        let genericParameters = try genericParameters(name)
+        var rawType: Optional<TypeReference> = .None
+        if at(.Colon) && builtinType(text(peek(1).span)).isSome() {
+            advance()
+            rawType = .Some(try typeReference())
+        } else {
+            try conformances(templateReference(name, genericParameters))
+        }
+        try expect(.LeftBrace)
+        var cases: [CaseDeclaration] = []
+        var methods: [FunctionDeclaration] = []
+        var rawValues: [Int] = []
+        while !at(.RightBrace) {
+            let memberDocs = try claimDocs()
+            if at(.Function) || at(.At) || atPrivate() {
+                skipsBody = bodiesElsewhere && genericParameters.count == 0
+                let method = prefixedMethod()
+                skipsBody = false
+                let declared = try method
+                recordDocs(memberDocs, "method", declared.name.text, name.text)
+                methods.append(declared)
+                continue
+            }
+            let caseName = try identifier(.ExpectedVariantName)
+            var payload: Optional<TypeReference> = .None
+            var initial: Optional<Int> = .None
+            if eat(.LeftParen) {
+                payload = .Some(try typeReference())
+                try expect(.RightParen)
+            } else if eat(.Colon) {
+                payload = .Some(try typeReference())
+            }
+            if eat(.Equals) {
+                let value = try expression()
+                if rawType.isSome() { rawValues.append(value) } else { initial = .Some(value) }
+            } else if rawType.isSome() {
+                rawValues.append(tree.addExpression(.IntegerLiteral(cases.count, false), caseName.span))
+            }
+            recordDocs(memberDocs, "case", caseName.text, name.text)
+            cases.append(CaseDeclaration { name = caseName, payload = payload, initial = initial })
+        }
+        try expect(.RightBrace)
+        match rawType {
+            Some(representation) -> {
+                if hasAttribute(annotations, .Open) {
+                    tree.taggedEnums.append(TaggedEnum { name = name, representation = representation, tags = rawTags(rawValues) })
+                } else {
+                    for method in rawEnumMethods(name, representation, cases, rawValues) { methods.append(method) }
+                }
+            }
+            None -> {}
+        }
+        let declared = EnumDeclaration {
+            name = name,
+            genericParameters = genericParameters,
+            typeArguments = [],
+            baseNameSpan = name.span,
+            specialized = false,
+            typeSuffix = 0,
+            cases = cases,
+            methods = methods,
+            existential = false
+        }
+        if genericParameters.count > 0 {
+            tree.genericEnums.append(declared)
+        } else {
+            tree.enums.append(declared)
+        }
+        return .Ok(spanFrom(start.span))
+    }
+}
+
+// `Any Family` or `some Family`: a value of some declaration the family
+// backs, which is the family's synthesized enum. The name keeps the
+// spelling, since a field or parameter written `some` is a child slot.
+function familyReference(keyword: String, family: Identifier, span: Span) -> TypeReference {
+    let name = Identifier { text = joinText([keyword, " ", family.text]), span = span }
+    return TypeReference { qualifier = .None, name = name, arguments = [], modes = [], instanceName = familyTypeName(family.text) }
+}
+
+function familyTypeName(family: String) -> String {
+    return joinText(["Any ", family])
+}
+
+// The type a template's own body means by its name: the template applied to
+// its parameters.
+function templateReference(name: Identifier, parameters: [Identifier]) -> TypeReference {
+    var arguments: [TypeReference] = []
+    for parameter in parameters { arguments.append(namedReference(parameter)) }
+    return TypeReference {
+        qualifier = .None, name = name, arguments = arguments, modes = [],
+        instanceName = genericInstanceName(name.text, arguments)
+    }
+}
+
+function namedReference(name: Identifier) -> TypeReference {
+    return TypeReference { qualifier = .None, name = name, arguments = [], modes = [], instanceName = name.text }
+}
+
+function genericInstanceName(name: String, arguments: [TypeReference]) -> String {
+    if arguments.count == 0 { return name }
+    var parts: [String] = [name, "<"]
+    for index in 0..arguments.count {
+        if index > 0 { parts.append(",") }
+        parts.append(arguments[index].instanceName)
+    }
+    parts.append(">")
+    return joinText(parts)
+}
+
+extend Parser {
+    // `namespace A.B { let X = 1 }`: each member is a global named by its
+    // whole dotted path, `A.B.X`, and a nested namespace extends the path.
+    // A segment is a name or a number, so `GPT.5.6` is a path.
+    function namespaceDeclaration(borrow mut self, outer: String) -> Result<Span, Failure> {
+        let start = advance().span
+        var path = outer
+        while true {
+            let segment = try pathSegment()
+            if utf8Count(path) > 0 {
+                path = joinText([path, ".", segment])
+            } else {
+                path = segment
+            }
+            if !eat(.Dot) { break }
+        }
+        // The comments before this namespace, handed in by its declaration or by
+        // the namespace that encloses it.
+        recordDocs(pendingDocs, "namespace", path, "")
+        pendingDocs = []
+        try expect(.LeftBrace)
+        while !at(.RightBrace) {
+            let memberDocs = try claimDocs()
+            if atWord("namespace") && namespacePathAhead() {
+                pendingDocs = memberDocs
+                try namespaceDeclaration(path)
+                continue
+            }
+            if at(.Function) {
+                let functionStart = advance().span
+                let written = try identifier(.ExpectedFunctionName)
+                let name = Identifier { text = joinText([path, ".", written.text]), span = written.span }
+                recordDocs(memberDocs, "function", name.text, "")
+                let declared = try functionDefinition(name, [], functionStart)
+                if declared.typeParameters.count > 0 {
+                    tree.genericFunctions.append(declared)
+                } else {
+                    tree.functions.append(declared)
+                }
+                tree.declarationSites.append(DeclarationSite { name = name, kind = "function", span = declared.span, family = "" })
+                continue
+            }
+            if !at(.Let) { return .Error(failure(.ExpectedDeclaration)) }
+            let memberStart = current().span
+            let binding = try readBinding()
+            let name = Identifier { text = joinText([path, ".", binding.name.text]), span = binding.name.span }
+            recordDocs(memberDocs, "let", name.text, "")
+            keepLiteralText(binding.value)
+            tree.globals.append(GlobalDeclaration {
+                binding = BindingStatement { mutable = false, name = name, annotation = binding.annotation, prefix = binding.prefix, value = binding.value },
+                span = spanFrom(memberStart)
+            })
+        }
+        try expect(.RightBrace)
+        return .Ok(spanFrom(start))
+    }
+
+    // A global's string literal keeps its text even without an escape, so a
+    // constant string can be written into a RIDL surface, which has no
+    // source to read it from.
+    // The value is one literal when its text is quoted with no quote inside.
+    function keepLiteralText(borrow mut self, value: Int) {
+        let span = tree.expressions[value].span
+        let raw = text(span)
+        let count = utf8Count(raw)
+        if count < 2 || utf8Byte(raw, 0) != 34 || utf8Byte(raw, count - 1) != 34 { return }
+        for index in 1..count - 1 {
+            if utf8Byte(raw, index) == 34 { return }
+        }
+        match stringLiteralText(raw) {
+            Some(decoded) -> {}
+            None -> tree.expressions[value] = Expression { kind = .StringLiteral(.Some(utf8Slice(raw, 1, utf8Count(raw) - 1))), span = span }
+        }
+    }
+
+    function namespacePathAhead(borrow self) -> Bool {
+        let kind = peek(1).kind
+        return kind == .Identifier || kind == .IntegerLiteral || kind == .FloatLiteral
+    }
+
+    function pathSegment(borrow mut self) -> Result<String, Failure> {
+        if at(.Identifier) || at(.IntegerLiteral) || at(.FloatLiteral) { return .Ok(text(advance().span)) }
+        return .Error(failure(.ExpectedMemberName))
+    }
+}

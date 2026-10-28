@@ -1,0 +1,510 @@
+// A top-level `let` whose value is a constant is that constant wherever it is
+// read: lowering writes the initializer in place of a load from the global, so
+// `public let pageSize: U64 = 4096` costs a reader nothing, in its own package
+// or one that imports it. A constant is a literal, or a construction, tag,
+// conversion or negation of constants, as `Rights(U64(4))` and a `Number`
+// literal are, or another constant global read. Integer arithmetic on
+// constants is one too when it folds to a value of its type without
+// trapping: `EdgeSet.leading | EdgeSet.trailing` is `10`.
+
+// How many constant globals deep a constant may read before it is taken for
+// one worked out at run time, which a cycle of globals reading each other is.
+let constantReadDepth: Int = 16
+
+// The upper bound of `Int`, which folding stays inside; the lower one is
+// `minimumInt()`, as a definition constant is a literal.
+let maximumInt: Int = 9223372036854775807
+
+extend CheckedProgram {
+    // The initializer a read of `global` lowers to, or nothing when the
+    // global is a `var` or its value is worked out at run time. A class
+    // instance is one object every reader shares, and a thread-local one a
+    // copy per thread, so neither is written in place.
+    function constantGlobal(borrow self, global: Int) -> Optional<Int> {
+        if !inlinable(global) { return .None }
+        match globals[global].initializer {
+            Some(value) -> {
+                if isConstantExpression(value) { return .Some(value) }
+                return .None
+            }
+            None -> return .None
+        }
+    }
+
+    function inlinable(borrow self, global: Int) -> Bool {
+        return !globals[global].mutable && !globals[global].threadLocal && !isClassType(self, globals[global].valueType)
+    }
+
+    function isConstantExpression(borrow self, index: Int) -> Bool {
+        return constantWithin(index, 0)
+    }
+
+    function constantWithin(borrow self, index: Int, depth: Int) -> Bool {
+        match constantShape(index) {
+            Integer -> return true
+            Boolean -> return true
+            Literal -> return true
+            Quoted -> return true
+            Wrapped(operand) -> return constantWithin(operand, depth)
+            Negated(operand) -> return constantWithin(operand, depth)
+            Complemented(operand) -> return constantWithin(operand, depth)
+            Fields(fields) -> {
+                for field in fields {
+                    if !constantWithin(field, depth) { return false }
+                }
+                return true
+            }
+            Global(global) -> {
+                if depth >= constantReadDepth || !inlinable(global) { return false }
+                match globals[global].initializer {
+                    Some(value) -> return constantWithin(value, depth + 1)
+                    None -> return false
+                }
+            }
+            Folded -> return foldedInteger(index, depth).isSome()
+            Projected -> return foldedInteger(index, depth).isSome()
+            Other -> return false
+        }
+        return false
+    }
+
+    // The integer `index` folds to: a literal, a constant global read, a
+    // conversion or negation of one, or integer arithmetic on two, each step
+    // in range of its type. Nothing for a step that would trap or overflow,
+    // which is left to run time.
+    function foldedInteger(borrow self, index: Int, depth: Int) -> Optional<Int> {
+        if depth > constantReadDepth { return .None }
+        let valueType = typeOf(index)
+        if !valueType.isInteger() { return .None }
+        match constantShape(index) {
+            Integer(value) -> return .Some(value)
+            Global(global) -> {
+                if globals[global].mutable { return .None }
+                match globals[global].initializer {
+                    Some(value) -> return foldedInteger(value, depth + 1)
+                    None -> return .None
+                }
+            }
+            Wrapped(operand) -> {
+                match foldedInteger(operand, depth) {
+                    Some(value) -> return integerInRange(value, typeOf(operand), valueType)
+                    None -> return .None
+                }
+            }
+            Negated(operand) -> {
+                match foldedInteger(operand, depth) {
+                    Some(value) -> {
+                        if !valueType.signed || value == minimumInt() { return .None }
+                        return integerInRange(0 - value, valueType, valueType)
+                    }
+                    None -> return .None
+                }
+            }
+            Complemented(operand) -> {
+                match foldedInteger(operand, depth) {
+                    Some(value) -> return integerInRange(~value, valueType, valueType)
+                    None -> return .None
+                }
+            }
+            Folded(operator, left, right) -> {
+                match foldedInteger(left, depth) {
+                    Some(first) -> {
+                        match foldedInteger(right, depth) {
+                            Some(second) -> return foldedArithmetic(operator, first, second, valueType)
+                            None -> return .None
+                        }
+                    }
+                    None -> return .None
+                }
+            }
+            Projected(value, field) -> {
+                match fieldValue(value, field, depth) {
+                    Some(read) -> return foldedInteger(read, depth + 1)
+                    None -> return .None
+                }
+            }
+            Boolean -> return .None
+            Literal -> return .None
+            Quoted -> return .None
+            Fields -> return .None
+            Other -> return .None
+        }
+        return .None
+    }
+
+    // The expression field `field` of the constant struct `value` is built
+    // with, through the constant globals it reads.
+    function fieldValue(borrow self, value: Int, field: Int, depth: Int) -> Optional<Int> {
+        if depth > constantReadDepth { return .None }
+        match constantShape(value) {
+            Fields(fields) -> {
+                if field >= fields.count { return .None }
+                return .Some(fields[field])
+            }
+            Global(global) -> {
+                if globals[global].mutable { return .None }
+                match globals[global].initializer {
+                    Some(initial) -> return fieldValue(initial, field, depth + 1)
+                    None -> return .None
+                }
+            }
+            Wrapped(operand) -> return fieldValue(operand, field, depth)
+            Integer -> return .None
+            Boolean -> return .None
+            Literal -> return .None
+            Quoted -> return .None
+            Negated -> return .None
+            Complemented -> return .None
+            Folded -> return .None
+            Projected -> return .None
+            Other -> return .None
+        }
+        return .None
+    }
+
+    // `first operator second` in `valueType`, when it neither traps nor
+    // leaves the type's range. A 64-bit unsigned word is only combined bit by
+    // bit: its high half reads here as negative.
+    function foldedArithmetic(borrow self, operator: ArithmeticOperator, first: Int, second: Int, valueType: Type) -> Optional<Int> {
+        let word = valueType.bits >= 64 && !valueType.signed
+        match operator {
+            BitAnd -> return integerInRange(first & second, valueType, valueType)
+            BitOr -> return integerInRange(first | second, valueType, valueType)
+            BitXor -> return integerInRange(first ^ second, valueType, valueType)
+            ShiftLeft -> {
+                if word || first < 0 || second < 0 || second >= 63 { return .None }
+                let shifted = first << second
+                if shifted >> second != first { return .None }
+                return integerInRange(shifted, valueType, valueType)
+            }
+            ShiftRight -> {
+                if word || first < 0 || second < 0 || second >= 64 { return .None }
+                return integerInRange(first >> second, valueType, valueType)
+            }
+            Add -> {
+                if word { return .None }
+                if second > 0 && first > maximumInt - second { return .None }
+                if second < 0 && first < minimumInt() - second { return .None }
+                return integerInRange(first + second, valueType, valueType)
+            }
+            Subtract -> {
+                if word { return .None }
+                if second < 0 && first > maximumInt + second { return .None }
+                if second > 0 && first < minimumInt() + second { return .None }
+                return integerInRange(first - second, valueType, valueType)
+            }
+            Multiply -> {
+                if word { return .None }
+                if first == 0 || second == 0 { return .Some(0) }
+                if first == minimumInt() || second == minimumInt() { return .None }
+                let product = first * second
+                if product / second != first { return .None }
+                return integerInRange(product, valueType, valueType)
+            }
+            Divide -> {
+                if word || second == 0 || (first == minimumInt() && second == -1) { return .None }
+                return integerInRange(first / second, valueType, valueType)
+            }
+            Remainder -> {
+                if word || second == 0 || (first == minimumInt() && second == -1) { return .None }
+                return integerInRange(first % second, valueType, valueType)
+            }
+        }
+        return .None
+    }
+
+    // `value`, read as `source`, when `target` holds it.
+    function integerInRange(borrow self, value: Int, source: Type, target: Type) -> Optional<Int> {
+        if source.bits >= 64 && !source.signed && value < 0 {
+            // A word past `Int`: only a 64-bit unsigned type holds it.
+            if target.bits >= 64 && !target.signed { return .Some(value) }
+            return .None
+        }
+        if target.bits >= 64 {
+            if !target.signed && value < 0 { return .None }
+            return .Some(value)
+        }
+        if target.signed {
+            let reach = 1 << (target.bits - 1)
+            if value < 0 - reach || value >= reach { return .None }
+            return .Some(value)
+        }
+        if value < 0 || value >= 1 << target.bits { return .None }
+        return .Some(value)
+    }
+
+    // What a constant can be built of, and everything else as `Other`.
+    function constantShape(borrow self, index: Int) -> ConstantShape {
+        match expressions[index].operation {
+            Integer(value) -> return .Integer(value)
+            Boolean(value) -> return .Boolean(value)
+            FloatLiteral -> return .Literal
+            StringLiteral -> return .Literal
+            StringText(text) -> return .Quoted(text)
+            Construct(fields) -> return .Fields(fields)
+            Tagged(variant, payload) -> {
+                match payload {
+                    Some(value) -> return .Fields([value])
+                    None -> return .Fields([])
+                }
+            }
+            GlobalRead(global) -> return .Global(global)
+            Arithmetic(operator, left, right) -> return .Folded(operator, left, right)
+            Member(value, field) -> return .Projected(value, field)
+            Bitcast(operand) -> return .Wrapped(operand)
+            Convert(operand) -> return .Wrapped(operand)
+            Unary(operator, operand) -> {
+                match operator {
+                    Negate -> return .Negated(operand)
+                    Complement -> return .Complemented(operand)
+                    Not -> return .Complemented(operand)
+                }
+            }
+            Sequence -> return .Other
+            BoxAny -> return .Other
+            TypeIs -> return .Other
+            UnboxAny -> return .Other
+            FunctionReference -> return .Other
+            IndirectCall -> return .Other
+            MakeClosure -> return .Other
+            TaskSpawn -> return .Other
+            TaskReady -> return .Other
+            TaskAwait -> return .Other
+            TaskCancel -> return .Other
+            TaskDetach -> return .Other
+            Async -> return .Other
+            RuntimeTrap -> return .Other
+            Try -> return .Other
+            ChannelCreate -> return .Other
+            ChannelReceiver -> return .Other
+            ChannelSend -> return .Other
+            ChannelClose -> return .Other
+            ClassView -> return .Other
+            ClassCall -> return .Other
+            StringConcat -> return .Other
+            TraceText -> return .Other
+            HeapAllocateRaw -> return .Other
+            HeapFreeRaw -> return .Other
+            Print -> return .Other
+            HeapRead -> return .Other
+            HeapWrite -> return .Other
+            Atomic -> return .Other
+            HeapCopy -> return .Other
+            HeapFill -> return .Other
+            HeapOffset -> return .Other
+            HeapLayout -> return .Other
+            ArrayLiteral -> return .Other
+            ArrayIndex -> return .Other
+            ArrayAppend -> return .Other
+            Transfer -> return .Other
+            Read -> return .Other
+            Call -> return .Other
+            Wrapping -> return .Other
+            Compare -> return .Other
+            Logical -> return .Other
+            Select -> return .Other
+            Choice -> return .Other
+            ForeignImage -> return .Other
+            ForeignElements -> return .Other
+            ForeignCallback -> return .Other
+            ForeignRead -> return .Other
+            ForeignUnion -> return .Other
+            EnumCode -> return .Other
+            EnumFromCode -> return .Other
+            Order -> return .Other
+            Hash -> return .Other
+        }
+        return .Other
+    }
+}
+
+enum ConstantShape {
+    Integer(Int)
+    Boolean(Bool)
+    // A float or a string, whose text is its source's.
+    Literal
+    // A string that carries its text.
+    Quoted(String)
+    // A conversion or a reinterpretation of the operand.
+    Wrapped(Int)
+    Negated(Int)
+    Complemented(Int)
+    // A struct's fields, or a variant's payload when it has one.
+    Fields([Int])
+    // A read of the global, a constant when its value is one.
+    Global(Int)
+    // Integer arithmetic, a constant when it folds (`foldedInteger`).
+    Folded(ArithmeticOperator, Int, Int)
+    // A field of a struct value, a distinct's representation among them,
+    // a constant when the integer it reads folds.
+    Projected(Int, Int)
+    Other
+}
+
+// The `let`s of the package being built that are written `public`.
+function publicGlobals(tree: SyntaxTree, declarations: Declarations) -> [Int] {
+    var globals: [Int] = []
+    for index in 0..declarations.globals.count {
+        let global = declarations.globals[index]
+        if global.mutable || !ownDeclaration(declarations, global.name.span.file) { continue }
+        if isExportedName(tree, global.name.span) { globals.append(index) }
+    }
+    return globals
+}
+
+extend CheckedProgram {
+    // A constant global's value as a RIDL literal: an integer, an unsigned
+    // one past `Int` as hexadecimal, `true` or `false`, or a `Number`'s
+    // decimal, or a quoted string. Nothing for a value RIDL has no literal
+    // for, a float among them, whose text the checked program does not keep.
+    function constantLiteral(borrow self, global: Int) -> Optional<String> {
+        match constantGlobal(global) {
+            Some(value) -> return literalText(value, globals[global].valueType)
+            None -> return .None
+        }
+    }
+
+    // A public constant's value as the contract writes it: its literal, or
+    // where RIDL has none, the struct, distinct, variant or array it is built
+    // as (section 20.3).
+    function contractConstant(borrow self, global: Int) -> Optional<String> {
+        match constantLiteral(global) {
+            Some(literal) -> return .Some(literal)
+            None -> {}
+        }
+        if global >= contractConstants.count || contractConstants[global] == "" { return .None }
+        return .Some(contractConstants[global])
+    }
+
+    function literalText(borrow self, index: Int, valueType: Type) -> Optional<String> {
+        match constantShape(index) {
+            Integer(value) -> {
+                if value < 0 && valueType.isInteger() && !valueType.signed { return .Some(hexadecimalWord(value)) }
+                return .Some(decimalText(value))
+            }
+            Boolean(value) -> {
+                if value { return .Some("true") }
+                return .Some("false")
+            }
+            Wrapped(operand) -> return literalText(operand, valueType)
+            Negated(operand) -> {
+                match literalText(operand, valueType) {
+                    Some(text) -> return .Some(joinText(["-", text]))
+                    None -> return .None
+                }
+            }
+            Fields(fields) -> {
+                if fields.count == 2 && isNumberWords(valueType) { return numberLiteralText(fields[0], fields[1]) }
+                if fields.count == 1 { return literalText(fields[0], typeOf(fields[0])) }
+                return .None
+            }
+            Quoted(text) -> return .Some(ridlString(text))
+            Global(global) -> {
+                match constantGlobal(global) {
+                    Some(value) -> return literalText(value, valueType)
+                    None -> return .None
+                }
+            }
+            Folded -> return foldedText(index, valueType)
+            Projected -> return foldedText(index, valueType)
+            Complemented -> return foldedText(index, valueType)
+            Literal -> return .None
+            Other -> return .None
+        }
+        return .None
+    }
+
+    // A folded integer's literal, a word past `Int` as hexadecimal.
+    function foldedText(borrow self, index: Int, valueType: Type) -> Optional<String> {
+        match foldedInteger(index, 0) {
+            Some(value) -> {
+                if value < 0 && valueType.isInteger() && !valueType.signed { return .Some(hexadecimalWord(value)) }
+                return .Some(decimalText(value))
+            }
+            None -> return .None
+        }
+    }
+
+    // The decimal a `Number`'s two words spell, when its mantissa fits an
+    // `Int`.
+    function numberLiteralText(borrow self, mantissaIndex: Int, scaleIndex: Int) -> Optional<String> {
+        var mantissa = 0
+        var scale = 0
+        match constantShape(mantissaIndex) {
+            Integer(value) -> mantissa = value
+            Boolean -> return .None
+            Literal -> return .None
+            Quoted -> return .None
+            Wrapped -> return .None
+            Negated -> return .None
+            Complemented -> return .None
+            Fields -> return .None
+            Global -> return .None
+            Folded -> return .None
+            Projected -> return .None
+            Other -> return .None
+        }
+        match constantShape(scaleIndex) {
+            Integer(value) -> scale = value
+            Boolean -> return .None
+            Literal -> return .None
+            Quoted -> return .None
+            Wrapped -> return .None
+            Negated -> return .None
+            Complemented -> return .None
+            Fields -> return .None
+            Global -> return .None
+            Folded -> return .None
+            Projected -> return .None
+            Other -> return .None
+        }
+        // A hexadecimal literal written as a `Number` names a `U64`'s bits,
+        // which a negative mantissa marked this way holds.
+        if scale == 256 && mantissa < 0 { return .Some(hexadecimalWord(mantissa)) }
+        if scale < 0 || scale > 18 { return .None }
+        var digits = decimalText(mantissa)
+        var sign = ""
+        if mantissa < 0 {
+            sign = "-"
+            digits = utf8Slice(digits, 1, utf8Count(digits))
+        }
+        if scale == 0 { return .Some(joinText([sign, digits])) }
+        while utf8Count(digits) <= scale { digits = joinText(["0", digits]) }
+        let point = utf8Count(digits) - scale
+        return .Some(joinText([sign, utf8Slice(digits, 0, point), ".", utf8Slice(digits, point, utf8Count(digits))]))
+    }
+}
+
+function minimumInt() -> Int {
+    return 0 - maximumInt - 1
+}
+
+// A word's 64 bits as `0x` and sixteen hexadecimal digits.
+function hexadecimalWord(word: Int) -> String {
+    let digits = "0123456789abcdef"
+    var parts: [String] = ["0x"]
+    var shift = 60
+    while shift >= 0 {
+        let nibble = (word >> shift) & 15
+        parts.append(utf8Slice(digits, nibble, nibble + 1))
+        shift -= 4
+    }
+    return joinText(parts)
+}
+
+// `text` quoted for RIDL, which reads a backslash as keeping the byte after it.
+function ridlString(text: String) -> String {
+    var parts: [String] = ["\""]
+    var run = 0
+    for index in 0..utf8Count(text) {
+        let byte = utf8Byte(text, index)
+        if byte == 34 || byte == 92 {
+            parts.append(utf8Slice(text, run, index))
+            parts.append("\\")
+            run = index
+        }
+    }
+    parts.append(utf8Slice(text, run, utf8Count(text)))
+    parts.append("\"")
+    return joinText(parts)
+}

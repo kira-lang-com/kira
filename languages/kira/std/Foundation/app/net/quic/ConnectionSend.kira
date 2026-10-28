@@ -1,0 +1,483 @@
+// Datagrams out: one packet per level with keys, coalesced into one
+// datagram, each filled with ACKs, CRYPTO data, control frames, stream data
+// and datagrams within the peer's credit and the congestion window.
+
+namespace QuicSendBudget {
+    // Header bytes a packet may need besides its connection IDs and token:
+    // the first byte, version, ID lengths, Length and a four-byte number.
+    let longHeader: Number = 13
+    let shortHeader: Number = 5
+    // Room too small for anything but a sliver is left for the next
+    // datagram.
+    let smallestPacket: Number = 48
+    // A CRYPTO or STREAM frame's header at its largest offsets.
+    let frameHeader: Number = 24
+}
+
+// A packet's frames as they are gathered.
+struct QuicPacketDraft {
+    var frames: [QuicFrame] = []
+    var size: Number = 0
+    let budget: Number
+    var eliciting: Bool = false
+
+    function fits(borrow self, bytes: Number) -> Bool {
+        return size + bytes <= budget
+    }
+
+    function add(borrow mut self, frame: QuicFrame) {
+        size += quicFrameSize(frame)
+        if quicElicitsAck(frame) { eliciting = true }
+        frames.append(frame)
+    }
+}
+
+extend QuicConnection {
+    // The next datagram to send, none when nothing is due.
+    function transmit(borrow mut self, now: QuicInstant) -> [UN8]? {
+        if state == .Closed || state == .Draining { return .None }
+        if state == .Closing { return transmitClose(now) }
+        retireStreams()
+        let limit = datagramLimit()
+        var datagram: [UN8] = []
+        for level in [TlsEncryptionLevel.Initial, TlsEncryptionLevel.Handshake, TlsEncryptionLevel.Application] {
+            let room = limit - datagram.count
+            if room < QuicSendBudget.smallestPacket { break }
+            match buildPacket(level, room, datagram.count, now) {
+                Some(bytes) -> datagram.appendAll(bytes)
+                None -> {}
+            }
+        }
+        if datagram.count == 0 { return .None }
+        bytesSent += datagram.count
+        return .Some(datagram)
+    }
+
+    // The largest datagram that may go now: the peer's limit once known,
+    // and three times what arrived until a server knows the client's
+    // address is real (RFC 9000 section 8.1).
+    function datagramLimit(borrow self) -> Number {
+        var limit = Quic.minimumDatagram
+        match peerParameters {
+            Some(parameters) -> limit = min(
+                parameters.maxUdpPayloadSize,
+                Number(limits.maxUdpPayload)
+            )
+            None -> {}
+        }
+        if !addressValidated {
+            limit = min(limit, QuicIdle.amplificationFactor * bytesReceived - bytesSent)
+        }
+        return limit
+    }
+
+    function packetHeader(borrow self, level: TlsEncryptionLevel) -> QuicPacketHeader {
+        return QuicPacketHeader {
+            level: level,
+            destination: copy peerId,
+            source: copy localId,
+            token: level == .Initial ? copy token : [],
+            keyPhase: keyPhase
+        }
+    }
+
+    function headerOverhead(borrow self, level: TlsEncryptionLevel) -> Number {
+        if level == .Application {
+            return QuicSendBudget.shortHeader + peerId.count + CryptoService.tagBytes
+        }
+        let tokenBytes = level == .Initial ? wireVarintSize(token.count) + token.count : 0
+        return QuicSendBudget.longHeader + peerId.count + localId.count + tokenBytes + CryptoService.tagBytes
+    }
+
+    function buildPacket(
+        borrow mut self,
+        level: TlsEncryptionLevel,
+        room: Number,
+        before: Number,
+        now: QuicInstant
+    ) -> [UN8]? {
+        let keys = match keys(level) {
+            Some(value) -> value
+            None -> return .None
+        }
+        var space = recovery.space(level)
+        let overhead = headerOverhead(level)
+        let ackDue = space.received.ackDue || level == .Application && quicDeadlinePassed(
+            ackDeadline,
+            now
+        )
+        let ack = space.received.frame(now, Number(limits.ackDelayExponent))
+        var ackBytes = 0
+        match ack {
+            Some(frame) -> ackBytes = quicFrameSize(.Ack(copy frame))
+            None -> {}
+        }
+        var draft = QuicPacketDraft { budget: room - overhead - ackBytes }
+        let index = quicLevelIndex(level)
+        let probe = probing[index]
+        if probe || recovery.canSend(room) { gather(level, draft) }
+        if probe && !draft.eliciting { draft.add(.Ping) }
+        probing[index] = false
+        var payload: [QuicFrame] = []
+        let sendAck = ack.isSome() && (ackDue || draft.eliciting)
+        if sendAck {
+            match ack {
+                Some(frame) -> payload.append(.Ack(frame))
+                None -> {}
+            }
+        }
+        if !draft.eliciting && !sendAck { return .None }
+        payload.appendAll(draft.frames)
+        if sendAck {
+            space.received.ackDue = false
+            space.received.elicitingUnacknowledged = 0
+            if level == .Application { ackDeadline = .None }
+        }
+        recovery.store(level, copy space)
+        return sealDraft(
+            level,
+            space,
+            payload,
+            QuicPacketShape {
+                eliciting: draft.eliciting,
+                before: before,
+                overhead: overhead,
+                now: now
+            }
+        )
+    }
+
+    function sealDraft(
+        borrow mut self,
+        level: TlsEncryptionLevel,
+        space: borrow QuicPacketSpace,
+        frames: borrow [QuicFrame],
+        shape: borrow QuicPacketShape
+    ) -> [UN8]? {
+        var writer = WireWriter {}
+        for frame in frames { quicWriteFrame(writer, frame) }
+        // An ack-eliciting Initial goes in a datagram of at least 1200 bytes
+        // (RFC 9000 section 14.1); PADDING makes up the rest.
+        if level == .Initial && shape.eliciting {
+            let numberBytes = quicNumberLength(space.nextNumber, copy space.largestAcknowledged)
+            let header = shape.overhead - QuicPacketLimit.largestNumberBytes + numberBytes
+            while shape.before + header + writer.count() < Quic.minimumDatagram {
+                writer.writeByte(0)
+            }
+        }
+        let outgoing = QuicOutgoingPacket {
+            header: packetHeader(level),
+            number: space.nextNumber,
+            largestAcknowledged: copy space.largestAcknowledged,
+            payload: writer.bytes
+        }
+        let sealing = match keys(level) {
+            Some(value) -> value.seal
+            None -> return .None
+        }
+        let bytes = try quicSealPacket(outgoing, sealing) otherwise return .None
+        var kept: [QuicFrame] = []
+        for frame in frames {
+            if quicRetransmittable(frame) { kept.append(copy frame) }
+        }
+        recovery.onSent(
+            level,
+            QuicSentPacket {
+                number: space.nextNumber,
+                sentAt: shape.now,
+                size: bytes.count,
+                elicitsAck: shape.eliciting,
+                inFlight: shape.eliciting,
+                frames: kept
+            }
+        )
+        if role == .Client && level == .Handshake { dropInitial() }
+        return .Some(bytes)
+    }
+
+    // CRYPTO data, then for 1-RTT control frames, stream data and datagrams.
+    function gather(borrow mut self, level: TlsEncryptionLevel, draft: borrow mut QuicPacketDraft) {
+        gatherCrypto(level, draft)
+        if level != .Application || applicationKeys.isNone() { return }
+        gatherControl(draft)
+        // A server has 1-RTT keys before the handshake completes; data
+        // waits for completion.
+        if state != .Connected { return }
+        gatherStreams(draft)
+        gatherDatagrams(draft)
+    }
+
+    function gatherCrypto(
+        borrow mut self,
+        level: TlsEncryptionLevel,
+        draft: borrow mut QuicPacketDraft
+    ) {
+        let index = quicLevelIndex(level)
+        var rest: [QuicPiece] = []
+        for piece in cryptoOut[index] {
+            let room = draft.budget - draft.size - QuicSendBudget.frameHeader
+            if room <= 0 {
+                rest.append(piece)
+                continue
+            }
+            let take = min(room, piece.data.count)
+            draft.add(
+                .Crypto(
+                    QuicCryptoFrame { offset: piece.offset, data: byteRun(piece.data, 0, take) }
+                )
+            )
+            if take < piece.data.count {
+                rest.append(
+                    QuicPiece {
+                        offset: piece.offset + take,
+                        data: byteRun(piece.data, take, piece.data.count)
+                    }
+                )
+            }
+        }
+        cryptoOut[index] = rest
+    }
+
+    function gatherControl(borrow mut self, draft: borrow mut QuicPacketDraft) {
+        var rest: [QuicFrame] = []
+        for frame in control {
+            if draft.fits(quicFrameSize(frame)) {
+                draft.add(copy frame)
+            } else {
+                rest.append(frame)
+            }
+        }
+        control = rest
+    }
+
+    function gatherDatagrams(borrow mut self, draft: borrow mut QuicPacketDraft) {
+        var rest: [[UN8]] = []
+        for data in datagramsOut {
+            let frame = QuicFrame.Datagram(copy data)
+            if draft.fits(quicFrameSize(frame)) {
+                draft.add(move frame)
+            } else {
+                rest.append(data)
+            }
+        }
+        datagramsOut = rest
+    }
+
+    function gatherStreams(borrow mut self, draft: borrow mut QuicPacketDraft) {
+        for index in 0..streams.count {
+            if draft.budget - draft.size <= QuicSendBudget.frameHeader { return }
+            var stream = copy streams[index]
+            if !stream.sending.hasWork() { continue }
+            match nextStreamFrame(stream, draft.budget - draft.size - QuicSendBudget.frameHeader) {
+                Some(frame) -> draft.add(.Stream(frame))
+                None -> {}
+            }
+            streams[index] = stream
+        }
+    }
+
+    // The stream's next frame within `room`, the stream's credit and the
+    // connection's.
+    function nextStreamFrame(
+        borrow mut self,
+        stream: borrow mut QuicStream,
+        room: Number
+    ) -> QuicStreamFrame? {
+        var sending = copy stream.sending
+        if sending.queued.count == 0 {
+            if !sending.finQueued || sending.finSent { return .None }
+            sending.finSent = true
+            sending.outstanding += 1
+            stream.sending = sending
+            return .Some(
+                QuicStreamFrame { id: stream.id, offset: sending.offset, data: [], fin: true }
+            )
+        }
+        let piece = copy sending.queued[0]
+        let fresh = max(piece.offset + piece.data.count - sending.sentHighest, 0)
+        let connectionRoom = sendLimit - sent + (piece.data.count - fresh)
+        let take = min(
+            min(room, piece.data.count),
+            min(sending.limit - piece.offset, connectionRoom)
+        )
+        if take <= 0 { return .None }
+        let end = piece.offset + take
+        sent += max(end - sending.sentHighest, 0)
+        sending.sentHighest = max(sending.sentHighest, end)
+        var rest: [QuicPiece] = []
+        if take < piece.data.count {
+            rest.append(
+                QuicPiece { offset: end, data: byteRun(piece.data, take, piece.data.count) }
+            )
+        }
+        for (position, queued) in sending.queued.enumerated() {
+            if position > 0 { rest.append(queued) }
+        }
+        sending.queued = rest
+        let fin = rest.count == 0 && sending.finQueued && end == sending.offset
+        if fin { sending.finSent = true }
+        sending.outstanding += 1
+        stream.sending = sending
+        return .Some(
+            QuicStreamFrame {
+                id: stream.id,
+                offset: piece.offset,
+                data: byteRun(piece.data, 0, take),
+                fin: fin
+            }
+        )
+    }
+
+    function transmitClose(borrow mut self, now: QuicInstant) -> [UN8]? {
+        if closeSent { return .None }
+        let frame = match closeFrame {
+            Some(value) -> value
+            None -> return .None
+        }
+        closeSent = true
+        lingerFrom(now)
+        for level in [TlsEncryptionLevel.Application, TlsEncryptionLevel.Handshake, TlsEncryptionLevel.Initial] {
+            if keys(level).isNone() { continue }
+            // An application's close cannot go in a handshake packet.
+            if level != .Application && frame.application { continue }
+            let space = recovery.space(level)
+            let shape = QuicPacketShape {
+                eliciting: level == .Initial,
+                before: 0,
+                overhead: headerOverhead(level),
+                now: now
+            }
+            return sealDraft(level, space, [.Close(copy frame)], shape)
+        }
+        return .None
+    }
+
+    // Frames of a packet the peer acknowledged.
+    function acknowledged(borrow mut self, frames: borrow [QuicFrame]) {
+        for frame in frames {
+            match quicResendKind(frame) {
+                Some(kind) -> {
+                    match kind {
+                        Stream(stream) -> streamAcknowledged(stream)
+                        Crypto(_) -> {}
+                        Control -> {}
+                    }
+                }
+                None -> {}
+            }
+        }
+    }
+
+    function streamAcknowledged(borrow mut self, frame: borrow QuicStreamFrame) {
+        let index = match streamIndex(frame.id) {
+            Some(value) -> value
+            None -> return
+        }
+        var stream = copy streams[index]
+        stream.sending.outstanding = max(stream.sending.outstanding - 1, 0)
+        if frame.fin { stream.sending.finAcknowledged = true }
+        streams[index] = stream
+    }
+
+    // Frames of a lost packet, queued to go again (RFC 9000 section 13.3).
+    function requeue(borrow mut self, level: TlsEncryptionLevel, frames: borrow [QuicFrame]) {
+        for frame in frames {
+            let kind = match quicResendKind(frame) {
+                Some(value) -> value
+                None -> continue
+            }
+            match kind {
+                Crypto(crypto) -> {
+                    let index = quicLevelIndex(level)
+                    if keys(level).isSome() {
+                        cryptoOut[index] = quicInsertedPiece(
+                            cryptoOut[index],
+                            QuicPiece { offset: crypto.offset, data: copy crypto.data }
+                        )
+                    }
+                }
+                Stream(stream) -> requeueStream(stream)
+                Control -> control.append(copy frame)
+            }
+        }
+    }
+
+    function requeueStream(borrow mut self, frame: borrow QuicStreamFrame) {
+        let index = match streamIndex(frame.id) {
+            Some(value) -> value
+            None -> return
+        }
+        var stream = copy streams[index]
+        stream.sending.outstanding = max(stream.sending.outstanding - 1, 0)
+        // After a reset only the bytes below its reliable size go again.
+        let limit = match stream.sending.resetError {
+            Some(_) -> stream.sending.reliableSize
+            None -> frame.offset + frame.data.count
+        }
+        for piece in quicPiecesBelow(
+            [QuicPiece { offset: frame.offset, data: copy frame.data }],
+            limit
+        ) {
+            if piece.data.count > 0 {
+                stream.sending.queued = quicInsertedPiece(stream.sending.queued, copy piece)
+            }
+        }
+        if frame.fin && stream.sending.resetError.isNone() { stream.sending.finSent = false }
+        streams[index] = stream
+    }
+}
+
+struct QuicPacketShape {
+    let eliciting: Bool
+    // Bytes already in the datagram before this packet.
+    let before: Number
+    let overhead: Number
+    let now: QuicInstant
+}
+
+function quicDeadlinePassed(deadline: borrow QuicInstant?, now: QuicInstant) -> Bool {
+    return match deadline {
+        Some(at) -> now.raw >= at.raw
+        None -> false
+    }
+}
+
+// How a lost frame is sent again, none when it is not: ACKs, PINGs,
+// padding, path probes, closes and datagrams are not (RFC 9000 section
+// 13.3).
+enum QuicResend {
+    Crypto(QuicCryptoFrame)
+    Stream(QuicStreamFrame)
+    // Queued again as it was.
+    Control
+}
+
+function quicResendKind(frame: borrow QuicFrame) -> QuicResend? {
+    return match frame {
+        Padding -> .None
+        Ping -> .None
+        Ack(_) -> .None
+        PathChallenge(_) -> .None
+        PathResponse(_) -> .None
+        Datagram(_) -> .None
+        Close(_) -> .None
+        Crypto(crypto) -> .Some(.Crypto(copy crypto))
+        Stream(stream) -> .Some(.Stream(copy stream))
+        ResetStream(_) -> .Some(.Control)
+        StopSending(_) -> .Some(.Control)
+        NewToken(_) -> .Some(.Control)
+        MaxData(_) -> .Some(.Control)
+        MaxStreamData(_) -> .Some(.Control)
+        MaxStreams(_) -> .Some(.Control)
+        DataBlocked(_) -> .Some(.Control)
+        StreamDataBlocked(_) -> .Some(.Control)
+        StreamsBlocked(_) -> .Some(.Control)
+        NewConnectionId(_) -> .Some(.Control)
+        RetireConnectionId(_) -> .Some(.Control)
+        HandshakeDone -> .Some(.Control)
+    }
+}
+
+function quicRetransmittable(frame: borrow QuicFrame) -> Bool {
+    return quicResendKind(frame).isSome()
+}

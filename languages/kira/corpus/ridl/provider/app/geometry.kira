@@ -1,0 +1,89 @@
+import Foundation
+
+// The library the RIDL cases import. Every public function is an export, and
+// the shapes cover what crosses the boundary: scalars, structs, payload enums,
+// strings, arrays (of strings too), Optional, Result, borrows and methods.
+
+public struct Point {
+    var x: Float
+    var y: Float
+}
+
+public enum Shape {
+    Circle(Float)
+    Rectangle(Point)
+    Empty
+}
+
+public distinct Tag = U32
+
+public function next(tag: Tag) -> Tag { return Tag(tag.raw + U32(1)) }
+
+public function add(a: Int, b: Int) -> Int { return a + b }
+
+public function negate(flag: Bool) -> Bool { return !flag }
+
+public function length(text: String) -> Int { return text.count }
+
+public function sum(items: [Int]) -> Int {
+    var total = 0
+    for item in items { total = total + item }
+    return total
+}
+
+public function joined(words: [String]) -> String {
+    var text = ""
+    for word in words { text = text + word }
+    return text
+}
+
+public function words(count: Int) -> [String] {
+    var out: [String] = []
+    for index in 0..count { out.append("w" + String(index)) }
+    return out
+}
+
+public function orZero(value: Optional<Int>) -> Int {
+    match value {
+        Some(found) -> return found
+        None -> return 0
+    }
+}
+
+public function point(x: Float, y: Float) -> Point { return Point { x = x, y = y } }
+
+public function area(shape: Shape) -> Float {
+    match shape {
+        Circle(radius) -> return radius * radius * 3.0
+        Rectangle(size) -> return size.x * size.y
+        Empty -> return 0.0
+    }
+}
+
+public function same(shape: Shape) -> Shape { return shape }
+
+public function greet(name: borrow String) -> String { return "hello " + name }
+
+public function half(value: Int) -> Result<Int, String> {
+    if value % 2 == 0 { return .Ok(value / 2) }
+    return .Error("odd")
+}
+
+// A call that answers nothing but can fail.
+public function checkEven(value: Int) -> Result<Void, String> {
+    if value % 2 == 0 { return .Ok }
+    return .Error("odd")
+}
+
+public function shift(point: borrow mut Point) { point.x = point.x + 1.0 }
+
+extend Point {
+    function total(borrow self) -> Float { return x + y }
+
+    // A mutable receiver: the callee mutates the caller's value in place, so
+    // a copy of the argument would leave it unchanged.
+    function bump(borrow mut self) -> Float {
+        x = x + 1.0
+        return x
+    }
+}

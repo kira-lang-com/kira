@@ -1,0 +1,324 @@
+extend Operation {
+    // The expressions an operation reads, for walks over a body.
+    function operands(borrow self) -> [Int] {
+        match self {
+            StringText -> return []
+            Sequence(body, result) -> return [result]
+            Integer -> return []
+            FloatLiteral -> return []
+            BoxAny(value, typeId) -> return [value]
+            TypeIs(value, typeId) -> return [value]
+            UnboxAny(value, typeId, handler) -> return [value]
+            FunctionReference -> return []
+            IndirectCall(callee, arguments) -> return withFirst(callee, arguments)
+            MakeClosure(target, captured) -> return captured
+            GlobalRead -> return []
+            TaskSpawn(target, values, workType) -> return values
+            TaskReady(task) -> return [task]
+            TaskAwait(task, typeId) -> return [task]
+            TaskCancel(task) -> return [task]
+            TaskDetach(task) -> return [task]
+            Async -> return []
+            RuntimeTrap -> return []
+            Try(operand, destination) -> return [operand]
+            ChannelCreate -> return []
+            ChannelReceiver(channel) -> return [channel]
+            ChannelSend(channel, sent) -> return [channel, sent]
+            ChannelClose(channel) -> return [channel]
+            ClassView(object) -> return [object]
+            ClassCall(target, arguments) -> return arguments
+            Boolean -> return []
+            StringLiteral -> return []
+            StringConcat(left, right) -> return [left, right]
+            TraceText(value) -> return [value]
+            HeapAllocateRaw(size, alignment) -> return [size, alignment]
+            HeapFreeRaw(pointer) -> return [pointer]
+            Print(text) -> return [text]
+            HeapRead(pointer) -> return [pointer]
+            HeapWrite(pointer, stored) -> return [pointer, stored]
+            Atomic(step) -> return step.operands()
+            HeapCopy(destination, source, count, _) -> return [destination, source, count]
+            HeapFill(destination, byte, count) -> return [destination, byte, count]
+            HeapOffset(pointer, offset) -> return [pointer, offset]
+            HeapLayout -> return []
+            ArrayLiteral(elements) -> return elements
+            ArrayIndex(array, index) -> return [array, index]
+            ArrayAppend(array, element) -> return [array, element]
+            Transfer(mode, value) -> return [value]
+            Read -> return []
+            Member(base, field) -> return [base]
+            Call(target, arguments) -> return arguments
+            Construct(fields) -> return fields
+            Tagged(variant, payload) -> {
+                match payload {
+                    Some(value) -> return [value]
+                    None -> return []
+                }
+            }
+            Unary(operator, operand) -> return [operand]
+            Arithmetic(operator, left, right) -> return [left, right]
+            Wrapping(operator, left, right) -> return [left, right]
+            Compare(comparison, left, right) -> return [left, right]
+            EnumCode(value) -> return [value]
+            EnumFromCode(value) -> return [value]
+            Order(left, right) -> return [left, right]
+            Hash(value) -> return [value]
+            Logical(connective, left, right) -> return [left, right]
+            Select(condition, whenTrue, whenFalse) -> return [condition, whenTrue, whenFalse]
+            Choice(subject, arms) -> {
+                var operands = [subject]
+                for arm in arms {
+                    match arm.value {
+                        Some(value) -> operands.append(value)
+                        None -> {}
+                    }
+                }
+                return operands
+            }
+            Bitcast(value) -> return [value]
+            Convert(value) -> return [value]
+            ForeignImage(value, retained) -> return [value]
+            ForeignElements(value, _) -> return [value]
+            ForeignCallback(_, _, closure) -> {
+                match closure {
+                    Some(value) -> return [value]
+                    None -> return []
+                }
+            }
+            ForeignRead(base, field) -> return [base]
+            ForeignUnion(_, member) -> {
+                match member {
+                    Some(value) -> return [value]
+                    None -> return []
+                }
+            }
+        }
+    }
+
+    // The function an operation calls, refers to, closes over or spawns.
+    function namedFunction(borrow self) -> Optional<Int> {
+        match self {
+            StringText -> return .None
+            Sequence -> return .None
+            Integer -> return .None
+            FloatLiteral -> return .None
+            BoxAny -> return .None
+            TypeIs -> return .None
+            UnboxAny -> return .None
+            FunctionReference(target) -> return .Some(target)
+            IndirectCall -> return .None
+            MakeClosure(target, captured) -> return .Some(target)
+            GlobalRead -> return .None
+            TaskSpawn(target, values, workType) -> return .Some(target)
+            TaskReady -> return .None
+            TaskAwait -> return .None
+            TaskCancel -> return .None
+            TaskDetach -> return .None
+            Async(step) -> return step.namedFunction()
+            RuntimeTrap -> return .None
+            Try -> return .None
+            ChannelCreate -> return .None
+            ChannelReceiver -> return .None
+            ChannelSend -> return .None
+            ChannelClose -> return .None
+            ClassView -> return .None
+            ClassCall -> return .None
+            Boolean -> return .None
+            StringLiteral -> return .None
+            StringConcat -> return .None
+            TraceText -> return .None
+            HeapAllocateRaw -> return .None
+            HeapFreeRaw -> return .None
+            Print -> return .None
+            HeapRead -> return .None
+            HeapWrite -> return .None
+            Atomic -> return .None
+            HeapCopy -> return .None
+            HeapFill -> return .None
+            HeapOffset -> return .None
+            HeapLayout -> return .None
+            ArrayLiteral -> return .None
+            ArrayIndex -> return .None
+            ArrayAppend -> return .None
+            Transfer -> return .None
+            Read -> return .None
+            Member -> return .None
+            Call(target, arguments) -> return .Some(target)
+            Construct -> return .None
+            Tagged -> return .None
+            Unary -> return .None
+            Arithmetic -> return .None
+            Wrapping -> return .None
+            Compare -> return .None
+            EnumCode -> return .None
+            EnumFromCode -> return .None
+            Order -> return .None
+            Hash -> return .None
+            Logical -> return .None
+            Select -> return .None
+            Choice -> return .None
+            Bitcast -> return .None
+            Convert -> return .None
+            ForeignImage -> return .None
+            ForeignElements -> return .None
+            ForeignCallback(_, callee, _) -> return .Some(callee)
+            ForeignRead -> return .None
+            ForeignUnion -> return .None
+        }
+    }
+
+    // The method a class call dispatches by name.
+    function dispatchedMember(borrow self) -> Optional<Int> {
+        match self {
+            StringText -> return .None
+            Sequence -> return .None
+            Integer -> return .None
+            FloatLiteral -> return .None
+            BoxAny -> return .None
+            TypeIs -> return .None
+            UnboxAny -> return .None
+            FunctionReference -> return .None
+            IndirectCall -> return .None
+            MakeClosure -> return .None
+            GlobalRead -> return .None
+            TaskSpawn -> return .None
+            TaskReady -> return .None
+            TaskAwait -> return .None
+            TaskCancel -> return .None
+            TaskDetach -> return .None
+            Async -> return .None
+            RuntimeTrap -> return .None
+            Try -> return .None
+            ChannelCreate -> return .None
+            ChannelReceiver -> return .None
+            ChannelSend -> return .None
+            ChannelClose -> return .None
+            ClassView -> return .None
+            ClassCall(target, arguments) -> return .Some(target)
+            Boolean -> return .None
+            StringLiteral -> return .None
+            StringConcat -> return .None
+            TraceText -> return .None
+            HeapAllocateRaw -> return .None
+            HeapFreeRaw -> return .None
+            Print -> return .None
+            HeapRead -> return .None
+            HeapWrite -> return .None
+            Atomic -> return .None
+            HeapCopy -> return .None
+            HeapFill -> return .None
+            HeapOffset -> return .None
+            HeapLayout -> return .None
+            ArrayLiteral -> return .None
+            ArrayIndex -> return .None
+            ArrayAppend -> return .None
+            Transfer -> return .None
+            Read -> return .None
+            Member -> return .None
+            Call -> return .None
+            Construct -> return .None
+            Tagged -> return .None
+            Unary -> return .None
+            Arithmetic -> return .None
+            Wrapping -> return .None
+            Compare -> return .None
+            EnumCode -> return .None
+            EnumFromCode -> return .None
+            Order -> return .None
+            Hash -> return .None
+            Logical -> return .None
+            Select -> return .None
+            Choice -> return .None
+            Bitcast -> return .None
+            Convert -> return .None
+            ForeignImage -> return .None
+            ForeignElements -> return .None
+            ForeignCallback -> return .None
+            ForeignRead -> return .None
+            ForeignUnion -> return .None
+        }
+    }
+
+    // The statements an operation runs: a sequence's before its value, and
+    // each arm's of a choice.
+    function nestedBodies(borrow self) -> [[Int]] {
+        match self {
+            StringText -> return []
+            Sequence(body, result) -> return [body]
+            Integer -> return []
+            FloatLiteral -> return []
+            BoxAny -> return []
+            TypeIs -> return []
+            UnboxAny -> return []
+            FunctionReference -> return []
+            IndirectCall -> return []
+            MakeClosure -> return []
+            GlobalRead -> return []
+            TaskSpawn -> return []
+            TaskReady -> return []
+            TaskAwait -> return []
+            TaskCancel -> return []
+            TaskDetach -> return []
+            Async -> return []
+            RuntimeTrap -> return []
+            Try -> return []
+            ChannelCreate -> return []
+            ChannelReceiver -> return []
+            ChannelSend -> return []
+            ChannelClose -> return []
+            ClassView -> return []
+            ClassCall -> return []
+            Boolean -> return []
+            StringLiteral -> return []
+            StringConcat -> return []
+            TraceText -> return []
+            HeapAllocateRaw -> return []
+            HeapFreeRaw -> return []
+            Print -> return []
+            HeapRead -> return []
+            HeapWrite -> return []
+            Atomic -> return []
+            HeapCopy -> return []
+            HeapFill -> return []
+            HeapOffset -> return []
+            HeapLayout -> return []
+            ArrayLiteral -> return []
+            ArrayIndex -> return []
+            ArrayAppend -> return []
+            Transfer -> return []
+            Read -> return []
+            Member -> return []
+            Call -> return []
+            Construct -> return []
+            Tagged -> return []
+            Unary -> return []
+            Arithmetic -> return []
+            Wrapping -> return []
+            Compare -> return []
+            EnumCode -> return []
+            EnumFromCode -> return []
+            Order -> return []
+            Hash -> return []
+            Logical -> return []
+            Select -> return []
+            Choice(subject, arms) -> {
+                var bodies: [[Int]] = []
+                for arm in arms { bodies.append(arm.body) }
+                return bodies
+            }
+            Bitcast -> return []
+            Convert -> return []
+            ForeignImage -> return []
+            ForeignElements -> return []
+            ForeignCallback -> return []
+            ForeignRead -> return []
+            ForeignUnion -> return []
+        }
+    }
+}
+
+function withFirst(first: Int, rest: [Int]) -> [Int] {
+    var all: [Int] = [first]
+    for item in rest { all.append(item) }
+    return all
+}

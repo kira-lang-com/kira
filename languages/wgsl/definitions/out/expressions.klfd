@@ -1,0 +1,401 @@
+// WGSL expressions and the statements only WGSL spells its own way.
+
+function wgslBinary(op: String) -> String {
+    match op {
+        "add" -> return "+"
+        "subtract" -> return "-"
+        "multiply" -> return "*"
+        "divide" -> return "/"
+        "modulo" -> return "%"
+        "equal" -> return "=="
+        "not_equal" -> return "!="
+        "less" -> return "<"
+        "less_equal" -> return "<="
+        "greater" -> return ">"
+        "greater_equal" -> return ">="
+        "and" -> return "&"
+        "inclusive_or" -> return "|"
+        "exclusive_or" -> return "^"
+        "logical_and" -> return "&&"
+        "logical_or" -> return "||"
+        "shift_left" -> return "<<"
+        "shift_right" -> return ">>"
+        else -> return op
+    }
+}
+
+function unaryOperator(op: String) -> String {
+    if op == "negate" { return "-" }
+    if op == "not" { return "!" }
+    return "~"
+}
+
+function wgslMathName(fun: String) -> String {
+    match fun {
+        "inverse_sqrt" -> return "inverseSqrt"
+        "face_forward" -> return "faceForward"
+        "count_one_bits" -> return "countOneBits"
+        "count_leading_zeros" -> return "countLeadingZeros"
+        "count_trailing_zeros" -> return "countTrailingZeros"
+        "first_leading_bit" -> return "firstLeadingBit"
+        "first_trailing_bit" -> return "firstTrailingBit"
+        "reverse_bits" -> return "reverseBits"
+        "extract_bits" -> return "extractBits"
+        "insert_bits" -> return "insertBits"
+        else -> return fun
+    }
+}
+
+function wgslAtomicFunction(fun: String) -> String {
+    match fun {
+        "add" -> return "atomicAdd"
+        "subtract" -> return "atomicSub"
+        "and" -> return "atomicAnd"
+        "or" -> return "atomicOr"
+        "xor" -> return "atomicXor"
+        "min" -> return "atomicMin"
+        "max" -> return "atomicMax"
+        "exchange" -> return "atomicExchange"
+        else -> return "atomicCompareExchangeWeak"
+    }
+}
+
+// The selector of a case from its KSIR value.
+function wgslCaseValue(value: String) -> String {
+    if value == "default" { return value }
+    if endsWithText(value, "u32") { return joinText([caseNumber(value), "u"]) }
+    return joinText([caseNumber(value), "i"])
+}
+
+extend TextOut {
+    // A float literal. WGSL has no literal for a value that is not finite;
+    // one is spelled through `bitcast` of its `f32` bits.
+    function wgslFloat(borrow self, table: String, owner: Int, index: Int, suffix: String) -> String {
+        if flag(table, owner, index, "finite") { return joinText([floatOf(table, owner, index), suffix]) }
+        let carried = joinText(["bitcast<f32>(", decimalText(field(table, owner, index, "bits")), "u)"])
+        if suffix == "h" { return joinText(["f16(", carried, ")"]) }
+        return carried
+    }
+
+    function dialectLiteral(borrow self, table: String, owner: Int, index: Int) -> String {
+        let value = text(table, owner, index, "literal")
+        let scalar = text(table, owner, index, "scalar")
+        if scalar == "bool" { return value }
+        if scalar == "i32" {
+            if value == "-2147483648" { return "i32(-2147483648)" }
+            return signedText(joinText([value, "i"]))
+        }
+        if scalar == "u32" { return joinText([value, "u"]) }
+        if scalar == "f32" { return signedText(wgslFloat(table, owner, index, "f")) }
+        if scalar == "f16" { return signedText(wgslFloat(table, owner, index, "h")) }
+        if scalar == "i64" { return signedText(joinText([value, "li"])) }
+        if scalar == "u64" { return joinText([value, "lu"]) }
+        return signedText(joinText([text(table, owner, index, "float"), "lf"]))
+    }
+
+    function dialectCompose(borrow self, typeIndex: Int, parts: [String]) -> String {
+        var written = wgslType(typeIndex)
+        if failedText(written) { written = "" }
+        return joinText([written, "(", joinWith(parts, ", "), ")"])
+    }
+
+    function resultType(borrow self, expression: Int) -> String {
+        return bodyType(typeOf(expression))
+    }
+
+    function wgslSample(borrow self, expression: Int) -> String {
+        let image = operandOf(expression, "image")
+        let depth = typeText(typeOf(image), "class") == "depth"
+        var parts: [String] = [operand(image), operand(operandOf(expression, "sampler")),
+            operand(operandOf(expression, "coordinate"))]
+        let arrayIndex = operandOf(expression, "array_index")
+        if arrayIndex >= 0 { parts.append(operand(arrayIndex)) }
+        let gather = operandOf(expression, "gather")
+        let reference = operandOf(expression, "depth_ref")
+        let level = text("expressions", current, expression, "level")
+        var name = ""
+        if gather >= 0 && reference < 0 {
+            if !depth {
+                var first: [String] = [joinText([decimalText(gather), "u"])]
+                for part in parts {
+                    first.append(part)
+                }
+                parts = first
+            }
+            name = "textureGather"
+        } else if gather >= 0 {
+            parts.append(operand(reference))
+            name = "textureGatherCompare"
+        } else if reference >= 0 && level == "zero" {
+            parts.append(operand(reference))
+            name = "textureSampleCompareLevel"
+        } else if reference >= 0 {
+            parts.append(operand(reference))
+            name = "textureSampleCompare"
+        } else if level == "auto" {
+            name = "textureSample"
+        } else if level == "zero" {
+            if depth {
+                parts.append("0i")
+            } else {
+                parts.append("0.0f")
+            }
+            name = "textureSampleLevel"
+        } else if level == "exact" {
+            parts.append(operand(operandOf(expression, "level_value")))
+            name = "textureSampleLevel"
+        } else if level == "bias" {
+            parts.append(operand(operandOf(expression, "level_value")))
+            name = "textureSampleBias"
+        } else {
+            parts.append(operand(operandOf(expression, "gradient_x")))
+            parts.append(operand(operandOf(expression, "gradient_y")))
+            name = "textureSampleGrad"
+        }
+        let offset = operandOf(expression, "offset")
+        if offset >= 0 { parts.append(operand(offset)) }
+        return joinText([name, "(", joinWith(parts, ", "), ")"])
+    }
+
+    function wgslLoad(borrow self, expression: Int) -> String {
+        let image = operandOf(expression, "image")
+        var parts: [String] = [operand(image), operand(operandOf(expression, "coordinate"))]
+        let arrayIndex = operandOf(expression, "array_index")
+        if arrayIndex >= 0 { parts.append(operand(arrayIndex)) }
+        var chosen = operandOf(expression, "sample")
+        if chosen < 0 { chosen = operandOf(expression, "level_value") }
+        if chosen >= 0 {
+            parts.append(operand(chosen))
+        } else if typeText(typeOf(image), "class") != "storage" {
+            parts.append("0i")
+        }
+        return joinText(["textureLoad(", joinWith(parts, ", "), ")"])
+    }
+
+    function wgslQuery(borrow self, expression: Int) -> String {
+        let image = operand(operandOf(expression, "image"))
+        let query = text("expressions", current, expression, "query")
+        if query == "levels" { return joinText(["textureNumLevels(", image, ")"]) }
+        if query == "layers" { return joinText(["textureNumLayers(", image, ")"]) }
+        if query == "samples" { return joinText(["textureNumSamples(", image, ")"]) }
+        let level = operandOf(expression, "level_value")
+        if level >= 0 { return joinText(["textureDimensions(", image, ", ", operand(level), ")"]) }
+        return joinText(["textureDimensions(", image, ")"])
+    }
+
+    function wgslRelational(borrow self, expression: Int) -> String {
+        let argument = operandOf(expression, "argument")
+        let value = operand(argument)
+        let fun = text("expressions", current, expression, "fun")
+        if fun == "all" || fun == "any" { return joinText([fun, "(", value, ")"]) }
+        if fun == "is_nan" { return joinText(["(", value, " != ", value, ")"]) }
+        var limit = "3.4028234663852886e38f"
+        if scalarOf(argument) == "f16" { limit = "65504.0h" }
+        return joinText(["(abs(", value, ") > ", resultType(argument), "(", limit, "))"])
+    }
+
+    function dialectExpression(borrow self, expression: Int) -> String {
+        let which = expressionKind(expression)
+        match which {
+            "literal" -> return dialectLiteral("expressions", current, expression)
+            "constant" -> return constantNames[operandOf(expression, "constant")]
+            "override" -> return overrideNames[operandOf(expression, "override")]
+            "zero" -> return joinText([resultType(expression), "()"])
+            "compose" -> {
+                var parts: [String] = []
+                let items = fieldCount("expressions", current, expression, "items")
+                for at in 0..items {
+                    parts.append(operand(fieldItem("expressions", current, expression, "items", at)))
+                }
+                return joinText([resultType(expression), "(", joinWith(parts, ", "), ")"])
+            }
+            "access" -> return joinText([operand(operandOf(expression, "base")), "[",
+                operand(operandOf(expression, "index")), "]"])
+            "access_index" -> {
+                let base = operandOf(expression, "base")
+                let index = operandOf(expression, "index")
+                let baseText = operand(base)
+                var baseType = typeOf(base)
+                if typeKind(baseType) == "pointer" { baseType = typeField(baseType, "base") }
+                let shape = typeKind(baseType)
+                if shape == "struct" { return joinText([baseText, ".", memberName(baseType, index)]) }
+                if shape == "vector" { return joinText([baseText, ".", laneText(index)]) }
+                return joinText([baseText, "[", decimalText(index), "]"])
+            }
+            "splat" -> return joinText([resultType(expression), "(", operand(operandOf(expression, "value")), ")"])
+            "swizzle" -> return joinText([operand(operandOf(expression, "vector")), ".",
+                text("expressions", current, expression, "pattern")])
+            "arg" -> {
+                let name = argumentNames[operandOf(expression, "argument")]
+                if typeKindOf(expression) == "pointer" { return joinText(["(*", name, ")"]) }
+                return name
+            }
+            "global" -> return globalNames[operandOf(expression, "global")]
+            "local" -> return localNames[operandOf(expression, "local")]
+            "load" -> {
+                let pointer = operandOf(expression, "pointer")
+                let pointee = pointeeOf(pointer)
+                if pointee >= 0 && typeKind(pointee) == "atomic" {
+                    return joinText(["atomicLoad(&", operand(pointer), ")"])
+                }
+                return operand(pointer)
+            }
+            "image_sample" -> return wgslSample(expression)
+            "image_load" -> return wgslLoad(expression)
+            "image_query" -> return wgslQuery(expression)
+            "unary" -> return joinText(["(", unaryOperator(text("expressions", current, expression, "op")),
+                operand(operandOf(expression, "expr")), ")"])
+            "binary" -> return joinText(["(", operand(operandOf(expression, "left")), " ",
+                wgslBinary(text("expressions", current, expression, "op")), " ",
+                operand(operandOf(expression, "right")), ")"])
+            "select" -> return joinText(["select(", operand(operandOf(expression, "reject")), ", ",
+                operand(operandOf(expression, "accept")), ", ", operand(operandOf(expression, "condition")), ")"])
+            "derivative" -> {
+                let axis = text("expressions", current, expression, "axis")
+                var name = "fwidth"
+                if axis == "x" {
+                    name = "dpdx"
+                } else if axis == "y" {
+                    name = "dpdy"
+                }
+                let control = text("expressions", current, expression, "control")
+                if control == "coarse" {
+                    name = joinText([name, "Coarse"])
+                } else if control == "fine" {
+                    name = joinText([name, "Fine"])
+                }
+                return joinText([name, "(", operand(operandOf(expression, "expr")), ")"])
+            }
+            "relational" -> return wgslRelational(expression)
+            "math" -> {
+                var parts: [String] = []
+                let items = fieldCount("expressions", current, expression, "items")
+                for at in 0..items {
+                    parts.append(operand(fieldItem("expressions", current, expression, "items", at)))
+                }
+                let fun = text("expressions", current, expression, "fun")
+                return joinText([wgslMathName(fun), "(", joinWith(parts, ", "), ")"])
+            }
+            "convert" -> return joinText([resultType(expression), "(", operand(operandOf(expression, "expr")), ")"])
+            "bitcast" -> return joinText(["bitcast<", resultType(expression), ">(",
+                operand(operandOf(expression, "expr")), ")"])
+            "array_length" -> return joinText(["arrayLength(&", operand(operandOf(expression, "pointer")), ")"])
+            else -> return joinText(["_ksir_unset", decimalText(expression)])
+        }
+    }
+
+    function dialectTemporary(borrow self, name: String, expression: Int, value: String) -> String {
+        return joinText(["let ", name, " = ", value, ";"])
+    }
+
+    // A switch: WGSL has no fallthrough, so an empty case that falls
+    // through joins the selectors of the next, and a default is required.
+    function writeWgslSwitch(borrow mut self, block: Int, position: Int, depth: Int) {
+        let selector = operand(statementField(block, position, "selector"))
+        line(depth, joinText(["switch ", selector, " {"]))
+        var pending: [String] = []
+        var defaulted = false
+        let cases = fieldCount("statements", block, position, "case_block")
+        for at in 0..cases {
+            let value = wgslCaseValue(textItem("statements", block, position, "case_value", at))
+            if value == "default" { defaulted = true }
+            pending.append(value)
+            let caseBlock = fieldItem("statements", block, position, "case_block", at)
+            if fieldItem("statements", block, position, "case_fall", at) == 1 {
+                if count("statements", caseBlock) > 0 { refuse("a switch case with a body that falls through") }
+            } else {
+                var label = joinText(["case ", joinWith(pending, ", ")])
+                if pending.count == 1 && pending[0] == "default" { label = "default" }
+                line(depth + 1, joinText([label, ": {"]))
+                pending = []
+                writeBlock(caseBlock, depth + 2)
+                line(depth + 1, "}")
+            }
+        }
+        if pending.count > 0 { line(depth + 1, joinText(["case ", joinWith(pending, ", "), ": {}"])) }
+        if !defaulted { line(depth + 1, "default: {}") }
+        line(depth, "}")
+    }
+
+    function dialectStatement(borrow mut self, block: Int, position: Int, which: String, depth: Int) -> Bool {
+        if which == "kill" {
+            line(depth, "discard;")
+            return true
+        }
+        if which == "image_store" {
+            var parts: [String] = [operand(statementField(block, position, "image")),
+                operand(statementField(block, position, "coordinate"))]
+            let arrayIndex = statementField(block, position, "array_index")
+            if arrayIndex >= 0 { parts.append(operand(arrayIndex)) }
+            parts.append(operand(statementField(block, position, "value")))
+            line(depth, joinText(["textureStore(", joinWith(parts, ", "), ");"]))
+            return true
+        }
+        if which == "atomic" {
+            var parts: [String] = [joinText(["&", operand(statementField(block, position, "pointer"))])]
+            let compare = statementField(block, position, "compare")
+            if compare >= 0 { parts.append(operand(compare)) }
+            parts.append(operand(statementField(block, position, "value")))
+            let fun = text("statements", block, position, "fun")
+            var call = joinText([wgslAtomicFunction(fun), "(", joinWith(parts, ", "), ")"])
+            if fun == "compare_exchange" { call = joinText([call, ".old_value"]) }
+            let result = statementField(block, position, "result")
+            if result >= 0 {
+                bake(result, call, depth)
+            } else {
+                line(depth, joinText([call, ";"]))
+            }
+            return true
+        }
+        if which == "control_barrier" || which == "memory_barrier" {
+            let flags = text("statements", block, position, "flags")
+            if containsWord(flags, "storage") { line(depth, "storageBarrier();") }
+            if containsWord(flags, "workgroup") { line(depth, "workgroupBarrier();") }
+            if containsWord(flags, "image") { line(depth, "textureBarrier();") }
+            return true
+        }
+        if which == "workgroup_uniform_load" {
+            let call = joinText(["workgroupUniformLoad(&", operand(statementField(block, position, "pointer")), ")"])
+            bake(statementField(block, position, "result"), call, depth)
+            return true
+        }
+        if which == "switch" {
+            writeWgslSwitch(block, position, depth)
+            return true
+        }
+        return false
+    }
+
+    function dialectNativeLoop(borrow self) -> Bool {
+        return true
+    }
+
+    function dialectCaseBreak(borrow self) -> Bool {
+        return false
+    }
+
+    function dialectCaseLabel(borrow self, value: String) -> String {
+        return wgslCaseValue(value)
+    }
+
+    function dialectKeepsArgument(borrow self, expression: Int) -> Bool {
+        return true
+    }
+
+    function dialectArgument(borrow self, expression: Int) -> String {
+        if typeKindOf(expression) == "pointer" { return joinText(["&", operand(expression)]) }
+        return operand(expression)
+    }
+
+    function dialectCallArguments(borrow self, callee: Int) -> [String] {
+        return []
+    }
+
+    function dialectBakeAlways(borrow self, expression: Int) -> Bool {
+        return false
+    }
+
+    function dialectLineDirective(borrow self, file: Int, lineNumber: Int) -> String {
+        return ""
+    }
+}

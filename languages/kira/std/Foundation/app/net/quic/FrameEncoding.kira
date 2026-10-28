@@ -1,0 +1,156 @@
+// Frames written into a packet's payload, the mirror of `readFrame`.
+
+function quicWriteType(writer: borrow mut WireWriter, kind: QuicFrameType) {
+    writer.writeVarint(code(kind))
+}
+
+function quicWriteAck(writer: borrow mut WireWriter, ack: borrow QuicAckFrame) {
+    quicWriteType(writer, .Ack)
+    let first = ack.ranges[0]
+    writer.writeVarint(first.largest)
+    writer.writeVarint(ack.delay)
+    writer.writeVarint(ack.ranges.count - 1)
+    writer.writeVarint(first.largest - first.smallest)
+    var smallest = first.smallest
+    for index in 1..ack.ranges.count {
+        let range = ack.ranges[index]
+        // The gap and length are each one less than they count (RFC 9000
+        // section 19.3.1).
+        writer.writeVarint(smallest - range.largest - 2)
+        writer.writeVarint(range.largest - range.smallest)
+        smallest = range.smallest
+    }
+}
+
+function quicWriteStream(writer: borrow mut WireWriter, frame: borrow QuicStreamFrame) {
+    // Always with an explicit length, so another frame may follow it.
+    var kind = code(QuicFrameType.Stream) | Quic.streamFlagLength
+    if frame.offset > 0 { kind = kind | Quic.streamFlagOffset }
+    if frame.fin { kind = kind | Quic.streamFlagFin }
+    writer.writeVarint(kind)
+    writer.writeVarint(frame.id.raw)
+    if frame.offset > 0 { writer.writeVarint(frame.offset) }
+    writer.writeVarint(frame.data.count)
+    writer.writeBytes(frame.data)
+}
+
+function quicWriteClose(writer: borrow mut WireWriter, close: borrow QuicCloseFrame) {
+    quicWriteType(
+        writer,
+        close.application ? QuicFrameType.ApplicationClose : QuicFrameType.ConnectionClose
+    )
+    writer.writeVarint(close.error)
+    if !close.application { writer.writeVarint(close.frameType) }
+    writer.writeVarint(close.reason.count)
+    writer.writeBytes(close.reason)
+}
+
+function quicWriteCount(
+    writer: borrow mut WireWriter,
+    count: borrow QuicStreamCount,
+    blocked: Bool
+) {
+    let kind = match count.kind {
+        Bidirectional -> blocked ? QuicFrameType.StreamsBlockedBidirectional : QuicFrameType.MaxStreamsBidirectional
+        Unidirectional -> blocked ? QuicFrameType.StreamsBlockedUnidirectional : QuicFrameType.MaxStreamsUnidirectional
+    }
+    quicWriteType(writer, kind)
+    writer.writeVarint(count.maximum)
+}
+
+function quicWriteCredit(
+    writer: borrow mut WireWriter,
+    kind: QuicFrameType,
+    credit: borrow QuicStreamCredit
+) {
+    quicWriteType(writer, kind)
+    writer.writeVarint(credit.id.raw)
+    writer.writeVarint(credit.maximum)
+}
+
+function quicWriteNumberFrame(writer: borrow mut WireWriter, kind: QuicFrameType, value: Number) {
+    quicWriteType(writer, kind)
+    writer.writeVarint(value)
+}
+
+function quicWriteFrame(writer: borrow mut WireWriter, frame: borrow QuicFrame) {
+    match frame {
+        Padding -> writer.writeByte(code(QuicFrameType.Padding))
+        Ping -> quicWriteType(writer, .Ping)
+        Ack(ack) -> quicWriteAck(writer, ack)
+        ResetStream(reset) -> {
+            let reliable = reset.reliableSize > 0
+            quicWriteType(
+                writer,
+                reliable ? QuicFrameType.ResetStreamAt : QuicFrameType.ResetStream
+            )
+            writer.writeVarint(reset.id.raw)
+            writer.writeVarint(reset.error)
+            writer.writeVarint(reset.finalSize)
+            if reliable { writer.writeVarint(reset.reliableSize) }
+        }
+        StopSending(stop) -> {
+            quicWriteType(writer, .StopSending)
+            writer.writeVarint(stop.id.raw)
+            writer.writeVarint(stop.error)
+        }
+        Crypto(crypto) -> {
+            quicWriteType(writer, .Crypto)
+            writer.writeVarint(crypto.offset)
+            writer.writeVarint(crypto.data.count)
+            writer.writeBytes(crypto.data)
+        }
+        NewToken(token) -> {
+            quicWriteType(writer, .NewToken)
+            writer.writeVarint(token.count)
+            writer.writeBytes(token)
+        }
+        Stream(stream) -> quicWriteStream(writer, stream)
+        MaxData(maximum) -> quicWriteNumberFrame(writer, .MaxData, maximum)
+        MaxStreamData(credit) -> quicWriteCredit(writer, .MaxStreamData, credit)
+        MaxStreams(count) -> quicWriteCount(writer, count, false)
+        DataBlocked(limit) -> quicWriteNumberFrame(writer, .DataBlocked, limit)
+        StreamDataBlocked(credit) -> quicWriteCredit(writer, .StreamDataBlocked, credit)
+        StreamsBlocked(count) -> quicWriteCount(writer, count, true)
+        NewConnectionId(issued) -> quicWriteNewConnectionId(writer, issued)
+        RetireConnectionId(sequence) -> quicWriteNumberFrame(writer, .RetireConnectionId, sequence)
+        PathChallenge(data) -> {
+            quicWriteType(writer, .PathChallenge)
+            writer.writeBytes(data)
+        }
+        PathResponse(data) -> {
+            quicWriteType(writer, .PathResponse)
+            writer.writeBytes(data)
+        }
+        Close(close) -> quicWriteClose(writer, close)
+        HandshakeDone -> quicWriteType(writer, .HandshakeDone)
+        Datagram(data) -> {
+            quicWriteType(writer, .DatagramWithLength)
+            writer.writeVarint(data.count)
+            writer.writeBytes(data)
+        }
+    }
+}
+
+function quicWriteNewConnectionId(
+    writer: borrow mut WireWriter,
+    issued: borrow QuicNewConnectionIdFrame
+) {
+    quicWriteType(writer, .NewConnectionId)
+    writer.writeVarint(issued.sequence)
+    writer.writeVarint(issued.retirePriorTo)
+    writer.writeVector(issued.id, Tls.shortVector)
+    writer.writeBytes(issued.resetToken)
+}
+
+// The bytes `frame` takes when written.
+function quicFrameSize(frame: borrow QuicFrame) -> Number {
+    var writer = WireWriter {}
+    quicWriteFrame(writer, frame)
+    return writer.count()
+}
+
+// The STREAM frame header's bytes before its data, at most.
+function quicStreamOverhead(id: QuicStreamNumber, offset: Number, length: Number) -> Number {
+    return 1 + wireVarintSize(id.raw) + wireVarintSize(offset) + wireVarintSize(length)
+}

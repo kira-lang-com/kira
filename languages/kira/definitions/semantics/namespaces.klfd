@@ -1,0 +1,334 @@
+// Type namespaces: each module names its own types, as in kira. Two modules
+// may each declare a `Point`; a file means its own module's, else the one
+// the first of its imports that declares one provides, and `Library.Point`
+// means the one `Library` declares. Only a repeat within one module is a
+// duplicate.
+//
+// The checker knows a type by its name, so before it runs, every name more
+// than one module declares is told apart: one declaration keeps the written
+// name and each other becomes `Name#Module`, after the name of the module
+// that declares it, and every reference is rewritten to the declaration its
+// file means. The first library to declare the name keeps it, so the names
+// the checker itself asks for, such as Foundation's `String`, still mean the
+// library's. A renamed type is declared to KIR under a suffix of its own, and
+// anything shown to the program drops the `#Module`.
+//
+// A spelling names the module, never its place in the load order, so a
+// package built as a unit of its own and the program that imports it give
+// its types and functions the same names.
+
+// The suffix a renamed type is declared to KIR with is this plus a hash of
+// its module's name, past any suffix an instance is given.
+let scopedTypeSuffixBase = 1099511627776
+
+// One type name, the modules that declare it, the one whose declaration
+// keeps the written name, and the modules that declare a function or global
+// of the same name, which a bare name in their own files means instead.
+struct ScopedType {
+    let name: String
+    var modules: [Int]
+    var keeper: Int
+    var functionModules: [Int]
+    // The modules whose declaration of the name is `public`: only those are
+    // what another module's file sees by a bare name.
+    var exported: [Int]
+}
+
+struct TypeScopes {
+    // The names more than one module declares, and those a module named
+    // apart declares.
+    let scoped: [ScopedType]
+    // `scoped` by `nameHash` of the name.
+    let buckets: [[Int]]
+    let sources: [SourceUnit]
+    // Per file id, the module it belongs to, or -1.
+    let fileModules: [Int]
+    // Per file id, the modules its imports resolve to, in order.
+    let fileImports: [[Int]]
+    // Per module, its name.
+    let moduleNames: [String]
+
+    function moduleOf(borrow self, file: Int) -> Int {
+        if file < 0 || file >= fileModules.count { return -1 }
+        return fileModules[file]
+    }
+
+    function entry(borrow self, name: String) -> Optional<ScopedType> {
+        for index in buckets[nameHash(name) % nameSetBuckets] {
+            if scoped[index].name == name { return .Some(scoped[index]) }
+        }
+        return .None
+    }
+
+    // The name `written` means in `file`: the declaration of the module that
+    // file sees first.
+    function typeName(borrow self, written: String, file: Int) -> String {
+        match entry(written) {
+            None -> return written
+            Some(scopedType) -> {
+                match seenModule(scopedType, moduleOf(file), file) {
+                    Some(module) -> return spelling(scopedType, module, moduleNames)
+                    None -> return written
+                }
+            }
+        }
+    }
+
+    // `Library.Name`: the one the module `qualifier` names among the file's
+    // imports declares.
+    function qualifiedTypeName(borrow self, written: String, qualifier: String, file: Int) -> String {
+        match entry(written) {
+            None -> return written
+            Some(scopedType) -> {
+                match importedModule(file, qualifier) {
+                    Some(module) -> {
+                        if hasModule(scopedType.modules, module) { return spelling(scopedType, module, moduleNames) }
+                        return written
+                    }
+                    None -> return written
+                }
+            }
+        }
+    }
+
+    // A bare name in an expression, which a function or global of the file's
+    // own module takes before an imported type does.
+    function expressionName(borrow self, written: String, file: Int) -> String {
+        match entry(written) {
+            None -> return written
+            Some(scopedType) -> {
+                let home = moduleOf(file)
+                if !hasModule(scopedType.modules, home) && hasModule(scopedType.functionModules, home) { return written }
+                return typeName(written, file)
+            }
+        }
+    }
+
+    function seenModule(borrow self, scopedType: ScopedType, home: Int, file: Int) -> Optional<Int> {
+        if hasModule(scopedType.modules, home) { return .Some(home) }
+        if file < 0 || file >= fileImports.count { return .None }
+        for module in fileImports[file] {
+            if hasModule(scopedType.modules, module) && hasModule(scopedType.exported, module) { return .Some(module) }
+        }
+        return .None
+    }
+
+    function importedModule(borrow self, file: Int, alias: String) -> Optional<Int> {
+        for source in sources {
+            if source.file != file { continue }
+            for imported in source.imports {
+                if imported.alias.text == alias { return imported.module }
+            }
+        }
+        return .None
+    }
+
+    // The declaration's own name: as written for the keeper, else
+    // `Name#module`.
+    function declaredName(borrow self, written: String, file: Int) -> String {
+        match entry(written) {
+            None -> return written
+            Some(scopedType) -> return spelling(scopedType, moduleOf(file), moduleNames)
+        }
+    }
+}
+
+function spelling(scopedType: ScopedType, module: Int, moduleNames: [String]) -> String {
+    if module == scopedType.keeper || module < 0 { return scopedType.name }
+    return joinText([scopedType.name, "#", moduleNames[module]])
+}
+
+function hasModule(modules: [Int], module: Int) -> Bool {
+    for listed in modules {
+        if listed == module { return true }
+    }
+    return false
+}
+
+// The KIR suffix a type name carries: `scopedTypeSuffixBase` plus the hash
+// of the module named after a `#`, or 0 for a name as written.
+function scopedTypeSuffix(name: String) -> Int {
+    let count = utf8Count(name)
+    for index in 0..count {
+        if utf8Byte(name, index) != asciiHash { continue }
+        var end = index + 1
+        while end < count && isIdentifierContinue(utf8Byte(name, end)) { end += 1 }
+        return scopedTypeSuffixBase + stableHash(utf8Slice(name, index + 1, end))
+    }
+    return 0
+}
+
+// The KIR suffix of a generic instance: a hash of its name, which spells its
+// type arguments, so every unit and every build that mints the instance
+// names it alike. It is never 0, the suffix of a name as written.
+function instanceSuffix(instanceName: String) -> Int {
+    return stableHash(instanceName) + 1
+}
+
+// A hash of `text` below `scopedTypeSuffixBase`, the same in every build.
+function stableHash(text: String) -> Int {
+    var hash = 0
+    for index in 0..utf8Count(text) {
+        hash = (hash * 257 + utf8Byte(text, index)) % 1099511627689
+    }
+    return hash
+}
+
+// A type name as the program shows it: every `#Module` dropped.
+function displayedTypeName(name: String) -> String {
+    var parts: [String] = []
+    var start = 0
+    var skipping = false
+    for index in 0..utf8Count(name) {
+        let byte = utf8Byte(name, index)
+        if byte == asciiHash {
+            parts.append(utf8Slice(name, start, index))
+            skipping = true
+        } else if skipping && !isIdentifierContinue(byte) {
+            skipping = false
+            start = index
+        }
+    }
+    if !skipping { parts.append(utf8Slice(name, start, utf8Count(name))) }
+    return joinText(parts)
+}
+
+// Which modules declare which type names, and which of those more than one
+// does.
+struct TypeOwners {
+    var entries: [ScopedType]
+    var buckets: [[Int]]
+    let fileModules: [Int]
+
+    function file(borrow mut self, name: Identifier, exported: Bool) {
+        let module = moduleOfFile(fileModules, name.span.file)
+        let bucket = nameHash(name.text) % nameSetBuckets
+        for index in buckets[bucket] {
+            if entries[index].name == name.text {
+                if !hasModule(entries[index].modules, module) { entries[index].modules.append(module) }
+                if exported && !hasModule(entries[index].exported, module) { entries[index].exported.append(module) }
+                return
+            }
+        }
+        var exports: [Int] = []
+        if exported { exports.append(module) }
+        buckets[bucket].append(entries.count)
+        entries.append(ScopedType { name = name.text, modules = [module], keeper = module, functionModules = [], exported = exports })
+    }
+}
+
+function moduleOfFile(fileModules: [Int], file: Int) -> Int {
+    if file < 0 || file >= fileModules.count { return -1 }
+    return fileModules[file]
+}
+
+function typeScopes(tree: SyntaxTree) -> TypeScopes {
+    var last = 0
+    for source in tree.sources {
+        if source.file > last { last = source.file }
+    }
+    var fileModules: [Int] = []
+    var fileImports: [[Int]] = []
+    for file in 0..last + 1 {
+        fileModules.append(-1)
+        let none: [Int] = []
+        fileImports.append(none)
+    }
+    for source in tree.sources {
+        fileModules[source.file] = source.module
+        for imported in source.imports {
+            match imported.module {
+                Some(module) -> fileImports[source.file].append(module)
+                None -> {}
+            }
+        }
+    }
+    var libraries: [Bool] = []
+    var namedApart: [Bool] = []
+    var separate: [Bool] = []
+    for module in tree.modules {
+        libraries.append(module.library)
+        namedApart.append(module.namedApart)
+        separate.append(module.separate)
+    }
+    var buckets: [[Int]] = []
+    for bucket in 0..nameSetBuckets {
+        let empty: [Int] = []
+        buckets.append(empty)
+    }
+    var owners = TypeOwners { entries = [], buckets = buckets, fileModules = fileModules }
+    for declared in tree.structs { owners.file(declared.name, isExportedName(tree, declared.name.span)) }
+    for declared in tree.genericStructs { owners.file(declared.name, isExportedName(tree, declared.name.span)) }
+    for declared in tree.enums { owners.file(declared.name, isExportedName(tree, declared.name.span)) }
+    for declared in tree.genericEnums { owners.file(declared.name, isExportedName(tree, declared.name.span)) }
+    for declared in tree.aliases { owners.file(declared.name, isExportedName(tree, declared.name.span)) }
+    for declared in tree.distincts { owners.file(declared.name, isExportedName(tree, declared.name.span)) }
+    for declared in tree.classes { owners.file(declared.name, isExportedName(tree, declared.name.span)) }
+    for declared in tree.constructs { owners.file(declared.name, isExportedName(tree, declared.name.span)) }
+    for declared in tree.traits { owners.file(declared.name, isExportedName(tree, declared.name.span)) }
+    var scoped: [ScopedType] = []
+    for entry in owners.entries {
+        if entry.modules.count > 1 || declaredApart(entry, namedApart) { scoped.append(keptBy(entry, libraries, namedApart, separate)) }
+    }
+    var scopedBuckets: [[Int]] = []
+    for bucket in 0..nameSetBuckets {
+        let empty: [Int] = []
+        scopedBuckets.append(empty)
+    }
+    for index in 0..scoped.count { scopedBuckets[nameHash(scoped[index].name) % nameSetBuckets].append(index) }
+    if scoped.count > 0 { fileFunctionModules(scoped, scopedBuckets, tree, fileModules) }
+    var moduleNames: [String] = []
+    for module in tree.modules { moduleNames.append(module.name) }
+    return TypeScopes {
+        scoped = scoped, buckets = scopedBuckets, sources = tree.sources, fileModules = fileModules,
+        fileImports = fileImports, moduleNames = moduleNames
+    }
+}
+
+function declaredApart(entry: ScopedType, namedApart: [Bool]) -> Bool {
+    for module in entry.modules {
+        if module >= 0 && module < namedApart.count && namedApart[module] { return true }
+    }
+    return false
+}
+
+// A package a unit of its own builds keeps the name, since that unit
+// spells it as written; else the first library to declare it, or with none
+// the first module. A module named apart never keeps it, and with only
+// those none does.
+function keptBy(entry: ScopedType, libraries: [Bool], namedApart: [Bool], separate: [Bool]) -> ScopedType {
+    var kept = entry
+    for module in entry.modules {
+        if module >= 0 && module < separate.count && separate[module] && !namedApart[module] {
+            kept.keeper = module
+            return kept
+        }
+    }
+    var first = -2
+    for module in entry.modules {
+        if module >= 0 && module < namedApart.count && namedApart[module] { continue }
+        if first == -2 { first = module }
+        if module >= 0 && module < libraries.count && libraries[module] {
+            kept.keeper = module
+            return kept
+        }
+    }
+    kept.keeper = first
+    return kept
+}
+
+// Notes, for each scoped name, the modules that declare a function or
+// global of that name.
+function fileFunctionModules(scoped: borrow mut [ScopedType], buckets: [[Int]], tree: SyntaxTree, fileModules: [Int]) {
+    for declared in tree.functions { fileFunctionModule(scoped, buckets, declared.name, fileModules) }
+    for declared in tree.genericFunctions { fileFunctionModule(scoped, buckets, declared.name, fileModules) }
+    for global in tree.globals { fileFunctionModule(scoped, buckets, global.binding.name, fileModules) }
+}
+
+function fileFunctionModule(scoped: borrow mut [ScopedType], buckets: [[Int]], name: Identifier, fileModules: [Int]) {
+    for index in buckets[nameHash(name.text) % nameSetBuckets] {
+        if scoped[index].name == name.text {
+            scoped[index].functionModules.append(moduleOfFile(fileModules, name.span.file))
+        }
+    }
+}

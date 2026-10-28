@@ -1,0 +1,169 @@
+function isArrayType(program: CheckedProgram, valueType: Type) -> Bool {
+    if valueType.kind != .Structure { return false }
+    return program.structs[valueType.declaration].genericBase == "Array"
+}
+
+// Whether a struct's values keep their storage in a runtime buffer: an array,
+// a closure, a class instance, a `String` or an `Any`.
+function holdsRuntimeBuffer(structure: StructType) -> Bool {
+    match structure.genericBase {
+        "Array", "Closure", "Class" -> return true
+        else -> {}
+    }
+    match structure.name.text {
+        "String", "Any" -> return true
+        else -> return false
+    }
+}
+
+function arrayRuntimeFunctions(declarations: Declarations) -> [Int] {
+    for structure in declarations.structs {
+        if holdsRuntimeBuffer(structure) {
+            var functions: [Int] = []
+            let names: [String] = ["makeArrayData", "heapBufferData", "retainArrayData", "releaseArrayData", "ensureUniqueArrayData", "resizeArrayData", "arrayDataIsUnique", "reallocateArrayBufferOps", "freeArrayBufferOps", "freeClosureContextData"]
+            for name in names {
+                match declarations.findFunction(.None, name) {
+                    Some(target) -> functions.append(target)
+                    None -> report(.UndefinedFunction, structure.name.span)
+                }
+            }
+            return functions
+        }
+    }
+    return []
+}
+
+extend Checker {
+    function checkArrayLiteral(borrow mut self, elements: [Int], expected: Optional<Type>, span: Span) -> Int {
+        var arrayType = Type.invalid()
+        match expected {
+            Some(target) -> {
+                if isArrayType(program, target) { arrayType = target }
+            }
+            None -> {}
+        }
+        var checked: [Int] = []
+        if arrayType.isInvalid() {
+            if elements.count == 0 {
+                report(.EmptyArrayUninferred, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+            let first = expression(elements[0], .None)
+            checked.append(first)
+            if typeOf(first).isInvalid() { return add(.Integer(0), Type.invalid(), span) }
+            arrayType = arrayOf(typeOf(first), span)
+            if arrayType.isInvalid() { return add(.Integer(0), Type.invalid(), span) }
+        }
+        let elementType = program.structs[arrayType.declaration].typeArguments[0]
+        for index in checked.count..elements.count {
+            checked.append(coerce(expression(elements[index], .Some(elementType)), elementType, .ArrayElementMismatch))
+        }
+        return add(.ArrayLiteral(checked), arrayType, span)
+    }
+
+    // `[T]`, minted if no declaration has named it yet.
+    function arrayOf(borrow mut self, element: Type, span: Span) -> Type {
+        let argument = declarations.reference(element, span)
+        let name = Identifier { text = "Array", span = span }
+        return resolveType(TypeReference {
+            qualifier = .None, name = name, arguments = [argument], modes = [],
+            instanceName = genericInstanceName(name.text, [argument])
+        })
+    }
+
+    function checkArrayIndex(borrow mut self, base: Int, index: Int, span: Span) -> Int {
+        var array = expression(base, .None)
+        if typeOf(array).kind == .Structure {
+            match program.structs[typeOf(array).declaration].shape {
+                CArray -> {
+                    let elements = program.structs[typeOf(array).declaration].fields[0].valueType
+                    array = add(.Member(array, 0), elements, program.expressions[array].span)
+                }
+                Plain -> {}
+                CLayout -> {}
+                CUnion -> {}
+                Callback -> {}
+                CPointer -> {}
+            }
+        }
+        let arrayType = typeOf(array)
+        if !isArrayType(program, arrayType) {
+            if !arrayType.isInvalid() { report(.OperatorOperand, span) }
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let offset = whole(integerIndex(expression(index, .Some(Type.int()))), Type.int(), .OperatorOperand)
+        return add(.ArrayIndex(array, offset), program.structs[arrayType.declaration].typeArguments[0], span)
+    }
+
+    function checkArrayMethod(borrow mut self, array: Int, method: Identifier, arguments: [Int], span: Span) -> Int {
+        if method.text == "contains" { return arrayContains(array, arguments, span) }
+        if method.text != "append" {
+            report(.UndefinedFunction, method.span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        if arguments.count != 1 {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        var before: [Int] = []
+        var after: [Int] = []
+        let appended = writable(array, .MutablyBorrowed, before, after)
+        checkCrossingArrayLength(appended, span)
+        let elementType = program.structs[typeOf(appended).declaration].typeArguments[0]
+        let element = coerce(expression(arguments[0], .Some(elementType)), elementType, .ArgumentTypeMismatch)
+        return writtenBack(add(.ArrayAppend(appended, element), Type.void(), span), before, after, span)
+    }
+
+    // `items.contains(value)`, through Foundation's `arrayContains` made for
+    // the element type.
+    function arrayContains(borrow mut self, array: Int, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 1 {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let elementType = program.structs[typeOf(array).declaration].typeArguments[0]
+        let value = coerce(expression(arguments[0], .Some(elementType)), elementType, .ArgumentTypeMismatch)
+        match genericFunctionNamed("arrayContains") {
+            Some(template) -> {
+                match mintFunction(template, [declarations.reference(elementType, span)], span) {
+                    Some(target) -> return callChecked(target, .None, [array, value], span)
+                    None -> return add(.Integer(0), Type.invalid(), span)
+                }
+            }
+            None -> {
+                report(.UndefinedFunction, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+}
+
+extend Declarations {
+    function typeSpelling(borrow self, valueType: Type) -> String {
+        match valueType.kind {
+            Integer -> {
+                if valueType.isInt() { return "Int" }
+                if valueType.signed {
+                    if valueType.bits == 8 { return "I8" }
+                    if valueType.bits == 16 { return "I16" }
+                    return "I32"
+                }
+                if valueType.bits == 8 { return "U8" }
+                if valueType.bits == 16 { return "U16" }
+                if valueType.bits == 32 { return "U32" }
+                return "U64"
+            }
+            Boolean -> return "Bool"
+            Decimal -> return valueType.numberName()
+            Floating -> {
+                if valueType.bits == 32 { return "F32" }
+                return "Float"
+            }
+            Pointer -> return "RawPtr"
+            Void -> return "Void"
+            Structure -> return structs[valueType.declaration].name.text
+            Enumeration -> return enums[valueType.declaration].name.text
+            Invalid -> return ""
+        }
+    }
+}

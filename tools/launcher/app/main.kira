@@ -1,0 +1,135 @@
+import KnvmCore
+
+// The launcher: resolves a compiler's selected toolchain and dispatches to its
+// binary.
+//
+// One binary, installed by `knvm sinstall` under the name of every compiler
+// knvm manages, and it resolves which one it is from the name it was invoked
+// under. So `kira` on PATH is this binary reading `kira`'s selection and
+// `klf` on PATH is the same binary reading `klf`'s, and a compiler added to the
+// registry gets a launcher without a line of code here.
+//
+// It reads the same `current.toml` and the same `<compiler>-toolchain.toml` pins
+// the manager writes, so what runs is always the toolchain the manager has
+// selected — never a copy frozen at whatever the language looked like on install
+// day.
+//
+// Exit code 2 means exactly one thing: the launcher itself could not dispatch.
+// Past a successful dispatch the exit status belongs to the compiler.
+
+// Process exit code for "the launcher could not dispatch".
+let exitLauncherFailed: Int = 2
+
+@Main
+function main() -> Int {
+    let invoked = invokedAs()
+    match compilerForBinary(allCompilers(), invoked) {
+        None -> { return reportUnknownName(invoked) }
+        Some(compiler) -> {
+            let start = workingDirectory()
+            var directory = ""
+            match start {
+                None -> { directory = "" }
+                Some(found) -> { directory = found }
+            }
+            match resolveToolchain(compiler, directory) {
+                Refused(reason) -> {
+                    errorLine(compiler.name + ": " + reason)
+                    return exitLauncherFailed
+                }
+                Toolchain(choice) -> { return dispatch(compiler, choice, directory) }
+            }
+        }
+    }
+    return exitLauncherFailed
+}
+
+// The name this program was invoked under.
+//
+// The basename, because the shell decides what it passes: a login shell hands a
+// launcher the path it resolved, an interactive one often hands it the bare name,
+// and both answer the same question. `.exe` is dropped because Windows adds it
+// and no compiler is called that.
+function invokedAs() -> String {
+    let name = lastComponentOfPath(commandLineExecutable())
+    if name.endsWith(windowsExecutableSuffix) {
+        return name.substring(0, name.count - windowsExecutableSuffix.count)
+    }
+    return name
+}
+
+let windowsExecutableSuffix: String = ".exe"
+
+// What a launcher installed under a name no compiler answers to says. It is a
+// mislaid file rather than a mistake in a command line: the manager installed
+// this binary, and nothing else can run it.
+function reportUnknownName(name: borrow String) -> Int {
+    errorLine(
+        toolName + ": `" + name + "` names no compiler this launcher dispatches (" + joinNames(
+            compilerNames(allCompilers())
+        ) + "); reinstall with `knvm sinstall`"
+    )
+    return exitLauncherFailed
+}
+
+// `a, b, c`.
+function joinNames(names: borrow [String]) -> String {
+    var text = ""
+    for index in 0..names.count {
+        if index > 0 { text = text + ", " }
+        text = text + names[index]
+    }
+    return text
+}
+
+// Hands the invocation over to the selected toolchain's binary.
+//
+// The compiler runs on this program's own streams with this program's own
+// environment, which is what `klf.process` does for an uncaptured command, so it
+// sees exactly what it would have seen had it been started directly. Its exit
+// status becomes this one's; a compiler a signal stopped is reported the way a
+// shell reports one rather than being silently called a failure.
+//
+// For `kira`, a compile verb gets `--sdk <path>` when the package names an SDK,
+// and `--dependency` for the git dependencies it fetches (knvm-core `Sdk.kira`),
+// so a package never spells where its SDK or its checkouts live.
+function dispatch(compiler: borrow Compiler, choice: borrow ToolchainChoice, start: borrow String) -> Int {
+    let binary = binaryPath(toolchainRoot(compiler, choice.channel, choice.version), compiler)
+    if !fileExists(binary) {
+        errorLine(
+            compiler.name + ": selected toolchain " + channelName(
+                choice.channel
+            ) + "/" + choice.version + " has no `" + compiler.binary + "` at " + binary + "; repair it with `" + provisionCommand(
+                compiler
+            ) + "`"
+        )
+        return exitLauncherFailed
+    }
+
+    var arguments = commandLineArguments()
+    if compiler.name == "kira" && !start.isEmpty() {
+        match withPackageArguments(arguments, start) {
+            Ok(extended) -> { arguments = extended }
+            Error(text) -> {
+                errorLine(text)
+                return exitLauncherFailed
+            }
+        }
+    }
+    let status = runTool(binary, arguments)
+    if status == toolNotRunnable { return reportUnstartable(compiler, binary) }
+    if status == toolStopped {
+        errorLine(compiler.name + ": " + binary + " was stopped by a signal")
+        return exitLauncherFailed
+    }
+    return status
+}
+
+function reportUnstartable(compiler: borrow Compiler, binary: borrow String) -> Int {
+    errorLine(
+        compiler.name + ": cannot execute " + binary + "; repair it with `" + provisionCommand(
+            compiler
+        ) + "`"
+    )
+    return exitLauncherFailed
+}

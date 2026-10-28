@@ -1,0 +1,59 @@
+import Heap
+
+// Text as bytes and back, in the sized-number byte `UN8`. A `UN8` is stored
+// as one byte, so text and bytes copy as one run.
+
+extend String {
+    // The UTF-8 bytes, in order.
+    function utf8(borrow self) -> [UN8] {
+        let out = makeArrayData(max(count, 1))
+        heapCopyBytes(out, data, count)
+        let empty: [UN8] = []
+        return Array { data = out, count = count, capacity = max(count, 1), ops = empty.ops }
+    }
+
+    // Each Unicode scalar, as text of its own, in order: what `for c in text`
+    // iterates. A lead byte says how long its sequence is, so a scalar is
+    // never cut through the middle.
+    function characters(borrow self) -> [String] {
+        let bytes = utf8()
+        var out: [String] = []
+        var at = 0
+        while at < bytes.count {
+            let lead = Number(bytes[at])
+            var length = 1
+            if lead >= 240 {
+                length = 4
+            } else if lead >= 224 {
+                length = 3
+            } else if lead >= 192 {
+                length = 2
+            }
+            let end = min(at + length, bytes.count)
+            match textFromByteRun(bytes, at, end) {
+                Some(character) -> out.append(character)
+                None -> {}
+            }
+            at = end
+        }
+        return out
+    }
+}
+
+// UTF-8 bytes as text, or nothing when they are not well-formed UTF-8.
+function textFromBytes(bytes: borrow [UN8]) -> String? {
+    return textFromByteRun(bytes, 0, bytes.count)
+}
+
+// The UTF-8 bytes from `start` up to `end`, clamped to the array, as text in
+// one copy, or nothing when they are not well-formed UTF-8.
+function textFromByteRun(bytes: borrow [UN8], start: Number, end: Number) -> String? {
+    let from = max(min(Number(start), bytes.count), 0)
+    let count = max(min(Number(end), bytes.count), from) - from
+    let empty = ""
+    let data = makeArrayData(count)
+    heapCopyBytes(data, heapOffset(bytes.data, from), count)
+    let text = String { data: data, count: count, capacity: count, ops: empty.ops }
+    if !isUtf8Text(text) { return .None }
+    return .Some(text)
+}

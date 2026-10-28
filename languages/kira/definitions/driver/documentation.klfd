@@ -1,0 +1,746 @@
+// `kira doc [path]` renders the public API of a package with its doc comments
+// as Markdown; `kira doc --check` reports every public declaration or member
+// without one (docs/documentation.md). `check` runs the phase, and `elaborate`
+// hands the parsed tree here before the checker reads it.
+
+// The index of the package's own module in the tree: the module whose root
+// holds the file `entry` the package was asked for, the innermost one when
+// packages nest. A library's tree also holds the packages it depends on
+// (Foundation, say), so module 0 is not necessarily the package.
+function ownModuleIndex(tree: borrow SyntaxTree, entry: String) -> Int {
+    let path = joinText(["/", normalizedPath(entry), "/"])
+    var best: Int = 0
+    var bestLength: Int = -1
+    for index in 0..tree.modules.count {
+        let root = joinText(["/", normalizedPath(tree.modules[index].root), "/"])
+        if containsText(path, root) && utf8Count(root) > bestLength {
+            best = index
+            bestLength = utf8Count(root)
+        }
+    }
+    return best
+}
+
+// Whether the package's own sources hold the file `file`. A dependency's
+// declarations are documented by its own package.
+function ownFile(tree: borrow SyntaxTree, file: Int, own: Int) -> Bool {
+    for source in tree.sources {
+        if source.file == file && source.module == own { return true }
+    }
+    return false
+}
+
+// The doc entry of the top-level declaration `name` (`owner` empty), or of
+// the member `name` of the type `owner`.
+function docEntry(tree: borrow SyntaxTree, name: String, owner: String) -> Optional<DocEntry> {
+    for entry in tree.documentation {
+        if entry.kind != "module" && entry.name == name && entry.owner == owner {
+            return .Some(entry)
+        }
+    }
+    return .None
+}
+
+// Whether `name` is written `private` among the members of its type.
+function isPrivateMemberName(tree: borrow SyntaxTree, name: String) -> Bool {
+    for member in tree.privateMembers {
+        if member.text == name { return true }
+    }
+    return false
+}
+
+// The names of the members of the public type `typeName` that the API shows:
+// the fields and methods of a struct, and the cases of an enum. Private members
+// and the methods an enum gets from its raw values are left out.
+function publicMembers(tree: borrow SyntaxTree, own: Int, typeName: String) -> [Identifier] {
+    var names: [Identifier] = []
+    for declared in tree.structs {
+        if declared.name.text != typeName { continue }
+        if !ownFile(tree, declared.name.span.file, own) { continue }
+        for field in declared.fields { names.append(field.name) }
+        for method in declared.methods { names.append(method.name) }
+    }
+    for declared in tree.enums {
+        if declared.name.text != typeName { continue }
+        if !ownFile(tree, declared.name.span.file, own) { continue }
+        for enumCase in declared.cases { names.append(enumCase.name) }
+    }
+    var shown: [Identifier] = []
+    for name in names {
+        if !isPrivateMemberName(tree, name.text) { shown.append(name) }
+    }
+    return shown
+}
+
+// What the declaration sites say `name` is: a function, a struct, or a
+// declaration that is no site of its own (a global, an extension).
+function siteKind(tree: borrow SyntaxTree, name: String) -> String {
+    for site in tree.declarationSites {
+        if site.name.text == name { return site.kind }
+    }
+    return "declaration"
+}
+
+// The text of the module's `//!` comments, or empty when the package has none.
+function moduleDocumentation(tree: borrow SyntaxTree, own: Int) -> String {
+    for entry in tree.documentation {
+        if entry.kind == "module" && ownFile(tree, entry.span.file, own) { return entry.text }
+    }
+    return ""
+}
+
+// The first paragraph of a doc comment, its summary: up to the first empty
+// line, with its line breaks turned into spaces.
+function summaryOf(text: String) -> String {
+    let count = utf8Count(text)
+    var end = count
+    for index in 0..count {
+        if utf8Byte(text, index) == asciiNewline && index + 1 < count && utf8Byte(text, index + 1) == asciiNewline {
+            end = index
+            break
+        }
+    }
+    var words: [String] = []
+    for index in 0..end {
+        if utf8Byte(text, index) == asciiNewline {
+            words.append(" ")
+        } else {
+            words.append(utf8Slice(text, index, index + 1))
+        }
+    }
+    return joinText(words)
+}
+
+// The text the entry of `name` (of `owner`) shows, with its intra-doc links
+// resolved, or that it has none.
+function documentedText(tree: borrow SyntaxTree, own: Int, name: String, owner: String) -> String {
+    match docEntry(tree, name, owner) {
+        Some(documented) -> return linkedText(tree, own, visibleText(documented.text))
+        None -> return "No documentation."
+    }
+}
+
+// One declaration's section: its heading, its text, and its members.
+function declarationSection(tree: borrow SyntaxTree, own: Int, name: String, kind: String) -> String {
+    var pieces: [String] = []
+    pieces.append(joinText(["## `", kind, " ", name, "`"]))
+    pieces.append(documentedText(tree, own, name, ""))
+    for member in publicMembers(tree, own, name) {
+        pieces.append(joinText(["### `", member.text, "`"]))
+        pieces.append(documentedText(tree, own, member.text, name))
+    }
+    return joinedWith(pieces, "\n\n")
+}
+
+// The byte that opens and closes an intra-doc link's name: `[`Name`]`.
+let docBacktick = 96
+
+// One intra-doc link of a doc text: the bytes `start` up to `end` (after the
+// closing `]`) hold `[`name`]`, and `name` is the path between the backticks.
+struct DocLink {
+    let start: Int
+    let end: Int
+    let name: String
+}
+
+// Whether `text` holds `part` at byte `index`.
+function holdsAt(text: String, index: Int, part: String) -> Bool {
+    let width = utf8Count(part)
+    if index + width > utf8Count(text) { return false }
+    return utf8Slice(text, index, index + width) == part
+}
+
+// The intra-doc links of `text`, in order. Lines inside a fenced code block are
+// code, so a `[`name`]` there is not a link.
+function docLinks(text: String) -> [DocLink] {
+    var links: [DocLink] = []
+    let count = utf8Count(text)
+    var inFence = false
+    var lineStart = true
+    var resumeAt = 0
+    for index in 0..count {
+        let startsLine = lineStart
+        lineStart = utf8Byte(text, index) == asciiNewline
+        if index < resumeAt { continue }
+        if startsLine && holdsAt(text, index, "```") {
+            inFence = !inFence
+            resumeAt = index + 3
+            continue
+        }
+        if inFence { continue }
+        if utf8Byte(text, index) == asciiLeftBracket && holdsAt(text, index + 1, "`") {
+            let close = closingBacktick(text, index + 2)
+            if close >= 0 {
+                links.append(DocLink { start = index, end = close + 2, name = utf8Slice(text, index + 2, close) })
+                resumeAt = close + 2
+            }
+        }
+    }
+    return links
+}
+
+// The index of the backtick that closes a link name starting at `from`, or -1
+// when the name is empty, runs past its line, or is not followed by `]`.
+function closingBacktick(text: String, from: Int) -> Int {
+    let count = utf8Count(text)
+    for index in from..count {
+        let byte = utf8Byte(text, index)
+        if byte == asciiNewline { return -1 }
+        if byte == docBacktick {
+            if index > from && index + 1 < count && utf8Byte(text, index + 1) == asciiRightBracket { return index }
+            return -1
+        }
+    }
+    return -1
+}
+
+// The index of the first occurrence of `part` in `text`, or -1.
+function firstIndexOf(text: String, part: String) -> Int {
+    let count = utf8Count(text)
+    let width = utf8Count(part)
+    if width > count { return -1 }
+    for index in 0..count - width + 1 {
+        if holdsAt(text, index, part) { return index }
+    }
+    return -1
+}
+
+// The module a link path names: `own` for a plain name, or the package written
+// before `::`. -1 when no module of the tree has that package's name.
+function linkModule(tree: borrow SyntaxTree, own: Int, path: String) -> Int {
+    let separator = firstIndexOf(path, "::")
+    if separator < 0 { return own }
+    let package = utf8Slice(path, 0, separator)
+    for index in 0..tree.modules.count {
+        if tree.modules[index].name == package { return index }
+    }
+    return -1
+}
+
+// The item part of a link path: what follows `::`, or the whole path.
+function linkItemName(path: String) -> String {
+    let separator = firstIndexOf(path, "::")
+    if separator < 0 { return path }
+    return utf8Slice(path, separator + 2, utf8Count(path))
+}
+
+// Whether the module declares a top-level name `name`.
+function declaresName(tree: borrow SyntaxTree, module: Int, name: String) -> Bool {
+    for site in tree.declarationSites {
+        if site.name.text == name && ownFile(tree, site.name.span.file, module) { return true }
+    }
+    for entry in tree.documentation {
+        if entry.kind != "module" && entry.owner == "" && entry.name == name && ownFile(tree, entry.span.file, module) { return true }
+    }
+    return false
+}
+
+// Whether the module declares the member `member` of the type `owner`.
+function docDeclaresMember(tree: borrow SyntaxTree, module: Int, owner: String, member: String) -> Bool {
+    for name in publicMembers(tree, module, owner) {
+        if name.text == member { return true }
+    }
+    for entry in tree.documentation {
+        if entry.kind != "module" && entry.owner == owner && entry.name == member && ownFile(tree, entry.span.file, module) { return true }
+    }
+    return false
+}
+
+// The anchor of a top-level declaration's section in the rendered page, or
+// empty when the page has no section for it (a private declaration).
+function declarationAnchor(tree: borrow SyntaxTree, own: Int, name: String) -> String {
+    if !isNamedExport(tree, name) { return "" }
+    var kind = siteKind(tree, name)
+    match docEntry(tree, name, "") {
+        Some(documented) -> kind = documented.kind
+        None -> {}
+    }
+    return joinText(["#", kind, "-", name])
+}
+
+// What the link path `item` denotes in the module: `Some` of the anchor of its
+// section (empty when it has none), or `None` when no declaration has the name.
+function resolveItem(tree: borrow SyntaxTree, module: Int, item: String) -> Optional<String> {
+    let dot = firstIndexOf(item, ".")
+    if dot < 0 {
+        if !declaresName(tree, module, item) { return .None }
+        return .Some(declarationAnchor(tree, module, item))
+    }
+    let owner = utf8Slice(item, 0, dot)
+    let member = utf8Slice(item, dot + 1, utf8Count(item))
+    if !docDeclaresMember(tree, module, owner, member) { return .None }
+    if !isNamedExport(tree, owner) { return .Some("") }
+    return .Some(declarationAnchor(tree, module, owner))
+}
+
+// The anchor a link name resolves to in the package `own`, or `None` when the
+// name is not an item of any package the link can reach.
+function resolveLink(tree: borrow SyntaxTree, own: Int, name: String) -> Optional<String> {
+    let module = linkModule(tree, own, name)
+    if module < 0 { return .None }
+    return resolveItem(tree, module, linkItemName(name))
+}
+
+// The Markdown of `text` with each intra-doc link to an item with a section
+// turned into a link to that section; a link that resolves to no section, or to
+// no item, is kept as it is written.
+function linkedText(tree: borrow SyntaxTree, own: Int, text: String) -> String {
+    let links = docLinks(text)
+    if links.count == 0 { return text }
+    var pieces: [String] = []
+    var position = 0
+    for link in links {
+        pieces.append(utf8Slice(text, position, link.start))
+        match resolveLink(tree, own, link.name) {
+            Some(anchor) -> {
+                if anchor == "" {
+                    pieces.append(utf8Slice(text, link.start, link.end))
+                } else {
+                    pieces.append(joinText(["[`", link.name, "`](", anchor, ")"]))
+                }
+            }
+            None -> pieces.append(utf8Slice(text, link.start, link.end))
+        }
+        position = link.end
+    }
+    pieces.append(utf8Slice(text, position, utf8Count(text)))
+    return joinedWith(pieces, "")
+}
+
+// The names an intra-doc link of the package could mean: its top-level
+// declarations and the members of its types, as `Type.member`.
+function linkCandidates(tree: borrow SyntaxTree, own: Int) -> [String] {
+    var names: [String] = []
+    for site in tree.declarationSites {
+        if ownFile(tree, site.name.span.file, own) { names.append(site.name.text) }
+    }
+    for entry in tree.documentation {
+        if entry.kind != "module" && entry.owner != "" && ownFile(tree, entry.span.file, own) {
+            names.append(joinText([entry.owner, ".", entry.name]))
+        }
+    }
+    return names
+}
+
+// The number of single-byte edits that turn `left` into `right`.
+function editDistance(left: String, right: String) -> Int {
+    let leftCount = utf8Count(left)
+    let rightCount = utf8Count(right)
+    var previous: [Int] = []
+    for column in 0..rightCount + 1 { previous.append(column) }
+    for row in 0..leftCount {
+        var current: [Int] = [row + 1]
+        for column in 0..rightCount {
+            let cost = utf8Byte(left, row) == utf8Byte(right, column) ? 0 : 1
+            let substitute = previous[column] + cost
+            let insert = previous[column + 1] + 1
+            let delete = current[column] + 1
+            current.append(smallerOf(substitute, smallerOf(insert, delete)))
+        }
+        previous = current
+    }
+    return previous[rightCount]
+}
+
+// The smaller of two counts.
+function smallerOf(first: Int, second: Int) -> Int {
+    return first < second ? first : second
+}
+
+// The candidate nearest to the unresolved link `name`, when it is near enough to
+// be a typo of it; `None` otherwise.
+function nearestCandidate(candidates: [String], name: String) -> Optional<String> {
+    let limit = utf8Count(name) / 3 + 1
+    var best: Optional<String> = .None
+    var bestDistance = limit + 1
+    for candidate in candidates {
+        let distance = editDistance(name, candidate)
+        if distance < bestDistance {
+            best = .Some(candidate)
+            bestDistance = distance
+        }
+    }
+    if bestDistance > limit { return .None }
+    return best
+}
+
+// Reports each intra-doc link of the package's own documentation that names no
+// item, at the doc comment holding it, with the nearest name the package has.
+function reportBrokenLinks(tree: borrow SyntaxTree, own: Int) {
+    let candidates = linkCandidates(tree, own)
+    for entry in tree.documentation {
+        if !ownFile(tree, entry.span.file, own) { continue }
+        for link in docLinks(entry.text) {
+            if resolveLink(tree, own, link.name).isNone() {
+                report(.UnresolvedLink, entry.span)
+                match nearestCandidate(candidates, linkItemName(link.name)) {
+                    Some(suggestion) -> writeDriverError(joinText(["  = help: did you mean `", suggestion, "`?\n"]))
+                    None -> {}
+                }
+            }
+        }
+    }
+}
+
+// The package's public API as Markdown: its title and module documentation,
+// an index of the summaries, then a section per public declaration.
+function renderDocumentation(tree: borrow SyntaxTree, own: Int) -> String {
+    if tree.modules.count == 0 { return "" }
+    var pieces: [String] = []
+    pieces.append(joinText(["# ", tree.modules[own].name]))
+    let moduleText = moduleDocumentation(tree, own)
+    if utf8Count(moduleText) > 0 { pieces.append(linkedText(tree, own, visibleText(moduleText))) }
+    var index: [String] = []
+    var sections: [String] = []
+    for exported in tree.exports {
+        if !ownFile(tree, exported.span.file, own) { continue }
+        var kind = siteKind(tree, exported.text)
+        var summary = "No documentation."
+        match docEntry(tree, exported.text, "") {
+            Some(documented) -> {
+                kind = documented.kind
+                summary = summaryOf(linkedText(tree, own, documented.text))
+            }
+            None -> {}
+        }
+        index.append(joinText(["- `", kind, " ", exported.text, "`: ", summary]))
+        sections.append(declarationSection(tree, own, exported.text, kind))
+    }
+    if index.count > 0 {
+        pieces.append("## Public API")
+        pieces.append(joinedWith(index, "\n"))
+    }
+    for section in sections { pieces.append(section) }
+    return joinedWith(pieces, "\n\n")
+}
+
+// Reports each public declaration and each member of a public type that has
+// no doc comment, as an error at its name.
+function reportUndocumented(tree: borrow SyntaxTree, own: Int) {
+    for exported in tree.exports {
+        if !ownFile(tree, exported.span.file, own) { continue }
+        if docEntry(tree, exported.text, "").isNone() {
+            report(.UndocumentedPublic, exported.span)
+        }
+        for member in publicMembers(tree, own, exported.text) {
+            if docEntry(tree, member.text, exported.text).isNone() {
+                report(.UndocumentedPublic, member.span)
+            }
+        }
+    }
+}
+
+// Whether the driver was asked for documentation: `kira doc`.
+function docRequested(session: Session) -> Bool {
+    match session.flag("doc") {
+        Boolean(value) -> return value
+        Integer(value) -> return false
+        String(value) -> return false
+    }
+}
+
+// Whether `kira doc` was asked to check the documentation: `--check`.
+function docCheckRequested(session: Session) -> Bool {
+    match session.flag("doc-check") {
+        Boolean(value) -> return value
+        Integer(value) -> return false
+        String(value) -> return false
+    }
+}
+
+// The output format `kira doc --format` asks for: `markdown` or `json`.
+function docFormat(session: Session) -> String {
+    match session.flag("doc-format") {
+        Boolean(value) -> return "markdown"
+        Integer(value) -> return "markdown"
+        String(value) -> return value
+    }
+}
+
+// The `kira doc` of one unit: its Markdown or JSON, or with `--check` the
+// undocumented public API as errors.
+function documentPackage(tree: borrow SyntaxTree, check: Bool, format: String, entry: String) {
+    let own = ownModuleIndex(tree, entry)
+    if tree.modules.count == 0 { return }
+    if format != "markdown" && format != "json" {
+        report(.UnknownDocFormat, Span { file = tree.sources[0].file, start = 0, end = 0 })
+        return
+    }
+    if check {
+        reportUndocumented(tree, own)
+        reportBrokenLinks(tree, own)
+        reportExamples(tree, own)
+        return
+    }
+    if format == "json" {
+        writeDriverOutput(joinText([documentationJson(tree, own), "\n"]))
+        return
+    }
+    writeDriverOutput(joinText([renderDocumentation(tree, own), "\n"]))
+}
+
+// The documentation as JSON, `--format json` (docs/documentation.md): the
+// package's name, its module text, and each documented declaration or member
+// of the package's own sources, in source order.
+function documentationJson(tree: borrow SyntaxTree, own: Int) -> String {
+    var entries: [String] = []
+    for entry in tree.documentation {
+        if entry.kind == "module" || !ownFile(tree, entry.span.file, own) { continue }
+        entries.append(jsonEntry(tree, own, entry))
+    }
+    let list = entries.count == 0 ? "[]" : joinText(["[\n", joinedWith(entries, ",\n"), "\n  ]"])
+    return joinText([
+        "{\n  \"format\": \"kira-doc/1\",\n  \"package\": ", jsonString(tree.modules[own].name),
+        ",\n  \"module\": ", jsonString(moduleDocumentation(tree, own)), ",\n  \"entries\": ", list, "\n}"
+    ])
+}
+
+// One entry of the JSON documentation: what it documents, whether the API
+// shows it, its text as written, and its intra-doc links (`links`).
+function jsonEntry(tree: borrow SyntaxTree, own: Int, entry: borrow DocEntry) -> String {
+    let shown = isPublicEntry(tree, entry) ? "true" : "false"
+    return joinText([
+        "    {\"kind\": ", jsonString(entry.kind), ", \"name\": ", jsonString(entry.name),
+        ", \"owner\": ", jsonString(entry.owner), ", \"public\": ", shown,
+        ", \"text\": ", jsonString(entry.text), ", \"links\": ", jsonLinks(tree, own, entry.text), "}"
+    ])
+}
+
+// The intra-doc links of `text` as a JSON array of `{"text", "target"}`: the
+// name as written, and the anchor of its section (`""` when the item has none,
+// `null` when no item has the name).
+function jsonLinks(tree: borrow SyntaxTree, own: Int, text: String) -> String {
+    let links = docLinks(text)
+    if links.count == 0 { return "[]" }
+    var items: [String] = []
+    for link in links {
+        var target = "null"
+        match resolveLink(tree, own, link.name) {
+            Some(anchor) -> target = jsonString(anchor)
+            None -> {}
+        }
+        items.append(joinText(["{\"text\": ", jsonString(link.name), ", \"target\": ", target, "}"]))
+    }
+    return joinText(["[", joinedWith(items, ", "), "]"])
+}
+
+// Whether the API shows what `entry` documents: an exported declaration, a
+// namespace with an exported member, or a public member of an exported type.
+function isPublicEntry(tree: borrow SyntaxTree, entry: borrow DocEntry) -> Bool {
+    if entry.owner == "" {
+        if isNamedExport(tree, entry.name) { return true }
+        return entry.kind == "namespace" && namespaceExported(tree, entry.name)
+    }
+    return isNamedExport(tree, entry.owner) && !isPrivateMemberName(tree, entry.name)
+}
+
+// Whether `name` is one of the package's exports.
+function isNamedExport(tree: borrow SyntaxTree, name: String) -> Bool {
+    for exported in tree.exports {
+        if exported.text == name { return true }
+    }
+    return false
+}
+
+// Whether a member of the namespace `name` is exported.
+function namespaceExported(tree: borrow SyntaxTree, name: String) -> Bool {
+    let prefix = joinText([name, "."])
+    let width = utf8Count(prefix)
+    for exported in tree.exports {
+        if utf8Count(exported.text) > width && utf8Slice(exported.text, 0, width) == prefix { return true }
+    }
+    return false
+}
+
+// `text` as a JSON string literal: quotes, backslashes and control characters
+// escaped, all other bytes as they are.
+function jsonString(text: String) -> String {
+    var pieces: [String] = ["\""]
+    for index in 0..utf8Count(text) {
+        pieces.append(jsonCharacter(text, index))
+    }
+    pieces.append("\"")
+    return joinText(pieces)
+}
+
+// The bytes of `text` at `index` as they are written in a JSON string.
+function jsonCharacter(text: String, index: Int) -> String {
+    let byte = utf8Byte(text, index)
+    if byte == asciiQuote { return "\\\"" }
+    if byte == asciiBackslash { return "\\\\" }
+    if byte == asciiNewline { return "\\n" }
+    if byte == asciiReturn { return "\\r" }
+    if byte == asciiTab { return "\\t" }
+    if byte < asciiSpace { return controlEscape(byte) }
+    return utf8Slice(text, index, index + 1)
+}
+
+// `\u00XX` for a control character, with lowercase hexadecimal digits.
+function controlEscape(byte: Int) -> String {
+    let digits = "0123456789abcdef"
+    let high = byte / 16
+    let low = byte % 16
+    return joinText(["\\u00", utf8Slice(digits, high, high + 1), utf8Slice(digits, low, low + 1)])
+}
+
+// One fenced code block of a doc comment's `# Examples` section: `info` is the
+// text after the opening fence (empty, `kira`, `no_run`, `compile_fail` or
+// `ignore`), and `code` is its lines.
+struct DocExample {
+    let info: String
+    let code: String
+}
+
+// The fenced code blocks under the `# Examples` heading of a doc text, in order.
+function docExamples(text: String) -> [DocExample] {
+    var examples: [DocExample] = []
+    var inExamples = false
+    var inBlock = false
+    var info = ""
+    var lines: [String] = []
+    for line in splitText(text, asciiNewline) {
+        if inBlock {
+            if trimmed(line) == "```" {
+                examples.append(DocExample { info = info, code = joinedWith(lines, "\n") })
+                inBlock = false
+                lines = []
+            } else {
+                lines.append(line)
+            }
+        } else if line == "# Examples" {
+            inExamples = true
+        } else if startsWithText(line, "# ") {
+            inExamples = false
+        } else if inExamples && startsWithText(line, "```") {
+            inBlock = true
+            info = trimmed(utf8Slice(line, 3, utf8Count(line)))
+        }
+    }
+    return examples
+}
+
+// What an example's info string asks for: `compile` (checked to compile),
+// `fail` (must not compile, `compile_fail`), or `skip` (`ignore`, or a block
+// in another language, which is not Kira).
+function exampleKind(info: String) -> String {
+    if info == "" || info == "kira" || info == "no_run" { return "compile" }
+    if info == "compile_fail" { return "fail" }
+    return "skip"
+}
+
+// The code an example compiles: a line written `# ` or `#` alone is hidden in
+// the docs, but it is code, so the marker is taken off.
+function compiledCode(code: String) -> String {
+    var lines: [String] = []
+    for line in splitText(code, asciiNewline) {
+        if line == "#" {
+            lines.append("")
+        } else if startsWithText(line, "# ") {
+            lines.append(utf8Slice(line, 2, utf8Count(line)))
+        } else {
+            lines.append(line)
+        }
+    }
+    return joinedWith(lines, "\n")
+}
+
+// Writes `text` to the file `path`, making no shell parse of it: the text and
+// the path travel as arguments of `sh`.
+function writeFileText(path: String, text: String) {
+    runCommand(["sh", "-c", "printf '%s' \"$1\" > \"$2\"", "sh", text, path])
+}
+
+// The absolute path of the directory `path`, or `path` itself when it cannot be
+// entered. A dependency's path is read from the package that declares it, so the
+// examples name the documented package by an absolute path.
+function absolutePath(path: String) -> String {
+    let status = runCommand(["sh", "-c", "cd \"$1\" && pwd", "sh", path])
+    if status != 0 { return path }
+    let lines = splitText(commandOutput(1), asciiNewline)
+    if lines.count == 0 { return path }
+    return lines[0]
+}
+
+// Writes the package that compiles one example: it depends on the documented
+// package by its path, imports it, and runs the example as `main` unless the
+// example declares its own `@Main`.
+function writeExamplePackage(tree: borrow SyntaxTree, own: Int, example: borrow DocExample, dir: String) {
+    let name = tree.modules[own].name
+    runCommand(["mkdir", "-p", joinPath(dir, "app")])
+    let manifest = joinText([
+        "construct Doctest extends Package {\n    let dependencies: [Dependency] = [\n        Dependency { name: \"",
+        name, "\", path: \"", absolutePath(tree.modules[own].root), "\" }\n    ]\n}\n"
+    ])
+    let code = compiledCode(example.code)
+    var body = code
+    if !containsText(code, "@Main") {
+        body = joinText(["@Main\nfunction main() -> Number {\n", code, "\n    return 0\n}\n"])
+    }
+    writeFileText(joinPath(dir, "package.kira"), manifest)
+    writeFileText(joinPath(dir, "app/main.kira"), joinText(["import ", name, "\n\n", body]))
+}
+
+// Compiles each example of a documented entry in its own package under `dir`,
+// and reports the ones whose outcome differs from what their info string says.
+function checkExample(tree: borrow SyntaxTree, own: Int, entry: borrow DocEntry, example: borrow DocExample, dir: String) {
+    let kind = exampleKind(example.info)
+    if kind == "skip" { return }
+    let owner = entry.kind == "module" ? tree.modules[own].name : entry.name
+    let item = entry.owner == "" ? owner : joinText([entry.owner, ".", entry.name])
+    writeExamplePackage(tree, own, example, dir)
+    let status = runCommand(["kira", "check", dir])
+    let errors = commandOutput(2)
+    if kind == "fail" {
+        if status == 0 {
+            report(.DocExampleCompiles, entry.span)
+            writeDriverError(joinText(["  = example of `", item, "` is marked compile_fail, but it compiles\n"]))
+        }
+        return
+    }
+    if status != 0 {
+        report(.DocExampleFails, entry.span)
+        writeDriverError(joinText(["  = example of `", item, "` does not compile:\n", errors, "\n"]))
+    }
+}
+
+// Compiles the examples of every doc comment of the package's own sources, each
+// under `.kira-doctests` in the package directory.
+function reportExamples(tree: borrow SyntaxTree, own: Int) {
+    let root = joinPath(absolutePath(tree.modules[own].root), ".kira-doctests")
+    var index = 0
+    for entry in tree.documentation {
+        if !ownFile(tree, entry.span.file, own) { continue }
+        for example in docExamples(entry.text) {
+            index = index + 1
+            checkExample(tree, own, entry, example, joinPath(root, joinText(["example-", decimalText(index)])))
+        }
+    }
+}
+
+// The text of a doc comment as the docs show it: the hidden lines of its Kira
+// code blocks (a line written `# ` or `#` alone) are left out. Other blocks,
+// and `ignore` blocks, keep every line.
+function visibleText(text: String) -> String {
+    var lines: [String] = []
+    var inFence = false
+    var hidesLines = false
+    for line in splitText(text, asciiNewline) {
+        if inFence {
+            if trimmed(line) == "```" {
+                inFence = false
+                hidesLines = false
+            } else if hidesLines && (line == "#" || startsWithText(line, "# ")) {
+                continue
+            }
+            lines.append(line)
+        } else if startsWithText(line, "```") {
+            let info = trimmed(utf8Slice(line, 3, utf8Count(line)))
+            inFence = true
+            hidesLines = exampleKind(info) != "skip" || info == "ignore"
+            lines.append(line)
+        } else {
+            lines.append(line)
+        }
+    }
+    return joinedWith(lines, "\n")
+}

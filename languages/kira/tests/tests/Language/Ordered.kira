@@ -1,0 +1,42 @@
+import Foundation
+
+// Ordered turns an enum's declaration order into a total order and exposes the
+// comparison, never the position it is built from.
+
+enum OdxSeverity {
+    Note
+    Warning
+    Error
+}
+
+// A distinct power-of-two style score per answer, so one total pins every
+// comparison instead of a sum hiding a swapped pair.
+function odxScore(ordering: borrow Ordering) -> Number {
+    match ordering {
+        Less -> return 1
+        Equal -> return 2
+        Greater -> return 4
+    }
+}
+
+@Test
+function orderedFollowsDeclarationOrder() {
+    expect!((odxScore(compare(OdxSeverity.Note, OdxSeverity.Error))) == (1))
+    expect!((odxScore(compare(OdxSeverity.Warning, OdxSeverity.Warning))) == (2))
+    expect!((odxScore(compare(OdxSeverity.Error, OdxSeverity.Note))) == (4))
+}
+
+@Test
+function orderedLessThanUsesDeclarationOrder() {
+    expect!(OdxSeverity.Note < OdxSeverity.Warning)
+    expect!(!(OdxSeverity.Error < OdxSeverity.Warning))
+    expect!(!(OdxSeverity.Warning < OdxSeverity.Warning))
+}
+
+@Test
+function nativeCompareAgreesWithTheDerivedOrder() {
+    let total = odxScore(compare(OdxSeverity.Note, OdxSeverity.Error))
+        + odxScore(compare(OdxSeverity.Warning, OdxSeverity.Warning)) * 10
+        + odxScore(compare(OdxSeverity.Error, OdxSeverity.Note)) * 100
+    expect!((total) == (421))
+}

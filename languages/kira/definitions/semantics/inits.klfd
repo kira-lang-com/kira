@@ -1,0 +1,171 @@
+// Choosing how a construct-backed declaration is constructed. Its
+// parenthesized header fills the stored members directly; each `init(...)`
+// member is another way, a static method returning the declaration whose
+// body ends in a construction through the header. `Name(...)` names the
+// header and every init together, and a construction picks among them by
+// the rule overloaded calls use, the header winning a tie.
+
+extend Checker {
+    // The init a construction of `owner` with these written arguments means,
+    // or nothing for the header. With `children`, a trailing block fills a
+    // content slot: one of the header's, or an init's last parameter right
+    // after the written arguments.
+    function chosenInit(borrow mut self, owner: Int, arguments: [Int], children: Bool) -> Optional<Int> {
+        let inits = declarations.overloadsOf(.Some(Type.structure(owner)), "init")
+        if inits.count == 0 { return .None }
+        let actual = trialTypes(arguments)
+        var chosen: Optional<Int> = .None
+        var best = OverloadScore { conversions = 0, defaults = 0, scope = 0 }
+        for init in inits {
+            var types: [Type] = []
+            for argumentType in actual { types.append(argumentType) }
+            if children {
+                match contentParameter(init) {
+                    Some(parameter) -> {
+                        if parameter.slot != types.count { continue }
+                        types.append(parameter.valueType)
+                    }
+                    None -> continue
+                }
+            }
+            match overloadScore(init, arguments, types) {
+                Some(score) -> {
+                    if chosen.isNone() || score.before(best) {
+                        chosen = .Some(init)
+                        best = score
+                    }
+                }
+                None -> {}
+            }
+        }
+        if chosen.isNone() { return .None }
+        if children && constructSlotsAmong(tree, constructIndices, program.structs[owner].name.text).count == 0 { return chosen }
+        match headerScore(owner, arguments, actual, children) {
+            Some(header) -> {
+                if !best.before(header) { return .None }
+            }
+            None -> {}
+        }
+        return chosen
+    }
+
+    // How closely the written arguments fit the header, or nothing when they
+    // do not fit. A labelled argument fills the member it names and an
+    // unlabelled one the next in order; a member left empty takes its
+    // default, and a trailing block fills the first content slot.
+    function headerScore(borrow self, owner: Int, arguments: [Int], actual: [Type], children: Bool) -> Optional<OverloadScore> {
+        let structType = program.structs[owner]
+        let slots = constructSlotsAmong(tree, constructIndices, structType.name.text)
+        var filled: [Bool] = []
+        for field in structType.fields { filled.append(false) }
+        var positional = 0
+        var conversions = 0
+        for index in 0..arguments.count {
+            var slot = positional
+            match tree.expressions[arguments[index]].kind.argumentLabel() {
+                Some(labelled) -> {
+                    match structType.field(labelled.name.text) {
+                        Some(field) -> slot = field
+                        None -> return .None
+                    }
+                }
+                None -> positional += 1
+            }
+            if slot >= filled.count || filled[slot] { return .None }
+            filled[slot] = true
+            let argumentType = actual[index]
+            let fieldType = structType.fields[slot].valueType
+            if !variantFits(arguments[index], fieldType) { return .None }
+            if argumentType.isInvalid() || argumentType.equals(fieldType) { continue }
+            if !reaches(argumentType, fieldType) { return .None }
+            conversions += 1
+        }
+        if children && slots.count > 0 {
+            match structType.field(slots[0].name.text) {
+                Some(field) -> filled[field] = true
+                None -> {}
+            }
+        }
+        var defaults = 0
+        for index in 0..filled.count {
+            if filled[index] { continue }
+            let field = structType.fields[index]
+            var listSlot = false
+            match slotNamed(slots, field.name.text) {
+                Some(slot) -> listSlot = slots[slot].list
+                None -> {}
+            }
+            if field.initial.isNone() && !listSlot { return .None }
+            defaults += 1
+        }
+        return .Some(OverloadScore { conversions = conversions, defaults = defaults, scope = 0 })
+    }
+
+    // The last parameter of `init` when it takes a trailing block's content.
+    function contentParameter(borrow self, init: Int) -> Optional<ContentParameter> {
+        let signature = declarations.signatures[init]
+        let declared = signature.declaration.parameters
+        if declared.count == 0 || !isContentReference(declared[declared.count - 1].annotation) { return .None }
+        let first = signature.parameters.count - declared.count
+        return .Some(ContentParameter {
+            slot = declared.count - 1,
+            valueType = signature.parameters[first + declared.count - 1].valueType
+        })
+    }
+}
+
+struct ContentParameter {
+    let slot: Int
+    let valueType: Type
+}
+
+// An init takes content in its last parameter only, since the children are
+// written after every argument; and it differs from the header in what it
+// takes, or a construction would fit both. Content is compared with content:
+// an init taking it collides only with a header that takes it too.
+function checkInits(declarations: Declarations, tree: SyntaxTree) {
+    let structs = constructStructs(tree)
+    for declared in tree.constructs {
+        match declared.parameters {
+            Some(header) -> {
+                match declarations.typeNamed(declared.name.text) {
+                    Some(owner) -> {
+                        let headerContent = constructSlotsAmong(tree, structs, declared.name.text).count > 0
+                        var headerTypes: [Type] = []
+                        for input in header {
+                            if isContentReference(input.annotation) { continue }
+                            match declarations.structs[owner.declaration].field(input.name.text) {
+                                Some(field) -> headerTypes.append(declarations.structs[owner.declaration].fields[field].valueType)
+                                None -> {}
+                            }
+                        }
+                        for init in declarations.overloadsOf(.Some(owner), "init") {
+                            checkInit(declarations.signatures[init], headerTypes, headerContent)
+                        }
+                    }
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+    }
+}
+
+function checkInit(signature: Signature, headerTypes: [Type], headerContent: Bool) {
+    let parameters = signature.declaration.parameters
+    var written = parameters.count
+    for index in 0..parameters.count {
+        if !isContentReference(parameters[index].annotation) { continue }
+        if index + 1 != parameters.count {
+            report(.InitContentNotLast, parameters[index].name.span)
+            return
+        }
+        if !headerContent { return }
+        written = index
+    }
+    if written != headerTypes.count { return }
+    for index in 0..written {
+        if !signature.parameters[index].valueType.equals(headerTypes[index]) { return }
+    }
+    report(.InitShadowsHeader, signature.name.span)
+}

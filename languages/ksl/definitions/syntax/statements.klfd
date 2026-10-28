@@ -1,0 +1,113 @@
+// Statements: `let`, assignment, `if`, `while`, `return`, blocks and
+// expressions evaluated for their effect.
+
+extend Parser {
+    function block(borrow mut self) -> Result<[Int], Failure> {
+        try expect(.LeftBrace)
+        var statements: [Int] = []
+        while !at(.RightBrace) && !at(.End) {
+            statements.append(try statement())
+        }
+        try expect(.RightBrace)
+        return .Ok(statements)
+    }
+
+    function addStatement(borrow mut self, kind: StatementKind, start: Span, value: Int) -> Int {
+        return tree.addStatement(Statement {
+            kind = kind, name = noIdentifier(start), typeReference = -1, target = -1, value = value,
+            body = [], otherwise = -1, span = since(start)
+        })
+    }
+
+    function statement(borrow mut self) -> Result<Int, Failure> {
+        let kind = token().kind
+        if kind == .Let { return letStatement() }
+        if kind == .If { return ifStatement() }
+        if kind == .While { return whileStatement() }
+        if kind == .Return { return returnStatement() }
+        if kind == .LeftBrace {
+            let start = token().span
+            let body = try block()
+            return .Ok(tree.addStatement(Statement {
+                kind = .Block, name = noIdentifier(start), typeReference = -1, target = -1, value = -1,
+                body = body, otherwise = -1, span = since(start)
+            }))
+        }
+        return evaluateOrAssign()
+    }
+
+    // `let name[: Type][ = value]`.
+    function letStatement(borrow mut self) -> Result<Int, Failure> {
+        let start = advance().span
+        let declared = try name()
+        var reference = -1
+        if eat(.Colon) { reference = try typeReference() }
+        var value = -1
+        if eat(.Equals) { value = try expression() }
+        return .Ok(tree.addStatement(Statement {
+            kind = .Let, name = declared, typeReference = reference, target = -1, value = value,
+            body = [], otherwise = -1, span = since(start)
+        }))
+    }
+
+    // An `else if` is one `If` statement; a plain `else` is a `Block`.
+    function ifStatement(borrow mut self) -> Result<Int, Failure> {
+        let start = advance().span
+        let condition = try expression()
+        let body = try block()
+        var otherwise = -1
+        if eat(.Else) {
+            if at(.If) {
+                otherwise = try ifStatement()
+            } else {
+                let elseStart = token().span
+                let elseBody = try block()
+                otherwise = tree.addStatement(Statement {
+                    kind = .Block, name = noIdentifier(elseStart), typeReference = -1, target = -1,
+                    value = -1, body = elseBody, otherwise = -1, span = since(elseStart)
+                })
+            }
+        }
+        return .Ok(tree.addStatement(Statement {
+            kind = .If, name = noIdentifier(start), typeReference = -1, target = -1, value = condition,
+            body = body, otherwise = otherwise, span = since(start)
+        }))
+    }
+
+    function whileStatement(borrow mut self) -> Result<Int, Failure> {
+        let start = advance().span
+        let condition = try expression()
+        let body = try block()
+        return .Ok(tree.addStatement(Statement {
+            kind = .While, name = noIdentifier(start), typeReference = -1, target = -1, value = condition,
+            body = body, otherwise = -1, span = since(start)
+        }))
+    }
+
+    // A value follows `return` when the next token can start one, whatever
+    // line it is on.
+    function returnStatement(borrow mut self) -> Result<Int, Failure> {
+        let start = advance().span
+        var value = -1
+        if startsExpression(token().kind) { value = try expression() }
+        return .Ok(addStatement(.Return, start, value))
+    }
+
+    function evaluateOrAssign(borrow mut self) -> Result<Int, Failure> {
+        let start = token().span
+        let first = try expression()
+        if eat(.Equals) {
+            let value = try expression()
+            return .Ok(tree.addStatement(Statement {
+                kind = .Assign, name = noIdentifier(start), typeReference = -1, target = first,
+                value = value, body = [], otherwise = -1, span = since(start)
+            }))
+        }
+        return .Ok(addStatement(.Evaluate, start, first))
+    }
+}
+
+function startsExpression(kind: TokenKind) -> Bool {
+    return kind == .Identifier || kind == .IntegerLiteral || kind == .FloatLiteral || kind == .True
+        || kind == .False || kind == .LeftParen || kind == .Minus || kind == .Bang
+}

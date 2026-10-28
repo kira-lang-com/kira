@@ -1,0 +1,216 @@
+// Which declarations a file may name.
+//
+// Every declaration of the program shares one namespace, so a name means the
+// same thing wherever it is written; what differs between files is whether it
+// may be written there. A file sees its own module, the package's `app/`
+// sources or one library's, and the libraries it imports. An import belongs
+// to the file that writes it. `Library.name` reaches a declaration through the
+// alias of one of the file's imports.
+
+extend Declarations {
+    function sameModule(borrow self, first: Int, second: Int) -> Bool {
+        match moduleOf(first) {
+            Some(left) -> {
+                match moduleOf(second) {
+                    Some(right) -> return left == right
+                    None -> return false
+                }
+            }
+            None -> return false
+        }
+    }
+    function sourcePosition(borrow self, file: Int) -> Int {
+        if file < 0 || file >= sourceIndex.count { return -1 }
+        return sourceIndex[file]
+    }
+
+    function source(borrow self, file: Int) -> Optional<SourceUnit> {
+        let position = sourcePosition(file)
+        if position < 0 { return .None }
+        return .Some(sources[position])
+    }
+
+    function inFoundation(borrow self, file: Int) -> Bool {
+        match moduleOf(file) {
+            Some(module) -> return modules[module].name == "Foundation"
+            None -> return false
+        }
+    }
+
+    function moduleOf(borrow self, file: Int) -> Optional<Int> {
+        let position = sourcePosition(file)
+        if position < 0 { return .None }
+        return .Some(sources[position].module)
+    }
+
+    // Whether code in `file` may name what `declaredIn` declares.
+    function visibleIn(borrow self, file: Int, declaredIn: Int) -> Bool {
+        match source(file) {
+            None -> return false
+            Some(here) -> {
+                match moduleOf(declaredIn) {
+                    None -> return false
+                    Some(module) -> {
+                        if here.module == module { return true }
+                        if modules[module].name == "Foundation" { return true }
+                        for imported in here.imports {
+                            match imported.module {
+                                Some(importedModule) -> {
+                                    if importedModule == module { return true }
+                                }
+                                None -> {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return false
+    }
+
+    // Reports a name written in `file` that its declaration's module does not
+    // let it see. `declaredIn` is -1 for a built-in, which every file sees.
+    function requireVisible(borrow self, file: Int, declaredIn: Int, span: Span) {
+        if declaredIn >= 0 && !visibleIn(file, declaredIn) {
+            report(.NotImported, span)
+        }
+    }
+
+    // The module `alias` names among the imports of `file`.
+    function aliased(borrow self, file: Int, alias: String) -> Optional<Int> {
+        match source(file) {
+            None -> return .None
+            Some(unit) -> {
+                for imported in unit.imports {
+                    if imported.alias.text == alias { return imported.module }
+                }
+            }
+        }
+        return .None
+    }
+
+    // The types Kira spells without an import, though Foundation declares
+    // them: `String`, `Any`, `CString`, `Type`, every array and the handle
+    // `nativeState` returns.
+    function isLanguageType(borrow self, named: Type) -> Bool {
+        if named.kind != .Structure { return false }
+        let structure = structs[named.declaration]
+        match structure.genericBase {
+            "Array", "NativeState", "Closure" -> return true
+            else -> {}
+        }
+        match structure.name.text {
+            "String", "Any", "CString", "Type", "Syntax", "Identifier", "Declaration" -> return true
+            else -> return false
+        }
+    }
+
+    // The file that declares a type, or no file for a built-in one.
+    function typeFile(borrow self, named: Type) -> Optional<Int> {
+        if named.kind == .Structure { return .Some(structs[named.declaration].name.span.file) }
+        if named.kind == .Enumeration { return .Some(enums[named.declaration].name.span.file) }
+        return .None
+    }
+
+    // The type a reference names, or `Invalid` after reporting that it names
+    // none or one its file cannot see.
+    function resolve(borrow self, reference: TypeReference) -> Type {
+        // `Row.ID`: an associated type a conformance of `Row` binds, as the
+        // alias it registered (traits.klfd).
+        match reference.qualifier {
+            Some(qualifier) -> {
+                let named = associatedTypeName(qualifier.text, reference.name.text)
+                for alias in aliases {
+                    if alias.name.text == named {
+                        return resolve(TypeReference {
+                            qualifier = .None, name = Identifier { text = named, span = reference.name.span },
+                            arguments = [], modes = reference.modes, instanceName = named
+                        })
+                    }
+                }
+            }
+            None -> {}
+        }
+        for alias in aliases {
+            if alias.name.text == reference.name.text {
+                requireVisible(reference.name.span.file, alias.name.span.file, reference.name.span)
+                return resolveCanonical(canonicalAliasReference(aliases, reference, 0))
+            }
+        }
+        return resolveCanonical(canonicalAliasReference(aliases, reference, 0))
+    }
+
+    function resolveCanonical(borrow self, reference: TypeReference) -> Type {
+        let file = reference.name.span.file
+        match reference.qualifier {
+            Some(qualifier) -> {
+                match aliased(file, qualifier.text) {
+                    Some(module) -> {
+                        match typeNamedIn(reference.instanceName, module) {
+                            Some(named) -> return qualifiedType(named, module, reference)
+                            None -> {}
+                        }
+                    }
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+        match typeNamedAt(reference.instanceName, file) {
+            Some(named) -> {
+                match reference.qualifier {
+                    Some(qualifier) -> {
+                        match aliased(file, qualifier.text) {
+                            Some(module) -> return qualifiedType(named, module, reference)
+                            None -> {
+                                report(.NotImported, qualifier.span)
+                                return Type.invalid()
+                            }
+                        }
+                    }
+                    None -> {
+                        if isLanguageType(named) { return named }
+                        match typeFile(named) {
+                            Some(declaredIn) -> requireVisible(file, declaredIn, reference.name.span)
+                            None -> {}
+                        }
+                        return named
+                    }
+                }
+            }
+            None -> {
+                // `some Leaf` naming a construct rather than a family is Leaf.
+                match concreteFamilyMember(reference) {
+                    Some(named) -> return named
+                    None -> {}
+                }
+                report(.UnknownType, reference.name.span)
+                return Type.invalid()
+            }
+        }
+    }
+
+    function concreteFamilyMember(borrow self, reference: TypeReference) -> Optional<Type> {
+        if familyName(reference).isNone() { return .None }
+        let prefix = familyTypeName("")
+        let name = reference.instanceName
+        if utf8Count(name) <= utf8Count(prefix) || utf8Slice(name, 0, utf8Count(prefix)) != prefix { return .None }
+        return typeNamed(utf8Slice(name, utf8Count(prefix), utf8Count(name)))
+    }
+
+    function qualifiedType(borrow self, named: Type, module: Int, reference: TypeReference) -> Type {
+        match typeFile(named) {
+            Some(declaredIn) -> {
+                match moduleOf(declaredIn) {
+                    Some(declaredModule) -> {
+                        if declaredModule == module { return named }
+                    }
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+        report(.UnknownType, reference.name.span)
+        return Type.invalid()
+    }
+}

@@ -1,0 +1,639 @@
+// Checking expressions.
+//
+// Each check takes the type its position expects, if any, which is what lets
+// a literal adapt to a width and a leading-dot variant find its enum. The
+// result is the index of the typed expression it produced.
+
+struct Operands {
+    let left: Int
+    let right: Int
+}
+
+extend Checker {
+    function expression(borrow mut self, index: Int, expected: Optional<Type>) -> Int {
+        let node = tree.expressions[index]
+        let span = node.span
+        match node.kind {
+            IntegerLiteral(value, hexadecimal) -> return integerLiteral(value, hexadecimal, expected, span)
+            FloatLiteral(text) -> {
+                var valueType = Type.floating(64)
+                match expected {
+                    Some(target) -> {
+                        if target.kind == .Decimal && !target.isNumber() && wholeText(text) {
+                            report(.LiteralOutOfRange, span)
+                            return add(.Integer(0), Type.invalid(), span)
+                        }
+                        if target.kind == .Decimal { return numberLiteral(text, span) }
+                        if target.isInteger() && wholeText(text) { return wideIntegerLiteral(text, target, span) }
+                        if target.kind == .Floating { valueType = target }
+                        // Anywhere that is not a width, as `Any`, a
+                        // fraction is the decimal a whole literal would be.
+                        if !target.isInteger() && target.kind != .Floating && program.numberWords >= 0 {
+                            return numberLiteral(text, span)
+                        }
+                    }
+                    None -> {
+                        if program.numberWords >= 0 { return numberLiteral(text, span) }
+                    }
+                }
+                return add(.FloatLiteral, valueType, span)
+            }
+            BooleanLiteral(value) -> return add(.Boolean(value), Type.boolean(), span)
+            StringLiteral(decoded) -> return checkStringLiteral(decoded, span)
+            ArrayLiteral(elements) -> return checkArrayLiteral(elements, expected, span)
+            Index(base, index) -> return checkArrayIndex(base, index, span)
+            Transfer(mode, operand) -> return checkTransfer(mode, operand, expected, span)
+            Labelled(name, operand) -> return expression(operand, expected)
+            TypeQuery(mode, operand, target) -> return checkTypeQuery(mode, operand, tree.typeReferences[target], span)
+            Name(name) -> return checkNameExpecting(name, expected)
+            Member(base, field) -> return checkMemberRead(base, field, expected, span)
+            Quote(parts) -> return checkQuote(parts, span)
+            ExpandedMacro(body, value) -> return checkExpandedMacro(body, value, expected, span)
+            MacroCall(callee, arguments, input) -> return checkMacro(callee, arguments, expected, span, false)
+            Call(callee, arguments) -> return checkCall(callee, arguments, expected, span)
+            GenericCall(callee, types, arguments) -> return checkGenericCall(callee, types, arguments, span)
+            MethodCall(receiver, method, arguments) -> return checkMethodCall(receiver, method, arguments, expected, span)
+            IndirectCall(target, arguments) -> return checkIndirectArguments(expression(target, .None), arguments, span)
+            Lambda(declared) -> return checkLambdaExpecting(declared, expected)
+            KeyPath(declared) -> return checkKeyPath(declared, expected)
+            Task(declared) -> return checkTask(declared)
+            Try(operand) -> return checkTry(operand, span)
+            Variant(name, payload) -> return checkVariant(name, payload, expected, span)
+            StructLiteral(name, types, fields) -> return checkStructLiteral(name, types, fields, expected, span)
+            Unary(operator, operand) -> return checkUnary(operator, operand, expected, span)
+            Binary(operator, left, right) -> return checkBinary(operator, left, right, expected, span)
+            Conditional(test, whenTrue, whenFalse) -> return checkConditional(test, whenTrue, whenFalse, expected, span)
+            MatchValue(subject, arms) -> return checkMatchValue(subject, arms, expected, span)
+            Content(content) -> return checkContent(content, expected, span)
+        }
+    }
+
+    // A literal takes the width its position expects, and must fit it.
+    function integerLiteral(borrow mut self, value: Int, hexadecimal: Bool, expected: Optional<Type>, span: Span) -> Int {
+        match expected {
+            Some(target) -> {
+                if target.kind == .Decimal && !target.isNumber() { return sizedLiteral(value, hexadecimal, target, span) }
+                if target.kind == .Decimal && !hexadecimal { return wholeLiteral(value, span) }
+                if target.kind == .Decimal && hexadecimal { return numberBitsLiteral(value, span) }
+                if target.kind == .Floating {
+                    let integer = add(.Integer(value), Type.int(), span)
+                    return add(.Convert(integer), target, span)
+                }
+                if target.isInteger() && !target.isInt() {
+                    if !target.holdsLiteral(value, hexadecimal) {
+                        report(.LiteralOutOfRange, span)
+                        return add(.Integer(value), Type.invalid(), span)
+                    }
+                    return add(.Integer(value), target, span)
+                }
+                // A position that is a word takes the literal as one, even
+                // where a quantity would take it as a decimal.
+                if target.isInt() { return add(.Integer(value), Type.int(), span) }
+            }
+            None -> {}
+        }
+        if program.numberWords >= 0 {
+            if hexadecimal { return numberBitsLiteral(value, span) }
+            return wholeLiteral(value, span)
+        }
+        return add(.Integer(value), Type.int(), span)
+    }
+
+    // A whole decimal past `Int`'s largest where a width is expected.
+    // `-9223372036854775808` is `Int`'s smallest and takes the width as any
+    // literal does; past it, only `U64` holds one, as the bits it names.
+    function wideIntegerLiteral(borrow mut self, text: String, target: Type, span: Span) -> Int {
+        let words = numberWordsOf(text)
+        if words.count == 2 && words[1] == 0 { return integerLiteral(words[0], false, .Some(target), span) }
+        let negative = utf8Byte(text, 0) == 45
+        if words.count == 0 || negative || target.signed || target.bits != 64 || words[1] != 256 {
+            report(.LiteralOutOfRange, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        return add(.Integer(words[0]), target, span)
+    }
+
+    // A literal where a sized number is expected must fit its bits.
+    function sizedLiteral(borrow mut self, value: Int, hexadecimal: Bool, target: Type, span: Span) -> Int {
+        if !target.holdsLiteral(value, hexadecimal) {
+            report(.LiteralOutOfRange, span)
+            return add(.Integer(value), Type.invalid(), span)
+        }
+        return sizedWord(value, target, span)
+    }
+
+    // `base.field`: `RawPtr.null`, a namespace member, a parent class's
+    // field, a module's global, a variant, or a field of the value.
+    function checkMemberRead(borrow mut self, base: Int, field: Identifier, expected: Optional<Type>, span: Span) -> Int {
+        match tree.expressions[base].kind.name() {
+            Some(name) -> {
+                if name.text == "RawPtr" && field.text == "null" && lookup(name.text).isNone() {
+                    let zero = add(.Integer(0), Type.int(), span)
+                    return add(.Convert(zero), Type.pointer(), span)
+                }
+            }
+            None -> {}
+        }
+        match namespaceMember(base, field) {
+            Some(value) -> return value
+            None -> {}
+        }
+        match parentClassField(base, field, span) {
+            Some(value) -> return value
+            None -> {}
+        }
+        match qualifiedGlobal(base, field) {
+            Some(value) -> return value
+            None -> {}
+        }
+        match qualifiedVariant(base, field, [], expected, span) {
+            Some(value) -> return value
+            None -> return member(memberBase(base), tupleField(field), span)
+        }
+    }
+
+    // A local, or in a method a field of the receiver named bare.
+    function checkName(borrow mut self, name: Identifier) -> Int {
+        match lookup(name.text) {
+            Some(local) -> {
+                if locals[local].moved {
+                    report(.UseAfterMove, name.span)
+                    return add(.Integer(0), Type.invalid(), name.span)
+                }
+                return add(.Read(local), locals[local].valueType, name.span)
+            }
+            None -> {}
+        }
+        match receiverField(name.text) {
+            Some(field) -> return member(bareReceiverRead(name.span), field, name.span)
+            None -> {}
+        }
+        match bareComputedMember(name.text) {
+            Some(target) -> return call(target, .Some(bareReceiverRead(name.span)), [], name.span)
+            None -> {}
+        }
+        match declarations.globalNamed(name.text) {
+            Some(global) -> return readGlobal(global, name.span)
+            None -> {}
+        }
+        match declarations.findFunction(.None, name.text) {
+            Some(target) -> {
+                let signature = declarations.signatures[target]
+                declarations.requireVisible(file(), signature.name.span.file, name.span)
+                let reference = canonicalAliasReference(declarations.aliases, functionReferenceType(signature.declaration), 0)
+                match declarations.typeNamedAt(reference.instanceName, reference.name.span.file) {
+                    Some(callable) -> return add(.FunctionReference(target), callable, name.span)
+                    None -> {
+                        report(.UnknownType, name.span)
+                        return add(.Integer(0), Type.invalid(), name.span)
+                    }
+                }
+            }
+            None -> {}
+        }
+        report(.UndefinedName, name.span)
+        return add(.Integer(0), Type.invalid(), name.span)
+    }
+
+    // `Enum.Case` or `Enum.Case(payload)`, a variant named through its enum
+    // rather than the type the context expects.
+    function qualifiedVariant(borrow mut self, base: Int, name: Identifier, arguments: [Int], expected: Optional<Type>, span: Span) -> Optional<Int> {
+        match tree.expressions[base].kind.name() {
+            None -> return .None
+            Some(owner) -> {
+                if lookup(owner.text).isSome() || namesMember(owner.text) || arguments.count > 1 { return .None }
+                var payload: Optional<Int> = .None
+                if arguments.count == 1 { payload = .Some(arguments[0]) }
+                match declarations.typeNamedAt(owner.text, owner.span.file) {
+                    None -> return templateVariant(owner, name, payload, expected, span)
+                    Some(named) -> {
+                        if named.kind != .Enumeration || program.enums[named.declaration].variant(name.text).isNone() { return .None }
+                        return .Some(checkVariant(name, payload, .Some(named), span))
+                    }
+                }
+            }
+        }
+    }
+
+    // `Template.Case(payload)` for a generic enum written without its
+    // arguments: the instance the position expects, or else the one the
+    // payload's type binds.
+    function templateVariant(borrow mut self, owner: Identifier, name: Identifier, payload: Optional<Int>, expected: Optional<Type>, span: Span) -> Optional<Int> {
+        match genericEnum(tree.genericEnums, owner.text) {
+            None -> return .None
+            Some(template) -> {
+                var written: Optional<TypeReference> = .None
+                var found = false
+                for declared in template.cases {
+                    if declared.name.text == name.text {
+                        found = true
+                        written = declared.payload
+                    }
+                }
+                if !found { return .None }
+                match expected {
+                    Some(target) -> {
+                        if instanceArguments(declarations, target, owner.text).isSome() {
+                            return .Some(checkVariant(name, payload, expected, span))
+                        }
+                    }
+                    None -> {}
+                }
+                var bound: [Optional<Type>] = []
+                let unbound: Optional<Type> = .None
+                for parameter in template.genericParameters { bound.append(unbound) }
+                var checked: Optional<Int> = .None
+                match payload {
+                    Some(value) -> {
+                        let operand = expression(value, .None)
+                        checked = .Some(operand)
+                        match written {
+                            Some(annotation) -> infer(annotation, typeOf(operand), template.genericParameters, bound)
+                            None -> {}
+                        }
+                    }
+                    None -> {}
+                }
+                var references: [TypeReference] = []
+                for binding in bound {
+                    match binding {
+                        Some(valueType) -> {
+                            if valueType.isInvalid() { return .Some(add(.Integer(0), Type.invalid(), span)) }
+                            references.append(declarations.reference(valueType, span))
+                        }
+                        None -> {
+                            report(.TypeArgumentsNotInferred, span)
+                            return .Some(add(.Integer(0), Type.invalid(), span))
+                        }
+                    }
+                }
+                let instance = resolveType(TypeReference {
+                    qualifier = .None, name = owner, arguments = references, modes = [],
+                    instanceName = genericInstanceName(owner.text, references)
+                })
+                if instance.kind != .Enumeration { return .Some(add(.Integer(0), Type.invalid(), span)) }
+                let enumType = program.enums[instance.declaration]
+                let variant = enumType.variant(name.text).unwrap()
+                match checked {
+                    Some(operand) -> {
+                        let payloadType = enumType.variants[variant].payload.unwrap()
+                        let value = coerce(operand, payloadType, .PayloadTypeMismatch)
+                        return .Some(add(.Tagged(variant, .Some(value)), instance, span))
+                    }
+                    None -> {
+                        let absent: Optional<Int> = .None
+                        return .Some(add(.Tagged(variant, variantPayload(enumType.variants[variant], absent, span)), instance, span))
+                    }
+                }
+            }
+        }
+    }
+
+    // The value a member is read from. A construct declaration's name stands
+    // for its default construction, or inside its own members for `self`.
+    function memberBase(borrow mut self, base: Int) -> Int {
+        match tree.expressions[base].kind.name() {
+            Some(name) -> {
+                if lookup(name.text).isNone() && !namesMember(name.text) && declarations.globalNamed(name.text).isNone() {
+                    match declarations.typeNamedAt(name.text, name.span.file) {
+                        Some(named) -> {
+                            if isConstructDeclaration(program, named) { return declarationReceiver(named, name) }
+                        }
+                        None -> {}
+                    }
+                }
+            }
+            None -> {}
+        }
+        return expression(base, .None)
+    }
+
+    // The local a member named bare is read through: a method's receiver,
+    // or, in a lambda written inside one, the receiver it captured.
+    function bareReceiver(borrow self) -> Optional<Int> {
+        if !bareMembers { return .None }
+        if program.functions[current].lambda { return lookup("self") }
+        if signature().receiver == .Static || signature().owner.isNone() { return .None }
+        return .Some(0)
+    }
+
+    // The receiver a member named bare is read through, read.
+    function bareReceiverRead(borrow mut self, span: Span) -> Int {
+        match bareReceiver() {
+            Some(receiver) -> return add(.Read(receiver), locals[receiver].valueType, span)
+            None -> return add(.Integer(0), Type.invalid(), span)
+        }
+    }
+
+    // Whether `name`, named bare, is a field or a computed member of the
+    // receiver.
+    function namesMember(borrow self, name: String) -> Bool {
+        return receiverField(name).isSome() || bareComputedMember(name).isSome()
+    }
+
+    // The receiver's field called `name`, named bare.
+    function receiverField(borrow self, name: String) -> Optional<Identifier> {
+        match bareReceiver() {
+            Some(receiver) -> {
+                let ownerType = locals[receiver].valueType
+                if ownerType.kind != .Structure { return .None }
+                let owner = ownerType.declaration
+                let declared = program.structs[owner]
+                var selected = declared.field(name)
+                if declared.genericBase == "Class" { selected = classFieldInContext(declared, name, classMethodOrigin(tree.classes, signature().declaration)) }
+                match selected {
+                    Some(field) -> return .Some(program.structs[owner].fields[field].name)
+                    None -> return .None
+                }
+            }
+            None -> return .None
+        }
+    }
+
+    function member(borrow mut self, base: Int, field: Identifier, span: Span) -> Int {
+        let baseType = typeOf(base)
+        if baseType.isInvalid() { return base }
+        if isTaskType(program, baseType) {
+            if field.text == "await" { return checkTaskAwait(base, span) }
+            if program.structs[baseType.declaration].genericBase == "MainThreadTask" {
+                report(.MainThreadHandleOpaque, field.span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+        if isChannelEnd(program, baseType) { return checkChannelMember(base, field, span) }
+        if field.text == "await" {
+            match conformanceArguments(declarations, tree, baseType, "Future") {
+                Some(claimed) -> {
+                    if claimed.count == 1 { return checkFutureAwait(base, claimed, span) }
+                }
+                None -> {}
+            }
+        }
+        match computedMember(baseType, field.text) {
+            Some(target) -> {
+                checkPrivateAccess(declarations.signatures[target].name, baseType, field.span)
+                return call(target, .Some(base), [], span)
+            }
+            None -> {}
+        }
+        if isDescriptorType(declarations, baseType) { return descriptorMember(base, field, span) }
+        if field.text == "type" && !declaresField(program, baseType, "type") { return runtimeType(base, span) }
+        if baseType.kind != .Structure {
+            report(.NoFields, field.span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let owner = program.structs[baseType.declaration]
+        if owner.field(field.text).isNone() {
+            match foreignMember(base, field, span) {
+                Some(read) -> return read
+                None -> {}
+            }
+        }
+        var selected = owner.field(field.text)
+        if owner.genericBase == "Class" {
+            let origin = classMethodOrigin(tree.classes, signature().declaration)
+            selected = classFieldInContext(owner, field.text, origin)
+        }
+        match selected {
+            Some(index) -> {
+                checkPrivateAccess(owner.fields[index].name, baseType, field.span)
+                let read = add(.Member(base, index), owner.fields[index].valueType, span)
+                if countedAsNumber(owner, field.text, span) { return numberCall(2, [read], Type.number(), span) }
+                return read
+            }
+            None -> {
+                report(.UnknownField, field.span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+
+    function checkUnary(borrow mut self, operator: UnaryOperator, operand: Int, expected: Optional<Type>, span: Span) -> Int {
+        match operator {
+            Not -> {
+                let checked = expression(operand, .Some(Type.boolean()))
+                requireOperand(checked, typeOf(checked).kind == .Boolean)
+                return add(.Unary(operator, checked), Type.boolean(), span)
+            }
+            Negate -> {}
+            Complement -> {}
+        }
+        let written = expression(operand, expected)
+        if typeOf(written).isSizedNumber() { return sizedUnary(operator, written, span) }
+        if typeOf(written).kind == .Decimal && operator == .Negate { return numberNegation(written, span) }
+        if typeOf(written).kind == .Decimal && operator == .Complement { return numberComplement(written, span) }
+        // `-d` on a distinct value negates its representation.
+        let checked = rawOf(written)
+        let operandType = typeOf(checked)
+        let numeric = operandType.isInteger() || (operator == .Negate && operandType.kind == .Floating)
+        requireOperand(checked, numeric)
+        // `~` acts on the raw 64 bits and answers `Int`: there is no narrower
+        // range for its result to leave.
+        if operator == .Complement && operandType.isInteger() && operandType.bits < 64 && !isDistinctType(program, typeOf(written)) {
+            return add(.Unary(operator, add(.Convert(checked), Type.int(), span)), Type.int(), span)
+        }
+        return distinctResult(add(.Unary(operator, checked), typeOf(checked), span), typeOf(written))
+    }
+
+    function requireOperand(borrow self, operand: Int, accepted: Bool) {
+        if !accepted && !typeOf(operand).isInvalid() {
+            report(.OperatorOperand, program.expressions[operand].span)
+        }
+    }
+
+    function checkBinary(borrow mut self, operator: BinaryOperator, left: Int, right: Int, expected: Optional<Type>, span: Span) -> Int {
+        match classify(operator) {
+            Connective(connective) -> {
+                let first = expression(left, .Some(Type.boolean()))
+                let second = expression(right, .Some(Type.boolean()))
+                requireOperand(first, typeOf(first).kind == .Boolean)
+                requireOperand(second, typeOf(second).kind == .Boolean)
+                return add(.Logical(connective, first, second), Type.boolean(), span)
+            }
+            Comparison(comparison) -> {
+                let equality = comparison == .Equal || comparison == .NotEqual
+                var first = 0
+                var second = 0
+                if tree.expressions[left].kind.takesOperandType() {
+                    second = expression(right, .None)
+                    if equality && isReflectionText(program, typeOf(second)) { return compareTexts(comparison, expression(left, .None), second, span) }
+                    if isDistinctType(program, typeOf(second)) { return compareOn(comparison, literalBesideDistinct(left, second), span) }
+                    first = expression(left, .Some(typeOf(second)))
+                } else {
+                    first = expression(left, .None)
+                    if equality && isReflectionText(program, typeOf(first)) { return compareTexts(comparison, first, expression(right, .None), span) }
+                    if isDistinctType(program, typeOf(first)) { return compareOn(comparison, distinctOperands(first, right), span) }
+                    second = expression(right, .Some(typeOf(first)))
+                    if equality && isReflectionText(program, typeOf(second)) { return compareTexts(comparison, first, second, span) }
+                }
+                return compareOn(comparison, reconcile(first, second, .OperatorOperands), span)
+            }
+            Arithmetic(arithmetic) -> {
+                if arithmetic == .ShiftLeft || arithmetic == .ShiftRight {
+                    let checked = expression(left, expected)
+                    if typeOf(checked).isSizedNumber() {
+                        let places = whole(expression(right, .None), Type.int(), .OperatorOperands)
+                        return add(.Arithmetic(arithmetic, checked, places), typeOf(checked), span)
+                    }
+                    // A `Number` shifts by a whole `Number`, as its other
+                    // bitwise operators combine two.
+                    if typeOf(checked).kind == .Decimal {
+                        let places = coerce(expression(right, .Some(Type.number())), Type.number(), .OperatorOperands)
+                        return numberArithmetic(arithmetic, Operands { left = checked, right = places }, span)
+                    }
+                    let value = rawOf(checked)
+                    // How far to shift by is a position, so a whole `Number`
+                    // is one, the way a whole one is an index or a bound.
+                    let count = rawOf(whole(expression(right, .None), Type.int(), .OperatorOperands))
+                    requireOperand(value, typeOf(value).isInteger())
+                    requireOperand(count, typeOf(count).isInteger())
+                    return distinctResult(add(.Arithmetic(arithmetic, value, count), typeOf(value), span), typeOf(checked))
+                }
+                if tree.expressions[left].kind.takesOperandType() {
+                    let second = expression(right, expected)
+                    if isDistinctType(program, typeOf(second)) {
+                        return distinctResult(arithmeticOn(arithmetic, literalBesideDistinct(left, second), span), typeOf(second))
+                    }
+                    return arithmeticOn(arithmetic, reconcile(expression(left, .Some(typeOf(second))), second, .OperatorOperands), span)
+                }
+                let receiver = expression(left, expected)
+                if isDistinctType(program, typeOf(receiver)) {
+                    return distinctResult(arithmeticOn(arithmetic, distinctOperands(receiver, right), span), typeOf(receiver))
+                }
+                match operatorMethod(typeOf(receiver), arithmetic) {
+                    Some(name) -> return checkMethodOn(receiver, Identifier { text = name, span = span }, [right], span)
+                    None -> return arithmeticOn(arithmetic, unifyFrom(receiver, right, .OperatorOperands), span)
+                }
+            }
+        }
+    }
+
+    // Two operands at one type, or `mismatch` when they have none. The left
+    // one is checked first, unless it is a leading-dot variant or a literal,
+    // which takes its type from the right one.
+    function unify(borrow mut self, left: Int, right: Int, expected: Optional<Type>, mismatch: Diagnostic) -> Operands {
+        if tree.expressions[left].kind.takesOperandType() {
+            let second = expression(right, expected)
+            return reconcile(expression(left, .Some(typeOf(second))), second, mismatch)
+        }
+        return unifyFrom(expression(left, expected), right, mismatch)
+    }
+
+    // The right operand checked against `first`, the left one already checked.
+    function unifyFrom(borrow mut self, first: Int, right: Int, mismatch: Diagnostic) -> Operands {
+        return reconcile(first, expression(right, .Some(typeOf(first))), mismatch)
+    }
+
+    function reconcile(borrow mut self, checkedLeft: Int, checkedRight: Int, mismatch: Diagnostic) -> Operands {
+        var first = checkedLeft
+        var second = checkedRight
+        let firstType = typeOf(first)
+        let secondType = typeOf(second)
+        if isAnyType(program, secondType) && !isAnyType(program, firstType) {
+            first = coerce(first, secondType, mismatch)
+        } else if firstType.isInteger() && secondType.kind == .Floating {
+            first = coerce(first, secondType, mismatch)
+        } else if firstType.isInt() && secondType.isInteger() && !secondType.isInt() {
+            first = coerce(first, secondType, mismatch)
+        } else if firstType.kind == .Decimal && secondType.kind == .Decimal && !secondType.widensToNumber(firstType) {
+            // Two sized numbers meet at the narrower one's wider partner, or
+            // at `Number` when neither holds the other.
+            if firstType.widensToNumber(secondType) {
+                first = coerce(first, secondType, mismatch)
+            } else {
+                first = coerce(first, Type.number(), mismatch)
+                second = coerce(second, Type.number(), mismatch)
+            }
+        } else if firstType.kind == .Decimal && secondType.isInteger() {
+            second = coerce(second, firstType, mismatch)
+        } else if secondType.kind == .Decimal && firstType.isInteger() {
+            first = coerce(first, secondType, mismatch)
+        } else {
+            second = coerce(second, firstType, mismatch)
+        }
+        return Operands { left = first, right = second }
+    }
+
+    function compareOn(borrow mut self, comparison: Comparison, operands: Operands, span: Span) -> Int {
+        let operandType = typeOf(operands.left)
+        if operandType.kind == .Decimal { return numberComparison(comparison, operands, span) }
+        let equality = comparison == .Equal || comparison == .NotEqual
+        let comparable = operandType.isInteger() || operandType.kind == .Floating
+            || (equality && (operandType.kind == .Boolean || operandType.kind == .Pointer || isForeignPointerValue(program, operandType) || isStringType(program, operandType) || isAnyType(program, operandType) || isClassType(program, operandType) || isDescriptorType(declarations, operandType)))
+            || (!equality && operandType.kind == .Enumeration)
+        if equality && !comparable && (operandType.kind == .Structure || operandType.kind == .Enumeration) {
+            if equalityLeaf(program, declarations, operandType, []).isSome() { report(.NoStructuralEquality, program.expressions[operands.left].span) }
+            return add(.Compare(comparison, operands.left, operands.right), Type.boolean(), span)
+        }
+        if !equality && operandType.kind == .Structure && !isStringType(program, operandType) {
+            if shapeLeaf(program, declarations, operandType, .Ordered, []).isSome() { report(.NotOrdered, program.expressions[operands.left].span) }
+            return add(.Compare(comparison, operands.left, operands.right), Type.boolean(), span)
+        }
+        if !equality && operandType.kind == .Enumeration && shapeLeaf(program, declarations, operandType, .Ordered, []).isSome() {
+            report(.NotOrdered, program.expressions[operands.left].span)
+        }
+        requireOperand(operands.left, comparable)
+        return add(.Compare(comparison, operands.left, operands.right), Type.boolean(), span)
+    }
+
+    function arithmeticOn(borrow mut self, arithmetic: ArithmeticOperator, operands: Operands, span: Span) -> Int {
+        let operandType = typeOf(operands.left)
+        if arithmetic == .Add && isStringType(program, operandType) {
+            return add(.StringConcat(operands.left, operands.right), operandType, span)
+        }
+        if operandType.kind == .Decimal { return numberArithmetic(arithmetic, operands, span) }
+        let numeric = operandType.isInteger() || operandType.kind == .Floating
+        let basic = arithmetic == .Add || arithmetic == .Subtract || arithmetic == .Multiply || arithmetic == .Divide || arithmetic == .Remainder
+        requireOperand(operands.left, numeric && (operandType.isInteger() || basic))
+        return add(.Arithmetic(arithmetic, operands.left, operands.right), operandType, span)
+    }
+
+    // `a + b`, `a - b`, `a * b` and `a / b` on a struct call its `add`,
+    // `subtract`, `multiply` or `divide` method when it declares one, so a
+    // value type spells its algebra with operators.
+    function operatorMethod(borrow self, receiverType: Type, arithmetic: ArithmeticOperator) -> Optional<String> {
+        if receiverType.kind != .Structure || isStringType(program, receiverType) { return .None }
+        var name = ""
+        match arithmetic {
+            Add -> name = "add"
+            Subtract -> name = "subtract"
+            Multiply -> name = "multiply"
+            Divide -> name = "divide"
+            Remainder -> return .None
+            ShiftLeft -> return .None
+            ShiftRight -> return .None
+            BitAnd -> return .None
+            BitOr -> return .None
+            BitXor -> return .None
+        }
+        match declarations.findFunction(.Some(receiverType), name) {
+            Some(target) -> {
+                if declarations.signatures[target].receiver == .Static { return .None }
+                return .Some(name)
+            }
+            None -> return .None
+        }
+    }
+
+    // `test ? whenTrue : whenFalse`: one branch runs, and both have one type.
+    function checkConditional(borrow mut self, test: Int, whenTrue: Int, whenFalse: Int, expected: Optional<Type>, span: Span) -> Int {
+        let condition = expression(test, .Some(Type.boolean()))
+        let found = typeOf(condition)
+        if !found.isInvalid() && found.kind != .Boolean {
+            report(.ConditionalNotBool, program.expressions[condition].span)
+        }
+        let branches = unify(whenTrue, whenFalse, expected, .ConditionalBranchesDisagree)
+        return add(.Select(condition, branches.left, branches.right), typeOf(branches.left), span)
+    }
+}
+
+// `pair.0` reads the `item0` field of the `TupleN` struct behind `(A, B)`.
+function tupleField(field: Identifier) -> Identifier {
+    let count = utf8Count(field.text)
+    if count == 0 { return field }
+    for index in 0..count {
+        let byte = utf8Byte(field.text, index)
+        if byte < 48 || byte > 57 { return field }
+    }
+    return Identifier { text = joinText(["item", field.text]), span = field.span }
+}

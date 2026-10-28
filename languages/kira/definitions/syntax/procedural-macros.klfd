@@ -1,0 +1,158 @@
+enum SourceMacroKind {
+    MacroFunction
+    MacroDerive
+    MacroAttribute
+    MacroWrapper
+    MacroCollector
+}
+
+// `comptime macro Name { … }`. Its members are `kind { … }`, `appliesTo
+// { … }`, `trigger { field }`, `replace { true }` and `expand(…) -> Syntax
+// { … }`, written in any order.
+struct ProceduralMacroDeclaration {
+    let name: Identifier
+    let kind: SourceMacroKind
+    let appliesTo: [String]
+    // A field annotated with the macro's name summons it over the
+    // declaration carrying the field.
+    let triggerField: Bool
+    // Its output takes the annotated declaration's place.
+    let replace: Bool
+    let expansion: FunctionDeclaration
+}
+
+struct SourceMacroInvocation {
+    let name: Identifier
+    let input: String
+    let span: Span
+}
+
+function sourceMacroKind(written: String) -> Optional<SourceMacroKind> {
+    match written {
+        "function" -> return .Some(.MacroFunction)
+        "derive" -> return .Some(.MacroDerive)
+        "attribute" -> return .Some(.MacroAttribute)
+        "wrapper" -> return .Some(.MacroWrapper)
+        "collector" -> return .Some(.MacroCollector)
+        else -> return .None
+    }
+}
+
+// The number of declarations `expand` is handed: a wrapper sees the
+// declaration and its template, every other kind one value.
+function expandArity(kind: SourceMacroKind) -> Int {
+    match kind {
+        MacroWrapper -> return 2
+        MacroFunction -> return 1
+        MacroDerive -> return 1
+        MacroAttribute -> return 1
+        MacroCollector -> return 1
+    }
+}
+
+function annotatesDeclarations(kind: SourceMacroKind) -> Bool {
+    match kind {
+        MacroFunction -> return false
+        MacroCollector -> return false
+        MacroDerive -> return true
+        MacroAttribute -> return true
+        MacroWrapper -> return true
+    }
+}
+
+extend Parser {
+    function proceduralMacroDeclaration(borrow mut self) -> Result<Span, Failure> {
+        let start = advance().span
+        advance()
+        let name = try identifier(.ExpectedDeclaration)
+        try expect(.LeftBrace)
+        var kind: Optional<SourceMacroKind> = .None
+        var applies: [String] = []
+        var triggerField = false
+        var replace = false
+        var expansion: Optional<FunctionDeclaration> = .None
+        while !at(.RightBrace) {
+            if at(.End) { return .Error(failure(.Expected)) }
+            if atWord("expand") && peek(1).kind == .LeftParen {
+                let expand = advance()
+                let functionName = Identifier { text = joinText(["__source_macro_", name.text]), span = expand.span }
+                quotes = true
+                let parsed = functionDefinition(functionName, [], expand.span)
+                quotes = false
+                expansion = .Some(try parsed)
+                continue
+            }
+            let member = try identifier(.ExpectedMember)
+            try expect(.LeftBrace)
+            var words: [Token] = []
+            while !at(.RightBrace) {
+                if at(.End) { return .Error(failure(.Expected)) }
+                let word = advance()
+                if word.kind != .Comma { words.append(word) }
+            }
+            try expect(.RightBrace)
+            match member.text {
+                "kind" -> {
+                    if words.count == 0 { return .Error(Failure { diagnostic = .MacroBadKind, span = member.span }) }
+                    match sourceMacroKind(text(words[0].span)) {
+                        Some(written) -> kind = .Some(written)
+                        None -> return .Error(Failure { diagnostic = .MacroBadKind, span = words[0].span })
+                    }
+                }
+                "appliesTo" -> { for word in words { applies.append(text(word.span)) } }
+                "trigger" -> { for word in words { if text(word.span) == "field" { triggerField = true } } }
+                "replace" -> { for word in words { if text(word.span) == "true" { replace = true } } }
+                else -> {}
+            }
+        }
+        try expect(.RightBrace)
+        var declaredKind: SourceMacroKind = .MacroFunction
+        match kind {
+            Some(written) -> declaredKind = written
+            None -> return .Error(Failure { diagnostic = .MacroBadKind, span = name.span })
+        }
+        match expansion {
+            Some(expanded) -> return declareProceduralMacro(name, declaredKind, applies, triggerField, replace, expanded, start)
+            None -> return .Error(Failure { diagnostic = .MacroExpandSignature, span = name.span })
+        }
+    }
+
+    function declareProceduralMacro(borrow mut self, name: Identifier, declaredKind: SourceMacroKind, applies: [String], triggerField: Bool, replace: Bool, expanded: FunctionDeclaration, start: Span) -> Result<Span, Failure> {
+        if annotatesDeclarations(declaredKind) == (applies.count == 0) {
+            return .Error(Failure { diagnostic = .MacroAppliesToPresence, span = name.span })
+        }
+        if triggerField && !replace {
+            return .Error(Failure { diagnostic = .MacroTriggerWithoutReplace, span = name.span })
+        }
+        if expanded.parameters.count != expandArity(declaredKind) {
+            return .Error(Failure { diagnostic = .MacroExpandSignature, span = expanded.name.span })
+        }
+        tree.proceduralMacros.append(ProceduralMacroDeclaration {
+            name = name, kind = declaredKind, appliesTo = applies,
+            triggerField = triggerField, replace = replace, expansion = expanded
+        })
+        return .Ok(spanFrom(start))
+    }
+
+    function sourceMacroInvocation(borrow mut self) -> Result<Span, Failure> {
+        let name = try identifier(.ExpectedDeclaration)
+        try expect(.Bang)
+        let opening = try expect(.LeftParen)
+        var depth = 1
+        var end = opening.span.end
+        while depth > 0 {
+            let token = advance()
+            if token.kind == .End { return .Error(failure(.Expected)) }
+            if token.kind == .LeftParen { depth += 1 }
+            else if token.kind == .RightParen {
+                depth -= 1
+                if depth == 0 { end = token.span.start }
+            }
+        }
+        let span = spanFrom(name.span)
+        tree.sourceInvocations.append(SourceMacroInvocation {
+            name = name, input = utf8Slice(source, opening.span.end, end), span = span
+        })
+        return .Ok(span)
+    }
+}

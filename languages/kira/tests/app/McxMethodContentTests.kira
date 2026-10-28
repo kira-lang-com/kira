@@ -1,0 +1,160 @@
+import Foundation
+
+// A trailing `{ … }` on a METHOD, filling that method's content parameter.
+// Prefix: mcx / Mcx.
+//
+// A construction has always taken children — `HStack(spacing: 8) { … }`. A
+// method could not, so every content-bearing modifier had to name a container
+// its caller did not care about: `.toolbar(Content() { … })` rather than
+// `.toolbar { … }`. The rule is the same one constructions use — the children
+// fill the LAST parameter, because they are written after every parenthesized
+// argument — and it now applies wherever that parameter is declared.
+//
+// Exercises: one child into a `some X` parameter; several into a `[some X]`;
+// a method called with parentheses and a block; one called with the block
+// alone; and a content parameter reached through a construct family, which is
+// where a modifier lives.
+
+construct McxNode {
+    @Required function total() -> Int
+}
+
+construct McxLeaf(n: Int) extends McxNode {
+    function total() -> Int {
+        return n
+    }
+}
+
+construct McxPair(first: Any McxNode, second: Any McxNode) extends McxNode {
+    function total() -> Int {
+        return first.total() * 10 + second.total()
+    }
+}
+
+construct McxSum(scale: Int) extends McxNode {
+    let parts: [some McxNode]
+
+    function total() -> Int {
+        var sum = 0
+        for index in 0..parts.count {
+            sum = sum + parts[index].total()
+        }
+        return sum * scale
+    }
+}
+
+extend McxNode {
+    // One child. The block fills it, so the call site names no container.
+    function paired(with: some McxNode) -> Any McxNode {
+        return McxPair(first: self, second: with)
+    }
+
+    // Several children, and an ordinary argument before them.
+    function gathered(scale: Int, parts: [some McxNode]) -> Any McxNode {
+        var all: [Any McxNode] = [self]
+        for index in 0..parts.count {
+            all.append(parts[index])
+        }
+        return McxSum(scale: scale) {
+            For(part in all) {
+                part
+            }
+        }
+    }
+}
+
+@Test
+function mcxAMethodTakesOneChild() {
+    let node = McxLeaf(n: 3).paired {
+        McxLeaf(n: 4)
+    }
+    let got = node.total()
+    expect!(got == 34)
+}
+
+@Test
+function mcxAMethodTakesSeveralChildren() {
+    let node = McxLeaf(n: 1).gathered(scale: 2) {
+        McxLeaf(n: 3)
+        McxLeaf(n: 5)
+    }
+    let got = node.total()
+    expect!(got == 18)
+}
+
+extend McxNode {
+    // One child after an ordinary argument, as `.safeAreaInset(edge:)` takes
+    // its bar.
+    function framed(scale: Int, inset: some McxNode) -> Any McxNode {
+        return McxSum(scale: scale) {
+            self
+            inset
+        }
+    }
+}
+
+// The labelled argument fills the parameter it names, and the block the one
+// it fills, not the first position the label left empty.
+@Test
+function mcxOneChildFollowsALabelledArgument() {
+    let node = McxLeaf(n: 2).framed(scale = 3) {
+        McxLeaf(n: 5)
+    }
+    let got = node.total()
+    expect!(got == 21)
+}
+
+// The block is the whole argument list, so the parentheses go away entirely —
+// which is the spelling the feature exists for.
+@Test
+function mcxAMethodWithNoArgumentsNeedsNoParentheses() {
+    let node = McxLeaf(n: 2).paired {
+        McxLeaf(n: 7)
+    }
+    let got = node.total()
+    expect!(got == 27)
+}
+
+// A builder inside the block produces children exactly as one inside a
+// construction's block does.
+@Test
+function mcxAForInsideTheBlockProducesChildren() {
+    let node = McxLeaf(n: 1).gathered(scale: 1) {
+        For(value in [2, 3, 4]) {
+            McxLeaf(n: value)
+        }
+    }
+    let got = node.total()
+    expect!(got == 10)
+}
+
+// A family requirement can mutate its erased receiver. The payload is updated
+// by the selected declaration and remains visible through the family field.
+construct McxMutableNode {
+    @Required let total: Int
+    @Required function bump(borrow mut self, by: Int) -> Int
+}
+
+construct McxMutableLeaf(total: Int) extends McxMutableNode {
+    function bump(borrow mut self, by: Int) -> Int {
+        self = McxMutableLeaf(total: self.total + by)
+        return self.total
+    }
+}
+
+@Test
+function mcxAMutableFamilyDispatchWritesBackThePayload() {
+    var node: some McxMutableNode = McxMutableLeaf(total: 5)
+    let got = node.bump(by: 6)
+    expect!(got == 11)
+}
+
+function mcxSection() -> Int {
+    var checksum = 0
+    checksum = checksum + McxLeaf(n: 3).paired { McxLeaf(n: 4) }.total()
+    checksum = checksum * 31 + McxLeaf(n: 1).gathered(scale: 2) {
+        McxLeaf(n: 3)
+        McxLeaf(n: 5)
+    }.total()
+    return checksum
+}

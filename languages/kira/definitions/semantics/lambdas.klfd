@@ -1,0 +1,428 @@
+extend Checker {
+    function checkLambda(borrow mut self, declared: LambdaDeclaration, expected: Optional<Type>) -> Int {
+        var callableType = Type.invalid()
+        // Where an optional function is expected, the closure is the function
+        // it holds, as Swift passes one for `(() -> Void)?`.
+        var optional = Type.invalid()
+        match expected {
+            Some(target) -> {
+                if isClosureType(program, target) { callableType = target }
+                match optionalPayload(program, target) {
+                    Some(payload) -> {
+                        if isClosureType(program, payload) {
+                            callableType = payload
+                            optional = target
+                        }
+                    }
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+        if callableType.isInvalid() {
+            report(.UnknownType, declared.span)
+            return add(.Integer(0), Type.invalid(), declared.span)
+        }
+        let callable = program.structs[callableType.declaration]
+        let count = callable.typeArguments.count - 1
+        if declared.parameters.count != count {
+            report(.ArgumentCount, declared.span)
+            return add(.Integer(0), Type.invalid(), declared.span)
+        }
+        let closure = lambdaClosure(declared, lambdaParameters(declared, callable, count), .Some(callableType))
+        if optional.isInvalid() { return closure }
+        match program.enums[optional.declaration].variant("Some") {
+            Some(present) -> return add(.Tagged(present, .Some(closure)), optional, declared.span)
+            None -> return closure
+        }
+    }
+
+    // A lambda written with its parameters' types binds the type parameters
+    // the callable `annotation` names in those places, as
+    // `{ playground: Playground in ... }` passed for `(Value) -> Any Widget`
+    // binds `Value`, before it is checked against the type that leaves.
+    function inferLambdaParameters(borrow mut self, value: Int, annotation: TypeReference, parameters: [Identifier], bound: borrow mut [Optional<Type>]) {
+        match tree.expressions[value].kind.labelled() {
+            Some(field) -> {
+                inferLambdaParameters(field.value, annotation, parameters, bound)
+                return
+            }
+            None -> {}
+        }
+        match tree.expressions[value].kind.lambda() {
+            Some(declared) -> {
+                let canonical = canonicalAliasReference(declarations.aliases, annotation, 0)
+                if canonical.name.text != "Closure" || canonical.arguments.count != declared.parameters.count + 1 { return }
+                for index in 0..declared.parameters.count {
+                    match declared.annotations[index] {
+                        Some(written) -> infer(canonical.arguments[index], resolveType(written), parameters, bound)
+                        None -> {}
+                    }
+                }
+            }
+            None -> {}
+        }
+        // A key path literal for a `KeyPath<Root, Value>` binds both from the
+        // root, written or already bound, and the fields it reads.
+        match tree.expressions[value].kind.keyPath() {
+            Some(declared) -> {
+                if annotation.name.text != "KeyPath" || annotation.arguments.count != 2 { return }
+                var root: Optional<Type> = .None
+                match declared.root {
+                    Some(written) -> root = .Some(resolveType(written))
+                    None -> root = boundType(annotation.arguments[0], parameters, bound)
+                }
+                match root {
+                    Some(rootType) -> {
+                        infer(annotation.arguments[0], rootType, parameters, bound)
+                        match memberPathType(rootType, declared.members) {
+                            Some(valueType) -> infer(annotation.arguments[1], valueType, parameters, bound)
+                            None -> {}
+                        }
+                    }
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+    }
+
+    // The type the stored fields `members` reach from a value of `root`, or
+    // nothing where one is not a stored field.
+    function memberPathType(borrow self, root: Type, members: [Identifier]) -> Optional<Type> {
+        var reached = root
+        for member in members {
+            if reached.kind != .Structure { return .None }
+            let structType = program.structs[reached.declaration]
+            match structType.field(member.text) {
+                Some(field) -> reached = structType.fields[field].valueType
+                None -> return .None
+            }
+        }
+        return .Some(reached)
+    }
+
+    // The closure `declared` makes, taking `parameters`, of the type
+    // `closure`; with none, its result is the type of the value its body
+    // ends with, as a key path's is the type of the member it reads.
+    function lambdaClosure(borrow mut self, declared: LambdaDeclaration, parameters: [ParameterSignature], closure: Optional<Type>) -> Int {
+        var resultType = Type.invalid()
+        match closure {
+            Some(known) -> resultType = program.structs[known.declaration].typeArguments[parameters.count]
+            None -> {}
+        }
+        var bound: [String] = []
+        for name in declared.parameters { bound.append(name.text) }
+        var uses: [CapturedUse] = []
+        captureBlock(declared.body, bound, uses)
+        let captures = captureSpecs(uses)
+        var values: [Int] = []
+        for captured in uses { values.append(captured.local) }
+        let parent = signature()
+        let savedCurrent = current
+        let savedLocals = locals
+        let savedVisible = visible
+        let savedScopes = scopes
+        let savedLoops = loops
+        let savedBareMembers = bareMembers
+        let savedInitializer = checkingInitializer
+        let savedSource = sourceOverride
+        let savedHandlers = handlers
+        let savedPropagated = propagated
+        let savedTry = tryAllowed
+        var target = declarations.signatures.count
+        // Named for the function that writes it and where, so every unit
+        // and every build that checks it names it alike.
+        let symbol = joinText(["__lambda#", parent.symbol, "@", decimalText(declared.span.start)])
+        let syntax = FunctionDeclaration {
+            name = Identifier { text = symbol, span = parent.name.span },
+            annotations = [], receiver = .Free, parameters = [], result = .None,
+            body = declared.body, span = declared.span, typeParameters = [], scope = parent.declaration.scope
+        }
+        let signature = Signature {
+            name = syntax.name, symbol = symbol, member = "", owner = .None, receiver = .Free,
+            parameters = parameters, result = resultType, entry = false, declaration = syntax
+        }
+        // A lambda inside another lambda's body is checked again each time
+        // that body is: its second check replaces the first, under the same
+        // symbol, so its function and its capture types are declared once.
+        var known = false
+        for index in 0..program.functions.count {
+            if program.functions[index].lambda && program.functions[index].symbol == symbol {
+                target = index
+                known = true
+                break
+            }
+        }
+        if known {
+            declarations.signatures[target] = signature
+        } else {
+            declarations.addSignature(signature)
+            program.functions.append(CheckedFunction {
+                symbol = symbol, name = parent.name.span, result = resultType, parameterCount = captures.count + parameters.count,
+                locals = [], body = [], entry = false, lambda = true, captures = captures, globalInitializer = false, service = false, foreign = .None, memberName = ""
+            })
+        }
+        enterLambda(target, captures, parameters, declared.span)
+        var body: [Int] = []
+        var closureType = Type.invalid()
+        match closure {
+            Some(known) -> {
+                body = checkLambdaBody(declared.body, resultType)
+                closureType = known
+            }
+            None -> {
+                body = inferredLambdaBody(declared.body, target)
+                resultType = declarations.signatures[target].result
+                if !resultType.isInvalid() { closureType = resolveType(closureReference(parameters, resultType, declared.span)) }
+            }
+        }
+        if !resultType.equals(Type.void()) && !alwaysReturns(body) { report(.MissingReturn, declared.span) }
+        program.functions[target] = CheckedFunction {
+            symbol = symbol, name = parent.name.span, result = resultType, parameterCount = captures.count + parameters.count,
+            locals = locals, body = body, entry = false, lambda = true, captures = captures, globalInitializer = false, service = false, foreign = .None, memberName = ""
+        }
+        current = savedCurrent
+        locals = savedLocals
+        visible = savedVisible
+        scopes = savedScopes
+        loops = savedLoops
+        bareMembers = savedBareMembers
+        checkingInitializer = savedInitializer
+        sourceOverride = savedSource
+        handlers = savedHandlers
+        propagated = savedPropagated
+        tryAllowed = savedTry
+        return add(.MakeClosure(target, values), closureType, declared.span)
+    }
+
+    // A body whose result type is the type of the value it ends with, which
+    // becomes the result of the lambda `target`.
+    function inferredLambdaBody(borrow mut self, body: [Int], target: Int) -> [Int] {
+        openScope()
+        var checked: [Int] = []
+        for index in 0..body.count {
+            let node = body[index]
+            // The value its body ends with, or gives back as its last
+            // statement, decides its result.
+            if index == body.count - 1 {
+                var last = tree.statements[node].kind.evaluatedExpression()
+                if last.isNone() { last = tree.statements[node].kind.returnedExpression() }
+                match last {
+                    Some(value) -> {
+                        let returned = expression(value, .None)
+                        declarations.signatures[target].result = typeOf(returned)
+                        checked.append(program.addStatement(.Return(.Some(returned))))
+                        continue
+                    }
+                    None -> {}
+                }
+            }
+            checkStatementInto(node, checked)
+        }
+        closeScope()
+        return checked
+    }
+
+    // The function type taking `parameters` to `result`.
+    function closureReference(borrow self, parameters: [ParameterSignature], result: Type, span: Span) -> TypeReference {
+        var arguments: [TypeReference] = []
+        var modes: [PassingMode] = []
+        for parameter in parameters {
+            arguments.append(declarations.declaredReference(parameter.valueType, span))
+            modes.append(parameter.mode)
+        }
+        arguments.append(declarations.declaredReference(result, span))
+        return TypeReference {
+            qualifier = .None, name = Identifier { text = "Closure", span = span },
+            arguments = arguments, modes = modes, instanceName = referenceInstanceName("Closure", arguments, modes)
+        }
+    }
+
+    // A key path: the closure reading its members from its root, which is
+    // written or the parameter of the function type expected. It borrows the
+    // root it reads, as a function type expected may say otherwise.
+    function checkKeyPath(borrow mut self, declared: KeyPathDeclaration, expected: Optional<Type>) -> Int {
+        var expectedPath: Optional<Type> = .None
+        match expected {
+            Some(target) -> {
+                if isKeyPathType(program, target) { return keyPathValue(declared, .Some(target), .None) }
+                if isClosureType(program, target) && program.structs[target.declaration].typeArguments.count == 2 { expectedPath = .Some(target) }
+            }
+            None -> {
+                // Written with its root where nothing is expected, it is the
+                // key path itself, as `let name = \Row.name` is in Swift.
+                if declared.root.isSome() && genericStruct(tree.genericStructs, "KeyPath").isSome() {
+                    return keyPathValue(declared, .None, .None)
+                }
+            }
+        }
+        var known: Optional<Type> = .None
+        match expectedPath {
+            Some(target) -> known = .Some(program.structs[target.declaration].typeArguments[0])
+            None -> {}
+        }
+        return keyPathFrom(declared, known, expectedPath)
+    }
+
+    // A key path as Foundation's `KeyPath<Root, Value>`: the members it reads,
+    // as its identity, and the function reading them. `target` is the
+    // instance expected; without one the root, written or `root`, and the
+    // value read decide it.
+    function keyPathValue(borrow mut self, declared: KeyPathDeclaration, target: Optional<Type>, root: Optional<Type>) -> Int {
+        var known = root
+        var reading: Optional<Type> = .None
+        match target {
+            Some(instance) -> {
+                let structType = program.structs[instance.declaration]
+                known = .Some(structType.typeArguments[0])
+                match structType.field("read") {
+                    Some(field) -> reading = .Some(structType.fields[field].valueType)
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+        let read = keyPathFrom(declared, known, reading)
+        let readType = typeOf(read)
+        if readType.isInvalid() || !isClosureType(program, readType) { return read }
+        var owner = Type.invalid()
+        match target {
+            Some(instance) -> owner = instance
+            None -> {
+                let callable = program.structs[readType.declaration]
+                let rootBound: Optional<Type> = .Some(callable.typeArguments[0])
+                let valueBound: Optional<Type> = .Some(callable.typeArguments[1])
+                match inferredReferences(declarations, [rootBound, valueBound], declared.span) {
+                    Some(references) -> {
+                        let name = Identifier { text = "KeyPath", span = declared.span }
+                        owner = resolveType(TypeReference {
+                            qualifier = .None, name = name, arguments = references, modes = [],
+                            instanceName = referenceInstanceName(name.text, references, [])
+                        })
+                    }
+                    None -> {}
+                }
+            }
+        }
+        if owner.isInvalid() { return add(.Integer(0), Type.invalid(), declared.span) }
+        var members: [String] = []
+        for member in declared.members {
+            if members.count > 0 { members.append(".") }
+            members.append(member.text)
+        }
+        let path = expression(tree.addExpression(.StringLiteral(.Some(joinText(members))), declared.span), .None)
+        return add(.Construct([path, read]), owner, declared.span)
+    }
+
+    // A key path whose root, unless it writes one, is `known`.
+    function keyPathFrom(borrow mut self, declared: KeyPathDeclaration, known: Optional<Type>, expectedPath: Optional<Type>) -> Int {
+        var rootType = Type.invalid()
+        match declared.root {
+            Some(root) -> rootType = resolveType(root)
+            None -> {
+                match known {
+                    Some(given) -> rootType = given
+                    None -> report(.UnknownType, declared.span)
+                }
+            }
+        }
+        if rootType.isInvalid() { return add(.Integer(0), Type.invalid(), declared.span) }
+        let root = Identifier { text = "root", span = declared.span }
+        var read = tree.addExpression(.Name(root), declared.span)
+        for member in declared.members { read = tree.addExpression(.Member(read, member), member.span) }
+        let unwritten: Optional<TypeReference> = .None
+        let reading = LambdaDeclaration {
+            parameters = [root], annotations = [unwritten], body = [tree.addStatement(.Evaluation(read), declared.span)], span = declared.span
+        }
+        match expectedPath {
+            Some(target) -> {
+                let callable = program.structs[target.declaration]
+                if callable.typeArguments[0].equals(rootType) {
+                    return lambdaClosure(reading, [ParameterSignature { name = root, valueType = rootType, mode = callable.callableModes[0] }], expectedPath)
+                }
+            }
+            None -> {}
+        }
+        return lambdaClosure(reading, [ParameterSignature { name = root, valueType = rootType, mode = .Borrowed }], .None)
+    }
+
+    // Each captured local as the lambda holds it; a mutable one moves to a
+    // cell both sides share.
+    function captureSpecs(borrow mut self, uses: borrow [CapturedUse]) -> [CaptureSpec] {
+        var captures: [CaptureSpec] = []
+        for captured in uses {
+            let local = captured.local
+            if locals[local].moved { report(.UseAfterMove, captured.name.span) }
+            if locals[local].passingMode == .MutablyBorrowed && !locals[local].captured {
+                report(.OutsideSubset, captured.name.span)
+            }
+            if locals[local].mutable { locals[local].cell = true }
+            captures.append(CaptureSpec { name = captured.name, valueType = locals[local].valueType, cell = locals[local].cell })
+        }
+        return captures
+    }
+
+    function lambdaParameters(borrow mut self, declared: borrow LambdaDeclaration, callable: borrow StructType, count: Int) -> [ParameterSignature] {
+        var parameters: [ParameterSignature] = []
+        for index in 0..count {
+            let parameterType = callable.typeArguments[index]
+            match declared.annotations[index] {
+                Some(annotation) -> {
+                    if !resolveType(annotation).equals(parameterType) { report(.ArgumentTypeMismatch, declared.parameters[index].span) }
+                }
+                None -> {}
+            }
+            parameters.append(ParameterSignature { name = declared.parameters[index], valueType = parameterType, mode = callable.callableModes[index] })
+        }
+        return parameters
+    }
+
+    function enterLambda(borrow mut self, target: Int, captures: borrow [CaptureSpec], parameters: borrow [ParameterSignature], span: Span) {
+        current = target
+        locals = []
+        visible = []
+        scopes = []
+        loops = 0
+        bareMembers = true
+        checkingInitializer = false
+        sourceOverride = .Some(span.file)
+        handlers = []
+        propagated = []
+        tryAllowed = false
+        for captured in captures {
+            let local = locals.count
+            locals.append(Local {
+                name = captured.name.text, valueType = captured.valueType,
+                mutable = captured.cell, byReference = false, moved = false,
+                cell = captured.cell, captured = true, passingMode = .Borrowed
+            })
+            visible.append(local)
+        }
+        for parameter in parameters {
+            let reference = parameter.mode == .MutablyBorrowed
+            let local = declareLocal(parameter.name.text, parameter.valueType, reference, reference)
+            locals[local].passingMode = parameter.mode
+        }
+    }
+
+    function checkLambdaBody(borrow mut self, body: [Int], resultType: Type) -> [Int] {
+        openScope()
+        var checked: [Int] = []
+        for index in 0..body.count {
+            let node = body[index]
+            if index == body.count - 1 && !resultType.equals(Type.void()) {
+                match tree.statements[node].kind.evaluatedExpression() {
+                    Some(value) -> {
+                        checked.append(program.addStatement(checkReturn(.Some(value), tree.statements[node].span)))
+                        continue
+                    }
+                    None -> {}
+                }
+            }
+            checkStatementInto(node, checked)
+        }
+        closeScope()
+        return checked
+    }
+}

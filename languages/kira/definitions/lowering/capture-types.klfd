@@ -1,0 +1,106 @@
+extend KirTypes {
+    function declareCaptureTypes(borrow mut self, builder: KirModuleBuilder, program: CheckedProgram) {
+        for index in 0..program.structs.count {
+            if program.structs[index].name.text == "TypeDescriptor" { descriptorTypes.append(structs[index]) }
+        }
+        for target in 0..program.functions.count {
+            let noType: Optional<KirType> = .None
+            let noGlobal: Optional<KirGlobal> = .None
+            let noFunction: Optional<KirFunctionBuilder> = .None
+            capturePayloadTypes.append(noType)
+            captureBoxTypes.append(noType)
+            captureBoxSizes.append(0)
+            capturePayloadSizes.append(0)
+            capturePayloadAlignments.append(0)
+            captureDescriptors.append(noGlobal)
+            captureDrops.append(noFunction)
+            captureCopies.append(noFunction)
+            let checked = program.functions[target]
+            if !checked.lambda || checked.captures.count == 0 { continue }
+            let name = program.named(checked.name)
+            let payload = builder.declareRecordSpecialization(name.start, name.end, ridlLayout, generatedSuffix(builder, "capture payload", checked.symbol))
+            for captured in checked.captures {
+                let fieldName = program.named(captured.name.span)
+                var fieldType = of(captured.valueType)
+                if captured.cell { fieldType = pointer }
+                builder.addRecordField(payload, fieldName.start, fieldName.end, fieldType)
+            }
+            let box = builder.declareRecordSpecialization(name.start, name.end, ridlLayout, generatedSuffix(builder, "capture box", checked.symbol))
+            builder.addRecordField(box, name.start, name.end, pointer)
+            builder.addRecordField(box, name.start, name.end, pointer)
+            builder.addRecordField(box, name.start, name.end, payload)
+            capturePayloadTypes[target] = .Some(payload)
+            captureBoxTypes[target] = .Some(box)
+            captureBoxSizes[target] = kir_type_size(builder, box)
+            capturePayloadSizes[target] = kir_type_size(builder, payload)
+            capturePayloadAlignments[target] = kir_type_align(builder, payload)
+            let drop = kir_signature_new_named(builder, name.start, name.end, unit, generatedSuffix(builder, "capture drop", checked.symbol))
+            kir_signature_parameter(drop, pointer)
+            kir_signature_parameter(drop, pointer)
+            captureDrops[target] = .Some(kir_signature_declare(drop))
+            let copier = kir_signature_new_named(builder, name.start, name.end, unit, generatedSuffix(builder, "capture copy", checked.symbol))
+            kir_signature_parameter(copier, pointer)
+            kir_signature_parameter(copier, pointer)
+            kir_signature_parameter(copier, pointer)
+            captureCopies[target] = .Some(kir_signature_declare(copier))
+            let descriptor = kir_global_new_named(builder, name.start, name.end, descriptorTypes[0], 1, generatedSuffix(builder, "capture descriptor", checked.symbol))
+            for byte in 0..kir_type_size(builder, descriptorTypes[0]) { kir_global_byte(descriptor, 0) }
+            captureDescriptors[target] = .Some(descriptor)
+        }
+    }
+
+    function capturePayloadType(borrow self, target: Int) -> KirType {
+        match capturePayloadTypes[target] {
+            Some(valueType) -> return valueType
+            None -> { abort() return unit }
+        }
+    }
+
+    function captureBoxType(borrow self, target: Int) -> KirType {
+        match captureBoxTypes[target] {
+            Some(valueType) -> return valueType
+            None -> { abort() return unit }
+        }
+    }
+
+    function declareCaptureDescriptors(borrow mut self, builder: KirModuleBuilder, program: CheckedProgram) {
+        var found = false
+        for descriptor in captureDescriptors {
+            if descriptor.isSome() { found = true }
+        }
+        if !found { return }
+        let span = program.named(program.functions[0].name)
+        let signature = kir_signature_new_named(builder, span.start, span.end, unit, generatedSuffix(builder, "capture descriptors", program.moduleName))
+        let initializer = kir_signature_define(signature)
+        kir_function_initializer(initializer)
+        initializer.switchTo(initializer.entryBlock())
+        for target in 0..captureDescriptors.count {
+            match captureDescriptors[target] {
+                Some(global) -> {
+                    let address = kir_value_global_address(initializer, global)
+                    initializer.store(initializer.integer(integer32, 1), initializer.field(address, 0, integer32))
+                    initializer.store(initializer.integer(integer32, 3), initializer.field(address, 1, integer32))
+                    initializer.store(initializer.integer(integer64, capturePayloadSizes[target]), initializer.field(address, 2, integer64))
+                    initializer.store(initializer.integer(integer64, capturePayloadAlignments[target]), initializer.field(address, 3, integer64))
+                    match captureCopies[target] {
+                        Some(copier) -> {
+                            let reference = kir_value_function_reference(initializer, copier)
+                            initializer.store(initializer.convert(convertBitcast, reference, pointer), initializer.field(address, 4, pointer))
+                        }
+                        None -> abort()
+                    }
+                    initializer.store(kir_value_null(initializer, pointer), initializer.field(address, 5, pointer))
+                    match captureDrops[target] {
+                        Some(drop) -> {
+                            let reference = kir_value_function_reference(initializer, drop)
+                            initializer.store(initializer.convert(convertBitcast, reference, pointer), initializer.field(address, 6, pointer))
+                        }
+                        None -> abort()
+                    }
+                }
+                None -> {}
+            }
+        }
+        initializer.returnVoid()
+    }
+}

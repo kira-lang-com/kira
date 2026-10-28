@@ -1,0 +1,202 @@
+import Foundation
+
+// ArxTests.kira
+// Migrated from tests/pass/run/{array_append_loop_no_stack_growth, array_append_parity,
+// array_call_parity, array_local_parity, array_element_borrow_mut_writeback_parity,
+// array_element_deep_field_store_parity, array_element_mixed_projection_parity,
+// array_element_nested_append_parity, conditional_array_return_parity}.
+// All top-level names use arx / Arx prefix. Arrays are reduced to scalars
+// (weighted sums / counts) since the runner only compares Int/Bool/String.
+
+// ---------------------------------------------------------------------------
+// Struct/helper types
+// ---------------------------------------------------------------------------
+
+struct ArxRow {
+    var v: Int
+}
+
+function arxBump(r: borrow mut ArxRow) {
+    r.v = r.v + 1
+}
+
+struct ArxInner {
+    var x: Int
+}
+
+struct ArxOuter {
+    var inner: ArxInner
+}
+
+struct ArxA {
+    var c: Int
+}
+
+struct ArxB {
+    var a: ArxA
+}
+
+struct ArxC {
+    var b: ArxB
+}
+
+struct ArxCell {
+    var xs: [Int]
+}
+
+struct ArxGrid {
+    var cells: [ArxCell]
+}
+
+struct ArxRowXs {
+    var xs: [Int]
+}
+
+struct ArxColor {
+    let r: Float = 0.0
+    let g: Float = 0.0
+    let b: Float = 0.0
+    let a: Float = 1.0
+}
+
+struct ArxGlow {
+    let color: ArxColor = ArxColor {}
+    let radius: Float = 0.0
+    let intensity: Float = 0.0
+}
+
+function arxGlowEffects(enabled: Bool) -> [ArxGlow] {
+    if enabled {
+        return [
+            ArxGlow {
+                color: ArxColor { r: 0.30, g: 0.55, b: 1.0, a: 1.0 },
+                radius: 22.0,
+                intensity: 0.28
+            }
+        ]
+    }
+    return []
+}
+
+function arxGlowCount(enabled: Bool) -> Int {
+    let effects = arxGlowEffects(enabled)
+    return effects.count
+}
+
+function arxPassThrough(values: [Int]) -> [Int] {
+    return values
+}
+
+function arxMakeValues() -> [Int] {
+    return arxPassThrough([4, 5, 6])
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+// From array_append_loop_no_stack_growth: regression for scratch-alloca
+// hoisting into the entry block (avoids unbounded native stack growth in a
+// 60000-iteration loop that rebuilds an array each pass).
+@Test
+function arxAppendLoopNoStackGrowth() {
+    var acc = 0
+    for i in 0..60000 {
+        var xs: [Int] = []
+        xs.append(i)
+        acc = acc + xs[0]
+    }
+    let got = acc
+    expect!(got == 1799970000)
+}
+
+// From array_append_parity: [4, 5] built via append, order preserved.
+@Test
+function arxAppendParity() {
+    var values: [Int] = []
+    values.append(4)
+    values.append(5)
+    let got = values[0] * 10 + values[1]
+    expect!(got == 45)
+}
+
+// From array_call_parity: array threaded through function calls/returns.
+@Test
+function arxCallParity() {
+    let values: [Int] = arxMakeValues()
+    let got = values[0] * 100 + values[1] * 10 + values[2]
+    expect!(got == 456)
+}
+
+// From array_local_parity: plain array literal local.
+@Test
+function arxLocalParity() {
+    let values = [1, 2, 3]
+    let got = values[0] * 100 + values[1] * 10 + values[2]
+    expect!(got == 123)
+}
+
+// From array_element_borrow_mut_writeback_parity: mutation through
+// `arr[i]` passed to a `borrow mut` param must write back into the array.
+@Test
+function arxElementBorrowMutWritebackParity() {
+    var arr: [ArxRow] = []
+    arr.append(ArxRow { v: 5 })
+    arxBump(arr[0])
+    arxBump(arr[0])
+    let got = arr[0].v
+    expect!(got == 7)
+}
+
+// From array_element_deep_field_store_parity: store through a place nested
+// 2+ projections below the array index must write back.
+@Test
+function arxElementDeepFieldStoreParity() {
+    var arr: [ArxOuter] = []
+    arr.append(ArxOuter { inner: ArxInner { x: 1 } })
+    arr[0].inner.x = 77
+    let got = arr[0].inner.x
+    expect!(got == 77)
+}
+
+// From array_element_mixed_projection_parity: 3-deep field chain rooted at
+// an array index, plus a nested-array-of-array element index write.
+@Test
+function arxElementMixedProjectionParity() {
+    var deep: [ArxC] = []
+    deep.append(ArxC { b: ArxB { a: ArxA { c: 1 } } })
+    deep[0].b.a.c = 333
+
+    var grid: [ArxGrid] = []
+    grid.append(ArxGrid { cells: [] })
+    grid[0].cells.append(ArxCell { xs: [7, 8, 9] })
+    grid[0].cells[0].xs[2] = 555
+
+    var out = deep[0].b.a.c * 1000000 + grid[0].cells[0].xs[2] * 1000 + grid[0].cells[0].xs[0]
+    let got = out
+    expect!(got == 333555007)
+}
+
+// From array_element_nested_append_parity: `arr[i].xs.append(v)` must grow
+// the nested array in place (write back), not a discarded transient copy.
+@Test
+function arxElementNestedAppendParity() {
+    var arr: [ArxRowXs] = []
+    arr.append(ArxRowXs { xs: [] })
+    arr[0].xs.append(42)
+    arr[0].xs.append(43)
+    var out = arr[0].xs.count * 10000 + arr[0].xs[0] * 100 + arr[0].xs[1]
+    let got = out
+    expect!(got == 24243)
+}
+
+// From conditional_array_return_parity: an array literal of heap structs
+// returned from one `if` branch, empty array from the other; owned
+// temporaries of a returning block must not be cleaned up by a sibling
+// block's return path.
+@Test
+function arxConditionalArrayReturnParity() {
+    var out = arxGlowCount(true) * 100 + arxGlowCount(false) * 10 + arxGlowCount(true)
+    let got = out
+    expect!(got == 101)
+}

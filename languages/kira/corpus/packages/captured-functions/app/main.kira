@@ -1,0 +1,42 @@
+import Foundation
+
+function makeAdder(base: Int) -> (Int) -> Int {
+    return { value in return base + value }
+}
+
+function makeCounter() -> () -> Int {
+    var count = 0
+    return { in
+        count = count + 1
+        return count
+    }
+}
+
+function makeReader(values: [Int], label: String) -> () -> Int {
+    return { in return values.count + label.count }
+}
+
+@Main
+function main() -> Int {
+    var values: [Int] = [1, 2, 3]
+    var label: String = "aa"
+    let reader = makeReader(copy values, copy label)
+    values.append(4)
+    label.append("!")
+    let counter = makeCounter()
+    let first = counter()
+    let second = counter()
+    let duplicate: () -> Int = copy counter
+    let third = duplicate()
+    let adder = makeAdder(10)
+    var callbacks: [() -> Int] = []
+    for index in 0..4 {
+        let callback: () -> Int = { in return index }
+        callbacks.append(copy callback)
+    }
+    var total = reader() + adder(2) + first + second + third
+    for callback in callbacks {
+        total = total + callback()
+    }
+    return total
+}

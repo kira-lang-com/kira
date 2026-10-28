@@ -1,0 +1,863 @@
+import Foundation
+
+// Reading Zstandard (RFC 8878): each frame a block at a time, its literals
+// raw, repeated or Huffman-coded, its sequences FSE-coded, and its content
+// size and checksum checked. Skippable frames are passed over; a frame that
+// needs a dictionary is refused.
+
+namespace ZstdReading {
+    // A skippable frame's magic, whose low 4 bits are free.
+    let skippableMagic: Number = 407710288
+    // The largest window read: what a match may reach back.
+    let largestWindow: Number = 2147483648
+    // The most symbols a Huffman tree has, and its longest code.
+    let huffmanSymbols: Number = 256
+    let longestCode: Number = 11
+    // How Huffman weights are coded: their largest accuracy, and how many
+    // values a weight takes.
+    let weightLog: Number = 6
+    let weightSymbols: Number = 13
+}
+
+// What decodes the symbols of one FSE distribution: each state's symbol, how
+// many bits lead to the next state, and what they are added to.
+struct FseTable {
+    let log: Number
+    let symbols: [Number]
+    let bits: [Number]
+    let bases: [Number]
+}
+
+// The decoding table of the normalized distribution `counts`, which sum to
+// `1 << log` with each -1 counting 1, spread as RFC 8878 section 4.1.1
+// spreads it.
+function fseTable(counts: borrow [Number], log: Number) -> FseTable {
+    let size: Number = 1 << log
+    let mask = size - 1
+    let step = (size >> 1) + (size >> 3) + 3
+    var symbols: [Number] = []
+    for slot in 0..size { symbols.append(0) }
+    // Symbols below probability one take the last states.
+    var high = size - 1
+    var next: [Number] = []
+    for symbol in 0..counts.count {
+        if counts[symbol] == -1 {
+            symbols[high] = symbol
+            high -= 1
+            next.append(1)
+        } else {
+            next.append(counts[symbol])
+        }
+    }
+    var position: Number = 0
+    for symbol in 0..counts.count {
+        if counts[symbol] <= 0 { continue }
+        for each in 0..counts[symbol] {
+            symbols[position] = symbol
+            position = (position + step) & mask
+            while position > high { position = (position + step) & mask }
+        }
+    }
+    var bits: [Number] = []
+    var bases: [Number] = []
+    for state in 0..size {
+        let symbol = symbols[state]
+        let count = next[symbol]
+        next[symbol] += 1
+        let width = log - highBit(count)
+        bits.append(width)
+        bases.append((count << width) - size)
+    }
+    return FseTable { log: log, symbols: symbols, bits: bits, bases: bases }
+}
+
+// The table of a distribution that is all `symbol`, which reads no bits.
+function repeatedFseTable(symbol: Number) -> FseTable {
+    return FseTable { log: 0, symbols: [symbol], bits: [0], bases: [0] }
+}
+
+// The distribution described at `at`, before `end`, of at most `symbols`
+// symbols and an accuracy up to `largest` (RFC 8878 section 4.1.1), and
+// where its description ends.
+function readDistribution(
+    bytes: borrow [UN8],
+    at: Number,
+    end: Number,
+    symbols: Number,
+    largest: Number
+) -> Result<(FseTable, Number), ArchiveFailure> {
+    if at >= end { return .Error(.Malformed("an FSE distribution is cut off")) }
+    let log = bitsAt(bytes, at, end, 0, 4) + ZstdFormat.smallestLog
+    if log > largest { return .Error(.Malformed("an FSE distribution is too accurate")) }
+    var bit: Number = 4
+    var remaining = (1 << log) + 1
+    var threshold: Number = 1 << log
+    var width = log + 1
+    var counts: [Number] = []
+    var zero = false
+    while remaining > 1 && counts.count < symbols {
+        if zero {
+            // After a zero probability, 2-bit runs of more zeros, 3 meaning
+            // another run follows.
+            var run = bitsAt(bytes, at, end, bit, 2)
+            bit += 2
+            while run == 3 {
+                for each in 0..3 { counts.append(0) }
+                run = bitsAt(bytes, at, end, bit, 2)
+                bit += 2
+            }
+            for each in 0..run { counts.append(0) }
+            zero = false
+            if counts.count >= symbols {
+                return .Error(.Malformed("an FSE distribution has too many symbols"))
+            }
+            continue
+        }
+        let most = 2 * threshold - 1 - remaining
+        var value = bitsAt(bytes, at, end, bit, width - 1)
+        if value < most {
+            bit += width - 1
+        } else {
+            value = bitsAt(bytes, at, end, bit, width)
+            if value >= threshold { value -= most }
+            bit += width
+        }
+        let count = value - 1
+        remaining -= count < 0 ? -count : count
+        counts.append(count)
+        zero = count == 0
+        if remaining < 1 { break }
+        while remaining < threshold {
+            width -= 1
+            threshold = threshold >> 1
+        }
+    }
+    if remaining != 1 { return .Error(.Malformed("an FSE distribution does not add up")) }
+    let after = at + trunc((bit + 7) / 8)
+    if after > end { return .Error(.Malformed("an FSE distribution is cut off")) }
+    while counts.count < symbols { counts.append(0) }
+    return .Ok((fseTable(counts, log), after))
+}
+
+// The `count` bits from bit `from` of the bytes from `start` to `end`, as a
+// little-endian number; bits before the first and past the last are zero.
+function bitsAt(
+    bytes: borrow [UN8],
+    start: Number,
+    end: Number,
+    from: Number,
+    count: Number
+) -> Number {
+    if count <= 0 { return 0 }
+    if from < 0 {
+        if from + count <= 0 { return 0 }
+        return bitsAt(bytes, start, end, 0, count + from) << (0 - from)
+    }
+    let first = start + (from >> 3)
+    let last = min(end, start + ((from + count + 7) >> 3))
+    var value: Number = 0
+    for index in first..last { value = value | (Number(bytes[index]) << ((index - first) * 8)) }
+    return (value >> (from & 7)) & ((1 << count) - 1)
+}
+
+// A stream read from its last bit back, as FSE and Huffman streams are:
+// the highest set bit of the last byte marks where it starts.
+struct BackwardBits {
+    let start: Number
+    let end: Number
+    // How many bits are left; below 0 once reading went past the first,
+    // which reads zeros.
+    var left: Number
+    // Seven bytes of the stream from bit `base`, which reads take from
+    // until they reach below it.
+    var base: Number
+    var cache: Number = 0
+
+    function read(borrow mut self, bytes: borrow [UN8], count: Number) -> Number {
+        let value = peek(bytes, count)
+        left -= count
+        return value
+    }
+
+    // The next `count` bits, left unread.
+    function peek(borrow mut self, bytes: borrow [UN8], count: Number) -> Number {
+        if count <= 0 { return 0 }
+        let from = left - count
+        if from < 0 { return bitsAt(bytes, start, end, from, count) }
+        if from < base {
+            base = from - (from & 7)
+            cache = 0
+            let first = start + (base >> 3)
+            for index in first..min(end, first + 7) {
+                cache = cache | (Number(bytes[index]) << ((index - first) * 8))
+            }
+        }
+        return (cache >> (from - base)) & ((1 << count) - 1)
+    }
+}
+
+function backwardBits(
+    bytes: borrow [UN8],
+    start: Number,
+    end: Number
+) -> Result<BackwardBits, ArchiveFailure> {
+    if end <= start { return .Error(.Malformed("a Zstandard bitstream is empty")) }
+    let last = Number(bytes[end - 1])
+    if last == 0 { return .Error(.Malformed("a Zstandard bitstream has no start mark")) }
+    let left = (end - start - 1) * 8 + highBit(last)
+    return .Ok(BackwardBits { start: start, end: end, left: left, base: left + 1 })
+}
+
+// A Huffman decoding table: what the next `longest` bits of a stream decode
+// to, and how many of them the code takes.
+struct HuffmanTable {
+    let longest: Number
+    let symbols: [Number]
+    let lengths: [Number]
+}
+
+// The Huffman tree described at `at`, before `end` (RFC 8878 section
+// 4.2.1), and where its description ends.
+function readHuffmanTable(bytes: borrow [UN8], at: Number, end: Number) -> Result<(
+    HuffmanTable, Number
+), ArchiveFailure> {
+    if at >= end { return .Error(.Malformed("a Huffman tree is cut off")) }
+    let header = Number(bytes[at])
+    var weights: [Number] = []
+    var after: Number = 0
+    if header >= 128 {
+        // Each weight in 4 bits, the first in the high ones.
+        let count = header - 127
+        after = at + 1 + trunc((count + 1) / 2)
+        if after > end { return .Error(.Malformed("a Huffman tree is cut off")) }
+        for index in 0..count {
+            let byte = Number(bytes[at + 1 + trunc(index / 2)])
+            weights.append(index % 2 == 0 ? byte >> 4 : byte & 15)
+        }
+    } else {
+        after = at + 1 + header
+        if after > end { return .Error(.Malformed("a Huffman tree is cut off")) }
+        let (table, streamStart) = match readDistribution(
+            bytes,
+            at + 1,
+            after,
+            ZstdReading.weightSymbols,
+            ZstdReading.weightLog
+        ) {
+            Ok(read) -> read
+            Error(failure) -> return .Error(failure)
+        }
+        var stream = match backwardBits(bytes, streamStart, after) {
+            Ok(made) -> made
+            Error(failure) -> return .Error(failure)
+        }
+        // Two states take turns; once the stream is spent, the other one's
+        // symbol is the last.
+        var one = stream.read(bytes, table.log)
+        var two = stream.read(bytes, table.log)
+        while true {
+            if weights.count >= ZstdReading.huffmanSymbols - 1 {
+                return .Error(.Malformed("a Huffman tree has too many weights"))
+            }
+            weights.append(table.symbols[one])
+            one = table.bases[one] + stream.read(bytes, table.bits[one])
+            if stream.left < 0 {
+                weights.append(table.symbols[two])
+                break
+            }
+            weights.append(table.symbols[two])
+            two = table.bases[two] + stream.read(bytes, table.bits[two])
+            if stream.left < 0 {
+                weights.append(table.symbols[one])
+                break
+            }
+        }
+    }
+    if weights.count >= ZstdReading.huffmanSymbols {
+        return .Error(.Malformed("a Huffman tree has too many weights"))
+    }
+    var total: Number = 0
+    for weight in weights {
+        if weight > ZstdReading.longestCode {
+            return .Error(.Malformed("a Huffman weight is too large"))
+        }
+        if weight > 0 { total += 1 << (weight - 1) }
+    }
+    if total == 0 { return .Error(.Malformed("a Huffman tree has no weights")) }
+    let longest = highBit(total) + 1
+    if longest > ZstdReading.longestCode {
+        return .Error(.Malformed("a Huffman tree is too deep"))
+    }
+    // The last weight is the one that fills the tree.
+    let rest = (1 << longest) - total
+    if (rest & (rest - 1)) != 0 { return .Error(.Malformed("a Huffman tree is not complete")) }
+    weights.append(highBit(rest) + 1)
+    // Each symbol takes `2^(weight - 1)` slots, the lightest first.
+    var starts: [Number] = []
+    for weight in 0..(longest + 2) { starts.append(0) }
+    for weight in weights {
+        if weight > 0 { starts[weight + 1] += 1 << (weight - 1) }
+    }
+    for weight in 1..(longest + 2) { starts[weight] += starts[weight - 1] }
+    var symbols: [Number] = []
+    var lengths: [Number] = []
+    for slot in 0..(1 << longest) {
+        symbols.append(0)
+        lengths.append(0)
+    }
+    for symbol in 0..weights.count {
+        let weight = weights[symbol]
+        if weight == 0 { continue }
+        let first = starts[weight]
+        for slot in first..(first + (1 << (weight - 1))) {
+            symbols[slot] = symbol
+            lengths[slot] = longest + 1 - weight
+        }
+        starts[weight] = first + (1 << (weight - 1))
+    }
+    return .Ok((HuffmanTable { longest: longest, symbols: symbols, lengths: lengths }, after))
+}
+
+// The `count` symbols of the Huffman stream from `start` to `end`, onto
+// `out`; the stream must hold exactly them.
+function decodeHuffman(
+    bytes: borrow [UN8],
+    start: Number,
+    end: Number,
+    count: Number,
+    table: borrow HuffmanTable,
+    out: borrow mut [UN8]
+) -> Result<Void, ArchiveFailure> {
+    var stream = match backwardBits(bytes, start, end) {
+        Ok(made) -> made
+        Error(failure) -> return .Error(failure)
+    }
+    for each in 0..count {
+        let slot = stream.peek(bytes, table.longest)
+        out.append(UN8(table.symbols[slot]))
+        stream.left -= table.lengths[slot]
+    }
+    if stream.left != 0 {
+        return .Error(.Malformed("a Huffman stream does not end where it should"))
+    }
+    return .Ok
+}
+
+// The little-endian number of `count` bytes at `at`.
+function zstdLittle(bytes: borrow [UN8], at: Number, count: Number) -> Number {
+    var value: Number = 0
+    for index in 0..count { value = value | (Number(bytes[at + index]) << (index * 8)) }
+    return value
+}
+
+/// A reader of Zstandard frames, giving their decompressed contents one block at a time.
+public struct ZstdReader {
+    /// The frames' bytes, as read.
+    let bytes: [UN8]
+    /// Where the reader is in `bytes`.
+    var at: Number = 0
+    /// Whether a frame has started and not yet ended.
+    var inFrame: Bool = false
+    /// How far back a match may reach in the current frame.
+    var window: Number = 0
+    /// The current frame's content size, when its header gives one, or -1 otherwise.
+    var contentSize: Number = -1
+    /// How many bytes the current frame has produced so far.
+    var produced: Number = 0
+    /// Whether the current frame ends with a checksum.
+    var checked: Bool = false
+    /// The running XXH64 hash of the current frame's contents, for its checksum.
+    var hasher: Xxh64Hasher
+    /// The current frame's recent contents, which matches copy from.
+    var history: [UN8] = []
+    /// The most recent repeat offset, the first of the three kept.
+    var latest: Number = 1
+    /// The second most recent repeat offset.
+    var second: Number = 4
+    /// The third most recent repeat offset.
+    var third: Number = 8
+    /// The Huffman table a block may say to use again, when it has one.
+    var huffman: HuffmanTable? = .None
+    /// The literal length table a block may say to use again, when it has one.
+    var literalLengths: FseTable? = .None
+    /// The offset table a block may say to use again, when it has one.
+    var offsets: FseTable? = .None
+    /// The match length table a block may say to use again, when it has one.
+    var matchLengths: FseTable? = .None
+    /// The predefined literal length distribution.
+    let literalLengthDefault: FseTable
+    /// The predefined offset distribution.
+    let offsetDefault: FseTable
+    /// The predefined match length distribution.
+    let matchLengthDefault: FseTable
+
+    /// The contents of the next block, or an empty run once the frames end. Fails when the frames are malformed.
+    function next(borrow mut self) -> Result<[UN8], ArchiveFailure> {
+        while true {
+            if !inFrame {
+                if at == bytes.count {
+                    let none: [UN8] = []
+                    return .Ok(none)
+                }
+                match startFrame() {
+                    Ok(started) -> {
+                        if !started { continue }
+                    }
+                    Error(failure) -> return .Error(failure)
+                }
+            }
+            // Keep what a match may reach, dropping the rest a window at a
+            // time.
+            if history.count > 2 * window + ZstdFormat.blockSize {
+                history = byteRun(history, history.count - window, history.count)
+            }
+            let before: Number = history.count
+            match readBlock() {
+                Ok -> {}
+                Error(failure) -> return .Error(failure)
+            }
+            if history.count > before { return .Ok(byteRun(history, before, history.count)) }
+        }
+        let none: [UN8] = []
+        return .Ok(none)
+    }
+
+    /// Reads the header of the frame at `at`. Answers false for a skippable frame, which it passes over.
+    function startFrame(borrow mut self) -> Result<Bool, ArchiveFailure> {
+        if at + 4 > bytes.count { return .Error(.Malformed("a Zstandard frame is cut off")) }
+        let magic = zstdLittle(bytes, at, 4)
+        if (magic & 4294967280) == ZstdReading.skippableMagic {
+            if at + 8 > bytes.count { return .Error(.Malformed("a skippable frame is cut off")) }
+            let size = zstdLittle(bytes, at + 4, 4)
+            if size > bytes.count - at - 8 {
+                return .Error(.Malformed("a skippable frame is cut off"))
+            }
+            at += 8 + size
+            return .Ok(false)
+        }
+        if magic != ZstdFormat.magic { return .Error(.Malformed("not a Zstandard frame")) }
+        if at + 5 > bytes.count { return .Error(.Malformed("a Zstandard frame header is cut off")) }
+        let descriptor = Number(bytes[at + 4])
+        if (descriptor & 8) != 0 {
+            return .Error(.Malformed("a Zstandard frame header sets its reserved bit"))
+        }
+        let single = (descriptor & 32) != 0
+        let identifierSize: Number = [0, 1, 2, 4][descriptor & 3]
+        let sizeFlag = descriptor >> 6
+        let contentWidth: Number = sizeFlag == 0 ? (single ? 1 : 0) : [0, 2, 4, 8][sizeFlag]
+        var cursor = at + 5
+        let headerEnd = cursor + (single ? 0 : 1) + identifierSize + contentWidth
+        if headerEnd > bytes.count {
+            return .Error(.Malformed("a Zstandard frame header is cut off"))
+        }
+        var reach: Number = 0
+        if !single {
+            let exponent = Number(bytes[cursor]) >> 3
+            let mantissa = Number(bytes[cursor]) & 7
+            let base: Number = 1 << (10 + exponent)
+            reach = base + trunc(base / 8) * mantissa
+            cursor += 1
+        }
+        if identifierSize > 0 && zstdLittle(bytes, cursor, identifierSize) != 0 {
+            return .Error(.Unsupported("a Zstandard frame that needs a dictionary"))
+        }
+        cursor += identifierSize
+        contentSize = -1
+        if contentWidth > 0 {
+            if contentWidth == 8 && Number(bytes[cursor + 7]) >= 128 {
+                return .Error(.Unsupported("a Zstandard frame of more than 2^63 bytes"))
+            }
+            contentSize = zstdLittle(bytes, cursor, contentWidth) + (contentWidth == 2 ? 256 : 0)
+        }
+        if single { reach = contentSize }
+        if reach > ZstdReading.largestWindow {
+            return .Error(.Unsupported("a Zstandard window of \(reach) bytes"))
+        }
+        at = headerEnd
+        inFrame = true
+        window = reach
+        produced = 0
+        checked = (descriptor & 4) != 0
+        hasher = xxh64Hasher()
+        history = []
+        latest = 1
+        second = 4
+        third = 8
+        huffman = .None
+        literalLengths = .None
+        offsets = .None
+        matchLengths = .None
+        return .Ok(true)
+    }
+
+    /// Reads the block at `at` onto the history, and the frame's end after its last block.
+    function readBlock(borrow mut self) -> Result<Void, ArchiveFailure> {
+        if at + 3 > bytes.count { return .Error(.Malformed("a Zstandard block is cut off")) }
+        let header = zstdLittle(bytes, at, 3)
+        let last = (header & 1) != 0
+        let kind = (header >> 1) & 3
+        let size = header >> 3
+        at += 3
+        let before: Number = history.count
+        let largest = min(window, ZstdFormat.blockSize)
+        let stored = kind == ZstdFormat.rleBlock ? 1 : size
+        if stored > bytes.count - at { return .Error(.Malformed("a Zstandard block is cut off")) }
+        if size > ZstdFormat.blockSize {
+            return .Error(.Malformed("a Zstandard block is too large"))
+        }
+        // Raw, repeated, compressed and reserved.
+        match kind {
+            0 -> history.appendAll(byteRun(bytes, at, at + size))
+            1 -> {
+                let byte = bytes[at]
+                for each in 0..size { history.append(byte) }
+            }
+            2 -> {
+                if size > largest { return .Error(.Malformed("a Zstandard block is too large")) }
+                match readCompressed(at, at + size) {
+                    Ok -> {}
+                    Error(failure) -> return .Error(failure)
+                }
+            }
+            else -> return .Error(.Malformed("a Zstandard block of the reserved type"))
+        }
+        at += stored
+        let made: Number = history.count - before
+        if made > ZstdFormat.blockSize {
+            return .Error(.Malformed("a Zstandard block makes too much"))
+        }
+        produced += made
+        if checked { hasher.add(history, before, history.count) }
+        if contentSize >= 0 && produced > contentSize {
+            return .Error(.Malformed("a Zstandard frame makes more than its content size"))
+        }
+        if last { return finishFrame() }
+        return .Ok
+    }
+
+    /// Checks the frame's checksum, when it has one, against the contents produced.
+    function finishFrame(borrow mut self) -> Result<Void, ArchiveFailure> {
+        inFrame = false
+        if contentSize >= 0 && produced != contentSize {
+            return .Error(.Malformed("a Zstandard frame makes less than its content size"))
+        }
+        if checked {
+            if at + 4 > bytes.count {
+                return .Error(.Malformed("a Zstandard frame's checksum is cut off"))
+            }
+            let expected = Number(hasher.digest() & U64(4294967295))
+            if zstdLittle(bytes, at, 4) != expected {
+                return .Error(.Malformed("a Zstandard frame's checksum is wrong"))
+            }
+            at += 4
+        }
+        return .Ok
+    }
+
+    /// Reads the compressed block from `start` to `end` onto the history.
+    function readCompressed(
+        borrow mut self,
+        start: Number,
+        end: Number
+    ) -> Result<Void, ArchiveFailure> {
+        let (literals, sequencesAt) = match readLiterals(start, end) {
+            Ok(read) -> read
+            Error(failure) -> return .Error(failure)
+        }
+        return readSequences(literals, sequencesAt, end)
+    }
+
+    /// Reads the literals section from `start`, before `end`, and answers where it ends.
+    function readLiterals(borrow mut self, start: Number, end: Number) -> Result<(
+        [UN8], Number
+    ), ArchiveFailure> {
+        if start >= end { return .Error(.Malformed("a literals section is cut off")) }
+        let first = Number(bytes[start])
+        let kind = first & 3
+        let format = (first >> 2) & 3
+        var literals: [UN8] = []
+        if kind == ZstdFormat.rawLiterals || kind == ZstdFormat.rleLiterals {
+            // A size of 5, 12 or 20 bits.
+            let fieldSize: Number = (format & 1) == 0 ? 1 : (format == 1 ? 2 : 3)
+            if start + fieldSize > end { return .Error(.Malformed("a literals header is cut off")) }
+            let field = zstdLittle(bytes, start, fieldSize)
+            let size = (format & 1) == 0 ? field >> 3 : field >> 4
+            let at = start + fieldSize
+            if size > ZstdFormat.blockSize { return .Error(.Malformed("too many literals")) }
+            if kind == ZstdFormat.rawLiterals {
+                if size > end - at { return .Error(.Malformed("raw literals are cut off")) }
+                return .Ok((byteRun(bytes, at, at + size), at + size))
+            }
+            if at >= end { return .Error(.Malformed("repeated literals are cut off")) }
+            for each in 0..size { literals.append(bytes[at]) }
+            return .Ok((literals, at + 1))
+        }
+        // Huffman-coded literals: their size and the stream's, 10, 14 or 18
+        // bits each, and one stream or four.
+        let fieldSize: Number = [3, 3, 4, 5][format]
+        let width: Number = [10, 10, 14, 18][format]
+        let streams: Number = format == 0 ? 1 : 4
+        if start + fieldSize > end { return .Error(.Malformed("a literals header is cut off")) }
+        let field = zstdLittle(bytes, start, fieldSize)
+        let size = (field >> 4) & ((1 << width) - 1)
+        let compressedSize = (field >> (4 + width)) & ((1 << width) - 1)
+        var at = start + fieldSize
+        let streamsEnd = at + compressedSize
+        if streamsEnd > end { return .Error(.Malformed("Huffman literals are cut off")) }
+        if size > ZstdFormat.blockSize { return .Error(.Malformed("too many literals")) }
+        if kind == ZstdFormat.compressedLiterals {
+            let (table, after) = match readHuffmanTable(bytes, at, streamsEnd) {
+                Ok(read) -> read
+                Error(failure) -> return .Error(failure)
+            }
+            huffman = .Some(table)
+            at = after
+        }
+        let table = match huffman {
+            Some(kept) -> kept
+            None -> return .Error(.Malformed("literals reuse a Huffman tree there is not"))
+        }
+        if streams == 1 {
+            match decodeHuffman(bytes, at, streamsEnd, size, table, literals) {
+                Ok -> {}
+                Error(failure) -> return .Error(failure)
+            }
+            return .Ok((literals, streamsEnd))
+        }
+        // Four streams after a table of the first three's sizes; each of the
+        // first three makes a quarter, rounded up.
+        if at + 6 > streamsEnd { return .Error(.Malformed("Huffman literals are cut off")) }
+        let quarter = trunc((size + 3) / 4)
+        if size < 3 * quarter { return .Error(.Malformed("too few literals for four streams")) }
+        var streamStart = at + 6
+        for stream in 0..4 {
+            let streamEnd = stream < 3 ? streamStart + zstdLittle(
+                bytes,
+                at + stream * 2,
+                2
+            ) : streamsEnd
+            if streamEnd > streamsEnd { return .Error(.Malformed("Huffman literals are cut off")) }
+            let count = stream < 3 ? quarter : size - 3 * quarter
+            match decodeHuffman(bytes, streamStart, streamEnd, count, table, literals) {
+                Ok -> {}
+                Error(failure) -> return .Error(failure)
+            }
+            streamStart = streamEnd
+        }
+        return .Ok((literals, streamsEnd))
+    }
+
+    /// The table a sequences section names with `mode` for one kind of code. Reads its description at `at`, and answers where that ends.
+    function sequenceTable(
+        borrow self,
+        mode: Number,
+        at: Number,
+        end: Number,
+        symbols: Number,
+        largest: Number,
+        predefined: borrow FseTable,
+        previous: borrow FseTable?
+    ) -> Result<(FseTable, Number), ArchiveFailure> {
+        // Predefined, one code repeated, described, or the last block's.
+        match mode {
+            0 -> return .Ok((copy predefined, at))
+            1 -> {
+                if at >= end { return .Error(.Malformed("a sequences section is cut off")) }
+                let symbol = Number(bytes[at])
+                if symbol >= symbols {
+                    return .Error(.Malformed("a repeated code is out of range"))
+                }
+                return .Ok((repeatedFseTable(symbol), at + 1))
+            }
+            2 -> return readDistribution(bytes, at, end, symbols, largest)
+            else -> {}
+        }
+        return match previous {
+            Some(kept) -> .Ok((copy kept, at))
+            None -> .Error(.Malformed("sequences reuse a table there is not"))
+        }
+    }
+
+    /// Runs the sequences section from `start` to `end` over `literals`, onto the history.
+    function readSequences(
+        borrow mut self,
+        literals: borrow [UN8],
+        start: Number,
+        end: Number
+    ) -> Result<Void, ArchiveFailure> {
+        if start >= end { return .Error(.Malformed("a sequences section is cut off")) }
+        let first = Number(bytes[start])
+        var count: Number = first
+        var at = start + 1
+        if first == 255 {
+            if start + 3 > end { return .Error(.Malformed("a sequences section is cut off")) }
+            count = zstdLittle(bytes, start + 1, 2) + 32512
+            at = start + 3
+        } else if first >= 128 {
+            if start + 2 > end { return .Error(.Malformed("a sequences section is cut off")) }
+            count = ((first - 128) << 8) + Number(bytes[start + 1])
+            at = start + 2
+        }
+        if count == 0 {
+            if at != end { return .Error(.Malformed("a sequences section has bytes after it")) }
+            history.appendAll(literals)
+            return .Ok
+        }
+        if at >= end { return .Error(.Malformed("a sequences section is cut off")) }
+        let modes = Number(bytes[at])
+        if (modes & 3) != 0 { return .Error(.Malformed("a sequences section sets reserved bits")) }
+        at += 1
+        let (lengthTable, afterLengths) = match sequenceTable(
+            modes >> 6,
+            at,
+            end,
+            ZstdFormat.literalLengthSymbols,
+            ZstdFormat.literalLengthLargestLog,
+            literalLengthDefault,
+            literalLengths
+        ) {
+            Ok(read) -> read
+            Error(failure) -> return .Error(failure)
+        }
+        let (offsetTable, afterOffsets) = match sequenceTable(
+            (modes >> 4) & 3,
+            afterLengths,
+            end,
+            ZstdFormat.offsetSymbols,
+            ZstdFormat.offsetLargestLog,
+            offsetDefault,
+            offsets
+        ) {
+            Ok(read) -> read
+            Error(failure) -> return .Error(failure)
+        }
+        let (matchTable, streamStart) = match sequenceTable(
+            (modes >> 2) & 3,
+            afterOffsets,
+            end,
+            ZstdFormat.matchLengthSymbols,
+            ZstdFormat.matchLengthLargestLog,
+            matchLengthDefault,
+            matchLengths
+        ) {
+            Ok(read) -> read
+            Error(failure) -> return .Error(failure)
+        }
+        literalLengths = .Some(copy lengthTable)
+        offsets = .Some(copy offsetTable)
+        matchLengths = .Some(copy matchTable)
+        var stream = match backwardBits(bytes, streamStart, end) {
+            Ok(made) -> made
+            Error(failure) -> return .Error(failure)
+        }
+        let lengthBases = literalLengthBases()
+        let lengthExtras = literalLengthExtraBits()
+        let matchBases = matchLengthBases()
+        let matchExtras = matchLengthExtraBits()
+        var lengthState = stream.read(bytes, lengthTable.log)
+        var offsetState = stream.read(bytes, offsetTable.log)
+        var matchState = stream.read(bytes, matchTable.log)
+        var literal: Number = 0
+        let limit: Number = history.count + ZstdFormat.blockSize
+        for sequence in 0..count {
+            let offsetCode = offsetTable.symbols[offsetState]
+            let matchCode = matchTable.symbols[matchState]
+            let lengthCode = lengthTable.symbols[lengthState]
+            let offsetValue = (1 << offsetCode) + stream.read(bytes, offsetCode)
+            let matched = matchBases[matchCode] + stream.read(bytes, matchExtras[matchCode])
+            let length = lengthBases[lengthCode] + stream.read(bytes, lengthExtras[lengthCode])
+            // Offset values 1 to 3 name a repeated offset, shifted by one
+            // after no literals; the third past the first is the first less
+            // one.
+            let named = offsetValue > 3 ? 0 : offsetValue + (length == 0 ? 1 : 0)
+            var offset = latest
+            match named {
+                0 -> offset = offsetValue - 3
+                1 -> {}
+                2 -> offset = second
+                3 -> offset = third
+                else -> {
+                    offset = latest - 1
+                    if offset == 0 { return .Error(.Malformed("a sequence repeats offset 0")) }
+                }
+            }
+            if named >= 2 || named == 0 {
+                if named != 2 { third = second }
+                second = latest
+                latest = offset
+            }
+            if length > literals.count - literal {
+                return .Error(.Malformed("a sequence takes more literals than there are"))
+            }
+            for index in literal..(literal + length) { history.append(literals[index]) }
+            literal += length
+            if offset > history.count {
+                return .Error(.Malformed("a match reaches before the frame"))
+            }
+            if matched > limit - history.count {
+                return .Error(.Malformed("a Zstandard block makes too much"))
+            }
+            let from: Number = history.count - offset
+            for index in from..(from + matched) { history.append(history[index]) }
+            if sequence + 1 < count {
+                lengthState = lengthTable.bases[lengthState]
+                    + stream.read(bytes, lengthTable.bits[lengthState])
+                matchState = matchTable.bases[matchState] + stream.read(
+                    bytes,
+                    matchTable.bits[matchState]
+                )
+                offsetState = offsetTable.bases[offsetState]
+                    + stream.read(bytes, offsetTable.bits[offsetState])
+            }
+            if stream.left < 0 { return .Error(.Malformed("a sequences stream is cut off")) }
+        }
+        if stream.left != 0 {
+            return .Error(.Malformed("a sequences stream does not end where it should"))
+        }
+        for index in literal..literals.count { history.append(literals[index]) }
+        return .Ok
+    }
+}
+
+/// A reader of the Zstandard frames `bytes`.
+public function openZstd(bytes: [UN8]) -> ZstdReader {
+    return ZstdReader {
+        bytes: move bytes,
+        hasher: xxh64Hasher(),
+        literalLengthDefault: fseTable(literalLengthDefaults(), ZstdFormat.literalLengthLog),
+        offsetDefault: fseTable(offsetDefaults(), ZstdFormat.offsetLog),
+        matchLengthDefault: fseTable(matchLengthDefaults(), ZstdFormat.matchLengthLog)
+    }
+}
+
+/// The whole of the Zstandard frames `bytes`, decompressed.
+///
+/// Skippable frames are passed over. Each frame's content size and XXH64
+/// checksum are checked when the frame carries them.
+///
+/// # Errors
+/// - `.Malformed` when the frames contradict the Zstandard format, are cut off,
+///   or a block, Huffman tree, or FSE distribution is invalid.
+/// - `.Unsupported` when a frame needs a dictionary or uses a window larger than
+///   this library reads.
+///
+/// # Examples
+/// ```
+/// match decompressZstd(bytes) {
+///     Ok(plain) -> use(plain)
+///     Error(failure) -> report(failure)
+/// }
+/// ```
+public function decompressZstd(bytes: [UN8]) -> Result<[UN8], ArchiveFailure> {
+    var reader = openZstd(move bytes)
+    var whole: [UN8] = []
+    while true {
+        let part = match reader.next() {
+            Ok(read) -> read
+            Error(failure) -> return .Error(failure)
+        }
+        if part.count == 0 { return .Ok(whole) }
+        whole.appendAll(part)
+    }
+    return .Ok(whole)
+}

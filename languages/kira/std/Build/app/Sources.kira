@@ -1,0 +1,315 @@
+import Foundation
+import Kten
+import Archive
+import Network
+
+// Upstream sources (DESIGN.md section 5.6): fetched and checked against the
+// digest the build names, unpacked, and patched, all in Kira.
+
+namespace Fetching {
+    // How many redirects a download follows.
+    let redirects: Number = 10
+    // How long one download may take, in microseconds.
+    let patience: Number = 3600000000
+}
+
+extend Graph {
+    // The file at the `http` or `https` URL `url`, which must have the
+    // SHA-256 `sha256`: the digest is what the build trusts, so anything else
+    // fails it. Redirects are followed.
+    function download(
+        borrow mut self,
+        name: borrow String,
+        url: borrow String,
+        sha256: borrow String
+    ) -> Artifact {
+        let label = "download \(name)"
+        checkTreePath(name, label)
+        let wanted = sha256.lowercased()
+        let start = copy url
+        return native(
+            NativeAction {
+                label: label,
+                code: sourceDigest!("package"),
+                parameters: ktenBare(
+                    [ktenField("url", .Text(copy url)), ktenField("sha256", .Text(copy wanted))]
+                ),
+                produces: copy wanted,
+                outputs: [Output { name: lastName(name) }],
+                work: { run in
+                    let body = match fetchFollowing(start) {
+                        Ok(bytes) -> bytes
+                        Error(failure) -> return .Error(failure)
+                    }
+                    let found = match sha256Hex(body) {
+                        Ok(hex) -> hex
+                        Error(failure) -> return .Error(failure)
+                    }
+                    if found != wanted {
+                        return .Error(.Failed("\(start) has the SHA-256 \(found), not \(wanted)"))
+                    }
+                    return match writeFileBytes(run.outputs[0], body) {
+                        Ok -> .Ok
+                        Error(failure) -> .Error(
+                            .Files("cannot write \(run.outputs[0]): \(traceText(failure))")
+                        )
+                    }
+                }
+            }
+        )[0]
+    }
+
+    // The tree the archive `archive` holds. Paths climbing out with `..`, and
+    // entries under a link the archive made, fail it; a hard link becomes a
+    // copy.
+    function extract(
+        borrow mut self,
+        name: borrow String,
+        archive: borrow Artifact,
+        format: ArchiveFormat
+    ) -> Artifact {
+        let none: [String] = []
+        return extract(name, archive, format, none)
+    }
+
+    // The tree the archive `archive` holds but for the entries at or under
+    // each of `excluding`: what this filesystem cannot hold, as two names
+    // differing only in case on one that folds it.
+    function extract(
+        borrow mut self,
+        name: borrow String,
+        archive: borrow Artifact,
+        format: ArchiveFormat,
+        excluding: borrow [String]
+    ) -> Artifact {
+        let label = "extract \(name)"
+        checkArtifact(archive, label)
+        checkTreePath(name, label)
+        if holdsTree(archive) {
+            problems.append("\(label) unpacks \(artifactName(archive)), which is a tree")
+        }
+        for path in excluding {
+            checkTreePath(path, label)
+        }
+        var left: [Kten] = []
+        for path in excluding {
+            left.append(.Text(copy path))
+        }
+        let leaving = copy excluding
+        return native(
+            NativeAction {
+                label: label,
+                code: sourceDigest!("package"),
+                parameters: ktenBare(
+                    [ktenField("format", .Text(traceText(format))), ktenField(
+                        "excluding",
+                        .List(left)
+                    )]
+                ),
+                inputs: [archive],
+                outputs: [Output { name: lastName(name), kind: .Tree }],
+                work: { run in
+                    let unpacked = extractArchiveExcept(
+                        run.inputs[0],
+                        format,
+                        run.outputs[0],
+                        leaving
+                    )
+                    return match unpacked {
+                        Ok -> .Ok
+                        Error(failure) -> .Error(.Failed(archiveFailureText(failure)))
+                    }
+                }
+            }
+        )[0]
+    }
+
+    // The file `file` decompressed.
+    function decompress(
+        borrow mut self,
+        name: borrow String,
+        file: borrow Artifact,
+        compression: Compression
+    ) -> Artifact {
+        let label = "decompress \(name)"
+        checkArtifact(file, label)
+        checkTreePath(name, label)
+        if holdsTree(file) {
+            problems.append("\(label) decompresses \(artifactName(file)), which is a tree")
+        }
+        return native(
+            NativeAction {
+                label: label,
+                code: sourceDigest!("package"),
+                parameters: .Text(traceText(compression)),
+                inputs: [file],
+                outputs: [Output { name: lastName(name) }],
+                work: { run in
+                    return match decompressFile(run.inputs[0], compression, run.outputs[0]) {
+                        Ok(size) -> .Ok
+                        Error(failure) -> .Error(.Failed(archiveFailureText(failure)))
+                    }
+                }
+            }
+        )[0]
+    }
+
+    // The tree `tree` with the unified diffs `patches` applied in order,
+    // their paths stripped of `strip` leading parts, as `patch -p<strip>`
+    // reads them. A hunk applies where its context is found whole, nearest
+    // where it says; one that is not found fails it.
+    function patch(
+        borrow mut self,
+        name: borrow String,
+        tree: borrow Artifact,
+        patches: borrow [Artifact],
+        strip: Number
+    ) -> Artifact {
+        let label = "patch \(name)"
+        checkArtifact(tree, label)
+        checkTreePath(name, label)
+        if !holdsTree(tree) {
+            problems.append("\(label) patches \(artifactName(tree)), which is no tree")
+        }
+        var inputs = [copy tree]
+        var names: [String] = []
+        for patch in patches {
+            checkArtifact(patch, label)
+            if holdsTree(patch) {
+                problems.append("\(label) applies \(artifactName(patch)), which is a tree")
+            }
+            inputs.append(copy patch)
+            names.append(artifactName(patch))
+        }
+        let origin = artifactName(tree)
+        return native(
+            NativeAction {
+                label: label,
+                code: sourceDigest!("package"),
+                parameters: .Number(strip),
+                inputs: inputs,
+                outputs: [Output { name: lastName(name), kind: .Tree }],
+                work: { run in
+                    var assembly = TreeAssembly {}
+                    match assembly.addTree(run.inputs[0], run.trees[0], "", origin) {
+                        Ok -> {}
+                        Error(failure) -> return .Error(failure)
+                    }
+                    // The patches change files after they are copied, so
+                    // none is told as a copy.
+                    match assembly.write(run.outputs[0], { path, digest in }) {
+                        Ok -> {}
+                        Error(failure) -> return .Error(failure)
+                    }
+                    for index in 1..run.inputs.count {
+                        let applied = match readArchiveFile(run.inputs[index]) {
+                            Ok(bytes) -> patchTree(run.outputs[0], bytes, strip)
+                            Error(failure) -> .Error(failure)
+                        }
+                        match applied {
+                            Ok -> {}
+                            Error(failure) -> return .Error(
+                                .Failed("\(names[index - 1]): \(archiveFailureText(failure))")
+                            )
+                        }
+                    }
+                    return .Ok
+                }
+            }
+        )[0]
+    }
+}
+
+// Every file of the patch `bytes` applied under `root`.
+function patchTree(
+    root: borrow String,
+    bytes: borrow [UN8],
+    strip: Number
+) -> Result<Void, ArchiveFailure> {
+    let files = match readPatch(bytes, strip) {
+        Ok(read) -> read
+        Error(failure) -> return .Error(failure)
+    }
+    if files.count == 0 { return .Error(.Malformed("the patch patches no file")) }
+    for file in files {
+        match applyPatchFile(root, file) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+    }
+    return .Ok
+}
+
+// The body at `url` once its redirects are followed.
+function fetchFollowing(url: borrow String) -> Result<[UN8], BuildFailure> {
+    var network = match openNetwork(NetworkOptions {}) {
+        Ok(opened) -> opened
+        Error(failure) -> return .Error(.Failed("cannot open the network: \(traceText(failure))"))
+    }
+    var current = copy url
+    for hop in 0..Fetching.redirects {
+        let target = match targetOf(current) {
+            Some(read) -> read
+            None -> return .Error(.Failed("\(current) is no http or https URL"))
+        }
+        let until = network.now().plus(Fetching.patience)
+        let response = match network.fetch(Request { method: .Get, target: target }, until) {
+            Ok(answer) -> answer
+            Error(failure) -> return .Error(
+                .Failed("cannot fetch \(current): \(fetchFailureText(failure))")
+            )
+        }
+        let status = code(response.status)
+        if status >= 300 && status < 400 {
+            let location = match response.fields.first("location") {
+                Some(given) -> given
+                None -> return .Error(.Failed("\(current) answered \(status) without a location"))
+            }
+            current = redirectedUrl(current, location)
+            continue
+        }
+        if status != 200 { return .Error(.Failed("\(current) answered \(status)")) }
+        return match response.body {
+            Bytes(bytes) -> .Ok(bytes)
+            Empty -> .Ok([])
+        }
+    }
+    return .Error(.Failed("\(url) redirects more than \(Fetching.redirects) times"))
+}
+
+// A failed fetch as one line. A server refusing TLS 1.3 says so: Network
+// speaks no older version, so another host for the file is the way out.
+function fetchFailureText(failure: borrow HttpFailure) -> String {
+    return match failure {
+        Tls(alert) -> match alert {
+            ProtocolVersion -> "the server refuses TLS 1.3, the only version Network speaks"
+            else -> traceText(failure)
+        }
+        else -> traceText(failure)
+    }
+}
+
+// Where a redirect from `from` to `location` leads: `location` itself when
+// it is absolute, otherwise under `from`'s origin or beside its path.
+function redirectedUrl(from: borrow String, location: borrow String) -> String {
+    if location.indexOf("://").isSome() { return copy location }
+    let marker = match from.indexOf("://") {
+        Some(at) -> at + 3
+        None -> return copy location
+    }
+    if location.startsWith("//") { return from.substring(0, marker - 2) + location }
+    let rest = from.substring(marker, from.count)
+    let slash = rest.indexOf("/").or(rest.count)
+    let origin = from.substring(0, marker + slash)
+    if location.startsWith("/") { return origin + location }
+    var path = rest.substring(slash, rest.count)
+    match path.indexOf("?") {
+        Some(at) -> path = path.substring(0, at)
+        None -> {}
+    }
+    var directory = "/"
+    for index in 0..path.count {
+        if path.substring(index, index + 1) == "/" { directory = path.substring(0, index + 1) }
+    }
+    return origin + directory + location
+}

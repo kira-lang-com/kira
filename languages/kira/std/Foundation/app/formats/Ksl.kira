@@ -1,0 +1,44 @@
+// Shader artifact shared by renderers and UI packages.
+struct KslArtifact {
+    var shaderName: String = ""
+    // Entry-point names, as the backend emitted them. Read them from here
+    // rather than writing a name a pipeline descriptor looks up: a name that
+    // does not match leaves the descriptor with a nil function.
+    var vertexEntry: String = ""
+    var fragmentEntry: String = ""
+    // The compute kernel's entry name; empty for a graphics shader.
+    var computeEntry: String = ""
+    // Every stage merged into one MSL library, for a backend that compiles a
+    // single module — the direct Metal backend does. For a compute shader this
+    // is the kernel.
+    //
+    // There is no per-stage MSL beside it, because Metal has none to give: one
+    // library holds every stage, and a pipeline picks between them by entry
+    // name. Metal stores all stages in this one source field.
+    var combinedMsl: String = ""
+    // Per-stage sources. A compute kernel is a stage like any other here: every
+    // target that splits stages emits one, and a backend that dispatches
+    // compute reads its own — `combinedMsl` is only Metal's answer to the same
+    // question. A graphics shader leaves the compute fields empty, which is
+    // what `computeEntry` being empty already says.
+    var vertexHlsl: String = ""
+    var fragmentHlsl: String = ""
+    var computeHlsl: String = ""
+    var vertexGlsl: String = ""
+    var fragmentGlsl: String = ""
+    var computeGlsl: String = ""
+    // WGSL, for WebGPU and wasm32-emscripten. Entry names reuse
+    // `vertexEntry`/`fragmentEntry`/`computeEntry`.
+    var vertexWgsl: String = ""
+    var fragmentWgsl: String = ""
+    var computeWgsl: String = ""
+    var vertexSpirv: [UN32] = []
+    var fragmentSpirv: [UN32] = []
+    var computeSpirv: [UN32] = []
+    // A compact resource descriptor emitted from KSL reflection: one record per
+    // resource, separated by `;`, each opening with a letter naming its kind —
+    // `u` uniform block, `s` storage buffer, `t` texture, `m` sampler. For a
+    // backend that configures a shader's bindings per shader rather than by
+    // convention. Empty for a shader that declares no resources.
+    var resourceReflection: String = ""
+}

@@ -1,0 +1,358 @@
+// What a debug build's `klist!` calls: the value read out of the `.klist`
+// file while the program runs, so an edited file needs no rebuild.
+//
+// A release build never calls these; `klist!` writes the value in as a
+// literal there. A value read here can sit on a hot path, so each file is
+// parsed once and read again only when a second has passed since it was last
+// read. The literal the call was compiled with is the answer when the file is
+// gone, malformed, or no longer holds the key at that type, as it is on a
+// machine the program was copied to without its sources.
+
+struct KlistNode {
+    let kind: String
+    let key: String
+    let text: String
+    // The index after this node's last descendant.
+    var end: Number
+}
+
+struct KlistDocument {
+    let path: String
+    var nodes: [KlistNode]
+    var readAt: Number
+}
+
+// How long a parsed file is answered from before it is read again.
+function klistFreshNanos() -> Number { return 1000000000 }
+
+class KlistParser {
+    var source: String = ""
+    var size: Number = 0
+    var at: Number = 0
+    var nodes: [KlistNode] = []
+    var failed: Bool = false
+
+    function byte(offset: Number) -> Number {
+        if at + offset >= size { return -1 }
+        return source.charAt(at + offset)
+    }
+
+    function here(text: borrow String) -> Bool {
+        if at + text.count > size { return false }
+        return source.substring(at, at + text.count) == text
+    }
+
+    function stop() -> Bool {
+        failed = true
+        return false
+    }
+
+    function skipSpace() {
+        while klistSpace(byte(0)) { at += 1 }
+    }
+
+    function skipPast(marker: borrow String) -> Bool {
+        while at < size {
+            if here(marker) {
+                at += marker.count
+                return true
+            }
+            at += 1
+        }
+        return false
+    }
+
+    function skipMisc() -> Bool {
+        while true {
+            skipSpace()
+            if here("<!--") {
+                if !skipPast("-->") { return stop() }
+            } else if here("<?") {
+                if !skipPast("?>") { return stop() }
+            } else {
+                return true
+            }
+        }
+        return true
+    }
+
+    function name() -> String {
+        let start = at
+        while byte(0) >= 97 && byte(0) <= 122 || byte(0) >= 65 && byte(0) <= 90 { at += 1 }
+        return source.substring(start, at)
+    }
+
+    function text(until: Number) -> String? {
+        var parts = ""
+        var run = at
+        while byte(0) != until {
+            if byte(0) == -1 { return .None }
+            if byte(0) == 38 {
+                parts = parts + source.substring(run, at)
+                let start = at
+                while byte(0) != 59 && byte(0) != -1 && at - start < 8 { at += 1 }
+                if byte(0) != 59 { return .None }
+                match source.substring(start, at + 1) {
+                    "&lt;" -> parts = parts + "<"
+                    "&gt;" -> parts = parts + ">"
+                    "&amp;" -> parts = parts + "&"
+                    "&quot;" -> parts = parts + "\""
+                    "&apos;" -> parts = parts + "'"
+                    else -> return .None
+                }
+                at += 1
+                run = at
+                continue
+            }
+            at += 1
+        }
+        return .Some(parts + source.substring(run, at))
+    }
+
+    function document() -> Bool {
+        if !skipMisc() || !here("<klist") { return stop() }
+        at += 6
+        skipSpace()
+        if !here("version=\"1\"") { return stop() }
+        at += 11
+        skipSpace()
+        if byte(0) != 62 { return stop() }
+        at += 1
+        if !skipMisc() || !value(false) || !skipMisc() || !here("</klist>") { return stop() }
+        at += 8
+        if !skipMisc() || at != size { return stop() }
+        return true
+    }
+
+    function value(keyed: Bool) -> Bool {
+        if byte(0) != 60 { return stop() }
+        at += 1
+        let kind = name()
+        var key = ""
+        var hasKey = false
+        skipSpace()
+        while byte(0) != 47 && byte(0) != 62 {
+            if name() != "key" { return stop() }
+            skipSpace()
+            if byte(0) != 61 { return stop() }
+            at += 1
+            skipSpace()
+            let quote = byte(0)
+            if quote != 34 && quote != 39 { return stop() }
+            at += 1
+            match text(quote) {
+                Some(written) -> key = written
+                None -> return stop()
+            }
+            at += 1
+            hasKey = true
+            skipSpace()
+        }
+        if keyed != hasKey { return stop() }
+        let index = nodes.count
+        nodes.append(KlistNode { kind = kind, key = key, text = "", end = index + 1 })
+        if byte(0) == 47 {
+            if byte(1) != 62 { return stop() }
+            at += 2
+            return true
+        }
+        at += 1
+        if kind == "dict" || kind == "array" {
+            while true {
+                if !skipMisc() { return false }
+                if here("</") { break }
+                if !value(kind == "dict") { return false }
+            }
+        } else {
+            match text(60) {
+                Some(written) -> nodes[index] = KlistNode {
+                    kind = kind,
+                    key = key,
+                    text = written,
+                    end = index + 1
+                }
+                None -> return stop()
+            }
+        }
+        at += 2
+        if name() != kind || byte(0) != 62 { return stop() }
+        at += 1
+        nodes[index].end = nodes.count
+        return true
+    }
+}
+
+function klistSpace(byte: Number) -> Bool {
+    return byte == 32 || byte == 9 || byte == 10 || byte == 13
+}
+
+// The index in the runtime's documents of the parsed file at `path`, read
+// again once it has been held for a second; its nodes are empty when it
+// cannot be read or is not a klist. Callers read the nodes where they are:
+// handing them out would copy a whole list for every value read.
+function klistDocument(path: borrow String) -> Number {
+    let now = kernelWallNanos()
+    for index in 0..runtimeContext.documents.count {
+        if runtimeContext.documents[index].path != path { continue }
+        if now - runtimeContext.documents[index].readAt >= klistFreshNanos() {
+            runtimeContext.documents[index].nodes = klistParse(path)
+            runtimeContext.documents[index].readAt = now
+        }
+        return index
+    }
+    runtimeContext.documents.append(
+        KlistDocument { path = path, nodes = klistParse(path), readAt = now }
+    )
+    return runtimeContext.documents.count - 1
+}
+
+// The parsed file at `path`, whole, for a reader that walks every node; none
+// when it cannot be read or is not a klist.
+function klistNodes(path: borrow String) -> [KlistNode] {
+    return runtimeContext.documents[klistDocument(path)].nodes
+}
+
+function klistParse(path: borrow String) -> [KlistNode] {
+    let parser = KlistParser {}
+    parser.source = fileText(path)
+    parser.size = parser.source.count
+    if parser.size == 0 || !parser.document() { return [] }
+    return parser.nodes
+}
+
+// The node `key` names in document `document`, or -1.
+function klistFind(document: Number, key: borrow String) -> Number {
+    if runtimeContext.documents[document].nodes.count == 0 { return -1 }
+    var current: Number = 0
+    for part in key.split(".") {
+        let kind = runtimeContext.documents[document].nodes[current].kind
+        let end = runtimeContext.documents[document].nodes[current].end
+        var found: Number = -1
+        var child = current + 1
+        var position: Number = 0
+        while child < end {
+            if kind == "dict" && runtimeContext.documents[document].nodes[child].key == part {
+                found = child
+                break
+            }
+            if kind == "array" && String(position) == part {
+                found = child
+                break
+            }
+            child = runtimeContext.documents[document].nodes[child].end
+            position += 1
+        }
+        if found < 0 { return -1 }
+        current = found
+    }
+    return current
+}
+
+// The node `key` names in the file at `path`, when there is one.
+function klistNode(path: borrow String, key: borrow String) -> KlistNode? {
+    let document = klistDocument(path)
+    let found = klistFind(document, key)
+    if found < 0 { return .None }
+    return .Some(runtimeContext.documents[document].nodes[found])
+}
+
+function klistString(path: borrow String, key: borrow String, fallback: String) -> String {
+    match klistNode(path, key) {
+        Some(node) -> {
+            if node.kind != "string" && node.kind != "date" { return fallback }
+            return node.text
+        }
+        None -> return fallback
+    }
+}
+
+function klistBoolean(path: borrow String, key: borrow String, fallback: Bool) -> Bool {
+    let kind = match klistNode(path, key) {
+        Some(node) -> node.kind
+        None -> ""
+    }
+    match kind {
+        "true" -> return true
+        "false" -> return false
+        else -> return fallback
+    }
+}
+
+function klistNumber(path: borrow String, key: borrow String, fallback: Number) -> Number {
+    var text = ""
+    match klistNode(path, key) {
+        Some(node) -> {
+            if node.kind != "number" { return fallback }
+            text = node.text
+        }
+        None -> return fallback
+    }
+    var start: Number = 0
+    if text.count > 0 && (text.charAt(0) == 43 || text.charAt(0) == 45) { start = 1 }
+    if text.count <= start + 2 || text.substring(start, start + 2) != "0x" {
+        for index in start..text.count {
+            let byte = text.charAt(index)
+            if (byte < 48 || byte > 57) && byte != 46 { return fallback }
+        }
+        return Number(text)
+    }
+    if text.count - start - 2 > 16 { return fallback }
+    var bits = Number(0)
+    for index in start + 2..text.count {
+        match hexDigitValue(storedByte(text, index)) {
+            Some(digit) -> bits = bits << Number(4) | Number(digit)
+            None -> return fallback
+        }
+    }
+    if text.charAt(0) == 45 { return Number(0) - Number(bits) }
+    return Number(bits)
+}
+
+function klistData(path: borrow String, key: borrow String, fallback: [UN8]) -> [UN8] {
+    var text = ""
+    match klistNode(path, key) {
+        Some(node) -> {
+            if node.kind != "data" { return fallback }
+            text = node.text
+        }
+        None -> return fallback
+    }
+    var bytes: [UN8] = []
+    var group: Number = 0
+    var held: Number = 0
+    for index in 0..text.count {
+        let byte = text.charAt(index)
+        var digit: Number = -1
+        if byte >= 65 && byte <= 90 { digit = byte - 65 }
+        if byte >= 97 && byte <= 122 { digit = byte - 71 }
+        if byte >= 48 && byte <= 57 { digit = byte + 4 }
+        if byte == 43 { digit = 62 }
+        if byte == 47 { digit = 63 }
+        if digit < 0 { continue }
+        group = group * 64 + digit
+        held += 6
+        if held >= 8 {
+            held -= 8
+            bytes.append(UN8(group >> held & 255))
+            group = group & ((1 << held) - 1)
+        }
+    }
+    return bytes
+}
+
+function klistStrings(path: borrow String, key: borrow String, fallback: [String]) -> [String] {
+    let document = klistDocument(path)
+    let found = klistFind(document, key)
+    if found < 0 || runtimeContext.documents[document].nodes[found].kind != "array" {
+        return fallback
+    }
+    var values: [String] = []
+    var child = found + 1
+    while child < runtimeContext.documents[document].nodes[found].end {
+        let node = runtimeContext.documents[document].nodes[child]
+        if node.kind != "string" && node.kind != "date" { return fallback }
+        values.append(node.text)
+        child = node.end
+    }
+    return values
+}

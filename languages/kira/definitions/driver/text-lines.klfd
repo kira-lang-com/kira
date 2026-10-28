@@ -1,0 +1,71 @@
+// Reading what a child program wrote: its lines, the text after a prefix,
+// and a status written in decimal.
+
+// The lines of `text`, each without its `\n` or `\r\n`; a last line without
+// an ending counts, an empty last one does not.
+function outputLines(text: String) -> [String] {
+    var lines: [String] = []
+    var start = 0
+    let count = utf8Count(text)
+    for index in 0..count {
+        if utf8Byte(text, index) == asciiNewline {
+            lines.append(withoutReturn(utf8Slice(text, start, index)))
+            start = index + 1
+        }
+    }
+    if start < count { lines.append(withoutReturn(utf8Slice(text, start, count))) }
+    return lines
+}
+
+function withoutReturn(line: String) -> String {
+    let count = utf8Count(line)
+    if count > 0 && utf8Byte(line, count - 1) == asciiReturn { return utf8Slice(line, 0, count - 1) }
+    return line
+}
+
+// `text` after `prefix`, when it starts with it.
+function afterPrefix(text: String, prefix: String) -> Optional<String> {
+    let length = utf8Count(prefix)
+    if utf8Count(text) < length { return .None }
+    for offset in 0..length {
+        if utf8Byte(text, offset) != utf8Byte(prefix, offset) { return .None }
+    }
+    return .Some(utf8Slice(text, length, utf8Count(text)))
+}
+
+// The 32-bit status `text` writes in decimal, with an optional sign.
+function statusValue(text: String) -> Optional<Int> {
+    let count = utf8Count(text)
+    var start = 0
+    var negative = false
+    if count > 0 && utf8Byte(text, 0) == asciiMinus {
+        negative = true
+        start = 1
+    } else if count > 0 && utf8Byte(text, 0) == asciiPlus {
+        start = 1
+    }
+    if start == count { return .None }
+    var limit = 2147483647
+    if negative { limit = 2147483648 }
+    var value = 0
+    for index in start..count {
+        let byte = utf8Byte(text, index)
+        if !isDigit(byte) { return .None }
+        value = value * 10 + byte - asciiZero
+        if value > limit { return .None }
+    }
+    if negative { return .Some(0 - value) }
+    return .Some(value)
+}
+
+// Whether `text` holds nothing but ASCII whitespace.
+function isBlank(text: String) -> Bool {
+    for index in 0..utf8Count(text) {
+        let byte = utf8Byte(text, index)
+        if !isWhitespace(byte) && byte != asciiVerticalTab && byte != asciiFormFeed { return false }
+    }
+    return true
+}
+
+let asciiVerticalTab = 11
+let asciiFormFeed = 12

@@ -1,0 +1,334 @@
+import Foundation
+
+// A block's literals section (RFC 8878 section 3.1.1.3.1): as they are, as
+// one repeated byte, or Huffman-coded in four streams with the code's
+// weights described first, FSE-compressed when that is shorter.
+
+namespace ZstdHuffman {
+    // The longest code a decoder takes.
+    let longest: Number = 11
+    // Below this many literals a code costs more than it saves.
+    let fewest: Number = 64
+    // The accuracy of the distribution that compresses the weights.
+    let weightLog: Number = 6
+    // The most weights described one per 4 bits.
+    let directWeights: Number = 128
+}
+
+// The literals section holding `literals`, whichever way is shortest.
+function literalsSection(literals: borrow [UN8]) -> [UN8] {
+    let raw = plainLiteralsSection(literals, ZstdFormat.rawLiterals)
+    if literals.count < ZstdHuffman.fewest { return raw }
+    var counts: [Number] = []
+    for symbol in 0..256 { counts.append(0) }
+    for byte in literals { counts[Number(byte)] += 1 }
+    var present: Number = 0
+    for count in counts {
+        if count > 0 { present += 1 }
+    }
+    if present == 1 {
+        let single: [UN8] = [literals[0]]
+        var section = literalsHeader(ZstdFormat.rleLiterals, literals.count)
+        section.appendAll(single)
+        return section
+    }
+    return match huffmanLiteralsSection(literals, counts) {
+        Some(coded) -> coded.count < raw.count ? coded : raw
+        None -> raw
+    }
+}
+
+// A raw or RLE literals section's header, for `size` literals.
+function literalsHeader(type: Number, size: Number) -> [UN8] {
+    var header: [UN8] = []
+    if size < 32 {
+        header.append(UN8(type | (size << 3)))
+    } else if size < 4096 {
+        appendLittle(header, type | 4 | (size << 4), 2)
+    } else {
+        appendLittle(header, type | 12 | (size << 4), 3)
+    }
+    return header
+}
+
+function plainLiteralsSection(literals: borrow [UN8], type: Number) -> [UN8] {
+    var section = literalsHeader(type, literals.count)
+    section.appendAll(literals)
+    return section
+}
+
+// The literals Huffman-coded, when their code can be described.
+function huffmanLiteralsSection(literals: borrow [UN8], counts: borrow [Number]) -> [UN8]? {
+    let lengths = huffmanLengths(counts, ZstdHuffman.longest)
+    var longest: Number = 0
+    var last: Number = 0
+    for symbol in 0..256 {
+        if lengths[symbol] > 0 {
+            longest = max(longest, lengths[symbol])
+            last = symbol
+        }
+    }
+    // Each symbol's weight; the last symbol's is left for the decoder.
+    var weights: [Number] = []
+    for symbol in 0..last {
+        weights.append(lengths[symbol] == 0 ? 0 : longest + 1 - lengths[symbol])
+    }
+    let description = match huffmanDescription(weights) {
+        Some(found) -> found
+        None -> return .None
+    }
+    let codes = canonicalCodes(lengths, longest)
+    // Four streams, the first three of one size and the last of the rest.
+    let segment = trunc((literals.count + 3) / 4)
+    var streams: [[UN8]] = []
+    for index in 0..4 {
+        let from = min(index * segment, literals.count)
+        let to = index == 3 ? literals.count : min(from + segment, literals.count)
+        var writer = LowBitWriter {}
+        for step in 0..(to - from) {
+            let symbol = Number(literals[to - 1 - step])
+            writer.add(codes[symbol], lengths[symbol])
+        }
+        streams.append(writer.close())
+    }
+    var body = description
+    for index in 0..3 {
+        if streams[index].count > 65535 { return .None }
+        appendLittle(body, streams[index].count, 2)
+    }
+    for stream in streams { body.appendAll(stream) }
+    let regenerated = literals.count
+    let compressed = body.count
+    let type = ZstdFormat.compressedLiterals
+    var section: [UN8] = []
+    if regenerated < 1024 && compressed < 1024 {
+        appendLittle(section, type | 4 | (regenerated << 4) | (compressed << 14), 3)
+    } else if regenerated < 16384 && compressed < 16384 {
+        appendLittle(section, type | 8 | (regenerated << 4) | (compressed << 18), 4)
+    } else if regenerated < 262144 && compressed < 262144 {
+        appendLittle(section, type | 12 | (regenerated << 4) | (compressed << 22), 5)
+    } else {
+        return .None
+    }
+    section.appendAll(body)
+    return .Some(section)
+}
+
+// The code length of each byte from its count, none above `limit`: a
+// Huffman code, built again from flatter counts while it is too deep.
+function huffmanLengths(counts: borrow [Number], limit: Number) -> [Number] {
+    var flattened = copy counts
+    while true {
+        let lengths = huffmanDepths(flattened)
+        var deepest: Number = 0
+        for length in lengths { deepest = max(deepest, length) }
+        if deepest <= limit { return lengths }
+        for symbol in 0..flattened.count {
+            if flattened[symbol] > 0 { flattened[symbol] = trunc((flattened[symbol] + 1) / 2) }
+        }
+    }
+    return []
+}
+
+// The depth of each symbol with a count in a Huffman tree of the counts, by
+// the two-queue method.
+function huffmanDepths(counts: borrow [Number]) -> [Number] {
+    var leaves: [Number] = []
+    for symbol in 0..counts.count {
+        if counts[symbol] > 0 { leaves.append(symbol) }
+    }
+    let ordered = leaves.sorted(
+        { left, right in
+            return counts[left] < counts[right] || (counts[left] == counts[right] && left < right)
+        }
+    )
+    // Nodes: the leaves in order, then each joined pair.
+    var weight: [Number] = []
+    var parent: [Number] = []
+    for symbol in ordered {
+        weight.append(counts[symbol])
+        parent.append(-1)
+    }
+    var nextLeaf: Number = 0
+    var nextJoined = ordered.count
+    for join in 0..(ordered.count - 1) {
+        var picked: [Number] = []
+        for each in 0..2 {
+            let leafLeft = nextLeaf < ordered.count
+            let joinedLeft = nextJoined < weight.count
+            if leafLeft && (!joinedLeft || weight[nextLeaf] <= weight[nextJoined]) {
+                picked.append(nextLeaf)
+                nextLeaf += 1
+            } else {
+                picked.append(nextJoined)
+                nextJoined += 1
+            }
+        }
+        parent[picked[0]] = weight.count
+        parent[picked[1]] = weight.count
+        weight.append(weight[picked[0]] + weight[picked[1]])
+        parent.append(-1)
+    }
+    // A parent comes after its children, so depths fill from the root down.
+    var depth: [Number] = []
+    for node in 0..weight.count { depth.append(0) }
+    for step in 0..weight.count {
+        let node = weight.count - 1 - step
+        if parent[node] >= 0 { depth[node] = depth[parent[node]] + 1 }
+    }
+    var lengths: [Number] = []
+    for symbol in 0..counts.count { lengths.append(0) }
+    for index in 0..ordered.count { lengths[ordered[index]] = depth[index] }
+    return lengths
+}
+
+// The code of each symbol as the decoder assigns them: from the longest
+// codes up, each length's symbols in order, counting up from 0.
+function canonicalCodes(lengths: borrow [Number], longest: Number) -> [Number] {
+    var codes: [Number] = []
+    for symbol in 0..lengths.count { codes.append(0) }
+    var code: Number = 0
+    var previous = longest
+    for step in 0..longest {
+        let length = longest - step
+        if length < previous {
+            code = code >> (previous - length)
+            previous = length
+        }
+        for symbol in 0..lengths.count {
+            if lengths[symbol] != length { continue }
+            codes[symbol] = code
+            code += 1
+        }
+    }
+    return codes
+}
+
+// The description of a Huffman code's weights: FSE-compressed, or 4 bits
+// each, whichever there is and is shorter.
+function huffmanDescription(weights: borrow [Number]) -> [UN8]? {
+    var direct: [UN8]? = .None
+    if weights.count <= ZstdHuffman.directWeights {
+        var packed: [UN8] = [UN8(127 + weights.count)]
+        for pair in 0..(trunc((weights.count + 1) / 2)) {
+            let high = weights[pair * 2]
+            let low = pair * 2 + 1 < weights.count ? weights[pair * 2 + 1] : 0
+            packed.append(UN8((high << 4) | low))
+        }
+        direct = .Some(packed)
+    }
+    match compressedWeights(weights) {
+        Some(compressed) -> {
+            if compressed.count < 128 {
+                let shorter = match direct {
+                    Some(packed) -> compressed.count + 1 < packed.count
+                    None -> true
+                }
+                if shorter {
+                    var described: [UN8] = [UN8(compressed.count)]
+                    described.appendAll(compressed)
+                    return .Some(described)
+                }
+            }
+        }
+        None -> {}
+    }
+    return direct
+}
+
+// The weights FSE-coded with two interleaved states, after the
+// distribution's own description; nothing when there are too few.
+function compressedWeights(weights: borrow [Number]) -> [UN8]? {
+    if weights.count <= 2 { return .None }
+    let log = ZstdHuffman.weightLog
+    let size: Number = 1 << log
+    var counts: [Number] = []
+    for weight in 0..(ZstdHuffman.longest + 1) { counts.append(0) }
+    for weight in weights { counts[weight] += 1 }
+    var top: Number = 0
+    for weight in 0..counts.count {
+        if counts[weight] > 0 { top = weight }
+    }
+    // Each weight's share of the table, at least one slot, the largest
+    // taking what rounding left.
+    var normalized: [Number] = []
+    var total: Number = 0
+    var largest: Number = 0
+    for weight in 0..(top + 1) {
+        let count = counts[weight]
+        let share = count == 0 ? 0 : max(1, trunc(count * size / weights.count))
+        normalized.append(share)
+        total += share
+        if share > normalized[largest] { largest = weight }
+    }
+    normalized[largest] += size - total
+    if normalized[largest] < 1 { return .None }
+    var out = distributionDescription(normalized, log)
+    let encoder = fseEncoder(normalized, log)
+    var writer = LowBitWriter {}
+    var at = weights.count
+    var first: Number = 0
+    var second: Number = 0
+    if weights.count % 2 == 1 {
+        first = encoder.start(weights[at - 1])
+        second = encoder.start(weights[at - 2])
+        first = encoder.encode(first, weights[at - 3], writer)
+        at -= 3
+    } else {
+        second = encoder.start(weights[at - 1])
+        first = encoder.start(weights[at - 2])
+        at -= 2
+    }
+    while at > 0 {
+        second = encoder.encode(second, weights[at - 1], writer)
+        first = encoder.encode(first, weights[at - 2], writer)
+        at -= 2
+    }
+    encoder.flush(second, writer)
+    encoder.flush(first, writer)
+    out.appendAll(writer.close())
+    return .Some(out)
+}
+
+// An FSE distribution's description (RFC 8878 section 4.1.1): its accuracy,
+// then each count in as few bits as what remains allows, with runs of zero
+// counts shortened.
+function distributionDescription(normalized: borrow [Number], log: Number) -> [UN8] {
+    var writer = LowBitWriter {}
+    writer.add(log - 5, 4)
+    var remaining: Number = (1 << log) + 1
+    var threshold: Number = 1 << log
+    var bits = log + 1
+    var symbol: Number = 0
+    var previousZero = false
+    while symbol < normalized.count && remaining > 1 {
+        if previousZero {
+            var start = symbol
+            while symbol < normalized.count && normalized[symbol] == 0 { symbol += 1 }
+            while symbol >= start + 24 {
+                start += 24
+                writer.add(65535, 16)
+            }
+            while symbol >= start + 3 {
+                start += 3
+                writer.add(3, 2)
+            }
+            writer.add(symbol - start, 2)
+        }
+        let count = normalized[symbol]
+        symbol += 1
+        let most = 2 * threshold - 1 - remaining
+        remaining -= count < 0 ? -count : count
+        var value = count + 1
+        if value >= threshold { value += most }
+        writer.add(value, value < most ? bits - 1 : bits)
+        previousZero = value == 1
+        while remaining < threshold {
+            bits -= 1
+            threshold = threshold >> 1
+        }
+    }
+    // The description ends on a whole byte, without the stream's end mark.
+    if writer.heldCount > 0 { writer.bytes.append(UN8(writer.held & 255)) }
+    return copy writer.bytes
+}

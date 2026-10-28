@@ -1,0 +1,402 @@
+import Foundation
+
+// CfxScalarExtraTests.kira
+// Deep scalar test suite: arithmetic identities, operator precedence, integer
+// div/mod edge cases, comparison matrices, boolean truth tables, ternary chains,
+// float checksums, and Gauss/triangular/square-number cross-checks.
+// All top-level names use prefix cfxs / CfxS.
+
+// ---------------------------------------------------------------------------
+// Large safe values
+// ---------------------------------------------------------------------------
+
+// 10^10 = 10000000000
+@Test
+function cfxSLargeSafe1() {
+    expect!(100000 * 100000 == 10000000000)
+}
+
+// 999998000001
+@Test
+function cfxSLargeSafe2() {
+    expect!(999999 * 999999 == 999998000001)
+}
+
+// 1111111101
+@Test
+function cfxSLargeSafe3() {
+    let a = 123456789
+    let b = 9
+    expect!(a * b == 1111111101)
+}
+
+@Test
+function cfxSLargeDiv2() {
+    let a = 1000000000000
+    let b = 1000000
+    expect!(a / b == 1000000)
+}
+
+// ---------------------------------------------------------------------------
+// GCD cross-checks
+// ---------------------------------------------------------------------------
+
+@Test
+function cfxSGcdIdentity() {
+    expect!(cfxsGcd(42, 42) == 42)
+}
+
+@Test
+function cfxSGcdWithOne() {
+    expect!(cfxsGcd(1, 999) == 1)
+}
+
+@Test
+function cfxSGcdSymmetric() {
+    let g1 = cfxsGcd(48, 18)
+    let g2 = cfxsGcd(18, 48)
+    let result = g1 == g2 ? 1 : 0
+    expect!(result == 1)
+}
+
+// gcd(360,240)=120, gcd(120,180)=60, gcd(60,120)=60
+@Test
+function cfxSGcdChain() {
+    var g = cfxsGcd(360, 240)
+    g = cfxsGcd(g, 180)
+    g = cfxsGcd(g, 120)
+    expect!(g == 60)
+}
+
+// gcd(12,18)=6, lcm=36
+@Test
+function cfxSGcdLcmProduct() {
+    let a = 12
+    let b = 18
+    let g = cfxsGcd(a, b)
+    let lcm = a * b / g
+    expect!(lcm == 36)
+}
+
+// ---------------------------------------------------------------------------
+// Min/Max helpers
+// ---------------------------------------------------------------------------
+
+@Test
+function cfxSMinBasic() {
+    expect!(cfxsMin(7, 13) == 7)
+}
+
+@Test
+function cfxSMaxBasic() {
+    expect!(cfxsMax(7, 13) == 13)
+}
+
+@Test
+function cfxSMinEq() {
+    expect!(cfxsMin(5, 5) == 5)
+}
+
+@Test
+function cfxSAbsPos() {
+    expect!(cfxsAbs(42) == 42)
+}
+
+@Test
+function cfxSAbsNeg() {
+    expect!(cfxsAbs(0 - 42) == 42)
+}
+
+@Test
+function cfxSAbsZero() {
+    expect!(cfxsAbs(0) == 0)
+}
+
+@Test
+function cfxSMinOverArray() {
+    var mn = 1000000
+    let xs: [Int] = [42, 7, 99, 3, 55, 1, 88]
+    for v in xs {
+        mn = cfxsMin(mn, v)
+    }
+    expect!(mn == 1)
+}
+
+@Test
+function cfxSMaxOverArray() {
+    var mx = 0
+    let xs: [Int] = [42, 7, 99, 3, 55, 1, 88]
+    for v in xs {
+        mx = cfxsMax(mx, v)
+    }
+    expect!(mx == 99)
+}
+
+// ---------------------------------------------------------------------------
+// Mixed operator loop folds
+// ---------------------------------------------------------------------------
+
+// sum: i*2=420, -sum(i/3)=sum(0,0,1,1,1,2,2,2,3,3,3,4,4,4,5,5,5,6,6,6)=63
+// +sum(i%5)=sum(1,2,3,4,0,1,2,3,4,0,1,2,3,4,0,1,2,3,4,0)=40
+// total = 420-63+40 = 397
+@Test
+function cfxSMixedLoop1() {
+    var acc = 0
+    for i in 1..21 {
+        acc = acc + i * 2 - trunc(i / 3) + i % 5
+    }
+    expect!(acc == 397)
+}
+
+// evens 0,2,...,28: sum(i^2) = 4*sum(k^2,k=0..14) = 4*(14*15*29/6) = 4*1015 = 4060
+// odds 1,3,...,29 negated: -(1+3+...+29) = -(15^2) = -225
+// total = 4060-225 = 3835
+@Test
+function cfxSMixedLoop2() {
+    var acc = 0
+    for i in 0..30 {
+        acc = acc + (i % 2 == 0 ? i * i : (0 - i))
+    }
+    expect!(acc == 3835)
+}
+
+// 2^i: 2,4,8,16,32,64,128,256,512,1024 sum=2046
+// i^2: 1,4,9,16,25,36,49,64,81,100 sum=385
+// total = 2046-385 = 1661
+@Test
+function cfxSMixedLoop3() {
+    var acc = 0
+    for i in 1..11 {
+        acc = acc + cfxsPow(2, i) - cfxsPow(i, 2)
+    }
+    expect!(acc == 1661)
+}
+
+// ---------------------------------------------------------------------------
+// String .count (no concat)
+// ---------------------------------------------------------------------------
+
+@Test
+function cfxSStringCountHello() {
+    let s = "hello"
+    expect!(s.count == 5)
+}
+
+@Test
+function cfxSStringCountEmpty() {
+    let s = ""
+    expect!(s.count == 0)
+}
+
+@Test
+function cfxSStringCountLong() {
+    let s = "abcdefghij"
+    expect!(s.count == 10)
+}
+
+// A trap test: `expectTrap!` names the trap it expects, and the body runs in a child that traps.
+
+@Test
+function cfxSTrapDivZero() {
+    expectTrap!("")
+        let a = 7
+        let b = 0
+        let _ = a / b
+}
+
+@Test
+function cfxSTrapModZero() {
+    expectTrap!("")
+        let a = 100
+        let b = 0
+        let _ = a % b
+}
+
+@Test
+function cfxSTrapArrayOOB() {
+    expectTrap!("")
+    let xs: [Int] = [1, 2, 3]
+    let _ = xs[100]
+}
+
+@Test
+function cfxSTrapDivZeroNeg() {
+    expectTrap!("")
+        let a = 0 - 5
+        let b = 0
+        let _ = a / b
+}
+
+@Test
+function cfxSTrapDivZeroLarge() {
+    expectTrap!("")
+        let a = 9999999999
+        let b = 0
+        let _ = a / b
+}
+
+@Test
+function cfxSTrapOOBSingleElem() {
+    expectTrap!("")
+    let xs: [Int] = [99]
+    let _ = xs[1]
+}
+
+@Test
+function cfxSTrapModZeroLoop() {
+    expectTrap!("")
+    var d = 3
+    for i in 0..5 {
+        if i == 3 {
+            d = 0
+        }
+        let _ = 10 % d
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Negative `%` truncates toward zero (S8)
+//
+// `%` must truncate (sign follows the dividend) to match `/` (@divTrunc), the
+// LLVM backend's srem, and Rust — NOT floored (@mod). These previously failed
+// on the VM (floored gave 3 / -3) and disagreed with the LLVM backend.
+// ---------------------------------------------------------------------------
+
+@Test
+function cfxSModNegDividendPosDivisor() {
+    expect!((0 - 17) % 5 == 0 - 2)
+}
+
+@Test
+function cfxSModPosDividendNegDivisor() {
+    expect!(17 % (0 - 5) == 2)
+}
+
+@Test
+function cfxSModNegDividendNegDivisor() {
+    expect!((0 - 17) % (0 - 5) == 0 - 2)
+}
+
+@Test
+function cfxSModNegExact() {
+    expect!((0 - 20) % 5 == 0)
+}
+
+@Test
+function cfxSDivModIdentityNegDividend() {
+    let a: Int = 0 - 17
+    let b: Int = 5
+    expect!((a / b) * b + (a % b) == 0 - 17)
+}
+
+@Test
+function cfxSDivModIdentityNegDivisor() {
+    let a: Int = 17
+    let b: Int = 0 - 5
+    expect!((a / b) * b + (a % b) == 17)
+}
+
+// (a/b)*b + a%b == a over a grid of signed operands; count the holds.
+// a in [-12,12] = 25 values; b in [-4,4] \ {0} = 8 -> 200 holds.
+@Test
+function cfxSDivModIdentityGridMixedSigns() {
+    var ok = 0
+    for a in (0 - 12)..13 {
+        for b in (0 - 4)..5 {
+            if b != 0 {
+                if trunc(a / b) * b + (a % b) == a {
+                    ok = ok + 1
+                }
+            }
+        }
+    }
+    expect!(ok == 200)
+}
+
+// truncated remainder: sign follows dividend -> -1.0 (floored would be 3.0)
+@Test
+function cfxSFloatModNegTruncates() {
+    let r = (0.0 - 9.0) % 4.0
+    let result = r == (0.0 - 1.0) ? 1 : 0
+    expect!(result == 1)
+}
+
+// ---------------------------------------------------------------------------
+// Deep recursion
+// ---------------------------------------------------------------------------
+
+function cfxsDeepRec(d: Int) -> Int {
+    if d <= 0 {
+        return 0
+    }
+    return 1 + cfxsDeepRec(d - 1)
+}
+
+@Test
+function cfxSShallowRecursionOk() {
+    expect!(cfxsDeepRec(200) == 200)
+}
+
+@Test
+function cfxSDeepRecursionCompletes() {
+    expect!(cfxsDeepRec(1000) == 1000)
+}
+
+// ---------------------------------------------------------------------------
+// Float infinity and NaN
+//
+// Division by zero follows IEEE: x/0 is ±infinity (sign of the dividend and
+// the zero), 0/0 and inf-inf are NaN, and NaN compares unequal to everything,
+// itself included. Pinned here because a regression on one backend and not
+// another would be visible in nothing else — every ordinary float case has
+// the same answer either way.
+// ---------------------------------------------------------------------------
+
+@Test
+function cfxSFloatDivideByZeroIsInfinity() {
+    let zero: Float = 0.0
+    let result = 1.0 / zero == 2.0 / zero ? 1 : 0
+    expect!(result == 1)
+}
+
+@Test
+function cfxSFloatNegativeInfinityOrdersBelowEverything() {
+    let zero: Float = 0.0
+    let below: Float = -1000000.0
+    let result = (zero - 1.0) / zero < below ? 1 : 0
+    expect!(result == 1)
+}
+
+@Test
+function cfxSFloatPositiveInfinityOrdersAboveEverything() {
+    let zero: Float = 0.0
+    let large: Float = 1000000.0
+    let result = large < 1.0 / zero ? 1 : 0
+    expect!(result == 1)
+}
+
+// The one way NaN is written: 0.0/0.0. It is not equal to itself,
+// which no other float value can say.
+@Test
+function cfxSFloatZeroOverZeroIsNaN() {
+    let zero: Float = 0.0
+    let result = (zero / zero) == (zero / zero) ? 0 : 1
+    expect!(result == 1)
+}
+
+@Test
+function cfxSFloatNaNComparesUnequalToNumbers() {
+    let zero: Float = 0.0
+    let one: Float = 1.0
+    let nan = zero / zero
+    let result = nan == one || nan < one || nan > one ? 0 : 1
+    expect!(result == 1)
+}
+
+@Test
+function cfxSFloatInfinitySubtractsItselfToNaN() {
+    let zero: Float = 0.0
+    let infinity = 1.0 / zero
+    let result = (infinity - infinity) == infinity ? 0 : 1
+    expect!(result == 1)
+}

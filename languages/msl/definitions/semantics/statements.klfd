@@ -1,0 +1,282 @@
+// Statements. Each brace and each statement a control statement governs
+// opens a scope, as in C++. A `threadgroup` variable of a kernel is a
+// workgroup global named after it, and a local texture or sampler is
+// another name for the resource it is initialized from.
+
+function truncated(values: [Int], count: Int) -> [Int] {
+    var kept: [Int] = []
+    for index in 0..count {
+        kept.append(values[index])
+    }
+    return kept
+}
+
+extend Checker {
+    function addStatement(borrow mut self, statement: CheckedStatement) -> Int {
+        program.statements.append(statement)
+        return program.statements.count - 1
+    }
+
+    function plainStatement(borrow mut self, kind: CheckedStatementKind, value: Int, body: [Int], span: Span) -> Int {
+        return addStatement(CheckedStatement {
+            kind = kind, local = -1, value = value, step = -1, initial = [], body = body, otherwise = [], cases = [],
+            testAfter = false, span = span
+        })
+    }
+
+    function openScope(borrow mut self) {
+        scopes.append(visible.count)
+    }
+
+    function closeScope(borrow mut self) {
+        let start = scopes[scopes.count - 1]
+        visible = truncated(visible, start)
+        scopes = truncated(scopes, scopes.count - 1)
+    }
+
+    function checkBlock(borrow mut self, body: [Int], scoped: Bool) -> [Int] {
+        if scoped { openScope() }
+        var checked: [Int] = []
+        for index in body {
+            checkStatement(index, checked)
+        }
+        if scoped { closeScope() }
+        return checked
+    }
+
+    // A statement a control statement governs, in a scope of its own.
+    function checkGoverned(borrow mut self, index: Int) -> [Int] {
+        if index < 0 { return [] }
+        return checkBlock([index], true)
+    }
+
+    function checkStatement(borrow mut self, index: Int, into: borrow mut [Int]) {
+        let statement = tree.statements[index]
+        let span = statement.span
+        match statement.kind {
+            Declare -> {
+                let declared = checkDeclaration(statement)
+                if declared >= 0 { into.append(declared) }
+            }
+            Evaluate -> into.append(plainStatement(.EvaluateValue, checkExpression(statement.value), [], span))
+            If -> {
+                let condition = checkCondition(statement.value)
+                let body = checkGoverned(statement.body[0])
+                let otherwise = checkGoverned(statement.otherwise)
+                into.append(addStatement(CheckedStatement {
+                    kind = .IfElse, local = -1, value = condition, step = -1, initial = [], body = body,
+                    otherwise = otherwise, cases = [], testAfter = false, span = span
+                }))
+            }
+            Switch -> into.append(checkSwitch(statement))
+            Case -> report(.UnsupportedStatement, span)
+            For -> into.append(checkLoop(statement, false))
+            While -> into.append(checkLoop(statement, false))
+            Do -> into.append(checkLoop(statement, true))
+            Break -> {
+                if loops == 0 && switches == 0 { report(.OutsideLoop, span) }
+                into.append(plainStatement(.BreakOut, -1, [], span))
+            }
+            Continue -> {
+                if loops == 0 { report(.OutsideLoop, span) }
+                into.append(plainStatement(.ContinueOn, -1, [], span))
+            }
+            Return -> into.append(checkReturn(statement))
+            Block -> into.append(plainStatement(.Nested, -1, checkBlock(statement.body, true), span))
+            Group -> {
+                for part in statement.body {
+                    checkStatement(part, into)
+                }
+            }
+            Empty -> {}
+        }
+    }
+
+    function checkCondition(borrow mut self, index: Int) -> Int {
+        let condition = checkExpression(index)
+        return toCondition(condition)
+    }
+
+    // A local, a workgroup variable or a resource's other name; -1 when
+    // the declaration makes no statement.
+    function checkDeclaration(borrow mut self, statement: Statement) -> Int {
+        let written = tree.types[statement.typeSyntax]
+        let span = statement.span
+        if written.pointer || written.reference {
+            report(.StoredPointer, span)
+            return -1
+        }
+        if written.space == .ThreadgroupSpace {
+            declareShared(statement)
+            return -1
+        }
+        if written.space == .ConstantSpace || written.space == .DeviceSpace {
+            report(.UnsupportedStatement, span)
+            return -1
+        }
+        if written.name == "auto" {
+            if statement.value < 0 || written.extents.count > 0 {
+                report(.Deduction, span)
+                return -1
+            }
+            let value = checkExpression(statement.value)
+            let deduced = typeOf(value)
+            if isHandle(deduced) { return nameResource(statement.name, value, span) }
+            if !isConstructible(deduced) && !broken(value) { report(.TypeMismatch, span) }
+            let local = bind(statement.name, deduced, written.constant, span)
+            return declareLocal(local, value, span)
+        }
+        let localType = resolve(statement.typeSyntax)
+        if isHandle(localType) {
+            if statement.value < 0 {
+                report(.UnsupportedStatement, span)
+                return -1
+            }
+            let value = checkExpression(statement.value)
+            if typeOf(value) != localType && !broken(value) { report(.TypeMismatch, span) }
+            return nameResource(statement.name, value, span)
+        }
+        if !isConstructible(localType) && !isVoid(localType) { report(.UnsupportedType, span) }
+        var value = -1
+        if statement.value >= 0 { value = checkInitializer(statement.value, localType, span) }
+        let local = bind(statement.name, localType, written.constant, span)
+        return declareLocal(local, value, span)
+    }
+
+    function declareLocal(borrow mut self, local: Int, value: Int, span: Span) -> Int {
+        return addStatement(CheckedStatement {
+            kind = .DeclareLocal, local = local, value = value, step = -1, initial = [], body = [], otherwise = [],
+            cases = [], testAfter = false, span = span
+        })
+    }
+
+    // `texture2d<float> t = source;` names the resource `source` names.
+    function nameResource(borrow mut self, name: String, value: Int, span: Span) -> Int {
+        let named = program.expressions[value]
+        if named.kind == .Global {
+            handles.append(HandleName { name = name, global = named.target, parameter = -1 })
+        } else if named.kind == .BoundParameter {
+            handles.append(HandleName { name = name, global = -1, parameter = named.target })
+        } else if !broken(value) {
+            report(.UnsupportedStatement, span)
+        }
+        return -1
+    }
+
+    // `threadgroup T name;` in a kernel: a workgroup global.
+    function declareShared(borrow mut self, statement: Statement) {
+        let span = statement.span
+        let sharedType = resolve(statement.typeSyntax)
+        if stage != .KernelStage || statement.value >= 0 { report(.BadThreadgroup, span) }
+        if !isConstructible(sharedType) && !containsAtomic(sharedType) { report(.UnsupportedType, span) }
+        program.globals.append(CheckedGlobal {
+            name = statement.name, kind = .Threadgroup, globalType = sharedType, device = false, readOnly = false,
+            slot = -1, value = -1, id = -1, plain = false, comparison = false, span = span
+        })
+        handles.append(HandleName { name = statement.name, global = program.globals.count - 1, parameter = -1 })
+    }
+
+    function checkReturn(borrow mut self, statement: Statement) -> Int {
+        var value = -1
+        if statement.value >= 0 {
+            if isVoid(result) {
+                report(.TypeMismatch, statement.span)
+            } else {
+                value = checkInitializer(statement.value, result, statement.span)
+            }
+        } else if !isVoid(result) {
+            report(.TypeMismatch, statement.span)
+        }
+        return plainStatement(.ReturnValue, value, [], statement.span)
+    }
+
+    // `for`, `while` and `do`: an optional first statement, a condition
+    // (-1 when none, which always holds), a body and a step.
+    function checkLoop(borrow mut self, statement: Statement, testAfter: Bool) -> Int {
+        openScope()
+        var initial: [Int] = []
+        if statement.initial >= 0 { checkStatement(statement.initial, initial) }
+        var condition = -1
+        if statement.value >= 0 { condition = checkCondition(statement.value) }
+        var step = -1
+        if statement.step >= 0 { step = checkExpression(statement.step) }
+        loops += 1
+        let body = checkGoverned(statement.body[0])
+        loops -= 1
+        closeScope()
+        return addStatement(CheckedStatement {
+            kind = .LoopFor, local = -1, value = condition, step = step, initial = initial, body = body,
+            otherwise = [], cases = [], testAfter = testAfter, span = statement.span
+        })
+    }
+
+    // A switch's labels group the statements after them into cases. A
+    // case may fall through only when it has no statements, which joins
+    // its labels to the next; a switch without `default` gains an empty one.
+    function checkSwitch(borrow mut self, statement: Statement) -> Int {
+        var selector = checkExpression(statement.value)
+        let selectorType = typeOf(selector)
+        var scalar: Scalar = .Int
+        if isScalar(selectorType) && typeAt(selectorType).scalar == .UInt {
+            scalar = .UInt
+        } else if isScalar(selectorType) && typeAt(selectorType).scalar != .Bool && !isFloating(selectorType) {
+            scalar = typeAt(selectorType).scalar
+        } else if isScalar(selectorType) && typeAt(selectorType).scalar == .Bool {
+            selector = convertTo(selector, scalarType(.Int))
+        } else if !broken(selector) {
+            report(.TypeMismatch, statement.span)
+        }
+        switches += 1
+        openScope()
+        var cases: [CheckedCase] = []
+        var seen: [String] = []
+        var labels: [ConstValue] = []
+        var hasDefault = false
+        var sawDefault = false
+        var body: [Int] = []
+        var open = false
+        for index in statement.body {
+            let part = tree.statements[index]
+            if part.kind != .Case {
+                if !open { report(.UnsupportedStatement, part.span) }
+                checkStatement(index, body)
+                continue
+            }
+            if open && body.count > 0 {
+                if finishes(body, true) { report(.FallThrough, part.span) }
+                cases.append(CheckedCase { labels = labels, hasDefault = hasDefault, body = body, fallsThrough = false })
+                labels = []
+                hasDefault = false
+                body = []
+            }
+            open = true
+            if part.value < 0 {
+                if sawDefault { report(.DuplicateCase, part.span) }
+                sawDefault = true
+                hasDefault = true
+                continue
+            }
+            match fold(part.value) {
+                Some(label) -> {
+                    let text = decimalText(label)
+                    if contains(seen, text) { report(.DuplicateCase, part.span) }
+                    seen.append(text)
+                    labels.append(ConstValue { scalar = scalar, text = text })
+                }
+                None -> report(.NotConstant, part.span)
+            }
+        }
+        if open {
+            cases.append(CheckedCase { labels = labels, hasDefault = hasDefault, body = body, fallsThrough = false })
+        }
+        if !sawDefault {
+            cases.append(CheckedCase { labels = [], hasDefault = true, body = [], fallsThrough = false })
+        }
+        closeScope()
+        switches -= 1
+        return addStatement(CheckedStatement {
+            kind = .SwitchCases, local = -1, value = selector, step = -1, initial = [], body = [], otherwise = [],
+            cases = cases, testAfter = false, span = statement.span
+        })
+    }
+}

@@ -1,0 +1,158 @@
+import Foundation
+
+// Enums: payload-less and single-payload variants, exhaustive match with
+// payload binding, generic Result<T, E>, and linear attempt/try/handle.
+
+enum EnShade {
+    Light
+    Dark
+    Mid
+}
+
+enum EnNode {
+    Leaf(Int)
+    Tagged(Int)
+    Empty
+}
+
+enum EnMathError {
+    DivByZero
+    Negative
+}
+
+function enmShadeWeight(s: borrow EnShade) -> Int {
+    match s {
+        Light -> { return 1 }
+        Dark -> { return 2 }
+        Mid -> { return 3 }
+    }
+}
+
+function enmNodeValue(n: borrow EnNode) -> Int {
+    match n {
+        Leaf(v) -> { return v }
+        Tagged(v) -> { return v * 10 }
+        Empty -> { return 0 }
+    }
+}
+
+function enmSafeDiv(a: Int, b: Int) -> Result<Int, EnMathError> {
+    if b == 0 {
+        return .Error(.DivByZero)
+    }
+    if a < 0 {
+        return .Error(.Negative)
+    }
+    return .Ok(a / b)
+}
+
+function enmErrCode(e: borrow EnMathError) -> Int {
+    match e {
+        DivByZero -> { return 0 - 1 }
+        Negative -> { return 0 - 2 }
+    }
+}
+
+function enmChain(a: Int, b: Int, c: Int) -> Int {
+    let r1 = enmSafeDiv(a, b)
+    match r1 {
+        Ok(x) -> {
+            let r2 = enmSafeDiv(x, c)
+            match r2 {
+                Ok(y) -> { return x + y }
+                Error(e) -> { return enmErrCode(e) }
+            }
+        }
+        Error(e) -> { return enmErrCode(e) }
+    }
+}
+
+function enumsPayloadlessSection() -> Int {
+    var acc = 0
+    for i in 0..60 {
+        let s = enmShadeFor(i)
+        acc = acc + enmShadeWeight(s)
+    }
+    return acc
+}
+
+function enumsSinglePayloadSection() -> Int {
+    var acc = 0
+    for j in 0..50 {
+        let n = enmNodeFor(j)
+        acc = acc + enmNodeValue(n)
+    }
+    return acc
+}
+
+function enumsResultSection() -> Int {
+    var acc = 0
+    acc = acc + enmChain(100, 5, 2)
+    acc = acc + enmChain(100, 0, 2)
+    acc = acc + enmChain(0 - 4, 2, 1)
+    return acc
+}
+
+// Native drop-elaboration leak-guard churn (types live in
+// runparity/EmxTests.kira; app/ is one flat package). Each loop leaks
+// per-iteration on the LLVM binary if typed enum teardown regresses, so the
+// harness leak run catches it while these checksums pin exact parity phases.
+function enumsStringPayloadChurnSection() -> Int {
+    var acc = 0
+    for k in 0..40 {
+        let tags: [EmxTag] = [.Named("a" + "b"), .Anon, .Named("c" + "d")]
+        let bag = EmxBag { tags: move tags }
+        acc = acc + emxCountNamed(bag)
+    }
+    return acc
+}
+
+function enumsStructPayloadChurnSection() -> Int {
+    var acc = 0
+    for m in 0..40 {
+        let card = EmxCard()
+        acc = acc + emxPaintScore(card.paint)
+        for e in 0..card.effects.count {
+            acc = acc + emxPaintScore(card.effects[e])
+        }
+    }
+    return acc
+}
+
+function enumsConstructAnyChurnSection() -> Int {
+    var acc = 0
+    for q in 0..40 {
+        let cells: [EmxCell] = [.Filled(EmxCircle(r: 3)), .Empty, .Filled(EmxSquare(s: 4))]
+        let grid = EmxGrid { cells: move cells }
+        acc = acc + grid.cells.count + emxTotalArea(grid)
+    }
+    return acc
+}
+
+// NOTE: these intentionally return the enum directly from each branch. The
+// `var s = .X; s = .Y; return s` form (a mutable enum local
+// reassigned, then returned) miscompiles on the LLVM backend — see
+// FINDINGS.md (#1) and known-bugs/llvm_enum_var_local.
+function enmShadeFor(i: Int) -> EnShade {
+    if (i % 3) == 0 {
+        return .Light
+    } else if (i % 3) == 1 {
+        return .Dark
+    } else if (i % 3) == 2 {
+        return .Mid
+    } else {
+        return .Light
+    }
+}
+
+function enmNodeFor(j: Int) -> EnNode {
+    if (j % 3) == 0 {
+        return .Leaf(j)
+    } else if (j % 3) == 1 {
+        return .Tagged(j)
+    } else if (j % 3) == 2 {
+        return .Empty
+    } else {
+        return .Empty
+    }
+}

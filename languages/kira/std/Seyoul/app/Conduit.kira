@@ -1,0 +1,122 @@
+import Foundation
+import Heap
+
+// A conduit: a mailbox between threads. Any number of tasks on any threads
+// send; one task receives, on the thread it runs on.
+//
+//     let results = Conduit<Number>()
+//     pool.spawn(crunch(copy results))
+//     let first = results.receive().await
+//
+// The queue is guarded by a spin lock held only to push or take one value.
+// A send that finds the receiver waiting hands its waker to the receiver's
+// runtime, which wakes it on its own thread: a runtime's run queue is never
+// touched by another thread.
+class Conduit<Value>: Drop {
+    let lock: RawPtr = newSpinLock()
+    var ring: [Value?] = []
+    var head: Number = 0
+    var length: Number = 0
+    var closed: Bool = false
+    var receiver: Waker? = .None
+    var receiverRuntime: Runtime? = .None
+
+    // Queues `value` for the receiver. False, dropping it, once closed.
+    function send(value: Value) -> Bool {
+        lockSpin(self.lock)
+        if self.closed {
+            unlockSpin(self.lock)
+            return false
+        }
+        if self.length == self.ring.count { self.grow() }
+        let mask = self.ring.count - 1
+        self.ring[(self.head + self.length) & mask] = .Some(move value)
+        self.length += 1
+        self.wakeReceiver()
+        return true
+    }
+
+    // The next value, once one is sent; `.None` once the conduit is closed
+    // and empty.
+    function receive() -> ConduitReceive<Value> {
+        return ConduitReceive<Value> { conduit = self }
+    }
+
+    // Ends the conduit: the receiver takes what was sent, then `.None`.
+    function close() {
+        lockSpin(self.lock)
+        self.closed = true
+        self.wakeReceiver()
+    }
+
+    // Called holding the lock, which it gives up before waking anyone.
+    function wakeReceiver() {
+        let waiting = self.receiver
+        let runtime = self.receiverRuntime
+        self.receiver = .None
+        self.receiverRuntime = .None
+        unlockSpin(self.lock)
+        match waiting {
+            Some(waker) -> {
+                match runtime {
+                    Some(owner) -> owner.wakeExpected(copy waker)
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+    }
+
+    // Called holding the lock.
+    function take() -> Value? {
+        let taken: Value? = move self.ring[self.head]
+        self.ring[self.head] = .None
+        self.head = (self.head + 1) & (self.ring.count - 1)
+        self.length -= 1
+        return move taken
+    }
+
+    // Called holding the lock: doubles the ring, keeping the queued values
+    // in order from slot 0.
+    function grow() {
+        var capacity = self.ring.count * 2
+        if capacity == 0 { capacity = 8 }
+        var grown: [Value?] = []
+        let mask = self.ring.count - 1
+        for index in 0..self.length {
+            let moved: Value? = move self.ring[(self.head + index) & mask]
+            grown.append(move moved)
+        }
+        for index in self.length..capacity { grown.append(.None) }
+        self.ring = move grown
+        self.head = 0
+    }
+
+    function drop(borrow mut self) {
+        Heap.freeRaw(self.lock)
+    }
+}
+
+struct ConduitReceive<Value>: Future<Value?> {
+    let conduit: Conduit<Value>
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Value?> {
+        lockSpin(self.conduit.lock)
+        if self.conduit.length > 0 {
+            let taken = self.conduit.take()
+            unlockSpin(self.conduit.lock)
+            return .Ready(move taken)
+        }
+        if self.conduit.closed {
+            unlockSpin(self.conduit.lock)
+            return .Ready(.None)
+        }
+        if self.conduit.receiver.isNone() { seyoul.expecting += 1 }
+        self.conduit.receiver = .Some(context.waker)
+        self.conduit.receiverRuntime = .Some(seyoul)
+        unlockSpin(self.conduit.lock)
+        // A sender's wake interrupts the poller, so it is made before then.
+        let made = seyoul.reactor.ensurePoller()
+        return .Pending
+    }
+}

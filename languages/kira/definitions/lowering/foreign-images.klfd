@@ -1,0 +1,382 @@
+// C images: a value as C lays it out (KLF section 26.2). A Kira struct
+// crossing the seam is copied into one and back: a `Bool` is a byte, a
+// payload-less enum its case's number as a C int, a `CString`, an
+// `@FFI.Pointer` and an `@FFI.Callback` the pointer they hold, a distinct its
+// representation, an `@FFI.Array` its elements inline, and a C struct a
+// record of C layout over the images of its fields.
+
+// A C image record is named after its struct, past every suffix an instance
+// or a scoped type takes, plus a hash of the struct's name.
+let cImageSuffixBase = 2199023255552
+
+extend KirTypes {
+    // Each struct C sees by value, behind a pointer or inside another one
+    // gets its image record.
+    function declareForeignImages(borrow mut self, builder: KirModuleBuilder, program: CheckedProgram) {
+        let absent: Optional<KirType> = .None
+        for _ in program.structs {
+            images.append(absent)
+            imageSizes.append(0 - 1)
+            imageAlignments.append(1)
+            let none: [Int] = []
+            imageFields.append(none)
+            bitOffsets.append(none)
+        }
+        var pending: [Type] = []
+        for index in 0..program.structs.count {
+            match program.structs[index].shape {
+                CLayout -> pending.append(Type.structure(index))
+                CUnion -> pending.append(Type.structure(index))
+                CPointer(target) -> {
+                    match target {
+                        Some(pointee) -> pending.append(Type.structure(pointee))
+                        None -> {}
+                    }
+                }
+                CArray -> pending.append(Type.structure(index))
+                Plain -> {}
+                Callback -> {}
+            }
+        }
+        for foreign in program.foreignFunctions {
+            for parameter in foreign.parameterTypes { pending.append(parameter) }
+            pending.append(foreign.resultType)
+        }
+        for callback in program.foreignCallbacks {
+            for parameter in callback.parameters { pending.append(parameter) }
+            pending.append(callback.result)
+        }
+        var declared: [Int] = []
+        var at = 0
+        while at < pending.count {
+            let valueType = pending[at]
+            at += 1
+            if valueType.kind != .Structure || isArrayType(program, valueType) || isCStringType(program, valueType) { continue }
+            let structure = program.structs[valueType.declaration]
+            match structure.shape {
+                CArray -> pending.append(cArrayElementType(program, valueType))
+                Callback -> {}
+                CPointer -> {}
+                CLayout -> {
+                    if images[valueType.declaration].isSome() { continue }
+                    images[valueType.declaration] = .Some(declareImage(builder, program, valueType.declaration))
+                    declared.append(valueType.declaration)
+                    for field in structure.fields { pending.append(field.valueType) }
+                }
+                CUnion -> {
+                    if images[valueType.declaration].isSome() { continue }
+                    images[valueType.declaration] = .Some(declareImage(builder, program, valueType.declaration))
+                    declared.append(valueType.declaration)
+                    for field in structure.fields { pending.append(field.valueType) }
+                }
+                Plain -> {
+                    if structure.genericBase == "Distinct" {
+                        pending.append(structure.fields[0].valueType)
+                        continue
+                    }
+                    if images[valueType.declaration].isSome() { continue }
+                    images[valueType.declaration] = .Some(declareImage(builder, program, valueType.declaration))
+                    declared.append(valueType.declaration)
+                    for field in structure.fields { pending.append(field.valueType) }
+                }
+            }
+        }
+        for index in declared { completeImage(builder, program, index) }
+    }
+
+    function imageType(borrow self, program: CheckedProgram, valueType: Type) -> KirType {
+        match valueType.kind {
+            Integer -> return of(valueType)
+            Decimal -> return of(valueType)
+            Floating -> return of(valueType)
+            Pointer -> return pointer
+            Boolean -> return integer8
+            Enumeration -> return integer32
+            Void -> return unit
+            Invalid -> return unit
+            Structure -> {
+                match images[valueType.declaration] {
+                    Some(image) -> return image
+                    None -> {}
+                }
+                match program.structs[valueType.declaration].shape {
+                    CArray(count) -> return kir_type_array(count, imageType(program, cArrayElementType(program, valueType)))
+                    Plain -> return imageType(program, program.structs[valueType.declaration].fields[0].valueType)
+                    CLayout -> return pointer
+                    CUnion -> return pointer
+                    Callback -> return pointer
+                    CPointer -> return pointer
+                }
+            }
+        }
+    }
+
+    function imageSize(borrow self, program: CheckedProgram, valueType: Type) -> Int {
+        match valueType.kind {
+            Integer -> return valueType.bits / 8
+            Decimal -> return 8
+            Floating -> return valueType.bits / 8
+            Pointer -> return 8
+            Boolean -> return 1
+            Enumeration -> return 4
+            Void -> return 0
+            Invalid -> return 0
+            Structure -> {
+                if images[valueType.declaration].isSome() { return imageSizes[valueType.declaration] }
+                match program.structs[valueType.declaration].shape {
+                    CArray(count) -> return count * imageSize(program, cArrayElementType(program, valueType))
+                    Plain -> return imageSize(program, program.structs[valueType.declaration].fields[0].valueType)
+                    CLayout -> return 8
+                    CUnion -> return 8
+                    Callback -> return 8
+                    CPointer -> return 8
+                }
+            }
+        }
+    }
+
+    // The alignment C gives the image: a scalar's own width, a record's
+    // widest field, an array's element.
+    function imageAlignment(borrow self, program: CheckedProgram, valueType: Type) -> Int {
+        match valueType.kind {
+            Integer -> return valueType.bits / 8
+            Decimal -> return 8
+            Floating -> return valueType.bits / 8
+            Pointer -> return 8
+            Boolean -> return 1
+            Enumeration -> return 4
+            Void -> return 1
+            Invalid -> return 1
+            Structure -> {
+                if images[valueType.declaration].isSome() { return imageAlignments[valueType.declaration] }
+                match program.structs[valueType.declaration].shape {
+                    CArray -> return imageAlignment(program, cArrayElementType(program, valueType))
+                    Plain -> return imageAlignment(program, program.structs[valueType.declaration].fields[0].valueType)
+                    CLayout -> return 8
+                    CUnion -> return 8
+                    Callback -> return 8
+                    CPointer -> return 8
+                }
+            }
+        }
+    }
+}
+
+function declareImage(builder: KirModuleBuilder, program: CheckedProgram, index: Int) -> KirType {
+    let name = program.named(program.structs[index].baseNameSpan)
+    return builder.declareRecordSpecialization(name.start, name.end, cLayout, cImageSuffixBase + stableHash(program.structs[index].name.text))
+}
+
+// Layout rule 1 is C's (section 26.2).
+let cLayout = 1
+
+extend FunctionLowering {
+    // The Kira value at `source` written as its image at `image`. A value C
+    // keeps (`retains:`) has its strings copied into storage nothing collects.
+    function writeImage(borrow mut self, source: KirAddress, valueType: Type, image: KirAddress, retained: Bool) {
+        match valueType.kind {
+            Integer -> kir.store(kir.load(source), image)
+            Decimal -> kir.store(kir.load(source), image)
+            Floating -> kir.store(kir.load(source), image)
+            Pointer -> kir.store(kir.load(source), image)
+            Boolean -> kir.store(kir.convert(convertZeroExtend, kir.load(source), types.integer8), image)
+            Enumeration -> kir.store(kir.convert(convertTruncate, kir.tag(source), types.integer32), image)
+            Void -> {}
+            Invalid -> {}
+            Structure -> {
+                if isCStringType(program, valueType) {
+                    var text = kir.load(kir.field(source, 0, types.pointer))
+                    if retained { text = keptCString(text) }
+                    kir.store(text, image)
+                    return
+                }
+                let structure = program.structs[valueType.declaration]
+                if isUnionShape(structure.shape) {
+                    copyBytes(source, image, types.imageSize(program, valueType))
+                    return
+                }
+                match types.images[valueType.declaration] {
+                    Some -> {
+                        if program.fieldBits[valueType.declaration].count > 0 {
+                            zeroBytes(kir.convert(convertBitcast, kir.pointer(image), types.pointer), types.imageSize(program, valueType))
+                        }
+                        for index in 0..structure.fields.count {
+                            let from = kir.field(source, index, types.of(structure.fields[index].valueType))
+                            writeImageField(valueType.declaration, index, from, image, retained)
+                        }
+                        return
+                    }
+                    None -> {}
+                }
+                match structure.shape {
+                    CArray(count) -> writeArrayImage(source, valueType, image, count, retained)
+                    Plain -> {
+                        let fieldType = structure.fields[0].valueType
+                        writeImage(kir.field(source, 0, types.of(fieldType)), fieldType, image, retained)
+                    }
+                    CLayout -> kir.store(kir.load(kir.field(source, 0, types.pointer)), image)
+                    CUnion -> kir.store(kir.load(kir.field(source, 0, types.pointer)), image)
+                    Callback -> kir.store(kir.load(kir.field(source, 0, types.pointer)), image)
+                    CPointer -> kir.store(kir.load(kir.field(source, 0, types.pointer)), image)
+                }
+            }
+        }
+    }
+
+    // An `@FFI.Array`'s elements inline, up to its extent; the ones its
+    // array does not have are zero.
+    function writeArrayImage(borrow mut self, source: KirAddress, valueType: Type, image: KirAddress, count: Int, retained: Bool) {
+        let element = cArrayElementType(program, valueType)
+        let elementImage = types.imageType(program, element)
+        let arrayType = program.structs[valueType.declaration].fields[0].valueType
+        let header = kir.field(source, 0, types.of(arrayType))
+        zeroBytes(kir.convert(convertBitcast, kir.pointer(image), types.pointer), count * types.imageSize(program, element))
+        let counter = temporary(Type.int())
+        kir.store(kir.integer(types.integer64, 0), counter)
+        let length = kir.load(kir.field(header, 1, types.integer64))
+        let test = kir.block()
+        let within = kir.block()
+        let body = kir.block()
+        let done = kir.block()
+        flowInto(test)
+        enter(test)
+        let index = kir.load(counter)
+        kir.branchIf(kir.compare(kirPredicate(.Less, true), index, kir.integer(types.integer64, count)), within, done)
+        enter(within)
+        kir.branchIf(kir.compare(kirPredicate(.Less, true), index, length), body, done)
+        enter(body)
+        writeImage(arrayElement(header, arrayType, index), element, kir.element(image, index, elementImage), retained)
+        kir.store(kir.binary(kirOperator(.Add, true), false, true, index, kir.integer(types.integer64, 1)), counter)
+        flowInto(test)
+        enter(done)
+    }
+
+    // A union's bytes, which are C's on both sides.
+    function copyBytes(borrow mut self, from: KirAddress, to: KirAddress, byteCount: Int) {
+        let source = kir.convert(convertBitcast, kir.pointer(from), types.pointer)
+        let target = kir.convert(convertBitcast, kir.pointer(to), types.pointer)
+        kir.copyRaw(source, target, kir.integer(types.integer64, byteCount))
+    }
+
+    function zeroBytes(borrow mut self, start: KirValue, byteCount: Int) {
+        if byteCount <= 0 { return }
+        kir.setBytes(start, kir.integer(types.integer8, 0), kir.integer(types.integer64, byteCount))
+    }
+
+    // The image at `image` read back as a Kira value into `destination`.
+    function readImage(borrow mut self, image: KirAddress, valueType: Type, destination: KirAddress, span: Span) {
+        match valueType.kind {
+            Integer -> kir.store(kir.load(image), destination)
+            Decimal -> kir.store(kir.load(image), destination)
+            Floating -> kir.store(kir.load(image), destination)
+            Pointer -> kir.store(kir.load(image), destination)
+            Boolean -> {
+                let byte = kir.load(image)
+                kir.store(kir.compare(kirPredicate(.NotEqual, false), byte, kir.integer(types.integer8, 0)), destination)
+            }
+            Enumeration -> enumFromNumber(kir.load(image), valueType, destination, span)
+            Void -> {}
+            Invalid -> {}
+            Structure -> {
+                if isCStringType(program, valueType) {
+                    kir.store(kir.load(image), kir.field(destination, 0, types.pointer))
+                    return
+                }
+                let structure = program.structs[valueType.declaration]
+                if isUnionShape(structure.shape) {
+                    copyBytes(image, destination, types.imageSize(program, valueType))
+                    return
+                }
+                match types.images[valueType.declaration] {
+                    Some -> {
+                        for index in 0..structure.fields.count {
+                            let into = kir.field(destination, index, types.of(structure.fields[index].valueType))
+                            readImageField(valueType.declaration, index, image, into, span)
+                        }
+                        return
+                    }
+                    None -> {}
+                }
+                match structure.shape {
+                    CArray(count) -> readArrayImage(image, valueType, destination, count, span)
+                    Plain -> {
+                        let fieldType = structure.fields[0].valueType
+                        readImage(image, fieldType, kir.field(destination, 0, types.of(fieldType)), span)
+                    }
+                    CLayout -> kir.store(kir.load(image), kir.field(destination, 0, types.pointer))
+                    CUnion -> kir.store(kir.load(image), kir.field(destination, 0, types.pointer))
+                    Callback -> kir.store(kir.load(image), kir.field(destination, 0, types.pointer))
+                    CPointer -> kir.store(kir.load(image), kir.field(destination, 0, types.pointer))
+                }
+            }
+        }
+    }
+
+    // An `@FFI.Array` read back as an array of its full extent.
+    function readArrayImage(borrow mut self, image: KirAddress, valueType: Type, destination: KirAddress, count: Int, span: Span) {
+        let element = cArrayElementType(program, valueType)
+        let elementImage = types.imageType(program, element)
+        let arrayType = program.structs[valueType.declaration].fields[0].valueType
+        let header = kir.field(destination, 0, types.of(arrayType))
+        let length = kir.integer(types.integer64, count)
+        let bytes = kir.integer(types.integer64, count * types.byteSize(element))
+        initializeBufferHeader(header, arrayRuntimePointer(0, [bytes]), length)
+        let counter = temporary(Type.int())
+        kir.store(kir.integer(types.integer64, 0), counter)
+        let test = kir.block()
+        let body = kir.block()
+        let done = kir.block()
+        flowInto(test)
+        enter(test)
+        let index = kir.load(counter)
+        kir.branchIf(kir.compare(kirPredicate(.Less, true), index, length), body, done)
+        enter(body)
+        readImage(kir.element(image, index, elementImage), element, arrayElement(header, arrayType, index), span)
+        kir.store(kir.binary(kirOperator(.Add, true), false, true, index, kir.integer(types.integer64, 1)), counter)
+        flowInto(test)
+        enter(done)
+    }
+
+    // A payload-less enum from its case's number; a number no case has
+    // traps.
+    function enumFromNumber(borrow mut self, number: KirValue, valueType: Type, destination: KirAddress, span: Span) {
+        let done = kir.block()
+        let wide = kir.convert(convertSignExtend, number, types.integer64)
+        for variant in 0..program.enums[valueType.declaration].variants.count {
+            let hit = kir.block()
+            let next = kir.block()
+            kir.branchIf(kir.compare(kirPredicate(.Equal, false), wide, kir.integer(types.integer64, variant)), hit, next)
+            enter(hit)
+            kir.inject(destination, variant)
+            flowInto(done)
+            enter(next)
+        }
+        let enumName = spelledType(program, valueType)
+        let report = TrapReport {
+            code = checkTrap,
+            headline = joinText(["no case of `", enumName, "` has the number {0}"]),
+            label = joinText(["read as a `", enumName, "`"]),
+            note = joinText(["`", enumName, "` has cases numbered 0 through ", decimalText(program.enums[valueType.declaration].variants.count - 1), "; the C side wrote another number"]),
+            help = "check the number the C code writes, or make the enum `@Open` so unknown numbers are kept"
+        }
+        trapReported(span, report, [wide])
+        open = false
+        enter(done)
+    }
+
+    // A C string copied out of collected storage, for C to keep.
+    function keptCString(borrow mut self, text: KirValue) -> KirValue {
+        let cString = Type.structure(cStringDeclaration())
+        let given = temporary(cString)
+        kir.store(text, kir.field(given, 0, types.pointer))
+        let kept = temporary(cString)
+        kir.argument(kir.pointer(kept))
+        kir.argument(kir.pointer(given))
+        kir.callVoid(functions[program.foreignHelpers[1]])
+        return kir.load(kir.field(kept, 0, types.pointer))
+    }
+
+    function cStringDeclaration(borrow self) -> Int {
+        return program.functions[program.foreignHelpers[1]].result.declaration
+    }
+}

@@ -1,0 +1,859 @@
+// Checking calls, methods, variants and struct literals, and the
+// places a write may go through.
+
+extend Checker {
+    // `f(...)`: a numeric conversion when `f` names an integer type, one of
+    // the wrapping operations, a free function, or in a method a sibling
+    // method called on the same receiver.
+    function checkCall(borrow mut self, callee: Identifier, arguments: [Int], expected: Optional<Type>, span: Span) -> Int {
+        match callee.text {
+            "floatToBits", "floatToBits32", "bitsToFloat", "bitsToFloat32" -> return checkFloatBits(callee.text, arguments, span)
+            "numberWords", "numberFromWords" -> return checkNumberWords(callee.text, arguments, span)
+            "print" -> { if lookup(callee.text).isNone() { return checkPrint(arguments, span) } }
+            "traceText" -> { if lookup(callee.text).isNone() { return checkTraceText(arguments, span) } }
+            "#interpolated" -> return checkInterpolated(arguments, span)
+            "#contentPlace" -> return checkContentPlace(arguments, expected, span)
+            "runtimeTrap" -> { if arguments.count == 0 { return add(.RuntimeTrap(.Called), Type.void(), span) } }
+            "code" -> {
+                if shapeBuiltinFree(callee.text) { return checkCode(arguments, span) }
+                if lookup(callee.text).isSome() {
+                    report(.BuiltinShadow, callee.span)
+                    return invalidBuiltin(span)
+                }
+            }
+            "hash" -> {
+                if shapeBuiltinFree(callee.text) { return checkHash(arguments, span) }
+                if lookup(callee.text).isSome() {
+                    report(.BuiltinShadow, callee.span)
+                    return invalidBuiltin(span)
+                }
+            }
+            "compare" -> {
+                if shapeBuiltinFree(callee.text) { return checkCompareBuiltin(arguments, span) }
+                if lookup(callee.text).isSome() {
+                    report(.BuiltinShadow, callee.span)
+                    return invalidBuiltin(span)
+                }
+            }
+            "fromCode" -> { if shapeBuiltinFree(callee.text) { return checkFromCode([], arguments, span) } }
+            else -> {}
+        }
+        match lookup(callee.text) {
+            Some(local) -> {
+                if isCallableType(program, locals[local].valueType) {
+                    return checkIndirectArguments(checkName(callee), arguments, span)
+                }
+            }
+            None -> {}
+        }
+        match receiverField(callee.text) {
+            Some(field) -> {
+                let receiver = bareReceiverRead(callee.span)
+                let value = member(receiver, field, span)
+                if isCallableType(program, typeOf(value)) { return checkIndirectArguments(value, arguments, span) }
+            }
+            None -> {}
+        }
+        match declarations.globalVisibleAt(callee.text, callee.span.file) {
+            Some(global) -> {
+                if isCallableType(program, declarations.globals[global].valueType) {
+                    return checkIndirectArguments(readGlobal(global, callee.span), arguments, span)
+                }
+            }
+            None -> {}
+        }
+        if isNativeStateIntrinsic(callee.text) && declarations.findFunction(.None, callee.text).isNone() {
+            return checkNativeStateCall(callee.text, [], arguments, span)
+        }
+        match callee.text {
+            "String" -> { if arguments.count == 1 { return stringConversion(arguments[0], span) } }
+            "rawPointerWord" -> { if declarations.findFunction(.None, callee.text).isNone() { return pointerWord(arguments, span) } }
+            "heapAllocateRaw" -> return allocateRawCall(arguments, span)
+            "heapFreeRaw" -> return freeRawCall(arguments, span)
+            else -> {}
+        }
+        match typedHeapBuiltin(callee.text) {
+            Some(builtin) -> return typedHeapCall(builtin, arguments, expected, span)
+            None -> {}
+        }
+        match atomicBuiltin(callee.text) {
+            Some(builtin) -> {
+                if declarations.findFunction(.None, callee.text).isNone() {
+                    return atomicCall(builtin, .None, arguments, expected, span)
+                }
+            }
+            None -> {}
+        }
+        match builtinType(callee.text) {
+            Some(target) -> return conversion(target, arguments, span)
+            None -> {}
+        }
+        match wrappingOperator(callee.text) {
+            Some(operator) -> return wrapping(operator, arguments, span)
+            None -> {}
+        }
+        // A sibling method is nearer than any free function, as a field is
+        // nearer than a global: an imported library's function of the same
+        // name never takes the call away from the method. A type's name is
+        // its constructors', which its own `init`s call.
+        match nearestOwner(callee.text) {
+            Some(owner) -> {
+                match overload(.Some(owner), callee.text, arguments, span) {
+                    Some(method) -> {
+                        if signature().receiver == .Static { return call(method, .None, arguments, span) }
+                        let receiver = add(.Read(0), locals[0].valueType, callee.span)
+                        if isClassType(program, locals[0].valueType) { return dynamicClassCall(method, receiver, arguments, span) }
+                        return call(method, .Some(receiver), arguments, span)
+                    }
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+        match genericFunctionNamed(callee.text) {
+            Some(template) -> {
+                if takesGeneric(template, visibleOverloads(.None, callee.text), arguments) {
+                    return genericCall(template, [], arguments, expected, span)
+                }
+            }
+            None -> {}
+        }
+        match freeCallOverload(callee.text, arguments, expected, span) {
+            Some(target) -> {
+                declarations.requireVisible(file(), declarations.signatures[target].name.span.file, callee.span)
+                requirePublicRuntimeFunction(target, callee.span)
+                return call(target, .None, arguments, span)
+            }
+            None -> {}
+        }
+        match genericFunctionNamed(callee.text) {
+            Some(template) -> return genericCall(template, [], arguments, expected, span)
+            None -> {}
+        }
+        // A method sharing a type's name, after that type's constructors.
+        match signature().owner {
+            Some(owner) -> {
+                match overload(.Some(owner), callee.text, arguments, span) {
+                    Some(method) -> {
+                        if signature().receiver == .Static { return call(method, .None, arguments, span) }
+                        let receiver = add(.Read(0), locals[0].valueType, callee.span)
+                        if isClassType(program, locals[0].valueType) { return dynamicClassCall(method, receiver, arguments, span) }
+                        return call(method, .Some(receiver), arguments, span)
+                    }
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+        match constructorOwner(callee, expected) {
+            Some(owner) -> return constructArguments(owner, callee, arguments, span)
+            None -> {}
+        }
+        match genericStruct(tree.genericStructs, callee.text) {
+            Some(template) -> return inferredConstruction(template, callee, arguments, span)
+            None -> {}
+        }
+        // A function this file cannot see is one it has not imported.
+        if declarations.overloadsOf(.None, callee.text).count > 0 {
+            report(.NotImported, callee.span)
+        } else {
+            report(.UndefinedFunction, callee.span)
+        }
+        return add(.Integer(0), Type.invalid(), span)
+    }
+
+    // The type whose methods a bare call to `name` tries before the free
+    // functions: the method's own, unless `name` is a type's.
+    function nearestOwner(borrow self, name: String) -> Optional<Type> {
+        if declarations.typeNamed(name).isSome() { return .None }
+        return signature().owner
+    }
+
+    function constructorOwner(borrow self, name: Identifier, expected: Optional<Type>) -> Optional<Int> {
+        match expected {
+            Some(target) -> {
+                if target.kind == .Structure && instantiates(program.structs[target.declaration], name.text) {
+                    return .Some(target.declaration)
+                }
+            }
+            None -> {}
+        }
+        match declarations.typeNamedAt(name.text, name.span.file) {
+            Some(named) -> {
+                if named.kind == .Structure { return .Some(named.declaration) }
+            }
+            None -> {}
+        }
+        return .None
+    }
+
+    function checkGenericCall(borrow mut self, name: Identifier, types: [TypeReference], arguments: [Int], span: Span) -> Int {
+        if isNativeStateIntrinsic(name.text) && declarations.findFunction(.None, name.text).isNone() {
+            return checkNativeStateCall(name.text, types, arguments, span)
+        }
+        match genericFunctionNamed(name.text) {
+            Some(template) -> return genericCall(template, types, arguments, .None, span)
+            None -> {}
+        }
+        if typedHeapGeneric(name.text) { return typedHeapGenericCall(name, types, arguments, span) }
+        match atomicBuiltin(name.text) {
+            Some(builtin) -> {
+                if types.count != 1 {
+                    report(.ArgumentCount, name.span)
+                    return add(.Integer(0), Type.invalid(), span)
+                }
+                let given = resolveType(types[0])
+                if given.isInvalid() { return add(.Integer(0), Type.invalid(), span) }
+                return atomicCall(builtin, .Some(given), arguments, .None, span)
+            }
+            None -> {}
+        }
+        if name.text == "fromCode" && shapeBuiltinFree(name.text) { return checkFromCode(types, arguments, span) }
+        let reference = TypeReference {
+            qualifier = .None, name = name, arguments = types, modes = [],
+            instanceName = genericInstanceName(name.text, types)
+        }
+        let owner = resolveType(reference)
+        if owner.isInvalid() { return add(.Integer(0), Type.invalid(), span) }
+        if name.text == "Channel" { return checkChannelConstructor(owner, arguments, span) }
+        if owner.kind != .Structure {
+            report(.UnknownStruct, name.span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        return constructArguments(owner.declaration, name, arguments, span)
+    }
+
+    function constructArguments(borrow mut self, owner: Int, name: Identifier, arguments: [Int], span: Span) -> Int {
+        let declared = program.structs[owner]
+        if declared.genericBase == "Distinct" {
+            if arguments.count != 1 {
+                report(.DistinctConstructorArguments, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+            let representation = declared.fields[0].valueType
+            let value = coerce(expression(arguments[0], .Some(representation)), representation, .DistinctConstructorType)
+            return add(.Construct([value]), Type.structure(owner), span)
+        }
+        match chosenInit(owner, arguments, false) {
+            Some(init) -> return call(init, .None, arguments, span)
+            None -> {}
+        }
+        match genericInitCall(Type.structure(owner), arguments, span) {
+            Some(made) -> return made
+            None -> {}
+        }
+        var fields: [FieldValue] = []
+        var positional = 0
+        for argument in arguments {
+            match tree.expressions[argument].kind.argumentLabel() {
+                Some(labelled) -> fields.append(labelled)
+                None -> {
+                    if positional >= declared.fields.count {
+                        report(.ArgumentCount, span)
+                        return add(.Integer(0), Type.invalid(), span)
+                    }
+                    fields.append(FieldValue { name = declared.fields[positional].name, value = argument })
+                    positional += 1
+                }
+            }
+        }
+        return checkStructFields(owner, name, fields, span)
+    }
+
+    function checkMethodCall(borrow mut self, receiver: Int, method: Identifier, arguments: [Int], expected: Optional<Type>, span: Span) -> Int {
+        match qualifiedCall(receiver, method, arguments, expected, span) {
+            Some(checked) -> return checked
+            None -> {}
+        }
+        return checkMethodOn(expression(receiver, .None), method, arguments, span)
+    }
+
+    // `value.method(arguments)` with the receiver already checked.
+    function checkMethodOn(borrow mut self, value: Int, method: Identifier, arguments: [Int], span: Span) -> Int {
+        let receiverType = typeOf(value)
+        if receiverType.isInvalid() { return value }
+        match genericMethod(receiverType, method.text) {
+            Some(template) -> {
+                if takesGeneric(template, visibleOverloads(.Some(receiverType), method.text), arguments) {
+                    return callGenericMethod(value, template, arguments, span)
+                }
+            }
+            None -> {}
+        }
+        if isDistinctType(program, receiverType) && method.text == "has" && arguments.count == 1 {
+            let operands = distinctOperands(value, arguments[0])
+            if typeOf(operands.left).kind == .Decimal {
+                // Flags over a whole `Number`: the same test, on its bits.
+                let bits = numberArithmetic(.BitAnd, Operands { left = operands.left, right = operands.right }, span)
+                return numberComparison(.Equal, Operands { left = bits, right = operands.right }, span)
+            }
+            if !typeOf(operands.left).isInteger() {
+                report(.OperatorOperand, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+            let intersection = add(.Arithmetic(.BitAnd, operands.left, operands.right), typeOf(operands.left), span)
+            return add(.Compare(.Equal, intersection, operands.right), Type.boolean(), span)
+        }
+        if isTaskType(program, receiverType) { return checkTaskMethod(value, method, arguments, span) }
+        if isChannelEnd(program, receiverType) { return checkChannelMethod(value, method, arguments, span) }
+        if isArrayType(program, receiverType) && (method.text == "append" || method.text == "contains") {
+            return checkArrayMethod(value, method, arguments, span)
+        }
+        if receiverType.kind == .Structure {
+            let owner = program.structs[receiverType.declaration]
+            match owner.field(method.text) {
+                Some(field) -> {
+                    let fieldType = owner.fields[field].valueType
+                    if isClosureType(program, fieldType) || isKeyPathType(program, fieldType) {
+                        return checkIndirectArguments(add(.Member(value, field), fieldType, method.span), arguments, span)
+                    }
+                }
+                None -> {}
+            }
+        }
+        if receiverType.kind != .Void {
+            match overload(.Some(receiverType), method.text, arguments, span) {
+                Some(target) -> {
+                    checkPrivateAccess(declarations.signatures[target].name, receiverType, method.span)
+                    if isClassType(program, receiverType) { return dynamicClassCall(target, value, arguments, span) }
+                    return call(target, .Some(value), arguments, span)
+                }
+                None -> {}
+            }
+            match existentialMethod(receiverType, method.text) {
+                Some(found) -> {
+                    var generic = false
+                    match existentialGenericMethod(receiverType, method.text) {
+                        Some(other) -> generic = takesGeneric(other.template, [found.target], arguments)
+                        None -> {}
+                    }
+                    if !generic {
+                        // Of the family's methods of this name, the one the
+                        // arguments fit, as a type's own overloads are chosen.
+                        var target = found.target
+                        match overload(.Some(found.owner), method.text, arguments, span) {
+                            Some(chosen) -> target = chosen
+                            None -> {}
+                        }
+                        let existential = coerce(value, found.owner, .ArgumentTypeMismatch)
+                        return call(target, .Some(existential), arguments, span)
+                    }
+                }
+                None -> {}
+            }
+        }
+        match existentialGenericMethod(receiverType, method.text) {
+            Some(found) -> return callGenericMethod(coerce(value, found.owner, .ArgumentTypeMismatch), found.template, arguments, span)
+            None -> {}
+        }
+        report(.UndefinedFunction, method.span)
+        return add(.Integer(0), Type.invalid(), span)
+    }
+
+    // A method of a family or trait existential that carries `receiverType`,
+    // which a value of that type reaches by becoming the existential. A
+    // method that mutates its receiver is left out, since it would change
+    // the copy rather than the value.
+    function existentialMethod(borrow self, receiverType: Type, name: String) -> Optional<MethodTarget> {
+        for index in 0..program.enums.count {
+            let owner = Type.enumeration(index)
+            if existentialCase(program, receiverType, owner).isNone() { continue }
+            match declarations.findFunction(.Some(owner), name) {
+                Some(target) -> {
+                    if declarations.signatures[target].receiver != .MutablyBorrowed {
+                        return .Some(MethodTarget { target = target, owner = owner })
+                    }
+                }
+                None -> {}
+            }
+        }
+        // A family that crosses RIDL is its trait object, a struct the
+        // declaration's value is boxed into.
+        for index in 0..program.structs.count {
+            let owner = Type.structure(index)
+            if witnessBoxOf(receiverType, owner).isNone() { continue }
+            match declarations.findFunction(.Some(owner), name) {
+                Some(target) -> {
+                    if declarations.signatures[target].receiver != .MutablyBorrowed {
+                        return .Some(MethodTarget { target = target, owner = owner })
+                    }
+                }
+                None -> {}
+            }
+        }
+        return .None
+    }
+
+    // The method a receiver of `receiverType` reaches by `name`.
+    function methodOf(borrow self, receiverType: Type, name: String) -> Optional<Int> {
+        if receiverType.kind == .Void { return .None }
+        match declarations.findFunction(.Some(receiverType), name) {
+            Some(target) -> return .Some(target)
+            None -> {}
+        }
+        match existentialMethod(receiverType, name) {
+            Some(found) -> return .Some(found.target)
+            None -> return .None
+        }
+    }
+
+    // `Library.function(...)`: a free function reached through the alias of
+    // one of this file's imports. A local or field of that name wins.
+    function qualifiedCall(borrow mut self, receiver: Int, method: Identifier, arguments: [Int], expected: Optional<Type>, span: Span) -> Optional<Int> {
+        match qualifiedVariant(receiver, method, arguments, expected, span) {
+            Some(value) -> return .Some(value)
+            None -> {}
+        }
+        // `Alpha.Beta.seven()` calls the function a `namespace Alpha.Beta`
+        // block declares.
+        let path = dottedPath(receiver)
+        if utf8Count(path) > 0 {
+            let qualified = joinText([path, ".", method.text])
+            if visibleOverloads(.None, qualified).count > 0 {
+                return .Some(checkCall(Identifier { text = qualified, span = method.span }, arguments, expected, span))
+            }
+        }
+        match tree.expressions[receiver].kind.name() {
+            None -> return .None
+            Some(name) -> {
+                if lookup(name.text).isSome() || namesMember(name.text) { return .None }
+                if name.text == "Build" && (inComptime() || method.text == "debug" || method.text == "release") {
+                    match buildQuery(method, arguments, span) {
+                        Some(answer) -> return .Some(answer)
+                        None -> {}
+                    }
+                }
+                match comptimeNamespaceFunction(name.text, method.text) {
+                    Some(target) -> {
+                        if inComptime() {
+                            return .Some(checkCall(Identifier { text = target, span = method.span }, arguments, .None, span))
+                        }
+                    }
+                    None -> {}
+                }
+                match signature().owner {
+                    Some(selfType) -> {
+                        match declarations.typeNamedAt(name.text, name.span.file) {
+                            Some(parent) -> {
+                                if classIsSubtype(program, selfType, parent) {
+                                    let qualified = joinText([name.text, ".", method.text])
+                                    match overload(.Some(selfType), qualified, arguments, span) {
+                                        Some(target) -> {
+                                            let receiver = add(.Read(0), selfType, method.span)
+                                            return .Some(call(target, .Some(receiver), arguments, span))
+                                        }
+                                        None -> {
+                                            report(.UndefinedFunction, method.span)
+                                            return .Some(add(.Integer(0), Type.invalid(), span))
+                                        }
+                                    }
+                                }
+                            }
+                            None -> {}
+                        }
+                    }
+                    None -> {}
+                }
+                match declarations.typeNamedAt(name.text, name.span.file) {
+                    Some(owner) -> {
+                        if owner.kind == .Structure || owner.kind == .Enumeration {
+                            match overload(.Some(owner), method.text, arguments, span) {
+                                Some(target) -> {
+                                    declarations.requireVisible(file(), declarations.signatures[target].name.span.file, method.span)
+                                    if declarations.signatures[target].receiver == .Static {
+                                        return .Some(call(target, .None, arguments, span))
+                                    }
+                                    if isConstructDeclaration(program, owner) {
+                                        return .Some(call(target, .Some(declarationReceiver(owner, name)), arguments, span))
+                                    }
+                                }
+                                None -> {}
+                            }
+                        }
+                    }
+                    None -> {}
+                }
+                match declarations.aliased(file(), name.text) {
+                    None -> return .None
+                    Some(module) -> {
+                        var candidates: [Int] = []
+                        for candidate in declarations.overloadsOf(.None, method.text) {
+                            match declarations.moduleOf(declarations.signatures[candidate].name.span.file) {
+                                Some(declaredModule) -> {
+                                    if declaredModule == module { candidates.append(candidate) }
+                                }
+                                None -> {}
+                            }
+                        }
+                        if candidates.count > 0 {
+                            return .Some(call(chooseOverload(candidates, arguments, span), .None, arguments, span))
+                        }
+                        report(.UndefinedFunction, method.span)
+                        return .Some(add(.Integer(0), Type.invalid(), span))
+                    }
+                }
+            }
+        }
+    }
+
+    // What `Declaration.member()` runs against: the receiver inside the
+    // declaration's own members, a default construction anywhere else.
+    function declarationReceiver(borrow mut self, owner: Type, name: Identifier) -> Int {
+        match signature().owner {
+            Some(current) -> {
+                if current.equals(owner) && signature().receiver != .Static {
+                    return add(.Read(0), owner, name.span)
+                }
+            }
+            None -> {}
+        }
+        return constructArguments(owner.declaration, name, [], name.span)
+    }
+
+    // A call to a declared function. A `borrow mut` parameter, the mutable
+    // receiver included, needs a place the caller may write, and takes it at
+    // exactly its own type. A slot the call leaves empty takes the default
+    // its parameter declares.
+    function call(borrow mut self, target: Int, receiver: Optional<Int>, arguments: [Int], span: Span) -> Int {
+        let callee = declarations.signatures[target]
+        var first = 0
+        if receiver.isSome() { first = 1 }
+        let written = callee.parameters.count - callee.declaration.parameters.count
+        if isVariadicForeign(target) && arguments.count > callee.parameters.count {
+            var checked: [Int] = []
+            for index in 0..arguments.count {
+                if index < callee.parameters.count {
+                    checked.append(expression(arguments[index], .Some(callee.parameters[index].valueType)))
+                } else {
+                    checked.append(expression(arguments[index], variadicDefault(arguments[index])))
+                }
+            }
+            return callChecked(target, receiver, checked, span)
+        }
+        var filled: [Optional<Int>] = []
+        match parameterArguments(target, first, arguments, arguments.count) {
+            Some(slots) -> filled = slots
+            None -> {
+                report(.ArgumentCount, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+        var checked: [Int] = []
+        // C takes no ownership: a value it is given is lent for the call.
+        let foreign = hasAttribute(callee.declaration.annotations, .Foreign)
+        for slot in 0..filled.count {
+            let parameter = callee.parameters[first + slot]
+            let declared = first + slot - written
+            match filled[slot] {
+                Some(index) -> {
+                    let value = expression(arguments[index], .Some(parameter.valueType))
+                    let copies = declared >= 0 && declared < callee.declaration.parameters.count && callee.declaration.parameters[declared].copies
+                    if !foreign { checkNamedArgument(arguments[index], value, parameter.valueType, parameter.mode, copies) }
+                    checked.append(value)
+                }
+                None -> {
+                    var initial: Optional<Int> = .None
+                    if declared >= 0 { initial = callee.declaration.parameters[declared].initial }
+                    match initial {
+                        Some(value) -> checked.append(isolatedDefault(value, parameter.valueType, .ArgumentTypeMismatch))
+                        None -> {
+                            report(.ArgumentCount, span)
+                            return add(.Integer(0), Type.invalid(), span)
+                        }
+                    }
+                }
+            }
+        }
+        return callChecked(target, receiver, checked, span)
+    }
+
+    // Which of the first `count` arguments fills each parameter of `target`
+    // from `first` on, or nothing when they do not fit its parameters. A
+    // parameter is called by its label (`f(list: [1])`), so a labelled
+    // argument fills the parameter it names and an unlabelled one the next in
+    // order, as a construct header's members are filled; an argument past
+    // `arguments` is one written after them, a trailing block's content. A
+    // parameter no argument fills is left empty, for its default.
+    function parameterArguments(borrow self, target: Int, first: Int, arguments: [Int], count: Int) -> Optional<[Optional<Int>]> {
+        let callee = declarations.signatures[target]
+        let written = callee.parameters.count - callee.declaration.parameters.count
+        var filled: [Optional<Int>] = []
+        for slot in first..callee.parameters.count {
+            let empty: Optional<Int> = .None
+            filled.append(empty)
+        }
+        var positional = 0
+        for index in 0..count {
+            var slot = positional
+            var labelled: Optional<FieldValue> = .None
+            if index < arguments.count { labelled = tree.expressions[arguments[index]].kind.argumentLabel() }
+            match labelled {
+                Some(argument) -> {
+                    match parameterNamed(callee.declaration.parameters, argument.name.text) {
+                        Some(declared) -> slot = written + declared - first
+                        None -> return .None
+                    }
+                }
+                None -> {
+                    // A labelled argument before this one may have taken the
+                    // next position, as `inset(edge: 1) { bar }` gives its
+                    // bar after `edge`: the unlabelled one takes the first
+                    // position still empty.
+                    while slot < filled.count && filled[slot].isSome() { slot += 1 }
+                    positional = slot + 1
+                }
+            }
+            if slot < 0 || slot >= filled.count || filled[slot].isSome() { return .None }
+            filled[slot] = .Some(index)
+        }
+        return .Some(filled)
+    }
+
+    // A literal where C declares no parameter takes the type C gives it: a
+    // whole number is an `Int`, a decimal one a `double`.
+    function variadicDefault(borrow self, argument: Int) -> Optional<Type> {
+        match tree.expressions[argument].kind.literalShape() {
+            Integer -> return .Some(Type.int())
+            Decimal -> return .Some(Type.floating(64))
+            Operand(operand) -> return variadicDefault(operand)
+            Other -> return .None
+        }
+    }
+
+        function isVariadicForeign(borrow self, target: Int) -> Bool {
+        match program.functions[target].foreign {
+            Some(foreign) -> return program.foreignFunctions[foreign].variadic
+            None -> return false
+        }
+    }
+
+    // A call whose arguments are already checked, each still to become a value
+    // of its parameter's type.
+    function callChecked(borrow mut self, target: Int, receiver: Optional<Int>, arguments: [Int], span: Span) -> Int {
+        match program.functions[target].foreign {
+            Some(foreign) -> return foreignCall(target, program.foreignFunctions[foreign], arguments, span)
+            None -> {}
+        }
+        let callee = declarations.signatures[target]
+        if hasAttribute(callee.declaration.annotations, .MainThread) && !requestedCall(span) {
+            report(.MainThreadDirectCall, span)
+        }
+        var values: [Int] = []
+        var before: [Int] = []
+        var after: [Int] = []
+        var first = 0
+        match receiver {
+            Some(value) -> {
+                values.append(writable(value, callee.parameters[0].mode, before, after))
+                first = 1
+            }
+            None -> {}
+        }
+        let written = callee.parameters.count - callee.declaration.parameters.count
+        for index in 0..arguments.count {
+            let parameter = callee.parameters[first + index]
+            var value = arguments[index]
+            let declared = first + index - written
+            if declared >= 0 && declared < callee.declaration.parameters.count
+                && callee.declaration.parameters[declared].copies && program.expressions[value].operation.movingOperand().isSome() {
+                report(.CopyParameterMove, program.expressions[value].span)
+            }
+            if parameter.mode == .MutablyBorrowed {
+                value = writable(value, parameter.mode, before, after)
+                if !typeOf(value).equals(parameter.valueType) && !typeOf(value).isInvalid() {
+                    report(.ArgumentTypeMismatch, program.expressions[value].span)
+                }
+            } else {
+                value = coerce(value, parameter.valueType, .ArgumentTypeMismatch)
+            }
+            values.append(value)
+        }
+        return writtenBack(add(.Call(target, values), callee.result, span), before, after, span)
+    }
+
+    // `value` as what a parameter of `mode` is handed: a value lent mutably
+    // must be writable, through the computed member it is part of if it is
+    // one, whose read and store go to `before` and `after`.
+    function writable(borrow mut self, value: Int, mode: PassingMode, before: borrow mut [Int], after: borrow mut [Int]) -> Int {
+        if mode != .MutablyBorrowed { return value }
+        let written = writableThrough(value, before, after)
+        requireWritable(written, mode)
+        return written
+    }
+
+    function requireWritable(borrow self, value: Int, mode: PassingMode) {
+        if mode != .MutablyBorrowed { return }
+        if immutability(value).isSome() {
+            report(.MutatesImmutable, program.expressions[value].span)
+        }
+    }
+
+    // `.Case` or `.Case(payload)`, against the enum its position expects.
+    function checkVariant(borrow mut self, name: Identifier, payload: Optional<Int>, expected: Optional<Type>, span: Span) -> Int {
+        var owner: Optional<Int> = .None
+        match expected {
+            Some(target) -> {
+                if target.kind == .Enumeration { owner = .Some(target.declaration) }
+                if target.isInvalid() { return add(.Integer(0), Type.invalid(), span) }
+            }
+            None -> {}
+        }
+        match owner {
+            None -> {
+                report(.VariantWithoutEnum, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+            Some(index) -> {
+                let enumType = program.enums[index]
+                match enumType.variant(name.text) {
+                    None -> {
+                        report(.UnknownVariant, name.span)
+                        return add(.Integer(0), Type.invalid(), span)
+                    }
+                    Some(variant) -> {
+                        let value = variantPayload(enumType.variants[variant], payload, span)
+                        return add(.Tagged(variant, value), Type.enumeration(index), span)
+                    }
+                }
+            }
+        }
+    }
+
+    function variantPayload(borrow mut self, variant: Variant, payload: Optional<Int>, span: Span) -> Optional<Int> {
+        match variant.payload {
+            Some(payloadType) -> {
+                match payload {
+                    Some(value) -> {
+                        let checked = expression(value, .Some(payloadType))
+                        return .Some(coerce(checked, payloadType, .PayloadTypeMismatch))
+                    }
+                    None -> {
+                        match variant.initial {
+                            Some(initial) -> return .Some(isolatedDefault(initial, payloadType, .PayloadTypeMismatch))
+                            None -> {
+                                report(.PayloadMissing, span)
+                                return .None
+                            }
+                        }
+                    }
+                }
+            }
+            None -> {
+                match payload {
+                    Some(value) -> report(.PayloadUnexpected, tree.expressions[value].span)
+                    None -> {}
+                }
+                return .None
+            }
+        }
+    }
+
+    // The left side of `=`: a local or a field path, `var` at every step.
+    // What an assignment's target reads, checked as the place the
+    // assignment writes or, for a computed member, the member it sets.
+    function assignedPlace(borrow mut self, target: Int) -> Int {
+        match tree.expressions[target].kind.name() {
+            Some(name) -> {
+                if lookup(name.text).isNone() && !namesMember(name.text) && declarations.globalVisibleAt(name.text, name.span.file).isNone() {
+                    report(.AssignsUndefined, name.span)
+                    return add(.Integer(0), Type.invalid(), name.span)
+                }
+            }
+            None -> {}
+        }
+        return expression(target, .None)
+    }
+
+    // Why the checked expression is not a place that may be written, or
+    // nothing when it is one. Writing a field rewrites what holds it, so every
+    // step of a path must be mutable, not only the last.
+    function immutability(borrow self, place: Int) -> Optional<Diagnostic> {
+        if typeOf(place).isInvalid() { return .None }
+        match program.expressions[place].operation {
+            GlobalRead(global) -> {
+                if declarations.globals[global].mutable { return .None }
+                return .Some(.AssignsImmutableBinding)
+            }
+            TaskSpawn -> return .Some(.MutatesImmutable)
+            TaskReady -> return .Some(.MutatesImmutable)
+            TaskAwait -> return .Some(.MutatesImmutable)
+            TaskCancel -> return .Some(.MutatesImmutable)
+            TaskDetach -> return .Some(.MutatesImmutable)
+            Async -> return .Some(.MutatesImmutable)
+            RuntimeTrap -> return .Some(.MutatesImmutable)
+            StringText -> return .Some(.MutatesImmutable)
+            Sequence -> return .Some(.MutatesImmutable)
+            Try -> return .Some(.MutatesImmutable)
+            ChannelCreate -> return .Some(.MutatesImmutable)
+            ChannelReceiver -> return .Some(.MutatesImmutable)
+            ChannelSend -> return .Some(.MutatesImmutable)
+            ChannelClose -> return .Some(.MutatesImmutable)
+            ClassView -> return .Some(.MutatesImmutable)
+            ClassCall -> return .Some(.MutatesImmutable)
+            Read(local) -> {
+                if locals[local].mutable { return .None }
+                return .Some(.AssignsImmutableBinding)
+            }
+            Member(base, index) -> {
+                let owner = program.structs[typeOf(base).declaration]
+                if !owner.fields[index].mutable { return .Some(.AssignsImmutableField) }
+                if owner.genericBase == "Class" { return .None }
+                return immutability(base)
+            }
+            Integer -> return .Some(.MutatesImmutable)
+            FloatLiteral -> return .Some(.MutatesImmutable)
+            BoxAny -> return .Some(.MutatesImmutable)
+            TypeIs -> return .Some(.MutatesImmutable)
+            UnboxAny -> return .Some(.MutatesImmutable)
+            FunctionReference -> return .Some(.MutatesImmutable)
+            IndirectCall -> return .Some(.MutatesImmutable)
+            MakeClosure -> return .Some(.MutatesImmutable)
+            Boolean -> return .Some(.MutatesImmutable)
+            StringLiteral -> return .Some(.MutatesImmutable)
+            StringConcat -> return .Some(.MutatesImmutable)
+            TraceText -> return .Some(.MutatesImmutable)
+            HeapAllocateRaw -> return .Some(.MutatesImmutable)
+            HeapFreeRaw -> return .Some(.MutatesImmutable)
+            Print -> return .Some(.MutatesImmutable)
+            HeapRead -> return .Some(.MutatesImmutable)
+            HeapWrite -> return .Some(.MutatesImmutable)
+            Atomic -> return .Some(.MutatesImmutable)
+            HeapCopy -> return .Some(.MutatesImmutable)
+            HeapFill -> return .Some(.MutatesImmutable)
+            HeapOffset -> return .Some(.MutatesImmutable)
+            HeapLayout -> return .Some(.MutatesImmutable)
+            ArrayLiteral -> return .Some(.MutatesImmutable)
+            ArrayIndex(base, index) -> return immutability(base)
+            ArrayAppend -> return .Some(.MutatesImmutable)
+            Transfer -> return .Some(.MutatesImmutable)
+            Call -> return .Some(.MutatesImmutable)
+            Construct -> return .Some(.MutatesImmutable)
+            Tagged -> return .Some(.MutatesImmutable)
+            Unary -> return .Some(.MutatesImmutable)
+            Arithmetic -> return .Some(.MutatesImmutable)
+            Wrapping -> return .Some(.MutatesImmutable)
+            Compare -> return .Some(.MutatesImmutable)
+            EnumCode -> return .Some(.MutatesImmutable)
+            EnumFromCode -> return .Some(.MutatesImmutable)
+            Order -> return .Some(.MutatesImmutable)
+            Hash -> return .Some(.MutatesImmutable)
+            Logical -> return .Some(.MutatesImmutable)
+            Select -> return .Some(.MutatesImmutable)
+            Choice -> return .Some(.MutatesImmutable)
+            Bitcast -> return .Some(.MutatesImmutable)
+            Convert -> return .Some(.MutatesImmutable)
+            ForeignImage -> return .Some(.MutatesImmutable)
+            ForeignElements -> return .Some(.MutatesImmutable)
+            ForeignCallback -> return .Some(.MutatesImmutable)
+            ForeignRead -> return .Some(.MutatesImmutable)
+            ForeignUnion -> return .Some(.MutatesImmutable)
+        }
+    }
+}
+
+function parameterNamed(parameters: [Parameter], name: String) -> Optional<Int> {
+    for index in 0..parameters.count {
+        if parameters[index].name.text == name { return .Some(index) }
+    }
+    return .None
+}

@@ -1,0 +1,302 @@
+// The preprocessor: one file's tokens, with its includes spliced in, its
+// conditionals decided and its macros expanded.
+//
+// The subset is what shaders write: `#include` of `<metal_stdlib>` and
+// `<simd/simd.h>`, which are recognized and not read, and of quoted files
+// beside the includer; object-like `#define` and `#undef`; `#if`, `#ifdef`,
+// `#ifndef`, `#elif`, `#else` and `#endif`; `#error`; `#pragma once`.
+// Anything else is refused. An expanded token keeps the span of the name
+// it replaced, so a mistake inside a macro is reported where it is used.
+
+let includeLimit = 32
+
+struct Macro {
+    let name: String
+    let body: [Token]
+}
+
+// One open conditional: whether its current branch is kept, whether any
+// branch was, whether the enclosing region is kept, and where it opened.
+struct Conditional {
+    var active: Bool
+    var taken: Bool
+    let enclosing: Bool
+    var sawElse: Bool
+    let span: Span
+}
+
+// The open conditionals: the first `depth` of `frames`, innermost last.
+struct Conditionals {
+    var frames: [Conditional]
+    var depth: Int
+
+    function kept(borrow self) -> Bool {
+        return depth == 0 || frames[depth - 1].active
+    }
+
+    function push(borrow mut self, frame: Conditional) {
+        if depth == frames.count {
+            frames.append(frame)
+        } else {
+            frames[depth] = frame
+        }
+        depth += 1
+    }
+}
+
+struct Preprocessor {
+    let session: Session
+    var macros: [Macro]
+    var once: [String]
+    var output: [Token]
+}
+
+function preprocess(session: Session, path: String, file: Int) -> Result<[Token], Failure> {
+    var preprocessor = Preprocessor { session = session, macros = [], once = [], output = [] }
+    try preprocessor.include(path, file, 0)
+    let length = utf8Count(fileText(session, file as SourceFile))
+    preprocessor.output.append(Token {
+        kind = .End, text = "", span = Span { file = file, start = length, end = length }, lineStart = true
+    })
+    return .Ok(preprocessor.output)
+}
+
+// The tokens of a directive: those after `#` up to the next line.
+function directiveEnd(tokens: [Token], start: Int) -> Int {
+    var end = start
+    while end < tokens.count && tokens[end].kind != .End && !tokens[end].lineStart {
+        end += 1
+    }
+    return end
+}
+
+function slice(tokens: [Token], start: Int, end: Int) -> [Token] {
+    var taken: [Token] = []
+    for index in start..end {
+        taken.append(tokens[index])
+    }
+    return taken
+}
+
+extend Preprocessor {
+    function macroNamed(borrow self, name: String) -> Int {
+        for index in 0..macros.count {
+            if macros[index].name == name { return index }
+        }
+        return -1
+    }
+
+    function include(borrow mut self, path: String, file: Int, depth: Int) -> Result<Bool, Failure> {
+        let tokens = try lex(fileText(session, file as SourceFile), file)
+        var stack = Conditionals { frames = [], depth = 0 }
+        var index = 0
+        while tokens[index].kind != .End {
+            let token = tokens[index]
+            let kept = stack.kept()
+            if token.kind == .Hash && token.lineStart {
+                let end = directiveEnd(tokens, index + 1)
+                let line = slice(tokens, index + 1, end)
+                try conditional(line, token.span, stack)
+                if kept && !isConditional(line) { try directive(line, token.span, path, depth) }
+                index = end
+            } else {
+                if kept { expand(token, []) }
+                index += 1
+            }
+        }
+        if stack.depth > 0 {
+            return .Error(Failure { diagnostic = .BadConditional, span = stack.frames[stack.depth - 1].span })
+        }
+        return .Ok(true)
+    }
+
+    // Appends `token`, replaced by its macro's expansion when it names one
+    // that is not already being expanded.
+    function expand(borrow mut self, token: Token, expanding: [String]) {
+        if token.kind != .Word {
+            output.append(token)
+            return
+        }
+        let found = macroNamed(token.text)
+        if found < 0 || contains(expanding, token.text) {
+            output.append(token)
+            return
+        }
+        var inner = expanding
+        inner.append(token.text)
+        for part in macros[found].body {
+            expand(Token { kind = part.kind, text = part.text, span = token.span, lineStart = false }, inner)
+        }
+    }
+
+    // `#if` and its kin, which are read in skipped regions too.
+    function conditional(borrow mut self, line: [Token], hash: Span, stack: borrow mut Conditionals) -> Result<Bool, Failure> {
+        if !isConditional(line) { return .Ok(true) }
+        let word = line[0].text
+        let enclosing = stack.kept()
+        let span = Span { file = hash.file, start = hash.start, end = line[0].span.end }
+        let unbalanced = Failure { diagnostic = .BadConditional, span = span }
+        if word == "if" || word == "ifdef" || word == "ifndef" {
+            var holds = false
+            if enclosing { holds = try condition(line, span) }
+            stack.push(Conditional {
+                active = enclosing && holds, taken = holds, enclosing = enclosing, sawElse = false, span = span
+            })
+            return .Ok(true)
+        }
+        if stack.depth == 0 { return .Error(unbalanced) }
+        let top = stack.depth - 1
+        if word == "endif" {
+            stack.depth -= 1
+            return .Ok(true)
+        }
+        var frame = stack.frames[top]
+        if frame.sawElse { return .Error(unbalanced) }
+        if word == "else" {
+            frame.sawElse = true
+            frame.active = frame.enclosing && !frame.taken
+            frame.taken = true
+        } else if frame.enclosing && !frame.taken {
+            frame.active = try condition(line, span)
+            frame.taken = frame.active
+        } else {
+            frame.active = false
+        }
+        stack.frames[top] = frame
+        return .Ok(true)
+    }
+
+    // Whether an `#if`, `#ifdef`, `#ifndef` or `#elif` line holds.
+    function condition(borrow mut self, line: [Token], span: Span) -> Result<Bool, Failure> {
+        let word = line[0].text
+        if word == "ifdef" || word == "ifndef" {
+            if line.count != 2 || line[1].kind != .Word {
+                return .Error(Failure { diagnostic = .BadCondition, span = span })
+            }
+            let defined = macroNamed(line[1].text) >= 0
+            return .Ok(defined == (word == "ifdef"))
+        }
+        let value = try evaluateCondition(slice(line, 1, line.count), span)
+        return .Ok(value != 0)
+    }
+
+    function directive(borrow mut self, line: [Token], hash: Span, path: String, depth: Int) -> Result<Bool, Failure> {
+        if line.count == 0 { return .Ok(true) }
+        let span = Span { file = hash.file, start = hash.start, end = line[line.count - 1].span.end }
+        let bad = Failure { diagnostic = .BadDirective, span = span }
+        match line[0].text {
+            "include" -> return includeDirective(line, span, path, depth)
+            "define" -> {
+                if line.count < 2 || line[1].kind != .Word { return .Error(bad) }
+                // `NAME(` with no space between is a function-like macro.
+                if line.count > 2 && line[2].kind == .LeftParen && line[2].span.start == line[1].span.end {
+                    return .Error(bad)
+                }
+                let found = macroNamed(line[1].text)
+                let made = Macro { name = line[1].text, body = slice(line, 2, line.count) }
+                if found >= 0 {
+                    macros[found] = made
+                } else {
+                    macros.append(made)
+                }
+                return .Ok(true)
+            }
+            "undef" -> {
+                if line.count != 2 || line[1].kind != .Word { return .Error(bad) }
+                var kept: [Macro] = []
+                for known in macros {
+                    if known.name != line[1].text { kept.append(known) }
+                }
+                macros = kept
+                return .Ok(true)
+            }
+            "pragma" -> {
+                if line.count == 2 && line[1].text == "once" {
+                    once.append(path)
+                    return .Ok(true)
+                }
+                return .Error(bad)
+            }
+            "error" -> return .Error(Failure { diagnostic = .ErrorDirective, span = span })
+            else -> return .Error(bad)
+        }
+    }
+
+    function includeDirective(borrow mut self, line: [Token], span: Span, path: String, depth: Int) -> Result<Bool, Failure> {
+        if line.count == 2 && line[1].kind == .StringLiteral {
+            let written = line[1].text
+            let name = utf8Slice(written, 1, utf8Count(written) - 1)
+            let target = joinPath(directoryOf(path), name)
+            if contains(once, target) { return .Ok(true) }
+            if !pathExists(session, target) {
+                return .Error(Failure { diagnostic = .MissingInclude, span = span })
+            }
+            if depth + 1 > includeLimit { return .Error(Failure { diagnostic = .IncludeDepth, span = span }) }
+            return include(target, readFile(session, target), depth + 1)
+        }
+        if line.count < 3 || line[1].kind != .Less || line[line.count - 1].kind != .Greater {
+            return .Error(Failure { diagnostic = .BadDirective, span = span })
+        }
+        var parts: [String] = []
+        for index in 2..line.count - 1 {
+            parts.append(line[index].text)
+        }
+        let header = joinText(parts)
+        if header == "metal_stdlib" || header == "simd/simd.h" { return .Ok(true) }
+        return .Error(Failure { diagnostic = .UnknownHeader, span = span })
+    }
+}
+
+function isConditional(line: [Token]) -> Bool {
+    if line.count == 0 || line[0].kind != .Word { return false }
+    match line[0].text {
+        "if" -> return true
+        "ifdef" -> return true
+        "ifndef" -> return true
+        "elif" -> return true
+        "else" -> return true
+        "endif" -> return true
+        else -> return false
+    }
+}
+
+function contains(names: [String], name: String) -> Bool {
+    for known in names {
+        if known == name { return true }
+    }
+    return false
+}
+
+function directoryOf(path: String) -> String {
+    var slash = -1
+    for index in 0..utf8Count(path) {
+        if utf8Byte(path, index) == asciiSlash { slash = index }
+    }
+    if slash < 0 { return "." }
+    if slash == 0 { return "/" }
+    return utf8Slice(path, 0, slash)
+}
+
+function joinPath(directory: String, relative: String) -> String {
+    if utf8Count(relative) > 0 && utf8Byte(relative, 0) == asciiSlash { return relative }
+    match directory {
+        "." -> return relative
+        "/" -> return joinText(["/", relative])
+        else -> return joinText([directory, "/", relative])
+    }
+}
+
+// The file name of `path` without its directory and last extension.
+function shaderName(path: String) -> String {
+    var start = 0
+    var dot = utf8Count(path)
+    for index in 0..utf8Count(path) {
+        let byte = utf8Byte(path, index)
+        if byte == asciiSlash {
+            start = index + 1
+            dot = utf8Count(path)
+        }
+        if byte == asciiDot && index > start { dot = index }
+    }
+    return utf8Slice(path, start, dot)
+}

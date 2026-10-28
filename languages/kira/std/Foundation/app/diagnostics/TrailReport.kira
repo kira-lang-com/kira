@@ -1,0 +1,171 @@
+// How a trail event reads, laid out as the compiler lays out a diagnostic:
+//
+//     absorbed[Shop.catalog]: fell back to `CatalogStack()`
+//       --> app/catalog.kira:28:17
+//        |
+//     28 |     let stack = try loadCatalog(path) otherwise CatalogStack()
+//        |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ absorbed here
+//        = failure: CatalogError.Truncated
+//        |
+//       ::: Shop/inflate.kira:88:13
+//        |
+//     88 |             return .Error(.Truncated)
+//        |             ^^^^^^^^^^^^^^^^^^^^^^^^^ made here
+//        = error: CatalogError.Truncated
+//
+// A warning, a fault and a failure show the line they come from; quieter
+// events, printed or spilled, show only where. A spilled event also says
+// when it happened.
+
+function trailRendered(event: borrow TrailEvent, timed: Bool, printedCount: Number) -> String {
+    let site = describedSite(event.site)
+    let detailed = TrailLevel.Warn.admits(site.level) || site.kind != .Log
+    let gutter = trailGutterFor(event)
+    var text = trailLabel(site) + "[" + site.trail + "]"
+    var message = site.message
+    if site.kind == .Origin && event.values.count > 0 { message = event.values[0] }
+    if !message.isEmpty() { text = text + ": " + message }
+    if timed { text = text + " (at " + trailMilliseconds(event.time) + ")" }
+    text = text + "\n" + spacePadded("", gutter) + "--> " + trailLocation(site) + "\n"
+    if detailed {
+        text = text + trailExcerpt(site, gutter, trailCaretLabel(site.kind, event.cause.isSome()))
+    }
+    if site.kind != .Origin {
+        for index in 0..event.values.count {
+            text = text + trailBlank(
+                gutter
+            ) + "= " + site.names[index] + ": " + event.values[index] + "\n"
+        }
+    }
+    if printedCount > TrailLimit.repeats {
+        text = text + trailBlank(gutter) + "= note: printed " + String(
+            printedCount
+        ) + " times; repeats show at powers of two\n"
+    }
+    return text + trailChain(event, gutter)
+}
+
+// The events `event` follows from, newest first, each where it happened.
+function trailChain(event: borrow TrailEvent, gutter: Number) -> String {
+    var text = ""
+    var cause = event.cause
+    for step in 0..TrailLimit.chain {
+        match cause {
+            Some(serial) -> {
+                match trailRingFind(serial) {
+                    Some(slot) -> {
+                        let earlier = runtimeContext.trail.ring[slot]
+                        let site = describedSite(earlier.site)
+                        text = text + trailBlank(gutter) + "|\n" + spacePadded(
+                            "",
+                            gutter
+                        ) + "::: " + trailLocation(site) + "\n"
+                        text = text + trailExcerpt(
+                            site,
+                            gutter,
+                            trailCaretLabel(site.kind, earlier.cause.isSome())
+                        )
+                        if earlier.values.count > 0 {
+                            text = text + trailBlank(gutter) + "= " + trailValueName(
+                                site
+                            ) + ": " + earlier.values[0] + "\n"
+                        }
+                        cause = earlier.cause
+                    }
+                    None -> return text + trailBlank(
+                        gutter
+                    ) + "= note: what led to it is no longer recorded\n"
+                }
+            }
+            None -> return text
+        }
+    }
+    return text
+}
+
+// What a chained event's first value is called in a report.
+function trailValueName(site: borrow TrailSite) -> String {
+    if site.kind == .Origin { return "error" }
+    if site.names.count > 0 { return site.names[0] }
+    return "failure"
+}
+
+//    |
+// 28 |     let stack = try loadCatalog(path) otherwise CatalogStack()
+//    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ absorbed here
+function trailExcerpt(site: borrow TrailSite, gutter: Number, label: String) -> String {
+    if site.snippet.isEmpty() { return "" }
+    var text = trailBlank(gutter) + "|\n"
+    text = text + spacePadded(String(site.line), gutter) + " | " + site.snippet + "\n"
+    var marker = ""
+    // A tab in the line stays a tab under it, so the carets land under the
+    // site however wide the reader's tabs are.
+    for index in 0..site.column - 1 {
+        let tabbed = index < site.snippet.count && storedByte(site.snippet, index) == Ascii.tab
+        marker = marker + (tabbed ? "\t" : " ")
+    }
+    for index in 0..site.width { marker = marker + "^" }
+    if !label.isEmpty() { marker = marker + " " + label }
+    return text + trailBlank(gutter) + "| " + marker + "\n"
+}
+
+// The width of the widest line number a report on `event` shows.
+function trailGutterFor(event: borrow TrailEvent) -> Number {
+    var widest = String(describedSite(event.site).line).count
+    var cause = event.cause
+    for step in 0..TrailLimit.chain {
+        match cause {
+            Some(serial) -> {
+                match trailRingFind(serial) {
+                    Some(slot) -> {
+                        let earlier = runtimeContext.trail.ring[slot]
+                        let width = String(describedSite(earlier.site).line).count
+                        if width > widest { widest = width }
+                        cause = earlier.cause
+                    }
+                    None -> return widest
+                }
+            }
+            None -> return widest
+        }
+    }
+    return widest
+}
+
+function trailBlank(gutter: Number) -> String {
+    return spacePadded("", gutter) + " "
+}
+
+function trailLocation(site: borrow TrailSite) -> String {
+    return site.path + ":" + String(site.line) + ":" + String(site.column)
+}
+
+function trailLabel(site: borrow TrailSite) -> String {
+    match site.kind {
+        Absorbed -> return "absorbed"
+        Handled -> return "handled"
+        Origin -> return "error"
+        Log -> return site.level.name()
+    }
+}
+
+function trailCaretLabel(kind: borrow TrailKind, converted: Bool) -> String {
+    match kind {
+        Absorbed -> return "absorbed here"
+        Handled -> return "handled here"
+        Origin -> return converted ? "converted here" : "made here"
+        Log -> return ""
+    }
+}
+
+function trailMilliseconds(nanoseconds: Number) -> String {
+    let micros = trunc(nanoseconds / 1000)
+    return String(micros / 1000) + "." + zeroPadded(micros % 1000, 3) + "ms"
+}
+
+// `text` padded on the left with spaces to `width`.
+function spacePadded(text: borrow String, width: Number) -> String {
+    var padded = text
+    while padded.count < width { padded = " " + padded }
+    return padded
+}

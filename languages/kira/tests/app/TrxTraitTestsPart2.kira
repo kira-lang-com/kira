@@ -1,0 +1,94 @@
+import Foundation
+
+// ----- trait existentials -------------------------------------------------
+//
+// A trait's name used as a type holds "a value of some conforming type". The
+// value carries which concrete type it was, member calls dispatch to that
+// type's implementation, and a `Drop` body on the concrete type still runs —
+// exactly once — when the existential dies.
+
+struct TrxKey: TrxScored {
+    let n: Int
+
+    function score(borrow self) -> Int {
+        return n
+    }
+}
+
+struct TrxToken: TrxScored {
+    let n: Int
+
+    function score(borrow self) -> Int {
+        return n * 10
+    }
+}
+
+function trxScoreAny(value: TrxScored) -> Int {
+    return value.score()
+}
+
+@Test
+function trxAnExistentialBindingWrapsAndDispatches() {
+    let any: TrxScored = TrxKey(n: 3)
+    expect!(any.score() == 3)
+}
+
+@Test
+function trxASecondConformerIsADifferentVariantOfTheSameExistential() {
+    let other: TrxScored = TrxToken(n: 4)
+    expect!(other.score() == 40)
+}
+
+@Test
+function trxAParameterSpelledWithTheTraitAcceptsEitherConformer() {
+    expect!(trxScoreAny(value: TrxKey(n: 9)) + trxScoreAny(value: TrxToken(n: 7)) == 79)
+}
+
+@Test
+function trxAnArrayOfExistentialsHoldsHeterogeneousConformers() {
+    let both: [TrxScored] = [TrxKey(n: 2), TrxToken(n: 30)]
+    var total = 0
+    for item in both {
+        total = total + item.score()
+    }
+    expect!(total == 302)
+}
+
+@Test
+function trxADefaultRunsThroughAnExistential() {
+    let any: TrxScored = TrxKey(n: 6)
+    expect!(any.doubled() == 12)
+}
+
+@Test
+function trxTwoExistentialValuesCompareByTheirConcreteValue() {
+    let a: TrxScored = TrxKey(n: 5)
+    let b: TrxScored = TrxKey(n: 5)
+    let c: TrxScored = TrxToken(n: 5)
+    let sameAB = a == b
+    let sameAC = a == c
+    expect!(sameAB)
+    expect!(!sameAC)
+    expect!(a.score() + b.score() + c.score() == 60)
+}
+
+// ----- bare family-conformance head ---------------------------------------
+//
+// `Family Name { … }` spells a zero-parameter declaration backed by `Family`
+// without the `construct` keyword or an `extends` clause. Computed members
+// discharge the family's `@Required let`s exactly as the spelled-out form
+// does.
+
+construct TrxBare { @Required function bare(borrow self) -> Int }
+
+TrxBare TrxBareHeadCase {
+    function bare(borrow self) -> Int {
+        return 77
+    }
+}
+
+@Test
+function trxBareHeadIsCollected() {
+    let head = TrxBareHeadCase()
+    expect!(head.bare() == 77)
+}

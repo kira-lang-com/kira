@@ -1,0 +1,170 @@
+// Generic declarations as RIDL writes them (KLF-RIDL sections 20.7 and
+// 23.5): `struct Holder<Value>` with its fields, and the parameters and
+// result of each of its methods. A surface declares the template every named
+// instance it spells is laid out from, and a contract publishes it with its
+// `@Instance`s. A type that names no parameter is resolved here and spelled
+// by the surface as it spells any type; a parameter is written as its name.
+
+// A run of RIDL text, a type the surface spells, or the name of a generic
+// declaration an argument list follows, which the surface declares too.
+enum RidlPiece {
+    Written(String)
+    Resolved(Type)
+    Generic(String)
+}
+
+// A field, or a method's parameter, of a generic declaration.
+struct RidlTemplateSlot {
+    let name: String
+    let mode: PassingMode
+    var pieces: [RidlPiece]
+}
+
+// A method of a generic declaration. Its receiver is the one each instance's
+// method has, which the surface reads from the instance.
+struct RidlTemplateMethod {
+    let name: String
+    var parameters: [RidlTemplateSlot]
+    // Empty when the method answers nothing.
+    var result: [RidlPiece]
+}
+
+struct RidlTemplate {
+    let name: String
+    // The file that declares it, which tells a contract whose it is.
+    let file: Int
+    let parameters: [String]
+    var fields: [RidlTemplateSlot]
+    var methods: [RidlTemplateMethod]
+    // The arguments of each `@Instance` the program's own declaration names,
+    // one piece each.
+    var instances: [[RidlPiece]]
+}
+
+extend Checker {
+    // Every generic struct and construct whose fields RIDL can write. A
+    // method RIDL cannot write is left out, as the surface leaves out a
+    // function it cannot carry.
+    function ridlTemplates(borrow self, declarations: Declarations) -> [RidlTemplate] {
+        var templates: [RidlTemplate] = []
+        let named = ownNamedInstances(tree)
+        for declared in tree.genericStructs {
+            var parameters: [String] = []
+            for parameter in declared.genericParameters { parameters.append(parameter.text) }
+            var complete = true
+            var fields: [RidlTemplateSlot] = []
+            for field in declared.fields {
+                match ridlPieces(declarations, field.annotation, parameters) {
+                    Some(pieces) -> fields.append(RidlTemplateSlot { name = field.name.text, mode = .Owned, pieces = pieces })
+                    None -> complete = false
+                }
+            }
+            if !complete { continue }
+            var methods: [RidlTemplateMethod] = []
+            for method in declared.methods {
+                match ridlTemplateMethod(declarations, method, parameters) {
+                    Some(written) -> methods.append(written)
+                    None -> {}
+                }
+            }
+            var instances: [[RidlPiece]] = []
+            for reference in named {
+                if ridlName(reference.name.text) != ridlName(declared.name.text) { continue }
+                var arguments: [RidlPiece] = []
+                for argument in reference.arguments {
+                    match ridlLeaf(declarations, argument) {
+                        Some(resolved) -> arguments.append(.Resolved(resolved))
+                        None -> {}
+                    }
+                }
+                if arguments.count == reference.arguments.count { instances.append(arguments) }
+            }
+            templates.append(RidlTemplate {
+                name = declared.name.text, file = declared.name.span.file, parameters = parameters, fields = fields, methods = methods, instances = instances
+            })
+        }
+        return templates
+    }
+}
+
+function ridlTemplateMethod(declarations: borrow Declarations, method: FunctionDeclaration, parameters: borrow [String]) -> Optional<RidlTemplateMethod> {
+    if method.receiver == .Static { return .None }
+    var slots: [RidlTemplateSlot] = []
+    for parameter in method.parameters {
+        match ridlPieces(declarations, parameter.annotation, parameters) {
+            Some(pieces) -> slots.append(RidlTemplateSlot { name = parameter.name.text, mode = parameter.mode, pieces = pieces })
+            None -> return .None
+        }
+    }
+    var result: [RidlPiece] = []
+    match method.result {
+        Some(reference) -> {
+            match ridlPieces(declarations, reference, parameters) {
+                Some(pieces) -> result = pieces
+                None -> return .None
+            }
+        }
+        None -> {}
+    }
+    return .Some(RidlTemplateMethod { name = method.name.text, parameters = slots, result = result })
+}
+
+// `reference` as RIDL pieces, where `parameters` are the declaration's type
+// parameters, or none when it names a type that cannot be resolved.
+function ridlPieces(declarations: borrow Declarations, reference: TypeReference, parameters: borrow [String]) -> Optional<[RidlPiece]> {
+    if !mentionsName(reference, parameters) {
+        // `Void` is written only as a closure's or a method's result.
+        if reference.name.text == "Void" && reference.arguments.count == 0 { return .Some([.Written("Void")]) }
+        match ridlLeaf(declarations, reference) {
+            Some(resolved) -> return .Some([.Resolved(resolved)])
+            None -> return .None
+        }
+    }
+    if reference.arguments.count == 0 { return .Some([.Written(reference.name.text)]) }
+    let name = reference.name.text
+    let closure = name == "Closure"
+    let tuple = startsWithText(name, "Tuple")
+    var pieces: [RidlPiece] = []
+    var last = reference.arguments.count
+    if name == "Array" {
+        pieces.append(.Written("["))
+    } else if closure {
+        // A RIDL function type's parameters are all owned (appendix A.2).
+        for mode in reference.modes {
+            if mode != .Owned { return .None }
+        }
+        pieces.append(.Written("("))
+        last = reference.arguments.count - 1
+    } else if tuple {
+        pieces.append(.Written("("))
+    } else {
+        pieces.append(.Generic(name))
+        pieces.append(.Written("<"))
+    }
+    for index in 0..last {
+        if index > 0 { pieces.append(.Written(", ")) }
+        match ridlPieces(declarations, reference.arguments[index], parameters) {
+            Some(argument) -> { for piece in argument { pieces.append(piece) } }
+            None -> return .None
+        }
+    }
+    if name == "Array" {
+        pieces.append(.Written("]"))
+    } else if closure {
+        pieces.append(.Written(") -> "))
+        match ridlPieces(declarations, reference.arguments[last], parameters) {
+            Some(result) -> { for piece in result { pieces.append(piece) } }
+            None -> return .None
+        }
+    } else if tuple {
+        pieces.append(.Written(")"))
+    } else {
+        pieces.append(.Written(">"))
+    }
+    return .Some(pieces)
+}
+
+// The type `reference` names, without reporting one it does not.
+function ridlLeaf(declarations: borrow Declarations, reference: TypeReference) -> Optional<Type> {
+    return declarations.typeNamed(canonicalAliasReference(declarations.aliases, reference, 0).instanceName)
+}

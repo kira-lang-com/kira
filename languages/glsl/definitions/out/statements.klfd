@@ -1,0 +1,235 @@
+// Math functions, combined-sampler sampling, and the statements GLSL spells
+// its own way.
+
+function glslMathName(fun: String) -> String {
+    match fun {
+        "atan2" -> return "atan"
+        "round" -> return "roundEven"
+        "inverse_sqrt" -> return "inversesqrt"
+        "face_forward" -> return "faceforward"
+        "reverse_bits" -> return "bitfieldReverse"
+        "pack4x8snorm" -> return "packSnorm4x8"
+        "pack4x8unorm" -> return "packUnorm4x8"
+        "pack2x16snorm" -> return "packSnorm2x16"
+        "pack2x16unorm" -> return "packUnorm2x16"
+        "pack2x16float" -> return "packHalf2x16"
+        "unpack4x8snorm" -> return "unpackSnorm4x8"
+        "unpack4x8unorm" -> return "unpackUnorm4x8"
+        "unpack2x16snorm" -> return "unpackSnorm2x16"
+        "unpack2x16unorm" -> return "unpackUnorm2x16"
+        "unpack2x16float" -> return "unpackHalf2x16"
+        "saturate" -> return "clamp"
+        "count_one_bits" -> return "bitCount"
+        "first_leading_bit" -> return "findMSB"
+        "first_trailing_bit" -> return "findLSB"
+        "count_trailing_zeros" -> return "findLSB"
+        "count_leading_zeros" -> return "findMSB"
+        "extract_bits" -> return "bitfieldExtract"
+        "insert_bits" -> return "bitfieldInsert"
+        else -> return fun
+    }
+}
+
+function glslAtomicFunction(fun: String) -> String {
+    match fun {
+        "add" -> return "atomicAdd"
+        "subtract" -> return "atomicAdd"
+        "and" -> return "atomicAnd"
+        "or" -> return "atomicOr"
+        "xor" -> return "atomicXor"
+        "min" -> return "atomicMin"
+        "max" -> return "atomicMax"
+        "exchange" -> return "atomicExchange"
+        else -> return "atomicCompSwap"
+    }
+}
+
+extend TextOut {
+    // `uint` or `uvecN` in the shape of an expression's type.
+    function uintShape(borrow self, expression: Int) -> String {
+        let lanes = lanesOf(expression)
+        if lanes > 0 { return joinText(["uvec", decimalText(lanes)]) }
+        return "uint"
+    }
+
+    function glslMath(borrow self, expression: Int) -> String {
+        var parts: [String] = []
+        let items = fieldCount("expressions", current, expression, "items")
+        for at in 0..items {
+            parts.append(operand(fieldItem("expressions", current, expression, "items", at)))
+        }
+        let fun = text("expressions", current, expression, "fun")
+        let named = glslMathName(fun)
+        var first = expression
+        if items > 0 { first = fieldItem("expressions", current, expression, "items", 0) }
+        let ty = resultType(expression)
+        if fun == "saturate" { return joinText(["clamp(", parts[0], ", 0.0, 1.0)"]) }
+        if fun == "count_one_bits" || fun == "first_leading_bit" || fun == "first_trailing_bit" {
+            return joinText([ty, "(", named, "(", parts[0], "))"])
+        }
+        if fun == "count_leading_zeros" {
+            return joinText([ty, "(31 - ", named, "(", uintShape(first), "(", parts[0], ")))"])
+        }
+        if fun == "count_trailing_zeros" {
+            return joinText([ty, "(min(", uintShape(first), "(", named, "(", parts[0], ")), 32u))"])
+        }
+        if fun == "extract_bits" {
+            return joinText([named, "(", parts[0], ", int(", parts[1], "), int(", parts[2], "))"])
+        }
+        if fun == "insert_bits" {
+            return joinText([named, "(", parts[0], ", ", parts[1], ", int(", parts[2], "), int(", parts[3], "))"])
+        }
+        if fun == "sign" && scalarKind(scalarOf(first)) == "uint" { return joinText(["min(", parts[0], ", 1u)"]) }
+        return joinText([named, "(", joinWith(parts, ", "), ")"])
+    }
+
+    // `image_sample` on a combined sampler: the coordinate carries the
+    // array layer and the depth reference, as GLSL's sampling functions
+    // take them.
+    function glslSample(borrow self, expression: Int) -> String {
+        let image = operandOf(expression, "image")
+        let imageType = typeOf(image)
+        let dimension = typeText(imageType, "dimension")
+        let arrayed = flag("types", -1, imageType, "arrayed")
+        let texture = operand(image)
+        var parts: [String] = [operand(operandOf(expression, "coordinate"))]
+        let arrayIndex = operandOf(expression, "array_index")
+        if arrayIndex >= 0 { parts.append(joinText(["float(", operand(arrayIndex), ")"])) }
+        let offsetIndex = operandOf(expression, "offset")
+        var offset = ""
+        if offsetIndex >= 0 { offset = operand(offsetIndex) }
+        let referenceIndex = operandOf(expression, "depth_ref")
+        var reference = ""
+        if referenceIndex >= 0 { reference = operand(referenceIndex) }
+        let gather = operandOf(expression, "gather")
+        if gather >= 0 {
+            let point = samplePoint(parts, dimension)
+            var last = decimalText(gather)
+            if referenceIndex >= 0 { last = reference }
+            if offsetIndex >= 0 {
+                return joinText(["textureGatherOffset(", texture, ", ", point, ", ", offset, ", ", last, ")"])
+            }
+            return joinText(["textureGather(", texture, ", ", point, ", ", last, ")"])
+        }
+        let cubeArray = dimension == "cube" && arrayed
+        var trailing = ""
+        if referenceIndex >= 0 && cubeArray {
+            trailing = reference
+        } else if referenceIndex >= 0 {
+            parts.append(reference)
+        }
+        let point = samplePoint(parts, dimension)
+        var suffix = ""
+        if offsetIndex >= 0 { suffix = "Offset" }
+        var arguments: [String] = [texture, point]
+        let level = text("expressions", current, expression, "level")
+        var name = ""
+        if level == "auto" {
+            if utf8Count(trailing) > 0 { arguments.append(trailing) }
+            name = "texture"
+        } else if level == "bias" {
+            if utf8Count(trailing) > 0 { arguments.append(trailing) }
+            if offsetIndex >= 0 { arguments.append(offset) }
+            arguments.append(operand(operandOf(expression, "level_value")))
+            return joinText(["texture", suffix, "(", joinWith(arguments, ", "), ")"])
+        } else if (level == "zero" || level == "exact") && referenceIndex >= 0 && (arrayed || dimension == "cube") {
+            if level != "zero" || cubeArray {
+                refuse("a depth comparison at an explicit level of an array or cube")
+            }
+            let zero = joinText(["vec", decimalText(coordinateCount(dimension)), "(0.0)"])
+            arguments.append(zero)
+            arguments.append(zero)
+            name = "textureGrad"
+        } else if level == "zero" {
+            arguments.append("0.0")
+            name = "textureLod"
+        } else if level == "exact" {
+            arguments.append(joinText(["float(", operand(operandOf(expression, "level_value")), ")"]))
+            name = "textureLod"
+        } else {
+            arguments.append(operand(operandOf(expression, "gradient_x")))
+            arguments.append(operand(operandOf(expression, "gradient_y")))
+            name = "textureGrad"
+        }
+        if offsetIndex >= 0 { arguments.append(offset) }
+        return joinText([name, suffix, "(", joinWith(arguments, ", "), ")"])
+    }
+
+    function writeAtomic(borrow mut self, block: Int, position: Int, depth: Int) {
+        let target = operand(statementField(block, position, "pointer"))
+        let valueIndex = statementField(block, position, "value")
+        var value = operand(valueIndex)
+        let fun = text("statements", block, position, "fun")
+        if fun == "subtract" && scalarKind(scalarOf(valueIndex)) == "uint" {
+            value = joinText(["(0u - ", value, ")"])
+        } else if fun == "subtract" {
+            value = joinText(["(-", value, ")"])
+        }
+        let named = glslAtomicFunction(fun)
+        let compare = statementField(block, position, "compare")
+        var call = joinText([named, "(", target, ", ", value, ")"])
+        if compare >= 0 { call = joinText([named, "(", target, ", ", operand(compare), ", ", value, ")"]) }
+        let result = statementField(block, position, "result")
+        if result >= 0 {
+            bake(result, call, depth)
+        } else {
+            line(depth, joinText([call, ";"]))
+        }
+    }
+
+    function dialectStatement(borrow mut self, block: Int, position: Int, which: String, depth: Int) -> Bool {
+        if which == "kill" {
+            line(depth, "discard;")
+            return true
+        }
+        if which == "image_store" {
+            let image = operand(statementField(block, position, "image"))
+            let at = integerCoordinate(statementField(block, position, "coordinate"),
+                statementField(block, position, "array_index"))
+            let value = operand(statementField(block, position, "value"))
+            line(depth, joinText(["imageStore(", image, ", ", at, ", ", value, ");"]))
+            return true
+        }
+        if which == "atomic" {
+            writeAtomic(block, position, depth)
+            return true
+        }
+        if which == "control_barrier" || which == "memory_barrier" {
+            let flags = text("statements", block, position, "flags")
+            if containsWord(flags, "storage") { line(depth, "memoryBarrierBuffer();") }
+            if containsWord(flags, "workgroup") { line(depth, "memoryBarrierShared();") }
+            if containsWord(flags, "image") { line(depth, "memoryBarrierImage();") }
+            if which == "control_barrier" { line(depth, "barrier();") }
+            return true
+        }
+        if which == "workgroup_uniform_load" {
+            let value = operand(statementField(block, position, "pointer"))
+            line(depth, "barrier();")
+            bake(statementField(block, position, "result"), value, depth)
+            line(depth, "barrier();")
+            return true
+        }
+        if which == "call" {
+            let arguments = fieldCount("statements", block, position, "arguments")
+            for at in 0..arguments {
+                let argumentType = typeOf(fieldItem("statements", block, position, "arguments", at))
+                if typeKind(argumentType) == "pointer" {
+                    let space = typeText(argumentType, "space")
+                    if space != "function" && space != "private" {
+                        refuseAt("a pointer argument outside function or private memory", "statements", block,
+                            position)
+                    }
+                }
+            }
+        }
+        return false
+    }
+}
+
+// A sampling coordinate: the coordinate alone, or a vector of it and what
+// follows it.
+function samplePoint(parts: [String], dimension: String) -> String {
+    if parts.count == 1 { return parts[0] }
+    return joinText(["vec", decimalText(coordinateCount(dimension) + parts.count - 1), "(", joinWith(parts, ", "),
+        ")"])
+}

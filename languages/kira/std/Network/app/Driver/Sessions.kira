@@ -1,0 +1,283 @@
+import Foundation
+
+// HTTP/3 events from every session, turned into the driver's events for the
+// requests they belong to.
+
+extend Network {
+    function pumpSessions(borrow mut self) {
+        for index in 0..sessions.count {
+            let connection = match connectionIndex(index) {
+                Some(value) -> value
+                None -> {
+                    endSession(index, .Closed)
+                    continue
+                }
+            }
+            let slot = sessions[index].slot
+            sessions[index].http.pump(slots[slot].endpoint.connections[connection].connection)
+            while true {
+                let next = sessions[index].http.event()
+                let event = match next {
+                    Some(value) -> value
+                    None -> break
+                }
+                takeHttp(index, event)
+            }
+            // A session's CONNECT waits for the peer's SETTINGS, and a
+            // request for the peer to allow another stream.
+            if sessions[index].origin.count > 0 {
+                if sessions[index].connected { startRequests(index) }
+            } else {
+                deliverConnects(index)
+            }
+        }
+        var kept: [SessionEntry] = []
+        for session in sessions {
+            if !session.closed { kept.append(copy session) }
+        }
+        sessions = kept
+    }
+
+    function takeHttp(borrow mut self, session: Number, event: borrow Http3Event) {
+        let client = sessions[session].origin.count > 0
+        match event {
+            Connected(agreement) -> {
+                absorb agreement
+                sessions[session].connected = true
+                log debug(category: NetworkLog.Connection, "connected", session: session)
+                if client { startRequests(session) }
+            }
+            Head(head) -> {
+                if client {
+                    takeResponseHead(session, head)
+                } else {
+                    takeRequestHead(session, head)
+                }
+            }
+            Body(chunk) -> {
+                if client {
+                    match streamRequest(session, chunk.stream) {
+                        Some(index) -> events.append(
+                            .ResponseBody(
+                                BodyChunk { request: requests[index].id, bytes: copy chunk.bytes }
+                            )
+                        )
+                        None -> {}
+                    }
+                } else {
+                    takeRequestBody(session, chunk)
+                }
+            }
+            Ended(end) -> {
+                if client {
+                    match streamRequest(session, end.stream) {
+                        Some(index) -> endRequest(index, copy end.trailers, .None)
+                        None -> {}
+                    }
+                } else {
+                    takeRequestEnd(session, end)
+                }
+            }
+            Reset(failure) -> {
+                if client {
+                    match streamRequest(session, failure.id) {
+                        Some(index) -> endRequest(index, Fields {}, .Some(.Reset(failure.error)))
+                        None -> {}
+                    }
+                } else {
+                    match servedIndex(sessions[session].id, failure.id) {
+                        Some(index) -> dropServed(index)
+                        None -> {}
+                    }
+                }
+            }
+            // The peer stopped reading this side's body; its answer may
+            // still come.
+            Stopped(failure) -> absorb failure
+            Goaway(first) -> {
+                sessions[session].going = true
+                goneAway(session, first)
+            }
+            Closed(end) -> endSession(session, connectionFailure(end))
+            TransportStream(_) -> takeTransport(session, event)
+            TransportData(_) -> takeTransport(session, event)
+            TransportReset(_) -> takeTransport(session, event)
+            TransportStopped(_) -> takeTransport(session, event)
+            TransportDatagram(_) -> takeTransport(session, event)
+            TransportDraining(_) -> takeTransport(session, event)
+            TransportClosed(_) -> takeTransport(session, event)
+        }
+    }
+
+    function streamRequest(borrow self, session: Number, stream: QuicStreamNumber) -> Number? {
+        let key = sessions[session].id
+        for (index, request) in requests.enumerated() {
+            if request.session == .Some(key) && request.stream == .Some(stream) {
+                return .Some(index)
+            }
+        }
+        return .None
+    }
+
+    function takeResponseHead(borrow mut self, session: Number, head: borrow StreamHead) {
+        let index = match streamRequest(session, head.stream) {
+            Some(value) -> value
+            None -> return
+        }
+        match head.head {
+            ResponseHead(response) -> {
+                // Informational responses are the protocol's business.
+                if code(response.status) < StatusRange.informationalEnd { return }
+                if requests[index].route.quic && webIndex(
+                    SessionId(requests[index].id.raw)
+                ).isSome() {
+                    return settleSession(session, index, response.status)
+                }
+                events.append(
+                    .ResponseHead(
+                        ResponseHeadEvent {
+                            request: requests[index].id,
+                            status: response.status,
+                            fields: copy response.fields,
+                            version: .Http3
+                        }
+                    )
+                )
+            }
+            RequestHead(_) -> {}
+        }
+    }
+
+    function takeRequestHead(borrow mut self, session: Number, head: borrow StreamHead) {
+        match head.head {
+            RequestHead(request) -> {
+                served.append(
+                    ServerRequest {
+                        id: takeRequestId(),
+                        session: sessions[session].id,
+                        stream: head.stream,
+                        head: .Some(copy request),
+                        connect: request.method == .Connect && request.protocolName == .Some(
+                            WebTransport.protocolName
+                        )
+                    }
+                )
+                deliverConnects(session)
+            }
+            ResponseHead(_) -> {}
+        }
+    }
+
+    function takeRequestBody(borrow mut self, session: Number, chunk: borrow StreamBody) {
+        let index = match receivingIndex(sessions[session].id, chunk.stream) {
+            Some(value) -> value
+            None -> return
+        }
+        if served[index].body.count + chunk.bytes.count > options.requestBodyLimit {
+            refuse(session, chunk.stream, code(Http3Error.ExcessiveLoad))
+            return dropServed(index)
+        }
+        served[index].body.appendAll(chunk.bytes)
+    }
+
+    function takeRequestEnd(borrow mut self, session: Number, end: borrow StreamEnded) {
+        let index = match receivingIndex(sessions[session].id, end.stream) {
+            Some(value) -> value
+            None -> return
+        }
+        match slots[sessions[session].slot].server {
+            Some(server) -> deliverIncoming(index, server, sessions[session].peer)
+            None -> {}
+        }
+    }
+
+    // Served request `index` arrived whole: the program gets it.
+    function deliverIncoming(
+        borrow mut self,
+        index: Number,
+        server: ServerId,
+        peer: borrow String
+    ) {
+        let head = match served[index].head {
+            Some(value) -> value
+            None -> return
+        }
+        let bytes = copy served[index].body
+        served[index].body = []
+        served[index].received = true
+        served[index].bodiless = head.method == .Head
+        let message = Request {
+            method: head.method,
+            target: copy head.target,
+            fields: copy head.fields,
+            body: bytes.count == 0 ? .Empty : .Bytes(bytes),
+            protocolName: copy head.protocolName
+        }
+        events.append(
+            .Incoming(
+                IncomingRequest {
+                    request: served[index].id,
+                    server: server,
+                    message: message,
+                    peer: copy peer
+                }
+            )
+        )
+    }
+
+    // Resets a stream both ways.
+    function refuse(borrow mut self, session: Number, stream: QuicStreamNumber, error: Number) {
+        let connection = match connectionIndex(session) {
+            Some(value) -> value
+            None -> return
+        }
+        let slot = sessions[session].slot
+        absorb slots[slot].endpoint.connections[connection].connection.resetStream(stream, error)
+        absorb slots[slot].endpoint.connections[connection].connection.stopSending(stream, error)
+    }
+
+    // Requests on streams from `first` on were never served (RFC 9114
+    // section 5.2).
+    function goneAway(borrow mut self, session: Number, first: Number) {
+        let key = sessions[session].id
+        var unserved: [RequestId] = []
+        for request in requests {
+            let late = match request.stream {
+                Some(stream) -> stream.raw >= first
+                None -> false
+            }
+            if request.session == .Some(key) && late { unserved.append(request.id) }
+        }
+        for id in unserved { endRequestId(id, .Some(.Closed)) }
+    }
+
+    // The session's connection ended: its requests end with `failure`.
+    function endSession(borrow mut self, session: Number, failure: HttpFailure) {
+        log warn(category: NetworkLog.Session, "session ended with a failure", session: session, failure: failure)
+        sessions[session].closed = true
+        let key = sessions[session].id
+        var carried: [RequestId] = []
+        for request in requests {
+            if request.session == .Some(key) { carried.append(request.id) }
+        }
+        for id in carried { endRequestId(id, .Some(copy failure)) }
+        var gone: [SessionId] = []
+        for web in webSessions {
+            if web.session == .Some(key) { gone.append(web.id) }
+        }
+        for id in gone {
+            match webIndex(id) {
+                Some(index) -> closeWebSession(
+                    index,
+                    SessionClose { session: id, failure: .Some(copy failure) }
+                )
+                None -> {}
+            }
+        }
+        var kept: [ServerRequest] = []
+        for request in served {
+            if request.session != key { kept.append(copy request) }
+        }
+        served = kept
+    }
+}

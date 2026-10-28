@@ -1,0 +1,87 @@
+import Testing
+
+// The single-file programs of `corpus/heap.klfd` that the typed-memory and
+// atomic checks reject. Their text is inline so each diagnostic keeps the
+// line the corpus named.
+
+@Test
+function rejectsTypedMemoryMisuse() {
+    expect!(!compiles("""
+        // What typed memory refuses: a load with no type to read, a type with no C
+        // memory shape, and copies of values whose drop would then run twice: one
+        // itself, one through a case payload.
+        struct Owned: Drop {
+            let start: RawPtr
+
+            function drop(borrow mut self) {
+                heapFreeRaw(self.start)
+                return
+            }
+        }
+
+        enum Shape {
+            Dot
+            Line(Int)
+        }
+
+        enum Held {
+            Empty
+            Full(Owned)
+        }
+
+        @Main
+        function main() -> Int {
+            let start = heapAllocateRaw(16, 8)
+            heapLoad(start)
+            let text = heapLoad<Shape>(start)
+            let first = Owned { start = start }
+            let second = first
+            let held: Held = .Full(move second)
+            let again = held
+            return 0
+        }
+        """))
+    expect!(diagnosed(3396, 26, 0))
+    expect!(diagnosed(3397, 27, 0))
+    expect!(diagnosed(3398, 29, 0))
+    expect!(diagnosed(3398, 31, 0))
+}
+
+@Test
+function rejectsAtomicMisuse() {
+    expect!(!compiles("""
+        // What the atomics refuse: an operand no machine word holds, arithmetic on a
+        // pointer, an ordering written as anything but a case, and orderings the
+        // operation cannot have -- a releasing load, an acquiring store, a relaxed
+        // fence and a compare-exchange failing stronger than it succeeds.
+        enum MemoryOrder {
+            Relaxed
+            Acquire
+            Release
+            AcquireRelease
+            SequentiallyConsistent
+        }
+
+        @Main
+        function main() -> Int {
+            let cell = heapAllocateRaw(8, 8)
+            let order: MemoryOrder = .Relaxed
+            atomicAdd<Float>(cell, 1.0, .Relaxed)
+            atomicAdd<RawPtr>(cell, cell, .Relaxed)
+            atomicStore<Int>(cell, 1, order)
+            let loaded = atomicLoad<Int>(cell, .Release)
+            atomicStore<Int>(cell, 2, .Acquire)
+            atomicFence(.Relaxed)
+            let read = atomicCompareExchange<Int>(cell, 0, 1, .Relaxed, .Acquire)
+            heapFreeRaw(cell)
+            return 0
+        }
+        """))
+    expect!(diagnosed(3407, 17, 0))
+    expect!(diagnosed(3407, 18, 0))
+    expect!(diagnosed(3408, 19, 0))
+    expect!(diagnosed(3408, 20, 0))
+    expect!(diagnosed(3408, 21, 0))
+    expect!(diagnosed(3408, 22, 0))
+    expect!(diagnosed(3408, 23, 0))
+}

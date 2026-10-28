@@ -1,0 +1,153 @@
+// Every code kmsl reports.
+//
+// kmsl spells a code `KMSL-E<NNNN>` or `KMSL-W<NNNN>`. The kernel's
+// diagnostic channel carries one integer, so an error is its own number and
+// a warning is 5000 plus its number. The titles and explanations are the
+// `DiagnosticSpec` list in language.klfd; docs/diagnostics.md maps both.
+
+enum Diagnostic {
+    Unexpected
+    NotADeclaration
+    Unterminated
+    BadLiteral
+    BadDirective
+    UnknownHeader
+    MissingInclude
+    BadConditional
+    BadCondition
+    ErrorDirective
+    IncludeDepth
+
+    MixedStages
+    GraphicsEntries
+    ComputeEntries
+    PointerArithmetic
+    StoredPointer
+    ForeignPointer
+    ArgumentBuffer
+    FunctionTable
+    MeshShader
+    TileFunction
+    SimdGroup
+    GatedParameter
+    ClassTemplate
+    Lambda
+    ConstexprSampler
+    Printf
+    Recursion
+    UnsupportedType
+    UnsupportedStruct
+    UnsupportedAttribute
+    UnsupportedFunction
+    UnsupportedStatement
+    FallThrough
+    MemoryOrder
+    UnsupportedConstruct
+    NoEntry
+
+    UnknownType
+    UnknownName
+    Redeclared
+    TypeMismatch
+    ArgumentCount
+    NoSuchMember
+    NoMatch
+    Ambiguous
+    NotAssignable
+    BadEntryParameter
+    BadInterface
+    SlotConflict
+    NotConstant
+    MissingReturn
+    OutsideLoop
+    Deduction
+    BadOperator
+    DuplicateCase
+    WrongStage
+    BadThreadgroup
+
+    function code(borrow self) -> Int {
+        match self {
+            Unexpected -> return 1
+            NotADeclaration -> return 2
+            Unterminated -> return 3
+            BadLiteral -> return 4
+            BadDirective -> return 5
+            UnknownHeader -> return 6
+            MissingInclude -> return 7
+            BadConditional -> return 8
+            BadCondition -> return 9
+            ErrorDirective -> return 10
+            IncludeDepth -> return 11
+
+            MixedStages -> return 101
+            GraphicsEntries -> return 102
+            ComputeEntries -> return 103
+            PointerArithmetic -> return 104
+            StoredPointer -> return 105
+            ForeignPointer -> return 106
+            ArgumentBuffer -> return 107
+            FunctionTable -> return 108
+            MeshShader -> return 109
+            TileFunction -> return 110
+            SimdGroup -> return 111
+            GatedParameter -> return 112
+            ClassTemplate -> return 113
+            Lambda -> return 114
+            ConstexprSampler -> return 115
+            Printf -> return 116
+            Recursion -> return 117
+            UnsupportedType -> return 118
+            UnsupportedStruct -> return 119
+            UnsupportedAttribute -> return 120
+            UnsupportedFunction -> return 121
+            UnsupportedStatement -> return 122
+            FallThrough -> return 123
+            MemoryOrder -> return 124
+            UnsupportedConstruct -> return 125
+            NoEntry -> return 126
+
+            UnknownType -> return 201
+            UnknownName -> return 202
+            Redeclared -> return 203
+            TypeMismatch -> return 204
+            ArgumentCount -> return 205
+            NoSuchMember -> return 206
+            NoMatch -> return 207
+            Ambiguous -> return 208
+            NotAssignable -> return 209
+            BadEntryParameter -> return 210
+            BadInterface -> return 211
+            SlotConflict -> return 212
+            NotConstant -> return 213
+            MissingReturn -> return 214
+            OutsideLoop -> return 215
+            Deduction -> return 216
+            BadOperator -> return 217
+            DuplicateCase -> return 218
+            WrongStage -> return 219
+            BadThreadgroup -> return 220
+        }
+    }
+}
+
+// A byte range of one source file.
+struct Span {
+    let file: Int
+    let start: Int
+    let end: Int
+}
+
+// What stops preprocessing or parsing: the diagnostic and where it points.
+struct Failure {
+    let diagnostic: Diagnostic
+    let span: Span
+
+    function report(borrow self) {
+        report(diagnostic, span)
+    }
+}
+
+function report(diagnostic: Diagnostic, span: Span) {
+    diag_error_in(span.file as SourceFile, diagnostic.code(), span.start, span.end)
+}

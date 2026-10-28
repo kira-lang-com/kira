@@ -1,0 +1,31 @@
+// A depth pass: a graphics shader with no fragment stage.
+
+type Camera {
+    let viewProjection: Float4x4
+}
+
+type VertexIn {
+    let position: Float3
+}
+
+type VertexOut {
+    @builtin(position)
+    let clip_position: Float4
+}
+
+shader DepthOnly {
+    group Frame {
+        uniform camera: Camera
+    }
+
+    vertex {
+        input VertexIn
+        output VertexOut
+
+        function entry(vertexIn: VertexIn) -> VertexOut {
+            let out: VertexOut
+            out.clip_position = mul(camera.viewProjection, Float4(vertexIn.position, 1.0))
+            return out
+        }
+    }
+}

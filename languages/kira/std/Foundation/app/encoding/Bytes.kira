@@ -1,0 +1,264 @@
+// Turning scalars into bytes and back.
+//
+// A `[UN8]` is the shape a socket, a file, an FFI struct, and a hash all speak.
+// The scalars have to reach it and come back, and the one thing that must not be
+// left to each call site is the byte order: a length written little-endian and
+// read big-endian is a bug that passes every local test and fails across a wire.
+// So a writer and a reader each carry their `ByteOrder`.
+//
+// Floats go through `floatToBits`/`floatToBits32`, the IEEE-754
+// reinterpretations, so a float serializes as its exact bits rather than as a
+// rounded number. Signed integers share the two's-complement bit pattern of
+// their unsigned counterpart, so they encode through it and sign-extend on the
+// way back.
+
+enum ByteOrder {
+    Little
+    Big
+}
+
+enum ByteFailure {
+    // A read wanted more bytes than remain after this offset.
+    Truncated(Number)
+}
+
+namespace ByteWidth {
+    let singleByte: Number = 1
+    let halfWord: Number = 2
+    let word: Number = 4
+    let doubleWord: Number = 8
+    let bitsPerByte: Number = 8
+    // 2^31 and 2^63: the top bit of a word and of a double word. A `Number`
+    // holds up to 2^64, so the bit pattern of a negative value is built from
+    // two halves, never from 2^64 itself.
+    let wordSignBit: Number = 2147483648
+    let doubleWordSignBit: Number = 9223372036854775808
+}
+
+// How far the byte at `index` of a `width`-byte value sits from the value's
+// low end, in bits.
+function byteShift(order: ByteOrder, index: Number, width: Number) -> Number {
+    match order {
+        Little -> return index * ByteWidth.bitsPerByte
+        Big -> return (width - 1 - index) * ByteWidth.bitsPerByte
+    }
+}
+
+// The unsigned bit pattern of `value`, whose top bit is `signBit`.
+function unsignedBits(value: Number, signBit: Number) -> UNumber {
+    if value < 0 { return (value + signBit) + signBit }
+    return value
+}
+
+// The signed value of the unsigned bit pattern `bits`, whose top bit is `signBit`.
+function signedFromBits(bits: UNumber, signBit: Number) -> Number {
+    if bits >= signBit { return (bits - signBit) - signBit }
+    return bits
+}
+
+struct ByteWriter {
+    let order: ByteOrder
+    var bytes: [UN8] = []
+
+    function writeU8(borrow mut self, value: UN8) {
+        bytes.append(value)
+    }
+
+    function writeU16(borrow mut self, value: UN16) {
+        writeBits(Number(value), ByteWidth.halfWord)
+    }
+
+    function writeU32(borrow mut self, value: UN32) {
+        writeBits(Number(value), ByteWidth.word)
+    }
+
+    function writeU64(borrow mut self, value: UNumber) {
+        writeBits(value, ByteWidth.doubleWord)
+    }
+
+    // A negative `N32` goes out as its two's-complement pattern.
+    function writeI32(borrow mut self, value: N32) {
+        writeBits(unsignedBits(Number(value), ByteWidth.wordSignBit), ByteWidth.word)
+    }
+
+    function writeInt(borrow mut self, value: Number) {
+        writeBits(unsignedBits(value, ByteWidth.doubleWordSignBit), ByteWidth.doubleWord)
+    }
+
+    // The float's IEEE-754 bits, from the float builtins that answer fixed widths.
+    function writeF32(borrow mut self, value: Float) {
+        writeBits(Number(floatToBits32(F32(value))), ByteWidth.word)
+    }
+
+    function writeF64(borrow mut self, value: Float) {
+        writeBits(Number(floatToBits(value)), ByteWidth.doubleWord)
+    }
+
+    // Bytes written as they are, in their own order: a payload, a string's
+    // UTF-8, a nested record.
+    function writeBytes(borrow mut self, values: borrow [UN8]) {
+        for value in values { bytes.append(value) }
+    }
+
+    function writeBool(borrow mut self, value: Bool) {
+        writeU8(value ? UN8(1) : UN8(0))
+    }
+
+    // Each byte is the value shifted down to it and masked: a value's bytes
+    // come out in the order the byte order names.
+    function writeBits(borrow mut self, bits: Number, width: Number) {
+        for index in 0..width {
+            bytes.append(UN8((bits >> byteShift(order, index, width)) & 0xFF))
+        }
+    }
+}
+
+// Reads a packed structure front to back: each read takes the bytes at
+// `offset` and moves past them.
+struct ByteReader {
+    let bytes: [UN8]
+    let order: ByteOrder
+    var offset: UNumber = 0
+
+    function readU8(borrow mut self) -> Result<UN8, ByteFailure> {
+        match readBits(ByteWidth.singleByte) {
+            Ok(bits) -> return .Ok(UN8(bits))
+            Error(failure) -> return .Error(failure)
+        }
+    }
+
+    function readU16(borrow mut self) -> Result<UN16, ByteFailure> {
+        match readBits(ByteWidth.halfWord) {
+            Ok(bits) -> return .Ok(UN16(bits))
+            Error(failure) -> return .Error(failure)
+        }
+    }
+
+    function readU32(borrow mut self) -> Result<UN32, ByteFailure> {
+        match readBits(ByteWidth.word) {
+            Ok(bits) -> return .Ok(UN32(bits))
+            Error(failure) -> return .Error(failure)
+        }
+    }
+
+    function readU64(borrow mut self) -> Result<UNumber, ByteFailure> {
+        return readBits(ByteWidth.doubleWord)
+    }
+
+    // A top bit set in the fourth byte makes the value negative.
+    function readI32(borrow mut self) -> Result<N32, ByteFailure> {
+        match readBits(ByteWidth.word) {
+            Ok(bits) -> return .Ok(N32(signedFromBits(bits, ByteWidth.wordSignBit)))
+            Error(failure) -> return .Error(failure)
+        }
+    }
+
+    // A top bit set in the eighth byte makes the value negative, as `writeInt` wrote it.
+    function readInt(borrow mut self) -> Result<Number, ByteFailure> {
+        match readBits(ByteWidth.doubleWord) {
+            Ok(bits) -> return .Ok(signedFromBits(bits, ByteWidth.doubleWordSignBit))
+            Error(failure) -> return .Error(failure)
+        }
+    }
+
+    function readF32(borrow mut self) -> Result<Float, ByteFailure> {
+        match readBits(ByteWidth.word) {
+            Ok(bits) -> return .Ok(Float(bitsToFloat32(U32(bits))))
+            Error(failure) -> return .Error(failure)
+        }
+    }
+
+    function readF64(borrow mut self) -> Result<Float, ByteFailure> {
+        match readBits(ByteWidth.doubleWord) {
+            Ok(bits) -> return .Ok(bitsToFloat(U64(bits)))
+            Error(failure) -> return .Error(failure)
+        }
+    }
+
+    // The next `count` bytes as they are.
+    function readBytes(borrow mut self, count: Number) -> Result<[UN8], ByteFailure> {
+        if count < 0 { return .Error(.Truncated(offset)) }
+        match take(count) {
+            Ok(start) -> return .Ok(byteRun(bytes, start, start + count))
+            Error(failure) -> return .Error(failure)
+        }
+    }
+
+    // How many bytes are left after `offset`.
+    function remaining(borrow self) -> Number {
+        return bytes.count - offset
+    }
+
+    function readBool(borrow mut self) -> Result<Bool, ByteFailure> {
+        match readU8() {
+            Ok(byte) -> return .Ok(byte != UN8(0))
+            Error(failure) -> return .Error(failure)
+        }
+    }
+
+    function readBits(borrow mut self, width: Number) -> Result<UNumber, ByteFailure> {
+        match take(width) {
+            Ok(start) -> {
+                var bits: UNumber = 0
+                for index in 0..width {
+                    bits = bits | (Number(bytes[start + index]) << byteShift(order, index, width))
+                }
+                return .Ok(bits)
+            }
+            Error(failure) -> return .Error(failure)
+        }
+    }
+
+    // Where the next `width` bytes start, moving `offset` past them.
+    function take(borrow mut self, width: Number) -> Result<Number, ByteFailure> {
+        let start = offset
+        if start + width > bytes.count { return .Error(.Truncated(offset)) }
+        offset = offset + width
+        return .Ok(start)
+    }
+}
+
+// Scalars read in place from bytes whose range the caller has already proved,
+// such as a container's header or a chunk table, without copying them into a
+// `ByteReader`. A read past the end traps like any index.
+extend Array<UN8> {
+    function bitsAt(borrow self, offset: Number, width: Number, order: ByteOrder) -> UNumber {
+        var bits: UNumber = 0
+        for index in 0..width {
+            bits = bits | (Number(self[offset + index]) << byteShift(copy order, index, width))
+        }
+        return bits
+    }
+
+    function u16At(borrow self, offset: Number, order: ByteOrder) -> UN16 {
+        return UN16(bitsAt(offset, ByteWidth.halfWord, move order))
+    }
+
+    function u32At(borrow self, offset: Number, order: ByteOrder) -> UN32 {
+        return UN32(bitsAt(offset, ByteWidth.word, move order))
+    }
+
+    function u64At(borrow self, offset: Number, order: ByteOrder) -> UNumber {
+        return bitsAt(offset, ByteWidth.doubleWord, move order)
+    }
+
+    // Whether the bytes at `offset` are `expected`, as a binary signature
+    // such as PNG's or KTX2's is.
+    function holds(borrow self, offset: Number, expected: borrow [UN8]) -> Bool {
+        if offset < 0 || offset + expected.count > self.count { return false }
+        for index in 0..expected.count {
+            if self[offset + index] != expected[index] { return false }
+        }
+        return true
+    }
+
+    // Whether the bytes at `offset` spell `text`, as a format's tag does:
+    // `RIFF`, `fmt `, `glTF`.
+    function spells(borrow self, offset: Number, text: borrow String) -> Bool {
+        if offset < 0 || offset + text.count > self.count { return false }
+        for index in 0..text.count {
+            if self[offset + index] != text.byteAt(index) { return false }
+        }
+        return true
+    }
+}

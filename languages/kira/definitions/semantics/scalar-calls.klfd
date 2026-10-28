@@ -1,0 +1,110 @@
+// Calls the checker answers itself: raw heap allocation, scalar and pointer
+// conversions, and wrapping arithmetic.
+
+extend Checker {
+    function allocateRawCall(borrow mut self, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 2 {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let byteCount = expression(arguments[0], .Some(Type.int()))
+        let alignment = expression(arguments[1], .Some(Type.int()))
+        if typeOf(byteCount).isInvalid() || typeOf(alignment).isInvalid() {
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        return add(.HeapAllocateRaw(byteCount, alignment), Type.pointer(), span)
+    }
+
+    function freeRawCall(borrow mut self, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 1 {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let pointer = expression(arguments[0], .Some(Type.pointer()))
+        if typeOf(pointer).isInvalid() { return add(.Integer(0), Type.invalid(), span) }
+        if !typeOf(pointer).equals(Type.pointer()) {
+            report(.ArgumentTypeMismatch, program.expressions[pointer].span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        return add(.HeapFreeRaw(pointer), Type.void(), span)
+    }
+
+    // `I32(value)`: the value at another integer type, range-checked when the
+    // target cannot hold every value of the source. A distinct value converts
+    // from its representation.
+    function conversion(borrow mut self, target: Type, arguments: [Int], span: Span) -> Int {
+        if target.isSizedNumber() && arguments.count == 1 { return sizedConversion(target, arguments[0], span) }
+        if target.kind == .Decimal && arguments.count == 1 {
+            let made = toNumber(arguments[0], span)
+            if typeOf(made).isInvalid() || typeOf(made).equals(target) { return made }
+            return add(.Bitcast(made), target, span)
+        }
+        if arguments.count != 1 || (!target.isInteger() && target.kind != .Floating && target.kind != .Pointer) {
+            report(.ConversionArguments, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        if target.kind == .Pointer {
+            let word = whole(expression(arguments[0], .None), Type.int(), .ArgumentTypeMismatch)
+            if typeOf(word).isInvalid() { return word }
+            requireOperand(word, typeOf(word).isInteger())
+            return add(.Convert(word), target, span)
+        }
+        if target.isInteger() {
+            match numberConstantSyntax(tree, arguments[0]) {
+                Some(whole) -> {
+                    if lookup("Number").isNone() { return integerLiteral(whole, false, .Some(target), span) }
+                }
+                None -> {}
+            }
+        }
+        var value = expression(arguments[0], .Some(target))
+        var source = typeOf(value)
+        if isDistinctType(program, source) {
+            source = program.structs[source.declaration].fields[0].valueType
+            value = add(.Member(value, 0), source, span)
+        }
+        if source.isInvalid() || source.equals(target) { return value }
+        if source.kind == .Decimal { return fromNumber(value, target, span) }
+        requireOperand(value, source.isInteger() || source.kind == .Floating)
+        return add(.Convert(value), target, span)
+    }
+
+    // `rawPointerWord(pointer)`: the word an opaque pointer holds, as `U64`.
+    function pointerWord(borrow mut self, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 1 {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let pointer = expression(arguments[0], .None)
+        if typeOf(pointer).isInvalid() { return pointer }
+        requireOperand(pointer, typeOf(pointer).kind == .Pointer)
+        return add(.Convert(pointer), Type.integer(64, false), span)
+    }
+
+    // `wrappingAdd(a, b)` and its siblings wrap at the operands' width
+    // instead of trapping.
+    function wrapping(borrow mut self, operator: ArithmeticOperator, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 2 {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let operands = unify(arguments[0], arguments[1], .Some(Type.int()), .OperatorOperands)
+        var first = operands.left
+        var second = operands.right
+        // A sized number wraps at its own width, as the integer it is
+        // stored as; only `Number` itself becomes a word first.
+        if typeOf(first).isNumber() { first = whole(first, Type.int(), .OperatorOperands) }
+        if typeOf(second).isNumber() { second = whole(second, typeOf(first), .OperatorOperands) }
+        requireOperand(first, typeOf(first).isInteger() || typeOf(first).isSizedNumber())
+        return add(.Wrapping(operator, first, second), typeOf(first), span)
+    }
+}
+
+function wrappingOperator(name: String) -> Optional<ArithmeticOperator> {
+    match name {
+        "wrappingAdd" -> return .Some(.Add)
+        "wrappingSub" -> return .Some(.Subtract)
+        "wrappingMul" -> return .Some(.Multiply)
+        else -> return .None
+    }
+}

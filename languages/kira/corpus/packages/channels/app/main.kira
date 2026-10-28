@@ -1,0 +1,62 @@
+import Foundation
+
+async function fill(sender: Sender<Int>) -> Int {
+    sender.send(41)
+    return 1
+}
+
+function ordered() -> Int {
+    let sender = Channel<Int>()
+    let receiver = sender.receiver
+    sender.send(1)
+    sender.send(2)
+    sender.send(3)
+    attempt {
+        let first = try receiver.receive()
+        let second = try receiver.receive()
+        let third = try receiver.receive()
+        return first * 100 + second * 10 + third
+    } handle {
+        Closed { return -1 }
+    }
+}
+
+function closed() -> Int {
+    let sender = Channel<Int>()
+    sender.send(7)
+    sender.close()
+    attempt {
+        let first = try sender.receiver.receive()
+        let second = try sender.receiver.receive()
+        return first + second
+    } handle {
+        Closed { return 99 }
+    }
+}
+
+function driven() -> Int {
+    let sender = Channel<Int>()
+    let pending = Task { fill(sender) }
+    attempt {
+        let value = try sender.receiver.receive()
+        return value + pending.await
+    } handle {
+        Closed { return -1 }
+    }
+}
+
+function floating() -> Int {
+    let sender = Channel<Float>()
+    sender.send(0.5)
+    attempt {
+        let value = try sender.receiver.receive()
+        return value == 0.5 ? 1 : 0
+    } handle {
+        Closed { return -1 }
+    }
+}
+
+@Main
+function main() -> Int {
+    return ordered() + closed() + driven() + floating()
+}

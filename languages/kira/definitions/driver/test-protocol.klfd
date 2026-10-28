@@ -1,0 +1,231 @@
+// `kira test`: the built test program knows its tests and how each is
+// expected to end, and the driver asks it, one child run per question, as
+// kira's own runner does. `list` names every test, `expect NAME` says what a
+// pass is, and `check NAME` or `body NAME` runs the test that way. A child
+// answers in lines its output starts with `__kira_test_name__:` and
+// `__kira_test_result__:`.
+
+// A failed test carries what its child wrote on standard error: the
+// expectations that failed, or the trap that ended it.
+enum TestOutcome {
+    Passed
+    Failed(String)
+    Skipped
+}
+
+// One child run: how it ended and what it wrote.
+struct ChildRun {
+    let status: Int
+    let output: String
+    let errors: String
+}
+
+// What `expect` answers: check the test's result, run its body expecting a
+// failure, or skip it.
+let expectCheck = 10
+let expectFailure = 11
+let expectSkip = 12
+
+// A command that ended without a status, and one that could not start.
+let endedWithoutStatus = -1
+let notStarted = -2
+
+// Runs every test of the program `command` runs and prints a line for each
+// and a summary. Zero when none failed.
+function runTests(command: [String]) -> Int {
+    var names: [String] = []
+    match enumerateTests(command) {
+        Some(found) -> names = found
+        None -> return 1
+    }
+    var passed = 0
+    var failed = 0
+    var skipped = 0
+    for name in names {
+        match runTestCase(command, name) {
+            None -> return 1
+            Some(outcome) -> {
+                match outcome {
+                    Passed -> {
+                        passed = passed + 1
+                        writeDriverOutput(joinText(["ok   ", name, "\n"]))
+                    }
+                    Failed(account) -> {
+                        failed = failed + 1
+                        writeDriverOutput(joinText(["FAIL ", name, "\n"]))
+                        writeFailureAccount(account)
+                    }
+                    Skipped -> {
+                        skipped = skipped + 1
+                        writeDriverOutput(joinText(["skip ", name, " (diagnostic/compile expectation unsupported)\n"]))
+                    }
+                }
+            }
+        }
+    }
+    writeDriverOutput(joinText([
+        decimalText(passed), " passed, ", decimalText(failed), " failed, ",
+        decimalText(skipped), " skipped, ", decimalText(names.count), " total\n"
+    ]))
+    if failed == 0 { return 0 }
+    return 1
+}
+
+// The names `list` answers with; none after reporting why there are none.
+function enumerateTests(command: [String]) -> Optional<[String]> {
+    match runChild(command, "list", []) {
+        Some(child) -> return listedNames(child)
+        None -> return .None
+    }
+}
+
+function listedNames(child: ChildRun) -> Optional<[String]> {
+    if child.status != 0 {
+        reportChildFailure("test enumeration", child)
+        return .None
+    }
+    match protocolResult(child.output) {
+        Some(code) -> {
+            if code != 0 {
+                reportChildFailure("test enumeration protocol", child)
+                return .None
+            }
+        }
+        None -> {
+            reportChildFailure("test enumeration protocol", child)
+            return .None
+        }
+    }
+    var names: [String] = []
+    for line in outputLines(child.output) {
+        match afterPrefix(line, "__kira_test_name__:") {
+            Some(name) -> {
+                if utf8Count(name) > 0 { names.append(name) }
+            }
+            None -> {}
+        }
+    }
+    return .Some(names)
+}
+
+// How the test `name` ends; none when a child could not start.
+function runTestCase(command: [String], name: String) -> Optional<TestOutcome> {
+    match runChild(command, "expect", [name]) {
+        Some(expectation) -> {
+            match actionCode(expectation) {
+                Some(code) -> return expectedOutcome(command, name, code, announcedTrap(expectation.output))
+                None -> return .Some(.Failed(expectation.errors))
+            }
+        }
+        None -> return .None
+    }
+}
+
+// The message fragment a test's child announced for a trap, none when it
+// announced none.
+function announcedTrap(output: String) -> Optional<String> {
+    var fragment: Optional<String> = .None
+    for line in outputLines(output) {
+        match afterPrefix(line, "__kira_test_trap__:") {
+            Some(text) -> fragment = .Some(text)
+            None -> {}
+        }
+    }
+    return fragment
+}
+
+// Runs the test `name` the way `expect` answered with `code`. A trap test
+// passes when its child exits with a trap whose message contains the
+// announced fragment; an empty fragment accepts any trap.
+function expectedOutcome(command: [String], name: String, code: Int, trap: Optional<String>) -> Optional<TestOutcome> {
+    if code == expectSkip { return .Some(.Skipped) }
+    if code != expectCheck && code != expectFailure { return .Some(.Failed("")) }
+    var action = "check"
+    if code == expectFailure { action = "body" }
+    var fragment = ""
+    match trap {
+        Some(text) -> fragment = text
+        None -> {}
+    }
+    match runChild(command, action, [name]) {
+        Some(child) -> {
+            if code == expectFailure {
+                if child.status == 1 && containsText(child.errors, fragment) { return .Some(.Passed) }
+                if child.status == 1 {
+                    return .Some(.Failed(joinText(["no trap message contains \"", fragment, "\":\n", child.errors])))
+                }
+                if child.status == 0 { return .Some(.Failed("the test returned without trapping\n")) }
+                return .Some(.Failed(child.errors))
+            }
+            match actionCode(child) {
+                Some(result) -> {
+                    if result == 0 { return .Some(.Passed) }
+                    return .Some(.Failed(child.errors))
+                }
+                None -> return .Some(.Failed(child.errors))
+            }
+        }
+        None -> return .None
+    }
+}
+
+// Runs the program with `action` and its operands; none after reporting a
+// child that could not start.
+function runChild(command: [String], action: String, operands: [String]) -> Optional<ChildRun> {
+    var child: [String] = []
+    for part in command { child.append(part) }
+    child.append(action)
+    for operand in operands { child.append(operand) }
+    let status = runCommand(child)
+    if status == notStarted {
+        writeDriverError(joinText(["kira test: cannot start the ", action, " child\n"]))
+        return .None
+    }
+    return .Some(ChildRun { status = status, output = commandOutput(1), errors = commandOutput(2) })
+}
+
+// The code a child answered with: a failing status as it stands, else the
+// result line it wrote, and success for a child that exited cleanly without
+// one.
+function actionCode(child: ChildRun) -> Optional<Int> {
+    if child.status == endedWithoutStatus { return protocolResult(child.output) }
+    if child.status != 0 { return .Some(child.status) }
+    match protocolResult(child.output) {
+        Some(code) -> return .Some(code)
+        None -> return .Some(0)
+    }
+}
+
+// The code of the last result line in `output`.
+function protocolResult(output: String) -> Optional<Int> {
+    var result: Optional<Int> = .None
+    for line in outputLines(output) {
+        match afterPrefix(line, "__kira_test_result__:") {
+            Some(code) -> {
+                match statusValue(code) {
+                    Some(value) -> result = .Some(value)
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+    }
+    return result
+}
+
+// A failed test's account, each line indented under its `FAIL` line.
+function writeFailureAccount(account: String) {
+    for line in outputLines(account) {
+        if !isBlank(line) { writeDriverOutput(joinText(["    ", line, "\n"])) }
+    }
+}
+
+function reportChildFailure(label: String, child: ChildRun) {
+    if isBlank(child.errors) {
+        var status = "None"
+        if child.status >= 0 { status = joinText(["Some(", decimalText(child.status), ")"]) }
+        writeDriverError(joinText(["kira test: ", label, " child exited ", status, "\n"]))
+    } else {
+        writeDriverError(joinText(["kira test: ", label, " failed:\n", child.errors, "\n"]))
+    }
+}

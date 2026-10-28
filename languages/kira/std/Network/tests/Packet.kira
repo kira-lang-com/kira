@@ -1,0 +1,138 @@
+import Foundation
+
+// RFC 9001 appendix A.5's 1-RTT keys.
+function chachaKeys() -> TlsTrafficKeys {
+    return TlsTrafficKeys {
+        key: AeadKey {
+            suite: .ChaCha20Poly1305Sha256,
+            key: hexBytes("c6d98ff3441c3fe1b2182094f69caa2ed4b716b65488960a7a984979fb23e1c8")
+        },
+        iv: hexBytes("e0459b3474bdd0e44a41c144"),
+        header: hexBytes("25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4")
+    }
+}
+
+// RFC 9001 appendix A.5: a PING in a short header packet, sealed and read
+// back.
+@Test
+function shortPacketsMatchRfc9001Sample() {
+    let number = 654360564
+    let packet = QuicOutgoingPacket {
+        header: QuicPacketHeader { level: .Application, destination: [] },
+        number: number,
+        largestAcknowledged: .Some(number - 100000),
+        payload: [1]
+    }
+    let keys = chachaKeys()
+    let sealed = match quicSealPacket(packet, keys) {
+        Ok(bytes) -> bytes
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    expect!((hexText(sealed)) == "4cfe4189655e5cd55c41f69080575d7999c25a5bfb")
+    let raw = match quicReadHeader(sealed, 0, 0) {
+        Ok(value) -> value
+        Error(drop) -> {
+            expect!((traceText(drop)) == "")
+            return
+        }
+    }
+    let opened = match quicOpenPacket(sealed, raw, keys, .Some(number - 1)) {
+        Ok(value) -> value
+        Error(drop) -> {
+            expect!((traceText(drop)) == "")
+            return
+        }
+    }
+    expect!("\(opened.number)" == "\(number)")
+    expect!((opened.payload.count) == (1))
+    expect!((Number(opened.payload[0])) == (1))
+}
+
+// RFC 9001 appendix A.5's next-generation secret.
+function quicKeyUpdateMatchesRfc9001Outcome() -> String {
+    let secret = hexBytes("9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b")
+    let parameters = TlsSuiteParameters {
+        suite: .ChaCha20Poly1305Sha256,
+        hash: .Sha256,
+        hashBytes: TlsSuiteSize.sha256,
+        keyBytes: TlsSuiteSize.chachaKey
+    }
+    return match tlsUpdatedSecret(parameters, secret, .Quic) {
+        Ok(next) -> hexText(next)
+        Error(failure) -> traceText(failure)
+    }
+}
+
+@Test
+function quicKeyUpdateMatchesRfc9001() {
+    expect!(quicKeyUpdateMatchesRfc9001Outcome() == "1223504755036d556342ee9361d253421a826c9ecdf3c7148684b36b714881f9")
+}
+
+// A truncated packet number is expanded against the largest number received,
+// following RFC 9000 appendix A.3 and A.2, and a window's edge.
+@Test
+function packetNumbersRecoverFromTheirTruncation() {
+    expect!("\(quicFullNumber(39730, 2, .Some(2821665002)))" == "2821692210")
+    expect!("\(quicFullNumber(2, 1, .Some(254)))" == "258")
+    expect!("\(quicFullNumber(0, 1, .None))" == "0")
+    expect!("\(quicNumberLength(11295746, .Some(11266227)))" == "2")
+    expect!("\(quicNumberLength(11331838, .Some(11266227)))" == "3")
+}
+
+// Transport parameters round trip, and a repeated parameter is refused.
+@Test
+function transportParametersRoundTrip() {
+    let limits = QuicLimits {}
+    let sent = quicAnnouncedParameters(limits, [1, 2, 3, 4])
+    let bytes = quicEncodeParameters(sent)
+    let back = match quicDecodeParameters(bytes, false) {
+        Ok(value) -> value
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    expect!("\(back.initialMaxData)" == "16777216")
+    expect!((back.initialSource == sent.initialSource) == (true))
+    expect!("\(back.maxDatagramFrameSize)" == "65535")
+    var twice = WireWriter {}
+    twice.writeBytes(bytes)
+    twice.writeVarint(1)
+    twice.writeVarint(1)
+    twice.writeVarint(5)
+    expect!(traceText(quicDecodeParameters(twice.bytes, false)) == "Error(QuicTransportError.TransportParameterError)")
+}
+
+// RFC 9001 appendix A.4: a Retry for a client whose first Initial went to
+// 8394c8f03e515708, carrying the token "token". The integrity tag verifies
+// only against the original connection ID.
+@Test
+function retryIntegrityMatchesRfc9001() {
+    let packet = hexBytes(
+        "ff000000010008f067a5502a4262b5746f6b656e04a265ba2eff4d829058fb3f0f2496ba"
+    )
+    let raw = match quicReadHeader(packet, 0, Quic.connectionIdBytes) {
+        Ok(value) -> value
+        Error(drop) -> {
+            expect!((traceText(drop)) == "")
+            return
+        }
+    }
+    expect!((raw.retry) == (true))
+    let token = match quicRetryToken(packet, raw, hexBytes("8394c8f03e515708")) {
+        Some(value) -> value
+        None -> {
+            expect!(("rejected") == "")
+            return
+        }
+    }
+    let text = match textFromBytes(token) {
+        Some(value) -> value
+        None -> "?"
+    }
+    expect!((text) == "token")
+    expect!((quicRetryToken(packet, raw, hexBytes("8394c8f03e515709")).isSome()) == (false))
+}

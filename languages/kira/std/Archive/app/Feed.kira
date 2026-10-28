@@ -1,0 +1,176 @@
+import Foundation
+
+// Bytes read in order from wherever they come: a file a piece at a time, or
+// a decompressor a run at a time.
+
+namespace FeedSize {
+    // How much of a file one pull reads.
+    let piece: Number = 1048576
+}
+
+struct ByteFeed {
+    // The next run of bytes; none once the input ends.
+    let pull: () -> Result<[UN8], ArchiveFailure>
+    var buffer: [UN8] = []
+    var at: Number = 0
+    var ended: Bool = false
+
+    // Whether `count` bytes are buffered, pulling until they are or the
+    // input ends.
+    function want(borrow mut self, count: Number) -> Result<Bool, ArchiveFailure> {
+        while buffer.count - at < count && !ended {
+            let part = match self.pull() {
+                Ok(read) -> read
+                Error(failure) -> return .Error(failure)
+            }
+            if part.count == 0 {
+                ended = true
+            } else if at == buffer.count {
+                buffer = move part
+                at = 0
+            } else {
+                var kept: [UN8] = []
+                for index in at..buffer.count { kept.append(buffer[index]) }
+                kept.appendAll(part)
+                buffer = move kept
+                at = 0
+            }
+        }
+        return .Ok(buffer.count - at >= count)
+    }
+
+    // The next `count` bytes; a failure naming `what` when the input ends
+    // first.
+    function take(
+        borrow mut self,
+        count: Number,
+        what: borrow String
+    ) -> Result<[UN8], ArchiveFailure> {
+        match want(count) {
+            Ok(enough) -> {
+                if !enough { return .Error(.Malformed("\(what) is cut off")) }
+            }
+            Error(failure) -> return .Error(failure)
+        }
+        var taken: [UN8] = []
+        for index in at..(at + count) { taken.append(buffer[index]) }
+        at += count
+        return .Ok(taken)
+    }
+
+    // The next `count` bytes onto `sink`.
+    function pass(
+        borrow mut self,
+        count: Number,
+        sink: borrow mut ArchiveSink,
+        what: borrow String
+    ) -> Result<Void, ArchiveFailure> {
+        var left = count
+        while left > 0 {
+            match want(1) {
+                Ok(enough) -> {
+                    if !enough { return .Error(.Malformed("\(what) is cut off")) }
+                }
+                Error(failure) -> return .Error(failure)
+            }
+            let now = min(left, buffer.count - at)
+            sink.appendRange(buffer, at, at + now)
+            match sink.spill() {
+                Ok -> {}
+                Error(failure) -> return .Error(failure)
+            }
+            at += now
+            left -= now
+        }
+        return .Ok
+    }
+
+    // Past the next `count` bytes.
+    function skip(
+        borrow mut self,
+        count: Number,
+        what: borrow String
+    ) -> Result<Void, ArchiveFailure> {
+        var left = count
+        while left > 0 {
+            match want(1) {
+                Ok(enough) -> {
+                    if !enough { return .Error(.Malformed("\(what) is cut off")) }
+                }
+                Error(failure) -> return .Error(failure)
+            }
+            let now = min(left, buffer.count - at)
+            at += now
+            left -= now
+        }
+        return .Ok
+    }
+}
+
+// A feed of the file at `path`, read a piece at a time.
+function fileFeed(path: borrow String) -> Result<ByteFeed, ArchiveFailure> {
+    let file = match openFileHandle(path, .Read) {
+        Ok(opened) -> opened
+        Error(failure) -> return .Error(.Files("cannot open \(path): \(traceText(failure))"))
+    }
+    let name = copy path
+    var offset: Number = 0
+    var open = true
+    return .Ok(
+        ByteFeed {
+            pull: { in
+                let none: [UN8] = []
+                if !open { return .Ok(none) }
+                let read = match file.read(offset, FeedSize.piece) {
+                    Ok(bytes) -> bytes
+                    Error(failure) -> return .Error(
+                        .Files("cannot read \(name): \(traceText(failure))")
+                    )
+                }
+                offset += read.count
+                if read.count == 0 {
+                    open = false
+                    match file.close() {
+                        Ok -> {}
+                        Error(failure) -> return .Error(
+                            .Files("cannot close \(name): \(traceText(failure))")
+                        )
+                    }
+                }
+                return .Ok(read)
+            }
+        }
+    )
+}
+
+// A feed of bytes already in hand.
+function heldFeed(bytes: [UN8]) -> ByteFeed {
+    return ByteFeed {
+        pull: { in
+            let none: [UN8] = []
+            return .Ok(none)
+        },
+        buffer: move bytes,
+        ended: true
+    }
+}
+
+// A feed of the .xz file at `path`, decompressed as it is read.
+function feedXz(path: borrow String) -> Result<ByteFeed, ArchiveFailure> {
+    let bytes = match readArchiveFile(path) {
+        Ok(read) -> read
+        Error(failure) -> return .Error(failure)
+    }
+    var reader = openXz(move bytes)
+    return .Ok(ByteFeed { pull: { in return reader.next() } })
+}
+
+// A feed of the .zst file at `path`, decompressed as it is read.
+function feedZstd(path: borrow String) -> Result<ByteFeed, ArchiveFailure> {
+    let bytes = match readArchiveFile(path) {
+        Ok(read) -> read
+        Error(failure) -> return .Error(failure)
+    }
+    var reader = openZstd(move bytes)
+    return .Ok(ByteFeed { pull: { in return reader.next() } })
+}

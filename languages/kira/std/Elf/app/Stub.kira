@@ -1,0 +1,341 @@
+import Foundation
+
+// An interface stub: a shared library reduced to what a linker reads when it
+// links against it, its dynamic symbols, the libraries it needs and its
+// soname, laid out as `llvm-ifs --output-elf` lays one out. A library whose
+// code changes without its interface changing gives the same stub, so what
+// links against the stub need not be linked again.
+
+// One dynamic symbol a stub keeps.
+struct StubSymbol {
+    let name: String
+    let weak: Bool
+    let defined: Bool
+    // `STT_NOTYPE`, `STT_OBJECT`, `STT_FUNC` or `STT_TLS`.
+    let kind: Number
+    let size: Number
+}
+
+namespace StubFormat {
+    // `sh_type`.
+    let dynamicSymbols: Number = 11
+    let dynamic: Number = 6
+    // `d_tag`.
+    let end: Number = 0
+    let needed: Number = 1
+    let stringTable: Number = 5
+    let symbolTable: Number = 6
+    let stringSize: Number = 10
+    let soname: Number = 14
+    // `st_info`'s bindings and the types a stub carries.
+    let global: Number = 1
+    let weak: Number = 2
+    let functionType: Number = 2
+    let threadLocal: Number = 6
+    // The size of a symbol and of a dynamic entry.
+    let symbol: Number = 24
+    let entry: Number = 16
+}
+
+/// The interface stub of the shared library `bytes`: its dynamic symbols, the libraries it needs and its soname, as a linker reads them. A library whose code changes without its interface changing gives the same stub.
+///
+/// Everything the linker never reads is left out. A defined symbol is placed in section 1, an undefined one in none, and every value is 0. `DT_STRSZ` holds the size of `.dynstr`, as the System V ABI defines it, where `llvm-ifs` writes the size of `.dynsym`. Every other byte is the same as its output.
+public function interfaceStub(bytes: borrow [UN8]) -> Result<[UN8], ElfFailure> {
+    let image = match readElf(bytes) {
+        Ok(read) -> read
+        Error(failure) -> return .Error(failure)
+    }
+    var symbolsAt: Number = -1
+    var dynamicAt: Number = -1
+    for (index, section) in image.sections.enumerated() {
+        if section.kind == StubFormat.dynamicSymbols && symbolsAt < 0 { symbolsAt = index }
+        if section.kind == StubFormat.dynamic && dynamicAt < 0 { dynamicAt = index }
+    }
+    if symbolsAt < 0 { return .Error(.Unsupported("the file has no dynamic symbols")) }
+    if dynamicAt < 0 { return .Error(.Unsupported("the file has no dynamic section")) }
+    let symbols = match stubSymbols(bytes, image, image.sections[symbolsAt]) {
+        Ok(read) -> read
+        Error(failure) -> return .Error(failure)
+    }
+    let dynamic = image.sections[dynamicAt]
+    let strings = image.sections[dynamic.link]
+    var needed: [String] = []
+    var soname: String? = .None
+    for index in 0..trunc(dynamic.size / StubFormat.entry) {
+        let at = dynamic.offset + index * StubFormat.entry
+        let tag = elfWord(bytes, at, 8)
+        if tag == StubFormat.end { break }
+        if tag != StubFormat.needed && tag != StubFormat.soname { continue }
+        let name = match elfName(bytes, strings.offset, strings.size, elfWord(bytes, at + 8, 8)) {
+            Some(read) -> read
+            None -> return .Error(.Malformed("dynamic entry \(index) names no string"))
+        }
+        if tag == StubFormat.needed { needed.append(name) } else { soname = .Some(name) }
+    }
+    return .Ok(stubBytes(image.machine, symbols, needed, soname))
+}
+
+// The dynamic symbols of `table` a stub keeps, sorted by name.
+function stubSymbols(
+    bytes: borrow [UN8],
+    image: borrow ElfImage,
+    table: borrow ElfSection
+) -> Result<[StubSymbol], ElfFailure> {
+    let strings = image.sections[table.link]
+    var read: [StubSymbol] = []
+    for index in 1..trunc(table.size / StubFormat.symbol) {
+        let at = table.offset + index * StubFormat.symbol
+        let binding = Number(bytes[at + 4]) >> 4
+        if binding != StubFormat.global && binding != StubFormat.weak { continue }
+        let visibility = Number(bytes[at + 5]) & 3
+        if visibility != 0 && visibility != 3 { continue }
+        let name = match elfName(bytes, strings.offset, strings.size, elfWord(bytes, at, 4)) {
+            Some(text) -> text
+            None -> return .Error(.Malformed("dynamic symbol \(index) has no name"))
+        }
+        let kind = Number(bytes[at + 4]) & 15
+        if kind > 3 && kind != StubFormat.threadLocal {
+            return .Error(
+                .Unsupported("symbol \(name) is of type \(kind), which a stub does not carry")
+            )
+        }
+        read.append(
+            StubSymbol {
+                name: name,
+                weak: binding == StubFormat.weak,
+                defined: elfWord(bytes, at + 6, 2) != 0,
+                kind: kind,
+                size: kind == StubFormat.functionType ? 0 : elfWord(bytes, at + 16, 8)
+            }
+        )
+    }
+    let sorted = read.sorted({ a, b in return bytesBefore(a.name.utf8(), b.name.utf8()) })
+    var kept: [StubSymbol] = []
+    for symbol in sorted {
+        if kept.count == 0 || kept[kept.count - 1].name != symbol.name {
+            kept.append(copy symbol)
+            continue
+        }
+        let first = kept[kept.count - 1]
+        if first.kind != symbol.kind || first.size != symbol.size {
+            return .Error(
+                .Unsupported("symbol \(symbol.name) is given twice, with different types or sizes")
+            )
+        }
+    }
+    return .Ok(kept)
+}
+
+// The stub's bytes: the header, `.dynsym` right after it, `.dynstr`,
+// `.dynamic`, `.shstrtab`, then the section headers. Each section's address
+// is its offset, and no program header maps it.
+function stubBytes(
+    machine: Number,
+    symbols: borrow [StubSymbol],
+    needed: borrow [String],
+    soname: borrow String?
+) -> [UN8] {
+    var names: [String] = []
+    for symbol in symbols { names.append(copy symbol.name) }
+    for library in needed { names.append(copy library) }
+    match soname {
+        Some(name) -> names.append(copy name)
+        None -> {}
+    }
+    let strings = stubStrings(names)
+    let sectionNames = stubStrings([".dynsym", ".dynstr", ".dynamic", ".shstrtab"])
+    let symbolsAt = ElfFormat.header
+    let symbolsSize = (symbols.count + 1) * StubFormat.symbol
+    let stringsAt = symbolsAt + symbolsSize
+    let dynamicAt = elfAligned(stringsAt + strings.bytes.count, 8)
+    let entries = 4 + needed.count + (soname.isSome() ? 1 : 0)
+    let dynamicSize = entries * StubFormat.entry
+    let namesAt = dynamicAt + dynamicSize
+    let headersAt = elfAligned(namesAt + sectionNames.bytes.count, 8)
+    var output: [UN8] = [127, 69, 76, 70, UN8(ElfFormat.wide), UN8(ElfFormat.little), 1]
+    padElf(output, ElfFormat.header)
+    putElfWord(output, 16, ElfFormat.shared, 2)
+    putElfWord(output, 18, machine, 2)
+    putElfWord(output, 20, 1, 4)
+    putElfWord(output, 40, headersAt, 8)
+    putElfWord(output, 52, ElfFormat.header, 2)
+    putElfWord(output, 54, ElfFormat.programHeader, 2)
+    putElfWord(output, 58, ElfFormat.sectionHeader, 2)
+    putElfWord(output, 60, 5, 2)
+    putElfWord(output, 62, 4, 2)
+    for index in 0..StubFormat.symbol { output.append(0) }
+    for (index, symbol) in symbols.enumerated() {
+        let binding = symbol.weak ? StubFormat.weak : StubFormat.global
+        appendElfWord(output, strings.offsets[index], 4)
+        appendElfWord(output, (binding << 4) | symbol.kind, 1)
+        appendElfWord(output, 0, 1)
+        appendElfWord(output, symbol.defined ? 1 : 0, 2)
+        appendElfWord(output, 0, 8)
+        appendElfWord(output, symbol.size, 8)
+    }
+    output.appendAll(strings.bytes)
+    padElf(output, 8)
+    appendDynamicEntry(output, StubFormat.symbolTable, symbolsAt)
+    appendDynamicEntry(output, StubFormat.stringTable, stringsAt)
+    appendDynamicEntry(output, StubFormat.stringSize, strings.bytes.count)
+    for index in 0..needed.count {
+        appendDynamicEntry(output, StubFormat.needed, strings.offsets[symbols.count + index])
+    }
+    if soname.isSome() {
+        appendDynamicEntry(output, StubFormat.soname, strings.offsets[names.count - 1])
+    }
+    appendDynamicEntry(output, StubFormat.end, 0)
+    output.appendAll(sectionNames.bytes)
+    padElf(output, 8)
+    let allocated = ElfFormat.allocated
+    for index in 0..ElfFormat.sectionHeader { output.append(0) }
+    appendStubSection(
+        output,
+        StubSection {
+            name: sectionNames.offsets[0],
+            kind: StubFormat.dynamicSymbols,
+            flags: allocated,
+            at: symbolsAt,
+            size: symbolsSize,
+            link: 2,
+            info: 1,
+            alignment: 8,
+            entry: StubFormat.symbol
+        }
+    )
+    appendStubSection(
+        output,
+        StubSection {
+            name: sectionNames.offsets[1],
+            kind: ElfFormat.strings,
+            flags: allocated,
+            at: stringsAt,
+            size: strings.bytes.count,
+            link: 0,
+            info: 0,
+            alignment: 1,
+            entry: 0
+        }
+    )
+    appendStubSection(
+        output,
+        StubSection {
+            name: sectionNames.offsets[2],
+            kind: StubFormat.dynamic,
+            flags: allocated,
+            at: dynamicAt,
+            size: dynamicSize,
+            link: 2,
+            info: 0,
+            alignment: 8,
+            entry: StubFormat.entry
+        }
+    )
+    appendStubSection(
+        output,
+        StubSection {
+            name: sectionNames.offsets[3],
+            kind: ElfFormat.strings,
+            flags: 0,
+            at: namesAt,
+            size: sectionNames.bytes.count,
+            link: 0,
+            info: 0,
+            alignment: 1,
+            entry: 0
+        }
+    )
+    return output
+}
+
+// One section header of a stub, whose address is its offset.
+struct StubSection {
+    let name: Number
+    let kind: Number
+    let flags: Number
+    let at: Number
+    let size: Number
+    let link: Number
+    let info: Number
+    let alignment: Number
+    let entry: Number
+}
+
+function appendStubSection(bytes: borrow mut [UN8], section: borrow StubSection) {
+    appendElfWord(bytes, section.name, 4)
+    appendElfWord(bytes, section.kind, 4)
+    appendElfWord(bytes, section.flags, 8)
+    appendElfWord(bytes, section.at, 8)
+    appendElfWord(bytes, section.at, 8)
+    appendElfWord(bytes, section.size, 8)
+    appendElfWord(bytes, section.link, 4)
+    appendElfWord(bytes, section.info, 4)
+    appendElfWord(bytes, section.alignment, 8)
+    appendElfWord(bytes, section.entry, 8)
+}
+
+function appendDynamicEntry(bytes: borrow mut [UN8], tag: Number, value: Number) {
+    appendElfWord(bytes, tag, 8)
+    appendElfWord(bytes, value, 8)
+}
+
+// A string table of `names` as LLVM's `StringTableBuilder` lays an ELF one
+// out: the empty name first, then the names ordered by their bytes read
+// from the end, larger first and a name that ends sooner last, so a name
+// that ends the one before it is read from that one's tail.
+function stubStrings(names: borrow [String]) -> NameTable {
+    var encoded: [[UN8]] = []
+    var order: [Number] = []
+    for (index, name) in names.enumerated() {
+        encoded.append(name.utf8())
+        order.append(index)
+    }
+    let sorted = order.sorted({ a, b in return tailBefore(encoded[a], encoded[b]) })
+    var bytes: [UN8] = [0]
+    var offsets: [Number] = []
+    for index in 0..names.count { offsets.append(0) }
+    var previous: [UN8] = []
+    for index in sorted {
+        let name = encoded[index]
+        if bytesEnd(previous, name) {
+            offsets[index] = bytes.count - name.count - 1
+            continue
+        }
+        offsets[index] = bytes.count
+        bytes.appendAll(name)
+        bytes.append(0)
+        previous = copy name
+    }
+    return NameTable { bytes: bytes, offsets: offsets }
+}
+
+// Whether `a` comes before `b` read from their ends: at the first byte from
+// the end where they differ, `a`'s is larger, a name that has ended counting
+// as smaller than any byte.
+function tailBefore(a: borrow [UN8], b: borrow [UN8]) -> Bool {
+    for position in 0..max(a.count, b.count) {
+        let left = position < a.count ? Number(a[a.count - 1 - position]) : -1
+        let right = position < b.count ? Number(b[b.count - 1 - position]) : -1
+        if left != right { return left > right }
+    }
+    return false
+}
+
+// Whether `whole` ends with `tail`.
+function bytesEnd(whole: borrow [UN8], tail: borrow [UN8]) -> Bool {
+    if tail.count > whole.count { return false }
+    let start = whole.count - tail.count
+    for index in 0..tail.count {
+        if whole[start + index] != tail[index] { return false }
+    }
+    return true
+}
+
+// Whether `a` comes before `b` byte by byte, a name that ends first coming
+// first.
+function bytesBefore(a: borrow [UN8], b: borrow [UN8]) -> Bool {
+    for index in 0..min(a.count, b.count) {
+        if a[index] != b[index] { return a[index] < b[index] }
+    }
+    return a.count < b.count
+}

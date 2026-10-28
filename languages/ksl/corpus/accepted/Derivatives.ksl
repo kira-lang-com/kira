@@ -1,0 +1,54 @@
+// A fragment stage antialiasing a circle's edge by the distance's screen-space
+// rate: `fwidth`, and `dpdx` and `dpdy` it sums the magnitudes of.
+
+type VertexIn {
+    @builtin(vertex_index)
+    let vid: UInt
+}
+
+type VertexOut {
+    @builtin(position)
+    let clip_position: Float4
+    let local: Float2
+}
+
+type FragmentOut {
+    let color: Float4
+}
+
+shader Derivatives {
+    vertex {
+        input VertexIn
+        output VertexOut
+
+        function entry(input: VertexIn) -> VertexOut {
+            let x = 0.0 - 1.0
+            if input.vid == UInt(1) {
+                x = 3.0
+            }
+            let y = 0.0 - 1.0
+            if input.vid == UInt(2) {
+                y = 3.0
+            }
+            let out: VertexOut
+            out.clip_position = Float4(x, y, 0.0, 1.0)
+            out.local = Float2(x, y)
+            return out
+        }
+    }
+
+    fragment {
+        input VertexOut
+        output FragmentOut
+
+        function entry(input: VertexOut) -> FragmentOut {
+            let distance = length(input.local) - 0.5
+            let rate = fwidth(distance)
+            let slope = abs(dpdx(input.local)) + abs(dpdy(input.local))
+            let coverage = clamp(0.5 - distance / rate, 0.0, 1.0)
+            let result: FragmentOut
+            result.color = Float4(coverage, slope.x, slope.y, 1.0)
+            return result
+        }
+    }
+}

@@ -1,0 +1,187 @@
+import Foundation
+
+// CtxTests.kira
+// Migrated from tests/pass/run/{if_basic_parity, if_condition_trailing_call,
+// for_basic_parity, for_binding_parity, for_empty_parity, for_stateful_parity,
+// comparison_chain_parity, empty_control_flow_bodies}.
+// All top-level names use prefix ctx / Ctx.
+
+// ---------------------------------------------------------------------------
+// Helpers (from if_condition_trailing_call)
+// ---------------------------------------------------------------------------
+
+function ctxSyllable(a: Int, b: Int) -> Int {
+    return a * 27 + b
+}
+
+function ctxApply(cb: () -> Int) -> Int {
+    return cb()
+}
+
+function ctxIsPositive(value: Int) -> Bool {
+    return value > 0
+}
+
+// ---------------------------------------------------------------------------
+// Struct (from empty_control_flow_bodies)
+// ---------------------------------------------------------------------------
+
+struct CtxEcfP { var ok: Bool }
+
+// ---------------------------------------------------------------------------
+// if_basic_parity
+// ---------------------------------------------------------------------------
+
+@Test
+function ctxIfBasic() {
+    let value = 2
+    var out = ""
+    if value == 2 {
+        out = "if-then"
+    } else {
+        out = "if-else"
+    }
+    let got = out
+    expect!(got == "if-then")
+}
+
+// ---------------------------------------------------------------------------
+// if_condition_trailing_call
+// ---------------------------------------------------------------------------
+
+@Test
+function ctxIfConditionTrailingCall() {
+    var out = ""
+    let key = ctxSyllable(14, 9)
+
+    if key == ctxSyllable(14, 9) {
+        out = out + "1"
+    }
+
+    var n = 0
+    while n == ctxSyllable(0, 0) {
+        out = out + "2"
+        n = 1
+    }
+
+    if ctxIsPositive(key) {
+        out = out + "3"
+    }
+
+    if ctxApply(
+        {
+            in return 5
+        }
+    ) == 5 { out = out + "4" }
+    let got = out
+    expect!(got == "1234")
+}
+
+// ---------------------------------------------------------------------------
+// for_basic_parity
+// ---------------------------------------------------------------------------
+
+@Test
+function ctxForBasic() {
+    var out = 0
+    for item in [10, 20, 30] {
+        out = out + 1
+    }
+    let got = out
+    expect!(got == 3)
+}
+
+// ---------------------------------------------------------------------------
+// for_binding_parity
+// ---------------------------------------------------------------------------
+
+@Test
+function ctxForBinding() {
+    var total = 0
+    for item in [1, 2, 3] {
+        total = total + item
+    }
+    let got = total
+    expect!(got == 6)
+}
+
+// ---------------------------------------------------------------------------
+// for_empty_parity
+// ---------------------------------------------------------------------------
+
+@Test
+function ctxForEmpty() {
+    var out = 0
+    for item in [] {
+        out = out + 1
+    }
+    out = out + 100
+    let got = out
+    expect!(got == 100)
+}
+
+// ---------------------------------------------------------------------------
+// for_stateful_parity
+// ---------------------------------------------------------------------------
+
+@Test
+function ctxForStateful() {
+    var total = 0
+    var out = ""
+    for item in [1, 1, 1] {
+        total = total + 1
+        match total {
+            1 -> { out = out + "one," }
+            2 -> { out = out + "two," }
+            else -> {
+                out = out + "other,"
+            }
+        }
+    }
+    if total == 3 {
+        out = out + "done"
+    } else {
+        out = out + "broken"
+    }
+    let got = out
+    expect!(got == "one,two,other,done")
+}
+
+// ---------------------------------------------------------------------------
+// comparison_chain_parity
+// ---------------------------------------------------------------------------
+
+@Test
+function ctxSwitchBasic() {
+    var out = ""
+    if 2 == 1 {
+        out = "one"
+    } else if 2 == 2 {
+        out = "two"
+    } else {
+        out = "other"
+    }
+    let got = out
+    expect!(got == "two")
+}
+
+// ---------------------------------------------------------------------------
+// empty_control_flow_bodies
+// ---------------------------------------------------------------------------
+
+@Test
+function ctxEmptyControlFlowBodies() {
+    var n = 0
+    if true {}
+    while false {}
+    for x in [1, 2, 3] {}
+    if n == 0 {} else {}
+    for p in [CtxEcfP { ok: true }, CtxEcfP { ok: false }] {
+        if p.ok {
+            n = n + 1
+        }
+    }
+    if (CtxEcfP { ok: true }).ok { n = n + 10 }
+    let got = n
+    expect!(got == 11)
+}

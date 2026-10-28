@@ -1,0 +1,183 @@
+// C bit-fields (KLF section 26.2): `let flags: U32 @Bits(3)` in an
+// `@FFI.Struct`. The image is laid out by the target's C rules, which KIR
+// records do not spell, so a struct with bit-fields gets its offsets here:
+// a bit-field takes the next bits unless that would cross a unit of its
+// type, and any other member the next offset its alignment allows. The
+// record holds a zero-length array of the struct's alignment first, then
+// each run of bit-fields as the bytes it spans and every other member as
+// itself, which puts each where C does. A bit-field is read and written
+// through the unit of its type that holds it, low bits first, as every
+// supported target is little-endian.
+
+extend KirTypes {
+    // The image of a struct completed after the images it holds by value,
+    // whose sizes its own layout needs.
+    function completeImage(borrow mut self, builder: KirModuleBuilder, program: CheckedProgram, index: Int) {
+        if imageSizes[index] >= 0 { return }
+        imageSizes[index] = 0
+        match images[index] {
+            Some(image) -> {
+                let structure = program.structs[index]
+                for field in structure.fields { completeHeld(builder, program, field.valueType) }
+                var fields: [Int] = []
+                for at in 0..structure.fields.count { fields.append(at) }
+                imageFields[index] = fields
+                if program.fieldBits[index].count > 0 {
+                    layOutBitFields(builder, program, index, image)
+                } else {
+                    for field in structure.fields {
+                        let name = program.named(field.name.span)
+                        builder.addRecordField(image, name.start, name.end, imageType(program, field.valueType))
+                    }
+                    if isUnionShape(structure.shape) { kir_type_record_union(image) }
+                }
+                imageSizes[index] = kir_type_size(builder, image)
+                imageAlignments[index] = kir_type_align(builder, image)
+            }
+            None -> {}
+        }
+    }
+
+    function completeHeld(borrow mut self, builder: KirModuleBuilder, program: CheckedProgram, valueType: Type) {
+        if valueType.kind != .Structure || isArrayType(program, valueType) || isCStringType(program, valueType) { return }
+        if images[valueType.declaration].isSome() {
+            completeImage(builder, program, valueType.declaration)
+            return
+        }
+        let structure = program.structs[valueType.declaration]
+        match structure.shape {
+            CArray -> completeHeld(builder, program, cArrayElementType(program, valueType))
+            Plain -> {
+                if structure.genericBase == "Distinct" { completeHeld(builder, program, structure.fields[0].valueType) }
+            }
+            CLayout -> {}
+            CUnion -> {}
+            Callback -> {}
+            CPointer -> {}
+        }
+    }
+
+    function layOutBitFields(borrow mut self, builder: KirModuleBuilder, program: CheckedProgram, index: Int, image: KirType) {
+        let structure = program.structs[index]
+        let widths = program.fieldBits[index]
+        var offsets: [Int] = []
+        var bytes: [Int] = []
+        var bit = 0
+        var alignment = 1
+        for at in 0..structure.fields.count {
+            let held = imageType(program, structure.fields[at].valueType)
+            let size = kir_type_size(builder, held)
+            let align = kir_type_align(builder, held)
+            if align > alignment { alignment = align }
+            if widths[at] > 0 {
+                let unit = size * 8
+                if bit % unit + widths[at] > unit { bit = roundedUp(bit, unit) }
+                offsets.append(bit)
+                bytes.append(0 - 1)
+                bit += widths[at]
+            } else {
+                let byte = roundedUp(roundedUp(bit, 8) / 8, align)
+                offsets.append(0 - 1)
+                bytes.append(byte)
+                bit = (byte + size) * 8
+            }
+        }
+        let name = program.named(structure.name.span)
+        builder.addRecordField(image, name.start, name.end, kir_type_array(0, kir_type_integer(alignment * 8)))
+        var fields: [Int] = []
+        var count = 1
+        var cursor = 0
+        var runEnd = 0 - 1
+        var runName = 0
+        for at in 0..structure.fields.count {
+            if widths[at] > 0 {
+                if runEnd < 0 { runName = at }
+                runEnd = roundedUp(offsets[at] + widths[at], 8) / 8
+                fields.append(0 - 1)
+                continue
+            }
+            if runEnd >= 0 {
+                addRun(builder, program, image, structure.fields[runName], runEnd - cursor)
+                count += 1
+                cursor = runEnd
+                runEnd = 0 - 1
+            }
+            let field = structure.fields[at]
+            let fieldName = program.named(field.name.span)
+            let held = imageType(program, field.valueType)
+            builder.addRecordField(image, fieldName.start, fieldName.end, held)
+            fields.append(count)
+            count += 1
+            cursor = bytes[at] + kir_type_size(builder, held)
+        }
+        if runEnd >= 0 { addRun(builder, program, image, structure.fields[runName], runEnd - cursor) }
+        imageFields[index] = fields
+        bitOffsets[index] = offsets
+    }
+
+    function addRun(borrow self, builder: KirModuleBuilder, program: CheckedProgram, image: KirType, first: Field, byteCount: Int) {
+        let name = program.named(first.name.span)
+        builder.addRecordField(image, name.start, name.end, kir_type_array(byteCount, integer8))
+    }
+}
+
+function roundedUp(value: Int, step: Int) -> Int {
+    return (value + step - 1) / step * step
+}
+
+extend FunctionLowering {
+    // Member `field` of the struct `owner`'s image at `image`, written from
+    // the Kira value at `source`.
+    function writeImageField(borrow mut self, owner: Int, field: Int, source: KirAddress, image: KirAddress, retained: Bool) {
+        let fieldType = program.structs[owner].fields[field].valueType
+        let slot = types.imageFields[owner][field]
+        if slot >= 0 {
+            writeImage(source, fieldType, kir.field(image, slot, types.imageType(program, fieldType)), retained)
+            return
+        }
+        let unit = bitUnit(owner, field, image)
+        let width = program.fieldBits[owner][field]
+        let shift = types.bitOffsets[owner][field] % fieldType.bits
+        let unitType = types.of(fieldType)
+        let low = lowBits(unitType, fieldType.bits, width)
+        let placed = kir.binary(kirOperator(.ShiftLeft, false), false, false, kir.binary(kirOperator(.BitAnd, false), false, false, kir.load(source), low), kir.integer(unitType, shift))
+        let mask = kir.binary(kirOperator(.ShiftLeft, false), false, false, low, kir.integer(unitType, shift))
+        let kept = kir.binary(kirOperator(.BitAnd, false), false, false, kir.load(unit), kir.binary(kirOperator(.BitXor, false), false, false, mask, kir.integer(unitType, 0 - 1)))
+        kir.store(kir.binary(kirOperator(.BitOr, false), false, false, kept, placed), unit)
+    }
+
+    // Member `field` of the image at `image` read into `destination`; a
+    // signed bit-field's top bit is its sign.
+    function readImageField(borrow mut self, owner: Int, field: Int, image: KirAddress, destination: KirAddress, span: Span) {
+        let fieldType = program.structs[owner].fields[field].valueType
+        let slot = types.imageFields[owner][field]
+        if slot >= 0 {
+            readImage(kir.field(image, slot, types.imageType(program, fieldType)), fieldType, destination, span)
+            return
+        }
+        let unit = kir.load(bitUnit(owner, field, image))
+        let width = program.fieldBits[owner][field]
+        let shift = types.bitOffsets[owner][field] % fieldType.bits
+        let unitType = types.of(fieldType)
+        if fieldType.signed {
+            let raised = kir.binary(kirOperator(.ShiftLeft, true), false, true, unit, kir.integer(unitType, fieldType.bits - shift - width))
+            kir.store(kir.binary(kirOperator(.ShiftRight, true), false, true, raised, kir.integer(unitType, fieldType.bits - width)), destination)
+            return
+        }
+        let lowered = kir.binary(kirOperator(.ShiftRight, false), false, false, unit, kir.integer(unitType, shift))
+        kir.store(kir.binary(kirOperator(.BitAnd, false), false, false, lowered, lowBits(unitType, fieldType.bits, width)), destination)
+    }
+
+    // The unit of the member's type, at its alignment, that holds the bits.
+    function bitUnit(borrow mut self, owner: Int, field: Int, image: KirAddress) -> KirAddress {
+        let fieldType = program.structs[owner].fields[field].valueType
+        let start = types.bitOffsets[owner][field] / fieldType.bits * (fieldType.bits / 8)
+        let base = kir.convert(convertBitcast, kir.pointer(image), types.pointer)
+        return kir.typedMemory(kir.offsetBytes(base, kir.integer(types.integer64, start)), types.of(fieldType))
+    }
+
+    // `width` low bits set, in a unit of `bits`.
+    function lowBits(borrow self, unitType: KirType, bits: Int, width: Int) -> KirValue {
+        return kir.binary(kirOperator(.ShiftRight, false), false, false, kir.integer(unitType, 0 - 1), kir.integer(unitType, bits - width))
+    }
+}

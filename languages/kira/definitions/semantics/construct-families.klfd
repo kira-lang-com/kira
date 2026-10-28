@@ -1,0 +1,331 @@
+// A family's values: the enum `Any Family` and the methods that dispatch on
+// it, built as ordinary syntax.
+//
+// A method member `m(args)` becomes
+//
+//     function m(borrow self, args) -> R {
+//         match self {
+//             Text(value) -> return value.m(args)
+//             ...
+//         }
+//     }
+//
+// and a value member reads `value.m` instead of calling it. A member that
+// mutates its receiver works on a copy of the payload and writes the case
+// back, so the caller's place sees the change.
+
+// The cases of a family enum are kept in name order, so every unit that builds
+// a family declares the same cases in the same order, whichever constructs its
+// tree holds first (`docs/conformers.md`). A unit's enum must not depend on
+// the order its own syntax was read in.
+function withCase(cases: [CaseDeclaration], added: CaseDeclaration) -> [CaseDeclaration] {
+    var result: [CaseDeclaration] = []
+    var placed = false
+    for existing in cases {
+        if !placed && textBefore(added.name.text, existing.name.text) {
+            result.append(added)
+            placed = true
+        }
+        result.append(existing)
+    }
+    if !placed { result.append(added) }
+    return result
+}
+
+// `withCase` for the variants a declaration's cases become.
+function withVariant(variants: [Variant], added: Variant) -> [Variant] {
+    var result: [Variant] = []
+    var placed = false
+    for existing in variants {
+        if !placed && textBefore(added.name.text, existing.name.text) {
+            result.append(added)
+            placed = true
+        }
+        result.append(existing)
+    }
+    if !placed { result.append(added) }
+    return result
+}
+
+function declareFamilyEnum(tree: borrow mut SyntaxTree, index: ConstructIndex, family: Family) {
+    let name = family.declaration.name
+    let gathered = !untestedCases(tree, name)
+    var cases: [CaseDeclaration] = []
+    for declared in tree.constructs {
+        if gathered && declared.parameters.isSome() && declared.typeParameters.count == 0 && index.seenThrough(declared, name.text, 0) {
+            cases = withCase(cases, CaseDeclaration { name = declared.name, payload = .Some(namedReference(declared.name)), initial = .None })
+        }
+    }
+    var methods: [FunctionDeclaration] = []
+    for method in family.members.methods { methods.append(dispatcher(tree, cases, method, false)) }
+    for method in family.members.computed { methods.append(dispatcher(tree, cases, method, false)) }
+    for field in family.members.requirements { methods.append(dispatcher(tree, cases, valueMember(field), true)) }
+    for field in family.members.fields { methods.append(dispatcher(tree, cases, valueMember(field), false)) }
+    tree.enums.append(EnumDeclaration {
+        name = Identifier { text = familyTypeName(name.text), span = name.span },
+        genericParameters = [], typeArguments = [], baseNameSpan = name.span, specialized = false, typeSuffix = scopedTypeSuffix(name.text),
+        cases = cases, methods = methods, existential = true
+    })
+}
+
+// Whether `family` is Foundation's `Test` in a build that runs no tests. Only
+// a test build's runner reads a test as a value of the family, and a test
+// build is one unit, so every other build gives the enum no cases: each unit
+// of a build split into packages then declares it alike, however many tests
+// its package holds.
+function untestedCases(tree: SyntaxTree, family: Identifier) -> Bool {
+    if tree.testing || family.text != "Test" { return false }
+    for source in tree.sources {
+        if source.file == family.span.file { return tree.modules[source.module].name == "Foundation" }
+    }
+    return false
+}
+
+// A family whose values cross RIDL (`witnessModule`): the struct `Any
+// Family`, a trait object of the RIDL trait the family is (KLF-RIDL sections
+// 21.7 and 27.7), two words holding a box and a witness table. Its members
+// are the trait's methods, each called through the table, so a value of a
+// declaration another module writes answers them as one of the program's
+// own does. A value member is a method taking nothing. A family the program
+// declares keeps each default as `__default_<member>`, a method taking the
+// trait object, which its module exports for the tables that do not answer
+// the member (section 23.2).
+function declareWitnessedFamily(tree: borrow mut SyntaxTree, family: Family, module: String) {
+    let name = family.declaration.name
+    let span = name.span
+    let own = !frameworkFile(tree, span.file)
+    var methods: [FunctionDeclaration] = []
+    for method in family.members.methods { addWitnessedMember(tree, methods, method, module, own) }
+    for method in family.members.computed { addWitnessedMember(tree, methods, method, module, own) }
+    for field in family.members.requirements { addWitnessedMember(tree, methods, valueMember(field), module, own) }
+    for field in family.members.fields { addWitnessedMember(tree, methods, valueMember(field), module, own) }
+    let word = namedReference(Identifier { text = "RawPtr", span = span })
+    tree.structs.append(StructDeclaration {
+        name = Identifier { text = familyTypeName(name.text), span = span },
+        genericParameters = [], typeArguments = [], callableModes = [], ancestors = [], genericBase = "Witnessed", baseNameSpan = span,
+        specialized = false, typeSuffix = scopedTypeSuffix(name.text),
+        fields = [witnessWord(Identifier { text = "box", span = span }, word), witnessWord(Identifier { text = "witness", span = span }, word)],
+        methods = methods
+    })
+}
+
+function witnessWord(name: Identifier, annotation: TypeReference) -> FieldDeclaration {
+    return FieldDeclaration { name = name, mutable = false, annotation = annotation, initial = .None, annotations = [], inferred = false, span = name.span }
+}
+
+// The trait method `member` is, called through the witness table, and the
+// default a family the program declares gives it. A framework's binding
+// marks its defaults `@Ridl`: the framework exports them.
+function addWitnessedMember(tree: borrow mut SyntaxTree, methods: borrow mut [FunctionDeclaration], member: FunctionDeclaration, module: String, own: Bool) {
+    let span = member.span
+    let computed = hasAttribute(member.annotations, .Computed)
+    let required = hasAttribute(member.annotations, .Required)
+    let defaulted = own ? (member.body.count > 0 && !required) : hasAttribute(member.annotations, .Ridl)
+    var annotations = [implicitTextAnnotation(tree, .Ridl, module, span)]
+    if computed { annotations.append(implicitAnnotation(.Computed, span)) }
+    // A member is called through the table, unlike a method an `extend` of
+    // the family adds, which its module exports as an entry of its own.
+    annotations.append(implicitTextAnnotation(tree, .Witness, defaulted ? witnessDefault : witnessMember, span))
+    var receiver: Receiver = .Borrowed
+    if member.receiver == .MutablyBorrowed { receiver = .MutablyBorrowed }
+    methods.append(FunctionDeclaration {
+        name = member.name, annotations = annotations, receiver = receiver, parameters = member.parameters, result = member.result,
+        body = [], span = span, typeParameters = [], scope = GenericScope.none()
+    })
+    if own && defaulted {
+        methods.append(FunctionDeclaration {
+            name = Identifier { text = witnessDefaultName(member.name.text), span = member.name.span },
+            annotations = [implicitTextAnnotation(tree, .Witness, witnessDefault, span)], receiver = receiver, parameters = member.parameters,
+            result = member.result, body = member.body, span = span, typeParameters = [], scope = GenericScope.none()
+        })
+    }
+}
+
+function witnessDefaultName(member: String) -> String {
+    return joinText(["__default_", member])
+}
+
+// A stored or required value as the computed member a family value reads.
+function valueMember(field: FieldDeclaration) -> FunctionDeclaration {
+    return FunctionDeclaration {
+        name = field.name, annotations = [implicitAnnotation(.Computed, field.name.span)],
+        receiver = .Free, parameters = [], result = .Some(field.annotation), body = [], span = field.name.span,
+        typeParameters = [], scope = GenericScope.none()
+    }
+}
+
+// A `required` value member may be missing from a declaration that answers
+// every family method itself; reading it through the family traps there.
+// A family no declaration joins still has its members, so code written
+// against it checks; with no value to call them on, their body is a trap.
+function dispatcher(tree: borrow mut SyntaxTree, cases: [CaseDeclaration], member: FunctionDeclaration, required: Bool) -> FunctionDeclaration {
+    let span = member.span
+    let computed = hasAttribute(member.annotations, .Computed)
+    var receiver: Receiver = .Borrowed
+    if member.receiver == .MutablyBorrowed { receiver = .MutablyBorrowed }
+    var arms: [MatchArm] = []
+    for case in cases {
+        let payload = Identifier { text = "__payload", span = span }
+        var body: [Int] = []
+        if required && !providesMember(tree, case.name, member.name.text) {
+            let trap = tree.addExpression(.Call(Identifier { text = "runtimeTrap", span = span }, []), span)
+            body.append(tree.addStatement(.Evaluation(trap), span))
+            arms.append(MatchArm { variant = case.name, binding = .Some(payload), pattern = .Variant, alternatives = [], body = body })
+            continue
+        }
+        if receiver == .MutablyBorrowed {
+            let updated = Identifier { text = "__updated", span = span }
+            body.append(tree.addStatement(.Binding(BindingStatement {
+                mutable = true, name = updated, annotation = .None, prefix = .None, value = tree.addExpression(.Name(payload), span)
+            }), span))
+            let result = dispatchedRead(tree, member, updated, computed)
+            let written = tree.addStatement(.Assignment(
+                tree.addExpression(.Name(Identifier { text = "self", span = span }), span),
+                tree.addExpression(.Variant(case.name, .Some(tree.addExpression(.Name(updated), span))), span)
+            ), span)
+            if member.result.isSome() {
+                let kept = Identifier { text = "__result", span = span }
+                body.append(tree.addStatement(.Binding(BindingStatement {
+                    mutable = false, name = kept, annotation = .None, prefix = .None, value = result
+                }), span))
+                body.append(written)
+                body.append(tree.addStatement(.Return(.Some(tree.addExpression(.Name(kept), span))), span))
+            } else {
+                body.append(tree.addStatement(.Evaluation(result), span))
+                body.append(written)
+            }
+        } else {
+            let result = dispatchedRead(tree, member, payload, computed)
+            if member.result.isSome() {
+                body.append(tree.addStatement(.Return(.Some(result)), span))
+            } else {
+                body.append(tree.addStatement(.Evaluation(result), span))
+            }
+        }
+        arms.append(MatchArm { variant = case.name, binding = .Some(payload), pattern = .Variant, alternatives = [], body = body })
+    }
+    var annotations = [implicitAnnotation(.Dispatch, span)]
+    if computed { annotations.append(implicitAnnotation(.Computed, span)) }
+    var dispatch = tree.addStatement(.Evaluation(tree.addExpression(.Call(Identifier { text = "runtimeTrap", span = span }, []), span)), span)
+    if cases.count > 0 {
+        dispatch = tree.addStatement(.Match(tree.addExpression(.Name(Identifier { text = "self", span = span }), span), arms), span)
+    }
+    return FunctionDeclaration {
+        name = member.name, annotations = annotations, receiver = receiver,
+        parameters = member.parameters, result = member.result,
+        body = [dispatch], span = span,
+        typeParameters = [], scope = GenericScope.none()
+    }
+}
+
+// Whether the struct a declaration became has a field or a member method
+// named `name`.
+function providesMember(tree: SyntaxTree, declaration: Identifier, name: String) -> Bool {
+    for declared in tree.structs {
+        if declared.name.span.same(declaration.span) {
+            for field in declared.fields { if field.name.text == name { return true } }
+            for method in declared.methods {
+                if method.name.text == name && !hasAttribute(method.annotations, .Required) { return true }
+            }
+        }
+    }
+    return false
+}
+
+// `payload.member` for a value member, `payload.member(parameters)` for a
+// method.
+function dispatchedRead(tree: borrow mut SyntaxTree, member: FunctionDeclaration, payload: Identifier, computed: Bool) -> Int {
+    let span = member.span
+    let base = tree.addExpression(.Name(payload), span)
+    if computed { return tree.addExpression(.Member(base, member.name), span) }
+    var arguments: [Int] = []
+    for parameter in member.parameters {
+        arguments.append(tree.addExpression(.Name(parameter.name), span))
+    }
+    return tree.addExpression(.MethodCall(base, member.name, arguments), span)
+}
+
+function isConstructDeclaration(program: CheckedProgram, named: Type) -> Bool {
+    return named.kind == .Structure && program.structs[named.declaration].genericBase == "Construct"
+}
+
+// The case of the family or trait enum `target` that carries a value of type
+// `actual`, which is how a value becomes one of the existential's.
+function existentialCase(program: CheckedProgram, actual: Type, target: Type) -> Optional<Int> {
+    if target.kind != .Enumeration { return .None }
+    let existential = program.enums[target.declaration]
+    if !existential.existential { return .None }
+    for index in 0..existential.variants.count {
+        match existential.variants[index].payload {
+            Some(payload) -> {
+                if payload.equals(actual) { return .Some(index) }
+            }
+            None -> {}
+        }
+    }
+    return .None
+}
+
+extend Checker {
+    // The instances of generic declarations a program names in its types are
+    // minted before analysis; each joins its families as one minted later
+    // does.
+    function joinNamedInstances(borrow mut self) {
+        for index in 0..declarations.structs.count {
+            let declared = declarations.structs[index]
+            if declared.specialized && declared.genericBase == "Construct" { joinFamilies(index) }
+        }
+    }
+
+    // An instance of a generic declaration joins each family it is seen
+    // through as a case of its own, and every dispatcher of the family gains
+    // the arm for it.
+    function joinFamilies(borrow mut self, instance: Int) {
+        let declared = declarations.structs[instance]
+        match constructNamed(tree.constructs, templateName(declared.name.text)) {
+            Some(written) -> {
+                let index = constructIndex(tree.constructs)
+                for number in 0..tree.enums.count {
+                    let family = tree.enums[number]
+                    if !family.existential || !startsWithText(family.name.text, "Any ") { continue }
+                    let familyName = utf8Slice(family.name.text, 4, utf8Count(family.name.text))
+                    if !index.seenThrough(written, familyName, 0) { continue }
+                    joinFamily(number, instance)
+                }
+            }
+            None -> {}
+        }
+    }
+
+    function joinFamily(borrow mut self, family: Int, instance: Int) {
+        let declared = tree.enums[family]
+        let name = declarations.structs[instance].name
+        var cases = declared.cases
+        cases = withCase(cases, CaseDeclaration { name = name, payload = .Some(namedReference(name)), initial = .None })
+        tree.enums[family] = EnumDeclaration {
+            name = declared.name, genericParameters = declared.genericParameters, typeArguments = declared.typeArguments,
+            baseNameSpan = declared.baseNameSpan, specialized = declared.specialized, typeSuffix = declared.typeSuffix,
+            cases = cases, methods = declared.methods, existential = declared.existential
+        }
+        declarations.enums[family].variants = withVariant(declarations.enums[family].variants, Variant { name = name, payload = .Some(Type.structure(instance)), initial = .None })
+        program.enums = declarations.enums
+        shiftFamilyVariants(family, variantNamed(declarations.enums[family].variants, name.text))
+        let owner = Type.enumeration(family)
+        for number in 0..declarations.signatures.count {
+            let signature = declarations.signatures[number]
+            if !hasAttribute(signature.declaration.annotations, .Dispatch) { continue }
+            match signature.owner {
+                Some(declaredOwner) -> {
+                    if !declaredOwner.equals(owner) { continue }
+                }
+                None -> continue
+            }
+            declarations.signatures[number] = Signature {
+                name = signature.name, symbol = signature.symbol, member = signature.member, owner = signature.owner,
+                receiver = signature.receiver, parameters = signature.parameters, result = signature.result, entry = signature.entry,
+                declaration = dispatcher(tree, cases, signature.declaration, true)
+            }
+            rechecks.append(number)
+        }
+    }
+}

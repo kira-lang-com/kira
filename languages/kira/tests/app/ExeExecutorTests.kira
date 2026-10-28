@@ -1,0 +1,156 @@
+import Foundation
+import Heap
+
+// Foundation's `Executor`: spawned async functions run interleaved at their
+// awaits, join their outputs, await each other through handles, and are
+// cancelled when aborted or when the executor goes away.
+
+// Appends `mark` to the log each time it is polled, pending `remaining`
+// times (self-woken) before it is ready.
+struct ExeStep: Future<Int> {
+    let log: RawPtr
+    let mark: Int
+    var remaining: Int
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Int> {
+        let count = Heap.readHeapWord(self.log)
+        Heap.writeHeapWord(Heap.offsetHeapBytes(self.log, 8 + count * 8), self.mark)
+        Heap.writeHeapWord(self.log, count + 1)
+        if self.remaining == 0 { return .Ready(self.mark) }
+        self.remaining -= 1
+        context.waker.wakeUp()
+        return .Pending
+    }
+}
+
+// Pending forever without waking anyone; counts its drop.
+struct ExeForever: Future<Int>, Drop {
+    let cell: RawPtr
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Int> {
+        return .Pending
+    }
+
+    function drop(borrow mut self) {
+        Heap.writeHeapWord(self.cell, Heap.readHeapWord(self.cell) + 1)
+    }
+}
+
+function exeLog() -> RawPtr {
+    let log = Heap.allocateRaw(8 * 64, 8)
+    Heap.writeHeapWord(log, 0)
+    return log
+}
+
+function exeEntry(log: RawPtr, index: Int) -> Int {
+    return Heap.readHeapWord(Heap.offsetHeapBytes(log, 8 + index * 8))
+}
+
+async function exeTwice(log: RawPtr, mark: Int) -> Int {
+    let first = ExeStep { log = log, mark = mark, remaining = 1 }.await
+    return first * 10
+}
+
+async function exeSum(a: Int, b: Int) -> Int {
+    return a + b
+}
+
+async function exeAwaitHandle(handle: JoinHandle<Int>) -> Int {
+    var awaited = move handle
+    let value = awaited.await
+    return value + 1
+}
+
+async function exeWaitForever(cell: RawPtr) -> Int {
+    let never = ExeForever { cell = cell }.await
+    return never
+}
+
+@Test
+function exeRunsSpawnedTasksToTheEnd() {
+    let executor = Executor()
+    let sum = executor.spawn(exeSum(2, 3))
+    executor.run()
+    expect!(sum.isFinished())
+    expect!(sum.join() == 5)
+    expect!(executor.pending() == 0)
+}
+
+@Test
+function exeInterleavesTasksAtAwaits() {
+    let log = exeLog()
+    let executor = Executor()
+    let a = executor.spawn(exeTwice(log, 1))
+    let b = executor.spawn(exeTwice(log, 2))
+    executor.run()
+    expect!(a.join() == 10)
+    expect!(b.join() == 20)
+    // Each step polls once, wakes itself and yields to the other task.
+    expect!(Heap.readHeapWord(log) == 4)
+    expect!(exeEntry(log, 0) == 1)
+    expect!(exeEntry(log, 1) == 2)
+    expect!(exeEntry(log, 2) == 1)
+    expect!(exeEntry(log, 3) == 2)
+    Heap.freeRaw(log)
+}
+
+@Test
+function exeBlockAnswersTheOutput() {
+    let executor = Executor()
+    expect!(executor.block(exeSum(20, 22)) == 42)
+}
+
+@Test
+function exeTaskAwaitsAnotherTasksHandle() {
+    let log = exeLog()
+    let executor = Executor()
+    let inner = executor.spawn(exeTwice(log, 7))
+    let outer = executor.spawn(exeAwaitHandle(move inner))
+    executor.run()
+    expect!(outer.join() == 71)
+    Heap.freeRaw(log)
+}
+
+@Test
+function exeManyTasksGrowTheQueue() {
+    let log = exeLog()
+    let executor = Executor()
+    var handles: [JoinHandle<Int>] = []
+    for index in 0..40 {
+        handles.append(executor.spawn(exeSum(index, 1)))
+    }
+    executor.run()
+    var total = 0
+    for handle in handles { total += handle.join() }
+    expect!(total == 820)
+    Heap.freeRaw(log)
+}
+
+@Test
+function exeAbortCancelsTheTask() {
+    let cell = Heap.allocateRaw(8, 8)
+    Heap.writeHeapWord(cell, 0)
+    let executor = Executor()
+    let stuck = executor.spawn(exeWaitForever(cell))
+    executor.run()
+    expect!(!stuck.isFinished())
+    expect!(executor.pending() == 1)
+    stuck.abort()
+    expect!(Heap.readHeapWord(cell) == 1)
+    Heap.freeRaw(cell)
+}
+
+@Test
+function exeDroppingTheExecutorCancelsUnfinishedTasks() {
+    let cell = Heap.allocateRaw(8, 8)
+    Heap.writeHeapWord(cell, 0)
+    exeRunAndLeave(cell)
+    expect!(Heap.readHeapWord(cell) == 1)
+    Heap.freeRaw(cell)
+}
+
+function exeRunAndLeave(cell: RawPtr) {
+    let executor = Executor()
+    let stuck = executor.spawn(exeWaitForever(cell))
+    executor.run()
+}

@@ -1,0 +1,252 @@
+// Types as KSL names them, the declared structs, and KSL's packing, which
+// a struct a host writes must already have: KSL cannot place a member
+// anywhere else.
+
+function scalarWord(scalar: String) -> String {
+    match scalar {
+        "f32" -> return "Float"
+        "f16" -> return "Half"
+        "i32" -> return "Int"
+        "u32" -> return "UInt"
+        "bool" -> return "Bool"
+        else -> return ""
+    }
+}
+
+// The KSL word of a KSIR built-in, or "" when KSL has none.
+function builtinWord(builtin: String) -> String {
+    match builtin {
+        "position" -> return "position"
+        "vertex_index" -> return "vertex_index"
+        "instance_index" -> return "instance_index"
+        "front_facing" -> return "front_facing"
+        "global_invocation_id" -> return "thread_id"
+        "local_invocation_id" -> return "local_id"
+        "workgroup_id" -> return "group_id"
+        "local_invocation_index" -> return "local_index"
+        else -> return ""
+    }
+}
+
+extend KslOut {
+    function prepareTypes(borrow mut self) {
+        typeNames = []
+        let types = count("types", -1)
+        for index in 0..types {
+            typeNames.append("")
+        }
+    }
+
+    // The KSL spelling of type `index`, refused at `at` when KSL has none.
+    function typeName(borrow mut self, index: Int, at: Int) -> String {
+        if index < 0 { return "" }
+        if utf8Count(typeNames[index]) > 0 { return typeNames[index] }
+        let spelled = spell(index)
+        if utf8Count(spelled) == 0 {
+            refuse(describeType(index), at)
+            return "Void"
+        }
+        typeNames[index] = spelled
+        return spelled
+    }
+
+    function describeType(borrow self, index: Int) -> String {
+        let which = kind("types", -1, index)
+        let scalar = text("types", -1, index, "scalar")
+        if which == "image" {
+            return joinText([
+                "image ", text("types", -1, index, "dimension"), " ", text("types", -1, index, "class"), " ",
+                scalar, " ", text("types", -1, index, "format")
+            ])
+        }
+        if which == "array" { return "array with a fixed length" }
+        if utf8Count(scalar) > 0 { return joinText([which, " of ", scalar]) }
+        return joinText(["type ", which])
+    }
+
+    function spell(borrow self, index: Int) -> String {
+        let which = kind("types", -1, index)
+        let scalar = scalarWord(text("types", -1, index, "scalar"))
+        match which {
+            "scalar" -> return scalar
+            // A storage element an `atomicAdd` reaches: KSL declares the
+            // integer, and the atomic follows from the call.
+            "atomic" -> return scalar
+            "vector" -> {
+                if utf8Count(scalar) == 0 { return "" }
+                return joinText([scalar, decimalText(field("types", -1, index, "lanes"))])
+            }
+            "matrix" -> {
+                let columns = field("types", -1, index, "columns")
+                if scalar != "Float" || columns != field("types", -1, index, "rows") { return "" }
+                return joinText(["Float", decimalText(columns), "x", decimalText(columns)])
+            }
+            "struct" -> {
+                let name = text("types", -1, index, "name")
+                if utf8Count(name) == 0 { return joinText(["Struct", decimalText(index)]) }
+                return kslName(name)
+            }
+            "array" -> {
+                if field("types", -1, index, "length") >= 0 || field("types", -1, index, "length_override") >= 0 {
+                    return ""
+                }
+                let element = spell(field("types", -1, index, "base"))
+                if utf8Count(element) == 0 { return "" }
+                return joinText(["[", element, "]"])
+            }
+            "image" -> return imageWord(index)
+            "sampler" -> {
+                if field("types", -1, index, "comparison") == 1 { return "SamplerComparison" }
+                return "Sampler"
+            }
+            else -> return ""
+        }
+    }
+
+    function imageWord(borrow self, index: Int) -> String {
+        if field("types", -1, index, "arrayed") == 1 || field("types", -1, index, "multisampled") == 1 {
+            return ""
+        }
+        let dimension = text("types", -1, index, "dimension")
+        let imageClass = text("types", -1, index, "class")
+        let scalar = text("types", -1, index, "scalar")
+        if dimension == "cube" {
+            if imageClass == "sampled" && scalar == "f32" { return "TextureCube" }
+            return ""
+        }
+        if dimension != "2d" { return "" }
+        match imageClass {
+            "sampled" -> {
+                if scalar == "f32" { return "Texture2d" }
+                if scalar == "u32" { return "Texture2dUint" }
+                return ""
+            }
+            "depth" -> return "Depth2d"
+            "storage" -> {
+                let format = text("types", -1, index, "format")
+                if format == "rgba8unorm" { return "Texture2d" }
+                if format == "r32uint" { return "Texture2dUint" }
+                return ""
+            }
+            else -> return ""
+        }
+    }
+
+    function writeStructs(borrow mut self) {
+        let types = count("types", -1)
+        for index in 0..types {
+            if kind("types", -1, index) == "struct" { writeStruct(index) }
+        }
+    }
+
+    function writeStruct(borrow mut self, index: Int) {
+        line(joinText(["type ", typeName(index, -1), " {"]))
+        indent += 1
+        let members = count("members", index)
+        let host = field("types", -1, index, "host_shared") == 1
+        var location = 0
+        var cursor = 0
+        for member in 0..members {
+            let memberType = field("members", index, member, "type")
+            let placed = packedSize(memberType)
+            cursor = roundUp(cursor, placed[1])
+            let offset = field("members", index, member, "offset")
+            if host && cursor != offset {
+                refuse(joinText([
+                    "packing that puts `", text("members", index, member, "name"), "` at offset ", decimalText(offset)
+                ]), -1)
+            }
+            cursor += placed[0]
+            let builtin = text("members", index, member, "builtin")
+            if utf8Count(builtin) > 0 {
+                let word = builtinWord(builtin)
+                if utf8Count(word) == 0 { refuse(joinText(["built-in `", builtin, "`"]), -1) }
+                line(joinText(["@builtin(", word, ")"]))
+            } else {
+                let at = field("members", index, member, "location")
+                if at >= 0 {
+                    if at != location { refuse("location out of declaration order", -1) }
+                    location = at + 1
+                    writeInterpolation(index, member)
+                }
+            }
+            line(joinText(["let ", kslName(text("members", index, member, "name")), ": ", typeName(memberType, -1)]))
+        }
+        indent -= 1
+        line("}")
+        line("")
+    }
+
+    function writeInterpolation(borrow mut self, structure: Int, member: Int) {
+        let sampling = text("members", structure, member, "sampling")
+        if utf8Count(sampling) > 0 && sampling != "center" {
+            refuse(joinText(["`", sampling, "` sampling"]), -1)
+        }
+        if field("members", structure, member, "blend_src") >= 0 { refuse("dual-source blending", -1) }
+        let interpolation = text("members", structure, member, "interpolation")
+        if interpolation == "flat" || interpolation == "linear" {
+            line(joinText(["@interpolate(", interpolation, ")"]))
+        }
+    }
+
+    // KSL's size and alignment of a member of type `index`.
+    function packedSize(borrow self, index: Int) -> [Int] {
+        let which = kind("types", -1, index)
+        match which {
+            "vector" -> {
+                if field("types", -1, index, "lanes") == 2 { return [8, 8] }
+                return [16, 16]
+            }
+            "matrix" -> return [16 * field("types", -1, index, "columns"), 16]
+            "struct" -> {
+                let alignment = uniformAlign(index)
+                return [roundUp(structEnd(index), alignment), alignment]
+            }
+            "array" -> return [0, 16]
+            else -> return [4, 4]
+        }
+    }
+
+    function uniformAlign(borrow self, structure: Int) -> Int {
+        var alignment = 16
+        let members = count("members", structure)
+        for member in 0..members {
+            let placed = packedSize(field("members", structure, member, "type"))
+            if placed[1] > alignment { alignment = placed[1] }
+        }
+        return alignment
+    }
+
+    function structEnd(borrow self, structure: Int) -> Int {
+        var cursor = 0
+        let members = count("members", structure)
+        for member in 0..members {
+            let placed = packedSize(field("members", structure, member, "type"))
+            cursor = roundUp(cursor, placed[1]) + placed[0]
+        }
+        return cursor
+    }
+
+    function storageAlign(borrow self, index: Int) -> Int {
+        if kind("types", -1, index) != "struct" {
+            let placed = packedSize(index)
+            return placed[1]
+        }
+        var alignment = 4
+        let members = count("members", index)
+        for member in 0..members {
+            let memberAlign = storageAlign(field("members", index, member, "type"))
+            if memberAlign > alignment { alignment = memberAlign }
+        }
+        return alignment
+    }
+
+    // The stride of a storage array of `element` in KSL.
+    function storageStride(borrow self, element: Int) -> Int {
+        if kind("types", -1, element) == "struct" {
+            return roundUp(structEnd(element), storageAlign(element))
+        }
+        let placed = packedSize(element)
+        return roundUp(placed[0], placed[1])
+    }
+}

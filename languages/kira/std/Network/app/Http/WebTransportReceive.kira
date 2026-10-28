@@ -1,0 +1,398 @@
+import Foundation
+
+// WebTransport's receiving side (draft-ietf-webtrans-http3-16): the peer's
+// streams and datagrams, held until their session is established, and the
+// capsules of a session's CONNECT stream.
+
+extend Http3Session {
+    // A stream the peer opened in a session: a unidirectional stream past
+    // its type, with the session still to read, or a bidirectional one past
+    // its signal and session.
+    function adoptStream(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        id: QuicStreamNumber,
+        session: QuicStreamNumber?,
+        bytes: borrow [UN8],
+        finished: Bool
+    ) {
+        transportStreams.append(TransportStream { id: id, session: session, local: false })
+        takeTransportBytes(quic, transportStreams.count - 1, bytes, finished)
+    }
+
+    function readTransport(borrow mut self, quic: borrow mut QuicConnection, index: Number) {
+        let read = match quic.read(transportStreams[index].id) {
+            Ok(value) -> value
+            Error(problem) -> {
+                absorb problem
+                return
+            }
+        }
+        takeTransportBytes(quic, index, read.data, read.finished)
+    }
+
+    function takeTransportBytes(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        index: Number,
+        bytes: borrow [UN8],
+        finished: Bool
+    ) {
+        var stream = copy transportStreams[index]
+        // QUIC reports a finished stream readable again; its end went once.
+        if stream.receiveDone { return }
+        stream.held.appendAll(bytes)
+        if finished { stream.heldEnd = true }
+        if stream.session.isNone() {
+            var reader = WireReader { bytes: copy stream.held }
+            match reader.readVarint() {
+                Ok(raw) -> {
+                    stream.session = .Some(QuicStreamNumber(raw))
+                    stream.held = reader.readRest()
+                }
+                Error(failure) -> absorb failure
+            }
+        }
+        transportStreams[index] = stream
+        let session = match stream.session {
+            Some(value) -> value
+            None -> return
+        }
+        // A session is a client's bidirectional stream (section 4).
+        if session.kind() != .Bidirectional || session.openedBy() != .Client {
+            return fail(quic, .IdError)
+        }
+        deliverStream(quic, index)
+    }
+
+    // What stream `index` holds goes to its session once established;
+    // until then it waits, within a limit (section 4.6).
+    function deliverStream(borrow mut self, quic: borrow mut QuicConnection, index: Number) {
+        let stream = copy transportStreams[index]
+        let session = match stream.session {
+            Some(value) -> value
+            None -> return
+        }
+        match transportIndex(session) {
+            Some(place) -> {
+                if transports[place].ended {
+                    return dropStream(quic, index, Http3Error.WtSessionGone)
+                }
+                if !transports[place].established { return holdStream(quic, index) }
+            }
+            None -> return holdStream(quic, index)
+        }
+        if !stream.announced {
+            events.append(
+                .TransportStream(TransportStreamOpened { session: session, stream: stream.id })
+            )
+            transportStreams[index].announced = true
+        }
+        if stream.held.count == 0 && !stream.heldEnd { return }
+        events.append(
+            .TransportData(
+                TransportBytes {
+                    session: session,
+                    stream: stream.id,
+                    bytes: copy stream.held,
+                    finished: stream.heldEnd
+                }
+            )
+        )
+        transportStreams[index].held = []
+        if stream.heldEnd {
+            transportStreams[index].heldEnd = false
+            transportStreams[index].receiveDone = true
+            retireStream(index)
+        }
+    }
+
+    function holdStream(borrow mut self, quic: borrow mut QuicConnection, index: Number) {
+        var waiting: Number = 0
+        for stream in transportStreams {
+            if !stream.local && !stream.announced { waiting += 1 }
+        }
+        if waiting > WebTransport.heldStreams {
+            dropStream(quic, index, Http3Error.WtBufferedStreamRejected)
+        }
+    }
+
+    // A peer's stream refused both ways and forgotten.
+    function dropStream(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        index: Number,
+        error: Http3Error
+    ) {
+        let stream = copy transportStreams[index]
+        if stream.receives() {
+            match quic.stopSending(stream.id, code(error)) {
+                Ok -> {}
+                Error(failure) -> absorb failure
+            }
+        }
+        if stream.sends() {
+            match quic.resetStream(stream.id, code(error)) {
+                Ok -> {}
+                Error(failure) -> absorb failure
+            }
+        }
+        removeStream(index)
+    }
+
+    function removeStream(borrow mut self, index: Number) {
+        var kept: [TransportStream] = []
+        for (position, stream) in transportStreams.enumerated() {
+            if position != index { kept.append(copy stream) }
+        }
+        transportStreams = kept
+    }
+
+    // A stream done both ways leaves the table.
+    function retireStream(borrow mut self, index: Number) {
+        let stream = copy transportStreams[index]
+        let sendOver = !stream.sends() || stream.sendDone
+        let receiveOver = !stream.receives() || stream.receiveDone
+        if sendOver && receiveOver { removeStream(index) }
+    }
+
+    // Held streams and datagrams whose session is now established, or
+    // gone.
+    function releaseHeld(borrow mut self, quic: borrow mut QuicConnection) {
+        var waiting: [QuicStreamNumber] = []
+        for stream in transportStreams {
+            if !stream.local && !stream.announced { waiting.append(stream.id) }
+        }
+        for id in waiting {
+            match transportStreamIndex(id) {
+                Some(index) -> deliverStream(quic, index)
+                None -> {}
+            }
+        }
+        var kept: [TransportDatagram] = []
+        for datagram in heldDatagrams {
+            match transportIndex(datagram.session) {
+                Some(place) -> {
+                    if transports[place].established && !transports[place].ended {
+                        events.append(.TransportDatagram(copy datagram))
+                    } else if !transports[place].ended {
+                        kept.append(copy datagram)
+                    }
+                }
+                None -> kept.append(copy datagram)
+            }
+        }
+        heldDatagrams = kept
+    }
+
+    // A QUIC datagram as an HTTP datagram of a session (RFC 9297 section
+    // 2.1); one no session can take is held a while, then dropped.
+    function takeDatagram(borrow mut self, quic: borrow mut QuicConnection, data: borrow [UN8]) {
+        absorb quic
+        var reader = WireReader { bytes: copy data }
+        let quarter: Number = match reader.readVarint() {
+            Ok(value) -> value
+            Error(failure) -> {
+                absorb failure
+                return
+            }
+        }
+        let datagram = TransportDatagram {
+            session: QuicStreamNumber(quarter * QuicStreamBits.kinds),
+            bytes: reader.readRest()
+        }
+        match transportIndex(datagram.session) {
+            Some(place) -> {
+                if transports[place].ended { return }
+                if transports[place].established {
+                    return events.append(.TransportDatagram(datagram))
+                }
+            }
+            None -> {}
+        }
+        if heldDatagrams.count < WebTransport.heldDatagrams { heldDatagrams.append(datagram) }
+    }
+
+    // The peer reset or stopped a session's stream, or its CONNECT stream.
+    // True when the stream was WebTransport's.
+    function transportFailure(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        failure: borrow QuicStreamFailure,
+        stopped: Bool
+    ) -> Bool {
+        match transportIndex(failure.id) {
+            Some(_) -> {
+                let close = TransportClose {
+                    session: failure.id,
+                    error: 0,
+                    reason: "",
+                    reset: .Some(failure.error)
+                }
+                endTransport(quic, failure.id, .Some(close), true)
+                forgetMessage(failure.id)
+                forgetTransport(failure.id)
+                return true
+            }
+            None -> {}
+        }
+        let index = match transportStreamIndex(failure.id) {
+            Some(value) -> value
+            None -> return false
+        }
+        let stream = copy transportStreams[index]
+        let session = match stream.session {
+            Some(value) -> value
+            None -> {
+                removeStream(index)
+                return true
+            }
+        }
+        if stream.announced {
+            let reported = TransportFailure {
+                session: session,
+                stream: stream.id,
+                error: applicationError(failure.error)
+            }
+            events.append(
+                stopped ? Http3Event.TransportStopped(reported) : Http3Event.TransportReset(
+                    reported
+                )
+            )
+        }
+        // A stopped stream was reset by QUIC already.
+        if stopped {
+            transportStreams[index].sendDone = true
+        } else {
+            transportStreams[index].receiveDone = true
+            transportStreams[index].held = []
+        }
+        if !stream.announced {
+            removeStream(index)
+        } else {
+            retireStream(index)
+        }
+        return true
+    }
+
+    function forgetTransport(borrow mut self, session: QuicStreamNumber) {
+        var kept: [TransportSession] = []
+        for transport in transports {
+            if transport.id != session { kept.append(copy transport) }
+        }
+        transports = kept
+    }
+
+    // The CONNECT stream ended cleanly: as a close with code 0 and no
+    // message, unless WT_CLOSE_SESSION came first (section 6).
+    function transportFinished(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        session: QuicStreamNumber
+    ) {
+        let close = TransportClose { session: session, error: 0, reason: "" }
+        endTransport(quic, session, .Some(close), true)
+        forgetMessage(session)
+        forgetTransport(session)
+    }
+
+    // Whole capsules of an established session's CONNECT stream (RFC
+    // 9297 section 3.2); unknown ones are skipped.
+    function takeCapsules(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        session: QuicStreamNumber
+    ) {
+        while true {
+            let index = match transportIndex(session) {
+                Some(value) -> value
+                None -> return
+            }
+            var transport = copy transports[index]
+            if transport.capsules.count == 0 { return }
+            if transport.closeHeard {
+                // Bytes after WT_CLOSE_SESSION (section 6).
+                return malformedCapsules(quic, session)
+            }
+            if transport.skipLeft > 0 {
+                let take = min(transport.skipLeft, transport.capsules.count)
+                transport.skipLeft -= take
+                transport.capsules = byteRun(transport.capsules, take, transport.capsules.count)
+                transports[index] = transport
+                continue
+            }
+            var reader = WireReader { bytes: copy transport.capsules }
+            let kind = try reader.readVarint() otherwise return
+            let length = try reader.readVarint() otherwise return
+            let typed: CapsuleType = fromCode<CapsuleType>(kind)
+            if length > WebTransport.capsuleLimit {
+                if typed == .CloseSession { return malformedCapsules(quic, session) }
+                transport.skipLeft = length
+                transport.capsules = reader.readRest()
+                transports[index] = transport
+                continue
+            }
+            if reader.remaining() < length { return }
+            let value = try reader.readBytes(length) otherwise return
+            transport.capsules = reader.readRest()
+            transports[index] = transport
+            match typed {
+                CloseSession -> {
+                    let close = match quicReadClose(session, value) {
+                        Some(found) -> found
+                        None -> return malformedCapsules(quic, session)
+                    }
+                    transports[index].closeHeard = true
+                    return endTransport(quic, session, .Some(close), true)
+                }
+                DrainSession -> events.append(.TransportDraining(session))
+                // Flow control capsules mean nothing without flow control
+                // (section 5.1).
+                else -> {}
+            }
+        }
+    }
+
+    // A malformed close ends the session with the CONNECT stream reset
+    // as H3_MESSAGE_ERROR (section 6).
+    function malformedCapsules(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        session: QuicStreamNumber
+    ) {
+        let error = code(Http3Error.MessageError)
+        match quic.resetStream(session, error) {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+        match quic.stopSending(session, error) {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+        let close = TransportClose { session: session, error: 0, reason: "", reset: .Some(error) }
+        endTransport(quic, session, .Some(close), false)
+        forgetMessage(session)
+        forgetTransport(session)
+    }
+
+    // CONNECT stream bytes from DATA frames, for `takeCapsules`.
+    function holdCapsuleBytes(borrow mut self, session: QuicStreamNumber, bytes: borrow [UN8]) {
+        match transportIndex(session) {
+            Some(index) -> transports[index].capsules.appendAll(bytes)
+            None -> {}
+        }
+    }
+}
+
+// WT_CLOSE_SESSION's code and UTF-8 message, none when malformed.
+function quicReadClose(session: QuicStreamNumber, value: borrow [UN8]) -> TransportClose? {
+    var reader = WireReader { bytes: copy value }
+    let error = try reader.readInteger(WebTransport.closeCodeBytes) otherwise return .None
+    let message = reader.readRest()
+    if message.count > WebTransport.messageLimit { return .None }
+    let reason = match textFromBytes(message) {
+        Some(text) -> text
+        None -> return .None
+    }
+    return .Some(TransportClose { session: session, error: error, reason: reason })
+}

@@ -1,0 +1,182 @@
+import Heap
+
+// Files held open across calls, on the kernel's `klf.fs` handle services: a
+// read or a write lands at an offset without reopening the file, `sync` makes
+// written data durable, and `syncDirectory` makes a created or renamed entry
+// durable. Every service answers a negative word for a failure, and this file
+// is the one place that word turns into a `FileHandleFailure`.
+
+@Service("klfsvc_fs_open")
+function kernelFileOpen(path: RawPtr, pathCount: Int, access: Int) -> Int
+
+@Service("klfsvc_fs_close")
+function kernelFileClose(handle: Int) -> Int
+
+@Service("klfsvc_fs_read_at")
+function kernelFileReadAt(handle: Int, offset: Int, destination: RawPtr, count: Int) -> Int
+
+@Service("klfsvc_fs_write_at")
+function kernelFileWriteAt(handle: Int, offset: Int, data: RawPtr, count: Int) -> Int
+
+@Service("klfsvc_fs_sync")
+function kernelFileSync(handle: Int) -> Int
+
+@Service("klfsvc_fs_truncate")
+function kernelFileTruncate(handle: Int, size: Int) -> Int
+
+@Service("klfsvc_fs_handle_size")
+function kernelFileHandleSize(handle: Int) -> Int
+
+@Service("klfsvc_fs_lock")
+function kernelFileLock(handle: Int, wait: Int) -> Int
+
+@Service("klfsvc_fs_sync_directory")
+function kernelDirectorySync(path: RawPtr, pathCount: Int) -> Int
+
+@Service("klfsvc_fs_close_descriptor")
+function kernelDescriptorClose(descriptor: U64) -> U64
+
+enum FileAccess: UN32 {
+    Read = 0
+    ReadWrite = 1
+    CreateNew = 2
+}
+
+// The failure words of the `klf.fs` handle services (framework D-382).
+enum FileHandleFailure {
+    Missing
+    Denied
+    Exists
+    Closed
+    StorageFull
+    InvalidPath
+    Io
+}
+
+distinct FileHandleId = Number
+
+struct FileHandle {
+    let id: FileHandleId
+
+    // Up to `count` bytes from `offset`; fewer only where the file ends. The
+    // kernel reads straight into the array's storage.
+    function read(
+        borrow self,
+        offset: UNumber,
+        count: UNumber
+    ) -> Result<[UN8], FileHandleFailure> {
+        let wanted = Number(count)
+        let data = makeArrayData(max(wanted, 1))
+        var total: Number = 0
+        for chunk in 0..chunkCount(wanted) {
+            let start = chunk * FileService.chunk
+            let asking = min(wanted - start, FileService.chunk)
+            let read = kernelFileReadAt(
+                id.raw,
+                Number(offset) + start,
+                heapOffset(data, start),
+                asking
+            )
+            if read < 0 {
+                freeBytes(data)
+                return .Error(handleFailure(read))
+            }
+            total += read
+            if read < asking { break }
+        }
+        let empty: [UN8] = []
+        return .Ok(Array { data = data, count = total, capacity = max(wanted, 1), ops = empty.ops })
+    }
+
+    // All of `bytes` at `offset`, growing the file where it ends first. The
+    // kernel writes straight from the array's storage.
+    function write(
+        borrow self,
+        offset: UNumber,
+        bytes: borrow [UN8]
+    ) -> Result<Void, FileHandleFailure> {
+        for chunk in 0..chunkCount(bytes.count) {
+            let start = chunk * FileService.chunk
+            let length = min(bytes.count - start, FileService.chunk)
+            let answer = kernelFileWriteAt(
+                id.raw,
+                Number(offset) + start,
+                heapOffset(bytes.data, start),
+                length
+            )
+            if answer < 0 { return .Error(handleFailure(answer)) }
+        }
+        return .Ok
+    }
+
+    function sync(borrow self) -> Result<Void, FileHandleFailure> {
+        return handleOutcome(kernelFileSync(id.raw))
+    }
+
+    function truncate(borrow self, size: UNumber) -> Result<Void, FileHandleFailure> {
+        return handleOutcome(kernelFileTruncate(id.raw, Number(size)))
+    }
+
+    function size(borrow self) -> Result<UNumber, FileHandleFailure> {
+        let answer = kernelFileHandleSize(id.raw)
+        if answer < 0 { return .Error(handleFailure(answer)) }
+        return .Ok(Number(answer))
+    }
+
+    // Takes the file's exclusive lock (framework D-391): true once held,
+    // false when another holder has it and `wait` is off. Closing the handle,
+    // or the process ending, releases it.
+    function lock(borrow self, wait: Bool) -> Result<Bool, FileHandleFailure> {
+        let answer = kernelFileLock(id.raw, wait ? 1 : 0)
+        if answer < 0 { return .Error(handleFailure(answer)) }
+        return .Ok(answer == 1)
+    }
+
+    function close(borrow self) -> Result<Void, FileHandleFailure> {
+        return handleOutcome(kernelFileClose(id.raw))
+    }
+}
+
+function openFileHandle(
+    path: borrow String,
+    access: FileAccess
+) -> Result<FileHandle, FileHandleFailure> {
+    let answer = kernelFileOpen(path.data, path.count, code(access))
+    if answer < 0 { return .Error(handleFailure(answer)) }
+    return .Ok(FileHandle { id: FileHandleId(answer) })
+}
+
+function syncDirectory(path: borrow String) -> Result<Void, FileHandleFailure> {
+    return handleOutcome(kernelDirectorySync(path.data, path.count))
+}
+
+// How many service calls move `count` bytes, at most a chunk each.
+function chunkCount(count: Number) -> Number {
+    return trunc((count + FileService.chunk - 1) / FileService.chunk)
+}
+
+function handleOutcome(answer: Number) -> Result<Void, FileHandleFailure> {
+    if answer < 0 { return .Error(handleFailure(answer)) }
+    return .Ok
+}
+
+function handleFailure(word: Number) -> FileHandleFailure {
+    return match word {
+            -1 -> .Missing
+            - 2 -> .Denied
+            - 3 -> .Exists
+            - 4 -> .Closed
+            - 5 -> .StorageFull
+            - 6 -> .InvalidPath
+        else -> .Io
+    }
+}
+
+// Closes an operating-system descriptor a library the program calls handed
+// it, such as the dma-buf a graphics driver exports for a texture, and
+// answers whether it closed. No `FileHandle` holds it, and a program never
+// closes one with a system call of its own (framework D-392).
+function closeDescriptor(descriptor: N32) -> Bool {
+    if descriptor < 0 { return false }
+    return kernelDescriptorClose(Number(descriptor)) == Number(1)
+}

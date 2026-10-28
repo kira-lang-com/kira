@@ -1,0 +1,109 @@
+// Threads of the program's own (KLF section 18.9).
+//
+//     var worker = spawnThread({ in atomicAdd(total, work(), .Relaxed) })
+//     worker.join()
+//
+// A thread runs its body beside the caller and shares the heap: a value one
+// thread makes can be read, retained and released on any other, its counts
+// being atomic. A body is any lambda; what it captures is shared with the
+// caller, so state both sides change is an atomic (`atomicAdd`, ...) or is
+// guarded by one. A thread is joined when its `Thread` is dropped, so a body
+// never outlives what it captured; `join` waits for it sooner.
+//
+// On the VM an instance has one thread, and `spawnThread` runs the body to
+// its end before it returns.
+
+@FFI.Callback { abi: c, params: [context: RawPtr], context: context }
+struct ThreadBody {}
+
+@Service("klfsvc_thread_spawn")
+function kernelThreadSpawn(entry: RawPtr, argument: RawPtr) -> U64
+
+@Service("klfsvc_thread_join")
+function kernelThreadJoin(handle: U64) -> U64
+
+@Service("klfsvc_thread_current")
+function kernelThreadCurrent() -> U64
+
+@Service("klfsvc_thread_park")
+function kernelThreadPark(timeout: U64) -> U64
+
+@Service("klfsvc_thread_unpark")
+function kernelThreadUnpark(thread: U64) -> U64
+
+@Service("klfsvc_thread_yield")
+function kernelThreadYield()
+
+@Service("klfsvc_thread_parallelism")
+function kernelThreadParallelism() -> U64
+
+// A running thread, joined at the latest when it is dropped.
+struct Thread: Drop {
+    // The kernel's handle, 0 once joined or when the body already ran.
+    var handle: Number
+    // Holds what the body captured for as long as the thread may run it.
+    var body: Optional<ThreadBody>
+
+    // Waits for the thread's body to end.
+    function join(borrow mut self) {
+        if handle != Number(0) {
+            kernelThreadJoin(handle)
+            handle = Number(0)
+        }
+        body = .None
+    }
+
+    function drop(borrow mut self) {
+        join()
+        return
+    }
+}
+
+// Starts a thread running `body`.
+function spawnThread(body: ThreadBody) -> Thread {
+    let handle = kernelThreadSpawn(body.pointer, body.context)
+    // Refused, as on the VM: the body runs here, to its end.
+    if handle > Number(0x7FFFFFFFFFFFFFFF) || handle == Number(0) {
+        body(body.context)
+        return Thread { handle = Number(0), body = .None }
+    }
+    return Thread { handle = handle, body = .Some(body) }
+}
+
+// The calling thread's number, which `unpark` takes.
+function currentThread() -> ThreadId {
+    return ThreadId { raw = kernelThreadCurrent() }
+}
+
+// Blocks the calling thread until another unparks it, or spuriously; an
+// `unpark` that came first makes it return at once. A caller rechecks what
+// it waits for.
+function parkThread() {
+    kernelThreadPark(Number(0xFFFFFFFFFFFFFFFF))
+}
+
+// `parkThread`, returning after `nanoseconds` at the latest.
+function parkThreadFor(nanoseconds: Number) {
+    if nanoseconds <= 0 { return }
+    kernelThreadPark(Number(nanoseconds))
+}
+
+// Offers the processor to another thread.
+function yieldThread() {
+    kernelThreadYield()
+}
+
+// How many threads can run at once, at least 1.
+function threadParallelism() -> Number {
+    return Number(kernelThreadParallelism())
+}
+
+// A thread's process-wide number.
+struct ThreadId {
+    let raw: Number
+
+    // Wakes the thread from its `park`, or makes its next one return at once.
+    function unpark(borrow self) {
+        kernelThreadUnpark(raw)
+    }
+}

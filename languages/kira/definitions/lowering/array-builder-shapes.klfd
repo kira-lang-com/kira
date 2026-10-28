@@ -1,0 +1,244 @@
+struct ArrayBuilderLoop {
+    let limit: Int
+    let body: [Int]
+}
+
+extend FunctionLowering {
+    function pureBuilderValue(borrow self, index: Int, locals: [Int]) -> Bool {
+        let expression = program.expressions[index]
+        if needsArrayCleanup(program, expression.valueType) { return false }
+        match expression.operation {
+            Integer -> return true
+            Boolean -> return true
+            FloatLiteral -> return true
+            Read(local) -> {
+                for allowed in locals { if local == allowed { return true } }
+                return false
+            }
+            Convert(operand) -> return pureBuilderValue(operand, locals)
+            Arithmetic(operator, left, right) -> return pureBuilderValue(left, locals) && pureBuilderValue(right, locals)
+            Wrapping(operator, left, right) -> return pureBuilderValue(left, locals) && pureBuilderValue(right, locals)
+            StringText -> return false
+            Sequence -> return false
+            BoxAny -> return false
+            TypeIs -> return false
+            UnboxAny -> return false
+            FunctionReference -> return false
+            IndirectCall -> return false
+            MakeClosure -> return false
+            GlobalRead -> return false
+            TaskSpawn -> return false
+            TaskReady -> return false
+            TaskAwait -> return false
+            TaskCancel -> return false
+            TaskDetach -> return false
+            Async -> return false
+            RuntimeTrap -> return false
+            Try -> return false
+            ChannelCreate -> return false
+            ChannelReceiver -> return false
+            ChannelSend -> return false
+            ChannelClose -> return false
+            ClassView -> return false
+            ClassCall -> return false
+            StringLiteral -> return false
+            StringConcat -> return false
+            TraceText -> return false
+            HeapAllocateRaw -> return false
+            HeapFreeRaw -> return false
+            Print -> return false
+            HeapRead -> return false
+            HeapWrite -> return false
+            Atomic -> return false
+            HeapCopy -> return false
+            HeapFill -> return false
+            HeapOffset -> return false
+            HeapLayout -> return false
+            ArrayLiteral -> return false
+            ArrayIndex -> return false
+            ArrayAppend -> return false
+            Transfer -> return false
+            Member -> return false
+            Call -> return false
+            Construct -> return false
+            Tagged -> return false
+            Unary -> return false
+            Compare -> return false
+            Logical -> return false
+            Select -> return false
+            Choice -> return false
+            Bitcast -> return false
+            ForeignImage -> return false
+            ForeignElements -> return false
+            ForeignCallback -> return false
+            ForeignRead -> return false
+            ForeignUnion -> return false
+            EnumCode -> return false
+            EnumFromCode -> return false
+            Order -> return false
+            Hash -> return false
+        }
+    }
+
+    function checkedBuilderLoop(borrow self, statement: CheckedStatement, counter: Int) -> Optional<ArrayBuilderLoop> {
+        match statement {
+            Loop(condition, body) -> {
+                if body.count < 2 || !unitCounterStep(program.statements[body[body.count - 1]], counter) { return .None }
+                match program.expressions[condition].operation {
+                    Compare(comparison, left, right) -> {
+                        if comparison != .Less || !arrayFillRead(left, counter) { return .None }
+                        match program.expressions[right].operation.readLocal() {
+                            Some(local) -> {
+                                if local >= checked.parameterCount || checked.locals[local].byReference || !checked.locals[local].valueType.equals(Type.int()) { return .None }
+                                return .Some(ArrayBuilderLoop { limit = right, body = body })
+                            }
+                            None -> return .None
+                        }
+                    }
+                    StringText -> return .None
+                    Sequence -> return .None
+                    Integer -> return .None
+                    FloatLiteral -> return .None
+                    BoxAny -> return .None
+                    TypeIs -> return .None
+                    UnboxAny -> return .None
+                    FunctionReference -> return .None
+                    IndirectCall -> return .None
+                    MakeClosure -> return .None
+                    GlobalRead -> return .None
+                    TaskSpawn -> return .None
+                    TaskReady -> return .None
+                    TaskAwait -> return .None
+                    TaskCancel -> return .None
+                    TaskDetach -> return .None
+                    Async -> return .None
+                    RuntimeTrap -> return .None
+                    Try -> return .None
+                    ChannelCreate -> return .None
+                    ChannelReceiver -> return .None
+                    ChannelSend -> return .None
+                    ChannelClose -> return .None
+                    ClassView -> return .None
+                    ClassCall -> return .None
+                    Boolean -> return .None
+                    StringLiteral -> return .None
+                    StringConcat -> return .None
+                    TraceText -> return .None
+                    HeapAllocateRaw -> return .None
+                    HeapFreeRaw -> return .None
+                    Print -> return .None
+                    HeapRead -> return .None
+                    HeapWrite -> return .None
+                    Atomic -> return .None
+                    HeapCopy -> return .None
+                    HeapFill -> return .None
+                    HeapOffset -> return .None
+                    HeapLayout -> return .None
+                    ArrayLiteral -> return .None
+                    ArrayIndex -> return .None
+                    ArrayAppend -> return .None
+                    Transfer -> return .None
+                    Read -> return .None
+                    Member -> return .None
+                    Call -> return .None
+                    Construct -> return .None
+                    Tagged -> return .None
+                    Unary -> return .None
+                    Arithmetic -> return .None
+                    Wrapping -> return .None
+                    Logical -> return .None
+                    Select -> return .None
+                    Choice -> return .None
+                    Bitcast -> return .None
+                    Convert -> return .None
+                    ForeignImage -> return .None
+                    ForeignElements -> return .None
+                    ForeignCallback -> return .None
+                    ForeignRead -> return .None
+                    ForeignUnion -> return .None
+                    EnumCode -> return .None
+                    EnumFromCode -> return .None
+                    Order -> return .None
+                    Hash -> return .None
+                }
+            }
+            Declare -> return .None
+            InitializeGlobal -> return .None
+            Assign -> return .None
+            Evaluate -> return .None
+            Branch -> return .None
+            Count -> return .None
+            Iterate -> return .None
+            Dispatch -> return .None
+            Attempt -> return .None
+            Return -> return .None
+            Break -> return .None
+            Continue -> return .None
+        }
+    }
+
+    function builderAppendCount(borrow self, body: [Int], array: Int, counter: Int) -> Int {
+        var locals = [counter]
+        var appends = 0
+        for index in 0..(body.count - 1) {
+            match program.statements[body[index]] {
+                Declare(local, expression) -> {
+                    let valueType = checked.locals[local].valueType
+                    if valueType.isAggregate() || checked.locals[local].cell || checked.locals[local].byReference || !pureBuilderValue(expression, locals) { return 0 }
+                    locals.append(local)
+                }
+                Evaluate(expression) -> {
+                    match program.expressions[expression].operation.arrayAppendOperands() {
+                        Some(operands) -> {
+                            if !arrayFillRead(operands.array, array) || !pureBuilderValue(operands.element, locals) { return 0 }
+                            appends += 1
+                        }
+                        None -> return 0
+                    }
+                }
+                InitializeGlobal -> return 0
+                Assign -> return 0
+                Branch -> return 0
+                Loop -> return 0
+                Count -> return 0
+                Iterate -> return 0
+                Dispatch -> return 0
+                Attempt -> return 0
+                Return -> return 0
+                Break -> return 0
+                Continue -> return 0
+            }
+        }
+        return appends
+    }
+
+    function emitBuilderStatement(borrow mut self, statement: CheckedStatement, elements: KirAddress, cursor: KirAddress, fast: Bool) {
+        match statement {
+            Declare(local, expression) -> {
+                if fast { kir.store(fastBuilderValue(expression), storage[local]) } else { self.statement(statement) }
+            }
+            Evaluate(expression) -> {
+                match program.expressions[expression].operation.arrayAppendOperands() {
+                    Some(operands) -> {
+                        let index = kir.load(cursor)
+                        let target = kir.element(elements, index, types.of(program.structs[checked.result.declaration].typeArguments[0]))
+                        if fast { kir.store(fastBuilderValue(operands.element), target) } else { write(operands.element, target) }
+                        kir.store(kir.binary(kirOperator(.Add, true), false, true, index, kir.integer(types.integer64, 1)), cursor)
+                    }
+                    None -> {}
+                }
+            }
+            InitializeGlobal -> {}
+            Assign -> {}
+            Branch -> {}
+            Loop -> {}
+            Count -> {}
+            Iterate -> {}
+            Dispatch -> {}
+            Attempt -> {}
+            Return -> {}
+            Break -> {}
+            Continue -> {}
+        }
+    }
+}

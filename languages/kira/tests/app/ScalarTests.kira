@@ -1,0 +1,302 @@
+import Foundation
+
+// Deep `kira test` suite for scalar arithmetic, comparisons, boolean logic,
+// conditional expressions, integer-division/modulo edge cases, and recursion.
+//
+// Every `Test` reduces its work to a single Int/Bool/String and asserts a
+// hand-computed expected value via `.Ok(...)`. The Test runner compares
+// only scalar values (struct/array equality is NOT structural), so aggregate
+// behaviour is always folded down to a deterministic scalar here.
+//
+// All top-level names in this file use the `sct`/`Scalar` prefix so they never
+// collide in the harness's single flat package namespace.
+//
+// NOTE: imports are file-scoped — this file imports Foundation explicitly above;
+// sibling files must add their own import to use Foundation symbols. `Test`,
+// `Result`, and `TestFailure` are in scope through this file's import.
+
+// --- helpers ---------------------------------------------------------------
+
+function sctFactorial(n: Int) -> Int {
+    if n <= 1 {
+        return 1
+    }
+    return n * sctFactorial(n - 1)
+}
+
+function sctFib(n: Int) -> Int {
+    if n < 2 {
+        return n
+    }
+    return sctFib(n - 1) + sctFib(n - 2)
+}
+
+function sctGcd(a: Int, b: Int) -> Int {
+    var x = a
+    var y = b
+    while y != 0 {
+        let t = x % y
+        x = y
+        y = t
+    }
+    return x
+}
+
+function sctPow(base: Int, exp: Int) -> Int {
+    var acc = 1
+    for i in 0..exp {
+        acc = acc * base
+    }
+    return acc
+}
+
+function sctSumTo(n: Int) -> Int {
+    var total = 0
+    for i in 1..(n + 1) {
+        total = total + i
+    }
+    return total
+}
+
+function sctClassify(n: Int) -> Int {
+    if (n % 3) == 0 {
+        return 100
+    } else if (n % 3) == 1 {
+        return 200
+    } else if (n % 3) == 2 {
+        return 300
+    } else {
+        return 0
+    }
+}
+
+// --- arithmetic ------------------------------------------------------------
+
+@Test
+function scalarAddCommutes() {
+    expect!(17 + 25 == 42)
+}
+
+@Test
+function scalarSubtractNegativeResult() {
+    expect!(10 - 31 == 0 - 21)
+}
+
+@Test
+function scalarMultiply() {
+    expect!(6 * 7 == 42)
+}
+
+@Test
+function scalarPrecedenceMulBeforeAdd() {
+    expect!(2 + 3 * 4 == 14)
+}
+
+@Test
+function scalarPrecedenceParens() {
+    expect!((2 + 3) * 4 == 20)
+}
+
+@Test
+function scalarNestedGrouping() {
+    expect!(0 - (3 * (4 + 5)) == 0 - 27)
+}
+
+@Test
+function scalarUnaryMinusFold() {
+    let a = 0 - 5
+    let b = 0 - a
+    expect!(a + b + (0 - 0) == 0)
+}
+
+@Test
+function scalarLeftAssocSubtraction() {
+    expect!(100 - 30 - 20 - 5 == 45)
+}
+
+// --- integer division / modulo --------------------------------------------
+
+// --- integer division / modulo --------------------------------------------
+
+@Test
+function scalarDivTruncatesTowardZero() {
+    let value: Int = 7 / 2
+    expect!(value == 3)
+}
+
+@Test
+function scalarModuloPositive() {
+    expect!(17 % 5 == 2)
+}
+
+@Test
+function scalarDivModIdentity() {
+    let a: Int = 12345
+    let b: Int = 71
+    expect!((a / b) * b + (a % b) == 12345)
+}
+
+@Test
+function scalarModuloCycleSum() {
+    var acc = 0
+    for i in 0..30 {
+        acc = acc + (i % 7)
+    }
+    // sum of (i%7) for i in 0..29: 4 full cycles of (0..6)=21 -> 84, +28%7=0 +29%7=1
+    expect!(acc == 85)
+}
+
+// --- comparisons -----------------------------------------------------------
+
+// --- comparisons -----------------------------------------------------------
+
+@Test
+function scalarLessThanTrue() {
+    expect!(3 < 7)
+}
+
+@Test
+function scalarGreaterEqualBoundary() {
+    expect!(7 >= 7)
+}
+
+@Test
+function scalarNotEqual() {
+    expect!(5 != 6)
+}
+
+@Test
+function scalarEqualityFalse() {
+    expect!(!(5 == 6))
+}
+
+// --- boolean logic ---------------------------------------------------------
+
+// --- boolean logic ---------------------------------------------------------
+
+@Test
+function scalarAndShortCircuit() {
+    let even = 10 % 2 == 0
+    expect!((4 > 2) && even)
+}
+
+@Test
+function scalarOrFalseLeft() {
+    expect!((1 > 2) || (3 > 2))
+}
+
+@Test
+function scalarNotComposition() {
+    let left = !(1 > 2)
+    let right = !(2 > 3)
+    expect!(left && right)
+}
+
+@Test
+function scalarBooleanTruthTableFold() {
+    var trues = 0
+    for a in 0..2 {
+        for b in 0..2 {
+            let av = a == 1
+            let bv = b == 1
+            if (av && bv) || (av || bv) {
+                trues = trues + 1
+            }
+        }
+    }
+    // (av&&bv)||(av||bv) is true unless both false -> 3 of 4 combos
+    expect!(trues == 3)
+}
+
+// --- conditional (ternary) expressions -------------------------------------
+
+// --- conditional (ternary) expressions -------------------------------------
+
+@Test
+function scalarTernaryPicksThen() {
+    let x = 9
+    expect!((x > 5 ? 100 : 200) == 100)
+}
+
+@Test
+function scalarTernaryFoldOverRange() {
+    var acc = 0
+    for i in 0..10 {
+        acc = acc + (i % 2 == 0 ? i : (0 - i))
+    }
+    // +0 -1 +2 -3 +4 -5 +6 -7 +8 -9 = -5
+    expect!(acc == 0 - 5)
+}
+
+// --- recursion -------------------------------------------------------------
+
+// --- recursion -------------------------------------------------------------
+
+@Test
+function scalarFactorialTen() {
+    expect!(sctFactorial(10) == 3628800)
+}
+
+@Test
+function scalarFibTwenty() {
+    expect!(sctFib(20) == 6765)
+}
+
+@Test
+function scalarGcdCoprime() {
+    expect!(sctGcd(1071, 462) == 21)
+}
+
+@Test
+function scalarGcdOne() {
+    expect!(sctGcd(17, 5) == 1)
+}
+
+@Test
+function scalarPowOfTwo() {
+    expect!(sctPow(2, 16) == 65536)
+}
+
+// --- loop accumulation -----------------------------------------------------
+
+// --- loop accumulation -----------------------------------------------------
+
+@Test
+function scalarGaussSum() {
+    expect!(sctSumTo(100) == 5050)
+}
+
+@Test
+function scalarMixedOperatorLoop() {
+    var acc = 0
+    for i in 1..51 {
+        acc = acc + (i * 3) - trunc(i / 2) + (i % 7)
+    }
+    // sum(i*3)=3825, -sum(i/2)=625, +sum(i%7)=148 -> 3348
+    expect!(acc == 3348)
+}
+
+@Test
+function scalarClassifySwitchFold() {
+    var acc = 0
+    for i in 0..12 {
+        acc = acc + sctClassify(i)
+    }
+    // 12 values cycling 100,200,300 -> 4*(100+200+300) = 2400
+    expect!(acc == 2400)
+}
+
+// --- float folded into an integer checksum ---------------------------------
+
+// --- float folded into an integer checksum ---------------------------------
+
+@Test
+function scalarFloatAccumulatesToInt() {
+    var f = 0.0
+    for k in 0..30 {
+        f = f + 1.5 * 2.0 - 0.5
+    }
+    // f == 30 * 2.5 == 75.0
+    let got = f > 74.9 && f < 75.1 ? 7500 : 0
+    expect!(got == 7500)
+}

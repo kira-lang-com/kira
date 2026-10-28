@@ -1,0 +1,113 @@
+// Callback state: a value boxed for a host to hand back through an opaque
+// word. The handle `nativeState` returns owns one reference and gives it up
+// with its scope; each token `nativeUserData` exports owns one more, given up
+// through `nativeUserDataRelease`. The value lives while one owner remains.
+//
+// Tokens are never reused. Storage slots are: a released state leaves its
+// slot on the free list, and the live-token index locates the next state
+// placed there. A token that outlived its state is absent from that index,
+// so using it still traps rather than reaching the slot's new occupant.
+
+struct NativeStateSlot {
+    var state: Optional<Any>
+    var owners: Int
+    var nextFree: Int = -1
+}
+
+struct NativeState<Boxed>: Drop {
+    let slot: Int
+
+    function drop(borrow mut self) {
+        nativeStateRelease(self.slot)
+    }
+}
+
+function nativeStateBox(value: Any) -> Int {
+    if runtimeContext.nativeStateIdentity == 9223372036854775807 { runtimeTrap() }
+    let identity = runtimeContext.nativeStateIdentity + 1
+    if rawPointerWord(RawPtr(identity)) != U64(identity) { runtimeTrap() }
+    runtimeContext.nativeStateIdentity = identity
+    var index = runtimeContext.nativeStateFree
+    if index < 0 {
+        index = runtimeContext.nativeStates.count
+        runtimeContext.nativeStates.append(
+            NativeStateSlot { state = .Some(move value), owners = 1 }
+        )
+    } else {
+        runtimeContext.nativeStateFree = runtimeContext.nativeStates[index].nextFree
+        runtimeContext.nativeStates[index].nextFree = -1
+        runtimeContext.nativeStates[index].state = .Some(move value)
+        runtimeContext.nativeStates[index].owners = 1
+    }
+    runtimeContext.nativeStateLocations.set(identity, index)
+    return identity
+}
+
+function nativeStateLive(slot: Int) -> Int {
+    match runtimeContext.nativeStateLocations.value(slot) {
+        Some(index) -> return index
+        None -> {
+            runtimeTrap()
+            return 0
+        }
+    }
+}
+
+function nativeStateSlotOf(token: RawPtr) -> Int {
+    let word = rawPointerWord(token)
+    if word > U64(runtimeContext.nativeStateIdentity) { runtimeTrap() }
+    return Int(word)
+}
+
+function nativeStateExport(slot: Int) -> RawPtr {
+    nativeStateRetain(slot)
+    return RawPtr(slot)
+}
+
+function nativeStateBorrow(slot: Int) -> RawPtr {
+    nativeStateLive(slot)
+    return RawPtr(slot)
+}
+
+function nativeStateRetain(slot: Int) {
+    let index = nativeStateLive(slot)
+    runtimeContext.nativeStates[index].owners = runtimeContext.nativeStates[index].owners + 1
+}
+
+function nativeStateRelease(slot: Int) {
+    let index = nativeStateLive(slot)
+    runtimeContext.nativeStates[index].owners = runtimeContext.nativeStates[index].owners - 1
+    if runtimeContext.nativeStates[index].owners == 0 {
+        runtimeContext.nativeStateLocations.remove(slot)
+        runtimeContext.nativeStates[index].state = .None
+        // Dropping the value may release nested states. Publish this slot
+        // only after those releases finish, using the free list they left.
+        runtimeContext.nativeStates[index].nextFree = runtimeContext.nativeStateFree
+        runtimeContext.nativeStateFree = index
+    }
+}
+
+function nativeStateRetainToken(token: RawPtr) {
+    nativeStateRetain(nativeStateSlotOf(token))
+}
+
+function nativeStateReleaseToken(token: RawPtr) {
+    nativeStateRelease(nativeStateSlotOf(token))
+}
+
+// The boxed value, sharing its storage with the slot, so a view recovered
+// from it writes the state itself.
+function nativeStateValue(token: RawPtr) -> Any {
+    let index = nativeStateLive(nativeStateSlotOf(token))
+    match runtimeContext.nativeStates[index].state {
+        Some(value) -> return value
+        None -> {
+            runtimeTrap()
+            return 0
+        }
+    }
+}
+
+// The handle's reference, given up where `nativeStateFree` is called rather
+// than at the end of the handle's scope.
+function nativeStateFreeHandle<Boxed>(state: NativeState<Boxed>) {}

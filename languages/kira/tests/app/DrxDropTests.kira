@@ -1,0 +1,263 @@
+import Foundation
+
+// User `Drop`: a body the engines run where they already release the value.
+// Prefix: drx / Drx.
+//
+// A type claims the compiler-known `Drop` trait and implements its one member.
+// The body runs once, before the type's own members are released, at every
+// point either engine releases a value of the type — a binding going out of
+// scope, a container being freed, a moved value dying in the callee that took
+// it.
+//
+// Ordering is what the printed section proves: the harness compares main's
+// output byte for byte across the VM and the native engine, so a body that ran
+// at a different moment on one of them fails there. The cases below prove the
+// rest: that a `Drop` value is still an ordinary value to use, that churning
+// one in a loop leaks nothing, and that a value moved into a callee is dropped
+// by the callee rather than twice.
+
+struct DrxTrace: Drop {
+    let tag: Int
+    function drop(borrow mut self) {
+        print(self.tag)
+    }
+}
+
+// A `Drop` type that owns heap storage: the members are released after the
+// body, so the body still reads them.
+struct DrxNamed: Drop {
+    let name: String
+    let tag: Int
+    function drop(borrow mut self) {
+        print(self.name)
+    }
+}
+
+// `Drop` claimed retroactively, for a type declared without a conformance list.
+struct DrxLate {
+    let tag: Int
+}
+
+extend DrxLate: Drop {
+    function drop(borrow mut self) {
+        print(self.tag)
+    }
+}
+
+// A container holding `Drop` values: freeing it releases them, which runs each
+// body.
+struct DrxPair {
+    let first: DrxTrace
+    let second: DrxTrace
+}
+
+function drxScoped(tag: Int) -> Int {
+    let held = DrxTrace(tag: tag)
+    return tag * 2
+}
+
+// Takes ownership: the value dies here, not at the binding the caller moved it
+// out of.
+function drxConsume(held: move DrxTrace) -> Int {
+    return held.tag + 1
+}
+
+// Borrows: the caller keeps the value, so nothing is released here.
+function drxRead(held: borrow DrxTrace) -> Int {
+    return held.tag * 10
+}
+
+function drxChurn(rounds: Int) -> Int {
+    var total = 0
+    for index in 0..rounds {
+        let held = DrxNamed(name: "dr" + "x", tag: index)
+        total = total + held.tag
+    }
+    return total
+}
+
+// The value the scoped body returns is the one the test expects.
+@Test
+function drxAScopedValueIsStillOrdinaryToUse() {
+    expect!(drxScoped(21) == 42)
+}
+
+@Test
+function drxABorrowLeavesTheValueUsable() {
+    let held = DrxTrace(tag: 3)
+    expect!(drxRead(held) + held.tag == 33)
+}
+
+@Test
+function drxAMovedValueReachesTheCalleeWhole() {
+    let held = DrxTrace(tag: 8)
+    expect!(drxConsume(move held) == 9)
+}
+
+@Test
+function drxARetroactiveDropIsAnOrdinaryConformance() {
+    let held = DrxLate(tag: 4)
+    expect!(held.tag * 5 == 20)
+}
+
+@Test
+function drxAContainerReleasesEveryDropItHolds() {
+    let pair = DrxPair(first: DrxTrace(tag: 1), second: DrxTrace(tag: 2))
+    expect!(pair.first.tag + pair.second.tag == 3)
+}
+
+// Churn: a heap-owning `Drop` type built and released 500 times, so a body that
+// leaked its members — or a release that ran none — scales into the harness
+// leak run.
+@Test
+function drxChurningADropTypeLeaksNothing() {
+    expect!(drxChurn(500) == 124750)
+}
+
+// A `Drop` type with methods. A method that only reads borrows its receiver; a
+// mutating one takes the receiver and writes it back, which is one value either
+// way.
+struct DrxCounter: Drop {
+    var tag: Int
+
+    function drop(borrow mut self) {
+        print(self.tag)
+    }
+
+    function bump(borrow mut self) {
+        self.tag = self.tag + 1
+    }
+
+    function value(borrow self) -> Int {
+        return self.tag
+    }
+}
+
+// Writable members, so a write can replace one.
+struct DrxSlots {
+    var first: DrxTrace
+    var second: DrxTrace
+}
+
+struct DrxCell {
+    var held: DrxCounter
+}
+
+struct DrxBag {
+    var items: [DrxTrace]
+}
+
+function drxTick(held: borrow mut DrxCounter) {
+    held.bump()
+}
+
+function drxBagTotal(bag: borrow DrxBag) -> Int {
+    var total = 0
+    for index in 0..bag.items.count {
+        total = total + bag.items[index].tag
+    }
+    return total
+}
+
+// A member read leaves the value where it was: the base of a further read, an
+// argument a callee borrows, and a non-mutating receiver all read through the
+// owner rather than taking a second value out of it.
+@Test
+function drxAMemberReadLeavesTheValueWithItsOwner() {
+    let pair = DrxPair(first: DrxTrace(tag: 1), second: DrxTrace(tag: 2))
+    expect!(pair.first.tag * 100 + drxRead(pair.first) + pair.second.tag == 112)
+}
+
+@Test
+function drxOverwritingABindingKeepsOneValue() {
+    var held = DrxTrace(tag: 1)
+    held = DrxTrace(tag: 2)
+    expect!(held.tag == 2)
+}
+
+@Test
+function drxWritingAMemberKeepsOneValue() {
+    var slots = DrxSlots(first: DrxTrace(tag: 1), second: DrxTrace(tag: 2))
+    slots.first = DrxTrace(tag: 3)
+    expect!(slots.first.tag + slots.second.tag == 5)
+}
+
+@Test
+function drxWritingAnElementKeepsOneValue() {
+    var elements: [DrxTrace] = [DrxTrace(tag: 1), DrxTrace(tag: 2)]
+    elements[0] = DrxTrace(tag: 3)
+    expect!(elements[0].tag + elements[1].tag == 5)
+}
+
+// Counting and indexing an array of `Drop` values reads through it: neither
+// takes the array out of the struct that holds it, and neither runs a body.
+@Test
+function drxAnArrayOfDropValuesReadsWithoutTaking() {
+    let bag = DrxBag(items: [DrxTrace(tag: 3), DrxTrace(tag: 4)])
+    expect!(bag.items.count * 100 + drxBagTotal(bag) == 207)
+}
+
+// A mutating method, direct and through a `borrow mut` parameter: the receiver
+// is taken and written back, so the write-back replaces nothing.
+@Test
+function drxAMutatingMethodKeepsOneValue() {
+    var counter = DrxCounter(tag: 5)
+    counter.bump()
+    drxTick(counter)
+    expect!(counter.value() == 7)
+}
+
+// Reading a member of an array element copies no element: the read walks to the
+// element's own storage and takes the one member it was asked for.
+@Test
+function drxAnElementMemberReadCopiesNothing() {
+    let cells: [DrxCell] = [DrxCell(held: DrxCounter(tag: 8)), DrxCell(held: DrxCounter(tag: 9))]
+    expect!(cells[1].held.tag - cells[0].held.value() == 1)
+}
+
+// The order, printed. Every line here is one body running, and the sequence is
+// what the cross-backend byte comparison pins.
+function drxSection() -> Int {
+    print(700)
+    // Out of scope at the end of the call, before the caller resumes.
+    print(drxScoped(1))
+    // Moved into the callee, which is where it dies — printed once, before the
+    // caller's next line rather than at the end of this function.
+    let moved = DrxTrace(tag: 5)
+    print(drxConsume(move moved))
+    // Borrowed, so nothing is released until this function returns.
+    let kept = DrxTrace(tag: 7)
+    print(drxRead(kept))
+    // A container's members, released with it.
+    let pair = DrxPair(first: DrxTrace(tag: 11), second: DrxTrace(tag: 12))
+    print(pair.first.tag)
+    // Heap-owning: the body reads the member the release frees after it.
+    let named = DrxNamed(name: "drx-named", tag: 13)
+    print(named.tag)
+    let late = DrxLate(tag: 14)
+    print(late.tag)
+    // A write replaces one value with another, and the replaced body runs at
+    // the write rather than at the end of the scope. A binding, a member, and
+    // an element follow the one rule.
+    var slot = DrxTrace(tag: 20)
+    slot = DrxTrace(tag: 21)
+    var slots = DrxSlots(first: DrxTrace(tag: 22), second: DrxTrace(tag: 23))
+    slots.first = DrxTrace(tag: 24)
+    var elements: [DrxTrace] = [DrxTrace(tag: 25)]
+    elements[0] = DrxTrace(tag: 26)
+    // Reads: counting an array, indexing one, walking to a member of an
+    // element, and lending one to a callee all leave every value where it was,
+    // so nothing is printed between these lines.
+    let bag = DrxBag(items: [DrxTrace(tag: 27), DrxTrace(tag: 28)])
+    print(bag.items.count)
+    print(bag.items[1].tag)
+    print(drxBagTotal(bag))
+    // A mutating method takes its receiver and writes it back, directly and
+    // through a `borrow mut` parameter: one value, no replaced one to release.
+    var counter = DrxCounter(tag: 29)
+    counter.bump()
+    drxTick(counter)
+    print(counter.value())
+    print(701)
+    return 7
+}

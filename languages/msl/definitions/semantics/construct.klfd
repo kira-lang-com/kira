@@ -1,0 +1,187 @@
+// Constructions, casts and initializers.
+//
+// `T(...)` and `T{...}` build a scalar, vector or matrix from parts; a
+// struct or array is built from a braced list, member by member, the
+// members it leaves out zero. `T()` and `T{}` are zero. A matrix built
+// from scalars is built column by column, and from one scalar has it on
+// its diagonal.
+
+extend Checker {
+    function zeroOf(borrow mut self, zeroType: Int, span: Span) -> Int {
+        return add(expressionOf(.Zero, zeroType, span))
+    }
+
+    function constructOf(borrow mut self, built: Int, parts: [Int], span: Span) -> Int {
+        var made = expressionOf(.Construct, built, span)
+        made.arguments = parts
+        return add(made)
+    }
+
+    function checkConstruct(borrow mut self, syntax: Expression) -> Int {
+        let built = resolve(syntax.typeSyntax)
+        if isVoid(built) { return invalid(syntax.span) }
+        let found = typeAt(built)
+        let aggregate = found.shape == .Struct || found.shape == .Array
+        if aggregate && !syntax.braced && syntax.arguments.count > 0 { return refuse(.NoMatch, syntax.span) }
+        return construction(built, syntax.arguments, syntax.span)
+    }
+
+    // `built` from the written `arguments`, as a constructor or a braced
+    // list.
+    function construction(borrow mut self, built: Int, arguments: [Int], span: Span) -> Int {
+        let found = typeAt(built)
+        if !isConstructible(built) { return refuse(.UnsupportedConstruct, span) }
+        if arguments.count == 0 { return zeroOf(built, span) }
+        match found.shape {
+            Struct -> return structConstruction(built, arguments, span)
+            Array -> return arrayConstruction(built, arguments, span)
+            ScalarShape -> {
+                if arguments.count != 1 { return refuse(.ArgumentCount, span) }
+                return convertExplicitly(checkExpression(arguments[0]), built, span)
+            }
+            Vector -> return vectorConstruction(built, arguments, span)
+            Matrix -> return matrixConstruction(built, arguments, span)
+            Void -> return invalid(span)
+            Image -> return invalid(span)
+            Sampler -> return invalid(span)
+            Atomic -> return invalid(span)
+        }
+    }
+
+    function structConstruction(borrow mut self, built: Int, arguments: [Int], span: Span) -> Int {
+        let members = program.structs[typeAt(built).structure].members
+        if arguments.count > members.count { return refuse(.ArgumentCount, span) }
+        var parts: [Int] = []
+        for index in 0..members.count {
+            if index < arguments.count {
+                parts.append(checkInitializer(arguments[index], members[index].memberType, span))
+            } else {
+                parts.append(zeroOf(members[index].memberType, span))
+            }
+        }
+        return constructOf(built, parts, span)
+    }
+
+    function arrayConstruction(borrow mut self, built: Int, arguments: [Int], span: Span) -> Int {
+        let found = typeAt(built)
+        if arguments.count > found.length { return refuse(.ArgumentCount, span) }
+        var parts: [Int] = []
+        for index in 0..found.length {
+            if index < arguments.count {
+                parts.append(checkInitializer(arguments[index], found.element, span))
+            } else {
+                parts.append(zeroOf(found.element, span))
+            }
+        }
+        return constructOf(built, parts, span)
+    }
+
+    // A vector from one scalar (splatted), one vector of its width
+    // (converted), or parts whose lanes add up to its width.
+    function vectorConstruction(borrow mut self, built: Int, arguments: [Int], span: Span) -> Int {
+        let found = typeAt(built)
+        var parts: [Int] = []
+        var total = 0
+        for argument in arguments {
+            let part = checkExpression(argument)
+            if broken(part) { return part }
+            let partType = typeOf(part)
+            if !isLaned(partType) { return refuse(.TypeMismatch, span) }
+            total += lanes(partType)
+            parts.append(convertExplicitly(part, withScalar(partType, found.scalar), span))
+        }
+        if parts.count == 1 && total == 1 { return convertTo(parts[0], built) }
+        if total != found.width { return refuse(.ArgumentCount, span) }
+        if parts.count == 1 { return parts[0] }
+        return constructOf(built, parts, span)
+    }
+
+    function matrixConstruction(borrow mut self, built: Int, arguments: [Int], span: Span) -> Int {
+        let found = typeAt(built)
+        let column = vectorType(found.scalar, found.rows)
+        var parts: [Int] = []
+        for argument in arguments {
+            let part = checkExpression(argument)
+            if broken(part) { return part }
+            parts.append(part)
+        }
+        if parts.count == 1 && typeAt(typeOf(parts[0])).shape == .Matrix {
+            return convertExplicitly(parts[0], built, span)
+        }
+        if parts.count == 1 && isScalar(typeOf(parts[0])) { return diagonal(built, parts[0], span) }
+        if parts.count == found.width {
+            var columns: [Int] = []
+            for part in parts {
+                columns.append(convertExplicitly(part, column, span))
+            }
+            return constructOf(built, columns, span)
+        }
+        if parts.count != found.width * found.rows { return refuse(.ArgumentCount, span) }
+        var columns: [Int] = []
+        for at in 0..found.width {
+            var lanes: [Int] = []
+            for row in 0..found.rows {
+                let part = parts[at * found.rows + row]
+                if !isScalar(typeOf(part)) { return refuse(.TypeMismatch, span) }
+                lanes.append(convertTo(part, scalarType(found.scalar)))
+            }
+            columns.append(constructOf(column, lanes, span))
+        }
+        return constructOf(built, columns, span)
+    }
+
+    // `floatNxM(s)`: `s` on the diagonal, zero elsewhere.
+    function diagonal(borrow mut self, built: Int, value: Int, span: Span) -> Int {
+        let found = typeAt(built)
+        let lane = convertTo(value, scalarType(found.scalar))
+        let column = vectorType(found.scalar, found.rows)
+        var columns: [Int] = []
+        for at in 0..found.width {
+            var lanes: [Int] = []
+            for row in 0..found.rows {
+                if row == at {
+                    lanes.append(lane)
+                } else {
+                    lanes.append(literal(found.scalar, "0.0", span))
+                }
+            }
+            columns.append(constructOf(column, lanes, span))
+        }
+        return constructOf(built, columns, span)
+    }
+
+    // A variable's or member's initial value: a braced list builds
+    // `target`; anything else converts to it implicitly.
+    function checkInitializer(borrow mut self, index: Int, target: Int, span: Span) -> Int {
+        let syntax = tree.expressions[index]
+        if syntax.kind == .InitializerList {
+            if isVoid(target) { return invalid(span) }
+            return construction(target, syntax.arguments, syntax.span)
+        }
+        return convertImplicitly(checkExpression(index), target, syntax.span)
+    }
+
+    // `static_cast<T>(x)` and `(T)x`.
+    function checkCast(borrow mut self, syntax: Expression) -> Int {
+        let target = resolve(syntax.typeSyntax)
+        let operand = checkExpression(syntax.left)
+        if isVoid(target) || broken(operand) { return invalid(syntax.span) }
+        return convertExplicitly(operand, target, syntax.span)
+    }
+
+    // `as_type<T>(x)`: the same bits as another type of 32-bit lanes.
+    function checkBitcast(borrow mut self, syntax: Expression) -> Int {
+        let target = resolve(syntax.typeSyntax)
+        let operand = checkExpression(syntax.left)
+        if isVoid(target) || broken(operand) { return invalid(syntax.span) }
+        let from = typeAt(typeOf(operand))
+        let to = typeAt(target)
+        let wide = from.scalar != .Bool && from.scalar != .Half && to.scalar != .Bool && to.scalar != .Half
+        if !isLaned(target) || !isLaned(typeOf(operand)) || lanes(target) != lanes(typeOf(operand)) || !wide {
+            return refuse(.UnsupportedFunction, syntax.span)
+        }
+        var made = expressionOf(.Bitcast, target, syntax.span)
+        made.left = operand
+        return add(made)
+    }
+}

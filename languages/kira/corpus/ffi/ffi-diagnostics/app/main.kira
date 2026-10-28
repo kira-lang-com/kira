@@ -1,0 +1,92 @@
+// What the C seam refuses, each at the declaration or call that says it.
+
+@FFI.Extern { library: missing, symbol: seam_box_live, abi: c }
+function unknownLibrary(): I32
+
+@FFI.Extern { library: klfseam, symbol: seam_box_frees, abi: c }
+function stringResult(): String
+
+@FFI.Union { layout: c }
+struct Word {
+    let bits: U32
+    let value: F32
+}
+
+@FFI.Union { layout: c }
+struct Mixed {
+    let text: String
+    let bits: U32
+}
+
+@FFI.Struct { layout: c }
+struct Box {
+    let value: I32
+    let live: I32
+}
+
+@FFI.Pointer { target: Box, ownership: shared }
+struct SharedBox {}
+
+@FFI.Pointer { target: Box, ownership: owned }
+struct UnfreedBox {}
+
+@FFI.Pointer { target: Box, ownership: owned, free: noSuchFree }
+struct MisfreedBox {}
+
+@FFI.Pointer { target: Box, ownership: owned, free: boxFree }
+struct OwnedBox {}
+
+@FFI.Extern { library: klfseam, symbol: seam_box_new, abi: c }
+function boxNew(value: I32): OwnedBox
+
+@FFI.Extern { library: klfseam, symbol: seam_box_value, abi: c }
+function boxValue(box: borrow OwnedBox): I32
+
+@FFI.Extern { library: klfseam, symbol: seam_box_free, abi: c }
+function boxFree(box: RawPtr)
+
+@FFI.Variadic
+function variadicAlone(kinds: CString): Int
+
+@FFI.Address { library: klfseam, symbol: seam_tally }
+@FFI.Variadic
+function variadicAddress(): RawPtr
+
+@FFI.Extern { library: klfseam, symbol: seam_tally, abi: c }
+@FFI.Variadic
+function tally(kinds: CString): Int
+
+@FFI.Callback { abi: c, params: [value: I32, data: I32], result: I32, context: data }
+struct BadContext {}
+
+@FFI.Callback { abi: c, params: [I32], result: I32 }
+struct Unary {}
+
+@FFI.Struct { layout: c }
+struct BadBits {
+    let wide: U8 @Bits(9)
+    let flag: Bool @Bits(1)
+}
+
+struct PlainBits {
+    let low: U32 @Bits(4)
+}
+
+@FFI.Syscall { name: mmap }
+function tooMany(a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int): Int
+
+@FFI.Syscall { name: write, library: klfseam }
+function floating(value: F64): Int
+
+@Main
+function main() {
+    let both = Word { bits: 1, value: 2.0 }
+    print(tally("i", Box { value: 1, live: 1 }))
+    let first = boxNew(1)
+    let offset: I32 = 2
+    let unary: Unary = { value in value + offset }
+    let copied = first
+    let second = move first
+    print(boxValue(first))
+    print(boxValue(second))
+}

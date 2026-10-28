@@ -1,0 +1,96 @@
+import Foundation
+
+function textRoundTrip() -> Result<Bool, FileFailure> {
+    let path = "kik-foundation-text-round-trip.txt"
+    try writeFile(path, "hello")
+    let direct = try readFile(path)
+    let file = try openFile(path)
+    let throughFile = try file.readAll()
+    let matches = direct.text == "hello" && direct.size == 5 && file.isOpen()
+        && throughFile.text == direct.text
+    try removePath(path)
+    return .Ok(matches)
+}
+
+function bytesRoundTrip() -> Result<Bool, FileFailure> {
+    let path = "kik-foundation-bytes-round-trip.bin"
+    let bytes: [UN8] = [104, 105, 0, 122]
+    try writeFileBytes(path, bytes)
+    let whole = try readFileRange(path, 0, 10)
+    let middle = try readFileRange(path, 2, 2)
+    let text = try readFile(path)
+    let short = try readFileRange(path, 99, 4)
+    let empty = try readFileRange(path, 0, 0)
+    let matches = whole == bytes && middle == [UN8(0), UN8(122)]
+        && text.size == 4 && text.text == "hi\0z" && short.count == 0 && empty.count == 0
+    match readFileRange(path, -1, 4) {
+        Ok(unexpected) -> return .Ok(false)
+        Error(failure) -> { if failure != .InvalidRange { return .Ok(false) } }
+    }
+    try removePath(path)
+    return .Ok(matches)
+}
+
+function directoryRoundTrip() -> Result<Bool, FileFailure> {
+    let root = "kik-foundation-directory"
+    try makeDirectory(root)
+    try makeDirectory(root)
+    try writeFile(root + "/one.txt", "1")
+    try makeDirectory(root + "/inner")
+    try writeFile(root + "/inner/two.txt", "2")
+    let listing = try listDirectory(root)
+    let matches = listing.count() == 2 && listing.entry(99).isNone()
+        && listing.entry(-1).isNone()
+    try renamePath(root + "/one.txt", root + "/renamed.txt")
+    let renamed = !pathExists(root + "/one.txt") && fileExists(root + "/renamed.txt")
+    try removePath(root)
+    return .Ok(matches && renamed && !pathExists(root))
+}
+
+function filesystemAssertion(result: Result<Bool, FileFailure>) -> Bool {
+    match result {
+        Ok(matches) -> return matches
+        Error(failure) -> {
+            log warn("filesystem assertion failed", failure)
+            return false
+        }
+    }
+}
+
+@Test
+function fsfTextRoundTrip() {
+    let got = filesystemAssertion(textRoundTrip())
+    expect!(got == true)
+}
+
+@Test
+function fsfBytesPreserveNulsAndRanges() {
+    let got = filesystemAssertion(bytesRoundTrip())
+    expect!(got == true)
+}
+
+@Test
+function fsfDirectoriesListAndRename() {
+    let got = filesystemAssertion(directoryRoundTrip())
+    expect!(got == true)
+}
+
+function fsfMissingPathsAnswerFailuresAnswer() -> Bool {
+    let path = "kik-foundation-missing-path"
+    match readFile(path) {
+        Ok(contents) -> return false
+        Error(failure) -> return failure == .Missing(path)
+    }
+}
+
+@Test
+function fsfMissingPathsAnswerFailures() {
+    expect!(fsfMissingPathsAnswerFailuresAnswer() == true)
+}
+
+@Test
+function fsfAnUnopenedDescriptorDoesNotClose() {
+    let descriptor: N32 = 1000000
+    let got = !closeDescriptor(-1) && !closeDescriptor(descriptor)
+    expect!(got == true)
+}

@@ -1,0 +1,284 @@
+// Making a connection, and what the TLS handshake gives it: CRYPTO bytes to
+// send, keys per level, and the peer's transport parameters.
+
+function quicFreshConnectionId() -> Result<[UN8], QuicTransportError> {
+    let id = try randomBytes(UNumber(Quic.connectionIdBytes)) otherwise return .Error(
+        .InternalError
+    )
+    return .Ok(id)
+}
+
+function quicStreamCounts(window: Number) -> QuicStreamCounts {
+    return QuicStreamCounts { allowed: Number(window), window: Number(window) }
+}
+
+function quicNewConnection(
+    tls: TlsHandshake,
+    ids: borrow QuicConnectionIds,
+    limits: borrow QuicLimits
+) -> Result<QuicConnection, QuicTransportError> {
+    let role = ids.role
+    let initial = try quicInitialLevelKeys(ids.original, role) otherwise return .Error(
+        .InternalError
+    )
+    return .Ok(
+        QuicConnection {
+            role: role,
+            limits: copy limits,
+            tls: move tls,
+            localId: copy ids.local,
+            peerId: copy ids.peer,
+            originalDestination: copy ids.original,
+            initialKeys: .Some(initial),
+            recovery: QuicLossRecovery { congestion: quicNewReno(Quic.minimumDatagram) },
+            bidirectional: quicStreamCounts(limits.bidirectionalStreams),
+            unidirectional: quicStreamCounts(limits.unidirectionalStreams),
+            receiveLimit: Number(limits.connectionData),
+            lastActivity: ids.now,
+            // A client chose the server's address itself; a server waits
+            // for proof the client's is real (RFC 9000 section 8).
+            addressValidated: role == .Client
+        }
+    )
+}
+
+// Who a new connection is and when it began.
+struct QuicConnectionIds {
+    let role: TlsRole
+    let now: QuicInstant
+    let local: [UN8]
+    let peer: [UN8]
+    let original: [UN8]
+}
+
+// A client connection with its first flight queued.
+function quicClient(
+    settings: QuicClientSettings,
+    now: QuicInstant
+) -> Result<QuicConnection, QuicTransportError> {
+    let local = try quicFreshConnectionId()
+    // The first destination ID is random and at least eight bytes (RFC 9000
+    // section 7.2).
+    let destination = try quicFreshConnectionId()
+    let parameters = quicAnnouncedParameters(settings.limits, local)
+    let tls = try tlsStartClient(
+        TlsClientSettings {
+            carrier: .Quic,
+            serverName: copy settings.serverName,
+            protocols: copy settings.protocols,
+            seconds: settings.seconds,
+            anchors: copy settings.anchors,
+            transportParameters: quicEncodeParameters(parameters)
+        }
+    ) otherwise return .Error(.InternalError)
+    let ids = QuicConnectionIds {
+        role: .Client,
+        now: now,
+        local: local,
+        peer: copy destination,
+        original: destination
+    }
+    var connection = try quicNewConnection(move tls, ids, settings.limits)
+    connection.takeTlsEvents(now)
+    return .Ok(connection)
+}
+
+// How a server connection begins: the client's first Initial, and what the
+// endpoint knows of it.
+struct QuicServerStart {
+    let first: QuicRawHeader
+    // The ID the client first sent to, when a Retry token proved the
+    // client's address (RFC 9000 section 8.1.2).
+    let retried: [UN8]? = .None
+    // The server's connection ID, and the stateless reset token it
+    // announces for it.
+    let local: [UN8]
+    let resetToken: [UN8]
+}
+
+// A server connection for the client whose first Initial is `start.first`.
+function quicServer(
+    settings: QuicServerSettings,
+    start: borrow QuicServerStart,
+    now: QuicInstant
+) -> Result<QuicConnection, QuicTransportError> {
+    let first = start.first
+    if first.level != .Initial || first.destination.count < Quic.connectionIdBytes {
+        return .Error(.ProtocolViolation)
+    }
+    let local = copy start.local
+    var parameters = quicAnnouncedParameters(settings.limits, local)
+    parameters.statelessResetToken = .Some(copy start.resetToken)
+    match start.retried {
+        Some(original) -> {
+            parameters.originalDestination = .Some(copy original)
+            parameters.retrySource = .Some(copy first.destination)
+        }
+        None -> parameters.originalDestination = .Some(copy first.destination)
+    }
+    let tls = tlsStartServer(
+        TlsServerSettings {
+            carrier: .Quic,
+            identity: move settings.identity,
+            protocols: copy settings.protocols,
+            transportParameters: quicEncodeParameters(parameters)
+        }
+    )
+    let ids = QuicConnectionIds {
+        role: .Server,
+        now: now,
+        local: local,
+        peer: copy first.source,
+        original: copy first.destination
+    }
+    var connection = try quicNewConnection(move tls, ids, settings.limits)
+    connection.addressValidated = start.retried.isSome()
+    return .Ok(connection)
+}
+
+extend QuicConnection {
+    // CRYPTO bytes that arrived at `level`, handed to TLS in order.
+    function takeCrypto(
+        borrow mut self,
+        level: TlsEncryptionLevel,
+        frame: borrow QuicCryptoFrame,
+        now: QuicInstant
+    ) -> Result<Void, QuicTransportError> {
+        let index = quicLevelIndex(level)
+        var buffer = copy cryptoIn[index]
+        try buffer.add(frame.offset, frame.data, false)
+        if buffer.highest() - buffer.delivered > Number(limits.cryptoBuffer) {
+            return .Error(.CryptoBufferExceeded)
+        }
+        let ready = buffer.read()
+        cryptoIn[index] = buffer
+        if ready.count == 0 { return .Ok }
+        match tls.receive(level, ready) {
+            Ok -> {}
+            Error(alert) -> {
+                close(Quic.cryptoError + code(alert), traceText(alert), false)
+                return .Ok
+            }
+        }
+        takeTlsEvents(now)
+        return .Ok
+    }
+
+    function takeTlsEvents(borrow mut self, now: QuicInstant) {
+        while true {
+            let next = tls.event()
+            let event = match next {
+                Some(value) -> value
+                None -> return
+            }
+            match event {
+                Send(bytes) -> queueCrypto(bytes.level, bytes.bytes)
+                Secrets(secrets) -> install(secrets)
+                Complete(agreement) -> handshakeComplete(agreement, now)
+                // TLS key updates do not exist over QUIC; the engine refuses
+                // the message before this.
+                PeerUpdatedKeys(_) -> {}
+            }
+        }
+    }
+
+    function queueCrypto(borrow mut self, level: TlsEncryptionLevel, bytes: borrow [UN8]) {
+        let index = quicLevelIndex(level)
+        var queued = copy cryptoOut[index]
+        queued.append(QuicPiece { offset: cryptoOffset[index], data: copy bytes })
+        cryptoOut[index] = queued
+        cryptoOffset[index] = cryptoOffset[index] + bytes.count
+    }
+
+    function install(borrow mut self, secrets: borrow TlsLevelSecrets) {
+        match installKeys(secrets) {
+            Ok -> {}
+            Error(failure) -> fail(failure)
+        }
+    }
+
+    function installKeys(
+        borrow mut self,
+        secrets: borrow TlsLevelSecrets
+    ) -> Result<Void, QuicTransportError> {
+        let client = try tlsTrafficKeys(secrets.parameters, secrets.client, .Quic)
+        otherwise return .Error(.InternalError)
+        let server = try tlsTrafficKeys(secrets.parameters, secrets.server, .Quic)
+        otherwise return .Error(.InternalError)
+        let own = role == .Client
+        let keys = own ? QuicLevelKeys { seal : client, open: server }: QuicLevelKeys {
+            seal: server,
+            open: client
+        }
+        match secrets.level {
+            Handshake -> handshakeKeys = .Some(keys)
+            Application -> {
+                applicationKeys = .Some(keys)
+                phaseSecrets = .Some(
+                    QuicPhaseSecrets {
+                        parameters: copy secrets.parameters,
+                        sealing: own ? copy secrets.client : copy secrets.server,
+                        opening: own ? copy secrets.server : copy secrets.client
+                    }
+                )
+            }
+            Initial -> return .Error(.InternalError)
+        }
+        return .Ok
+    }
+
+    function handshakeComplete(borrow mut self, agreement: borrow TlsAgreement, now: QuicInstant) {
+        let bytes = match agreement.peerTransportParameters {
+            Some(value) -> value
+            None -> return fail(.TransportParameterError)
+        }
+        let parameters = match quicDecodeParameters(bytes, role == .Client) {
+            Ok(value) -> value
+            Error(failure) -> return fail(failure)
+        }
+        // The IDs both sides used must be the ones the parameters name
+        // (RFC 9000 section 7.3).
+        if parameters.initialSource != .Some(copy peerId) { return fail(.TransportParameterError) }
+        if role == .Client && parameters.originalDestination != .Some(copy originalDestination) {
+            return fail(.TransportParameterError)
+        }
+        if role == .Client && parameters.retrySource != retrySource {
+            return fail(.TransportParameterError)
+        }
+        applyPeerParameters(parameters)
+        state = .Connected
+        events.append(.Connected(copy agreement))
+        if role == .Server {
+            // The server's handshake is confirmed once it completes (RFC
+            // 9001 section 4.1.2); HANDSHAKE_DONE tells the client.
+            control.append(.HandshakeDone)
+            confirmHandshake()
+        }
+    }
+
+    function applyPeerParameters(borrow mut self, parameters: borrow QuicTransportParameters) {
+        sendLimit = parameters.initialMaxData
+        bidirectional.peerAllows = parameters.initialMaxStreamsBidi
+        unidirectional.peerAllows = parameters.initialMaxStreamsUni
+        recovery.peerMaxAckDelay = parameters.maxAckDelay * QuicTime.millisecond
+        recovery.peerAckDelayExponent = parameters.ackDelayExponent
+        peerParameters = .Some(copy parameters)
+    }
+
+    function confirmHandshake(borrow mut self) {
+        if handshakeConfirmed { return }
+        handshakeConfirmed = true
+        recovery.handshakeConfirmed = true
+        recovery.discard(.Handshake)
+        handshakeKeys = .None
+    }
+
+    // The Initial keys go once Handshake packets flow (RFC 9001 section
+    // 4.9.1).
+    function dropInitial(borrow mut self) {
+        if initialKeys.isNone() { return }
+        initialKeys = .None
+        recovery.discard(.Initial)
+        cryptoOut[0] = []
+    }
+}

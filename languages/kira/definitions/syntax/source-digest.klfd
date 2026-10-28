@@ -1,0 +1,87 @@
+// `sourceDigest!()` is the SHA-256, as 64 hexadecimal digits, of the code
+// of the package calling it and of every package it imports, directly or
+// through another: each of their sources' own SHA-256, in the order the
+// tree holds them, which is the same from one build to the next. What macro
+// expansions wrote is no source of the package: leaving it out keeps every
+// call the same however many expansions come before it. A build
+// system keys work the package's code does on it, so an edit to that code,
+// or to a library it calls, changes the key, and nothing else does.
+//
+// `sourceDigest!("package")` is the same of the package's own sources alone,
+// leaving out every package it imports, Foundation too: what a build keys
+// work by when that work should not be done again because a library or the
+// toolchain under it changed.
+
+function expandSourceDigest(session: Session, tree: SyntaxTree, input: String, origin: Span) -> Result<Int, Failure> {
+    let own = try sourceDigestScope(input, origin)
+    match macroSourceUnit(tree, origin.file) {
+        Some(context) -> {
+            var modules = importedModules(tree, context.module)
+            if own { modules = onlyModule(tree, context.module) }
+            var lines: [String] = []
+            for source in tree.sources {
+                if !modules[source.module] || source.generated { continue }
+                for word in 0..4 { lines.append(hexadecimalWord(source_digest(session, source.file as SourceFile, word))) }
+                lines.append("\n")
+            }
+            let listing = addSource(session, origin.file as SourceFile, joinText(lines))
+            if listing < 0 { return .Error(Failure { diagnostic = .OutsideSubset, span = origin }) }
+            var digits: [String] = ["\""]
+            for word in 0..4 {
+                let hex = hexadecimalWord(source_digest(session, listing as SourceFile, word))
+                digits.append(utf8Slice(hex, 2, utf8Count(hex)))
+            }
+            digits.append("\"")
+            let expanded = addSource(session, origin.file as SourceFile, joinText(digits))
+            if expanded < 0 { return .Error(Failure { diagnostic = .OutsideSubset, span = origin }) }
+            return .Ok(expanded)
+        }
+        None -> return .Error(Failure { diagnostic = .OutsideSubset, span = origin })
+    }
+}
+
+// Whether the call asks for its own package's sources alone: written with
+// no arguments it does not, written `("package")` it does, and any other
+// argument is 9001.
+function sourceDigestScope(input: String, origin: Span) -> Result<Bool, Failure> {
+    let tokens = try lex(input, origin.file)
+    if tokens.count <= 1 { return .Ok(false) }
+    if tokens.count == 2 && tokens[0].kind == .StringLiteral {
+        let raw = utf8Slice(input, tokens[0].span.start, tokens[0].span.end)
+        if raw == "\"package\"" { return .Ok(true) }
+    }
+    return .Error(Failure { diagnostic = .OutsideSubset, span = origin })
+}
+
+// Per module of `tree`, whether it is `module`.
+function onlyModule(tree: SyntaxTree, module: Int) -> [Bool] {
+    var only: [Bool] = []
+    for index in 0..tree.modules.count { only.append(index == module) }
+    return only
+}
+
+// Per module of `tree`, whether it is `module` or one its sources import,
+// directly or through another.
+function importedModules(tree: SyntaxTree, module: Int) -> [Bool] {
+    var reached: [Bool] = []
+    for index in 0..tree.modules.count { reached.append(index == module) }
+    var changed = true
+    while changed {
+        changed = false
+        for source in tree.sources {
+            if !reached[source.module] { continue }
+            for imported in source.imports {
+                match imported.module {
+                    Some(target) -> {
+                        if !reached[target] {
+                            reached[target] = true
+                            changed = true
+                        }
+                    }
+                    None -> {}
+                }
+            }
+        }
+    }
+    return reached
+}

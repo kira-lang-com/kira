@@ -1,0 +1,50 @@
+import Foundation
+
+// The graph's schedule inputs and its read rules: which actions a request
+// needs, and what a command may read.
+
+@Test
+function neededActionsFollowTheirInputs() {
+    var graph = Graph { project: "Try", root: "/", request: BuildRequest {} }
+    let first = graph.command(
+        CommandAction { label: "first", tool: "true", outputs: [Output { name: "a" }] }
+    )
+    let second = graph.command(
+        CommandAction {
+            label: "second",
+            tool: "true",
+            arguments: [.Input(first[0])],
+            outputs: [Output { name: "b" }]
+        }
+    )
+    let other = graph.command(
+        CommandAction { label: "other", tool: "true", outputs: [Output { name: "c" }] }
+    )
+    graph.step(Step { name: "b", summary: "", produces: second })
+    graph.step(Step { name: "c", summary: "", produces: other })
+    expect!(traceText(graph.neededActions([0])) == "[true, true, false]")
+}
+
+// A command may read only sources: it cannot read another command's output,
+// write its depfile outside its directory, or send output to an undeclared
+// file.
+@Test
+function readsAreSourcesOnly() {
+    var graph = Graph { project: "Try", root: "/", request: BuildRequest {} }
+    let made = graph.command(
+        CommandAction { label: "make", tool: "true", outputs: [Output { name: "a" }] }
+    )
+    graph.command(
+        CommandAction {
+            label: "use",
+            tool: "true",
+            outputs: [Output { name: "b", kind: .Tree }],
+            reads: made,
+            depfile: "scratch/d",
+            standardOutput: "b"
+        }
+    )
+    expect!((graph.problems[0]) == "use reads make: a where it is, which only a source can be")
+    expect!((graph.problems[1]) == "use writes its depfile at scratch/d, outside its working directory")
+    expect!((graph.problems[2]) == "use sends its output to b, which is no file it declares")
+}

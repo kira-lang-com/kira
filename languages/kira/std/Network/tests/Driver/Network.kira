@@ -1,0 +1,259 @@
+import Foundation
+
+// The driver end to end: a server and a client in one `Network`, talking
+// HTTP/3 through real UDP sockets on loopback.
+
+namespace DriverTest {
+    // Long enough for a slow machine, short enough to fail a stuck test.
+    let patience: Number = 5000000
+}
+
+function echoRequest(
+    authority: borrow String,
+    path: borrow String,
+    body: borrow String
+) -> Request {
+    var fields = Fields {}
+    fields.add("content-type", "text/plain")
+    return Request {
+        method: .Post,
+        target: Target { scheme: "https", authority: copy authority, path: copy path },
+        fields: fields,
+        body: .Bytes(body.utf8())
+    }
+}
+
+function bodyText(bytes: borrow [UN8]) -> String {
+    return match textFromBytes(bytes) {
+        Some(text) -> text
+        None -> "?"
+    }
+}
+
+// The server half: every request is answered with its path and body.
+function answer(network: borrow mut Network, incoming: borrow IncomingRequest) -> String {
+    let body = match incoming.message.body {
+        Empty -> ""
+        Bytes(bytes) -> bodyText(bytes)
+    }
+    var fields = Fields {}
+    fields.add("content-type", "text/plain")
+    absorb network.respond(incoming.request, ResponseHead { status: .Ok, fields: fields })
+    absorb network.write(incoming.request, "\(incoming.message.target.path) \(body)".utf8())
+    var trailers = Fields {}
+    trailers.add("x-echo", "1")
+    absorb network.finish(incoming.request, trailers)
+    return "incoming \(traceText(incoming.message.method)) \(incoming.message.target.path) \(body)"
+}
+
+// Two requests sent at once through one `Network` that serves them too,
+// told as notes in the order things happened.
+function exchangeTwo(transport: Transport, protocols: [HttpVersion]) -> String {
+    let identity = match NetworkTesting.identity() {
+        Ok(value) -> value
+        Error(text) -> return text
+    }
+    var network = match openNetwork(
+        NetworkOptions { anchors: NetworkTesting.anchors(), transport: transport }
+    ) {
+        Ok(value) -> value
+        Error(failure) -> return traceText(failure)
+    }
+    let serving = ServeOptions { address: "127.0.0.1:0", identity: identity, protocols: protocols }
+    let server = match network.serve(serving) {
+        Ok(value) -> value
+        Error(failure) -> return traceText(failure)
+    }
+    let address = match network.address(server) {
+        Ok(value) -> value
+        Error(failure) -> return traceText(failure)
+    }
+    let first = match network.send(echoRequest(address, "/one", "ping")) {
+        Ok(value) -> value
+        Error(failure) -> return traceText(failure)
+    }
+    match network.send(echoRequest(address, "/two", "pong")) {
+        Ok(_) -> {}
+        Error(failure) -> return traceText(failure)
+    }
+    let deadline = network.now().plus(DriverTest.patience)
+    var notes: [String] = []
+    var ended = 0
+    while ended < 2 && network.now().raw < deadline.raw {
+        for event in network.wait(.Some(deadline)) {
+            match event {
+                Incoming(incoming) -> notes.append(answer(network, incoming))
+                ResponseHead(head) -> notes.append(
+                    "\(head.request == first ? "first" : "second") \(code(head.status)) \(traceText(head.version)) \(describeFields(head.fields))"
+                )
+                ResponseBody(chunk) -> notes.append(
+                    "\(chunk.request == first ? "first" : "second") body \(bodyText(chunk.bytes))"
+                )
+                ResponseEnded(end) -> {
+                    ended += 1
+                    notes.append(
+                        "\(end.request == first ? "first" : "second") ended \(describeFields(end.trailers)) \(traceText(end.failure))"
+                    )
+                }
+                SessionOpened(_) -> notes.append(traceText(event))
+                StreamOpened(_) -> notes.append(traceText(event))
+                StreamData(_) -> notes.append(traceText(event))
+                StreamEnded(_) -> notes.append(traceText(event))
+                Datagram(_) -> notes.append(traceText(event))
+                SessionDraining(_) -> notes.append(traceText(event))
+                SessionClosed(_) -> notes.append(traceText(event))
+            }
+        }
+    }
+    // Client connections and the server's side of them.
+    let port = address.split(":")[1]
+    let text = joined(joined(notes, "; ").split(port), "PORT")
+    return "\(text) | sessions \(network.sessions.count) links \(network.links.count)"
+}
+
+// Both requests share one QUIC connection, each on its own stream.
+@Test
+function servesHttp3OverLoopback() {
+    expect!(exchangeTwo(.Http3Only, [.Http3]) == "incoming Method.Post /one ping; incoming Method.Post /two pong; first 200 HttpVersion.Http3 content-type=text/plain; first body /one ping; first ended x-echo=1 None; second 200 HttpVersion.Http3 content-type=text/plain; second body /two pong; second ended x-echo=1 None | sessions 2 links 0")
+}
+
+
+// HTTPS over TCP: TLS, then HTTP/1.1 one request after the other on one
+// connection, each response advertising HTTP/3.
+@Test
+function servesHttp1OverTls() {
+    expect!(exchangeTwo(.Automatic, [.Http3, .Http1]) == "incoming Method.Post /one ping; first 200 HttpVersion.Http1 content-type=text/plain,alt-svc=h3=\":PORT\",transfer-encoding=chunked; first body /one ping; first ended x-echo=1 None; incoming Method.Post /two pong; second 200 HttpVersion.Http1 content-type=text/plain,alt-svc=h3=\":PORT\",transfer-encoding=chunked; second body /two pong; second ended x-echo=1 None | sessions 0 links 2")
+}
+
+
+// A port nobody listens on refuses the connection, and `fetch` says so
+// rather than waiting out its deadline.
+@Test
+function driverReportsRefusedConnections() {
+    let expected: String = "Error(HttpFailure.Connect(NetFailure.Refused)) false | HttpFailure.Connect(NetFailure.Refused)"
+    var network = match openNetwork(NetworkOptions { anchors: NetworkTesting.anchors() }) {
+        Ok(value) -> value
+        Error(failure) -> {
+            expect!((traceText(failure)) == expected)
+            return
+        }
+    }
+    let deadline = network.now().plus(DriverTest.patience)
+    let fetched = network.fetch(echoRequest("127.0.0.1:1", "/", "x"), deadline)
+    let late = network.now().raw >= deadline.raw
+    let refused = match routeFor(
+        Target { scheme: "http", authority: "example.com", path: "/" },
+        .Automatic
+    ) {
+        Ok(_) -> "allowed"
+        Error(failure) -> traceText(failure)
+    }
+    expect!((traceText(fetched)) == ("Error(HttpFailure.Connect(NetFailure.Refused))"))
+    expect!("\(late)" == "false")
+    expect!((refused) == ("HttpFailure.Connect(NetFailure.Refused)"))
+}
+
+
+// A body far larger than a socket takes at once: the client sends what
+// the socket takes, waits until it is writable and sends the rest from
+// where it stopped, so the server reads every byte, in order.
+@Test
+function driverSendsLargeBodiesWhole() {
+    let expected: String = "1048576 true true"
+    let identity = match NetworkTesting.identity() {
+        Ok(value) -> value
+        Error(text) -> {
+            expect!((text) == expected)
+            return
+        }
+    }
+    var network = match openNetwork(
+        NetworkOptions { anchors: NetworkTesting.anchors(), transport: .Automatic }
+    ) {
+        Ok(value) -> value
+        Error(failure) -> {
+            expect!((traceText(failure)) == expected)
+            return
+        }
+    }
+    let serving = ServeOptions {
+        address: "127.0.0.1:0",
+        identity: identity,
+        protocols: [.Http1]
+    }
+    let server = match network.serve(serving) {
+        Ok(value) -> value
+        Error(failure) -> {
+            expect!((traceText(failure)) == expected)
+            return
+        }
+    }
+    let address = match network.address(server) {
+        Ok(value) -> value
+        Error(failure) -> {
+            expect!((traceText(failure)) == expected)
+            return
+        }
+    }
+    let size: Number = 1048576
+    var bytes: [UN8] = []
+    for index in 0..size { bytes.append(UN8(index % 251)) }
+    var fields = Fields {}
+    fields.add("content-type", "application/octet-stream")
+    let request = Request {
+        method: .Post,
+        target: Target { scheme: "https", authority: copy address, path: "/large" },
+        fields: fields,
+        body: .Bytes(move bytes)
+    }
+    match network.send(move request) {
+        Ok(_) -> {}
+        Error(failure) -> {
+            expect!((traceText(failure)) == expected)
+            return
+        }
+    }
+    let deadline = network.now().plus(DriverTest.patience)
+    var heard = "nothing"
+    var ended = false
+    while !ended && network.now().raw < deadline.raw {
+        for event in network.wait(.Some(deadline)) {
+            match event {
+                Incoming(incoming) -> {
+                    let received: [UN8] = match incoming.message.body {
+                        Empty -> []
+                        Bytes(body) -> copy body
+                    }
+                    var ordered = received.count == size
+                    if ordered {
+                        for index in 0..size {
+                            if received[index] != UN8(index % 251) {
+                                ordered = false
+                                break
+                            }
+                        }
+                    }
+                    heard = "\(received.count) \(ordered)"
+                    absorb network.respond(
+                        incoming.request,
+                        ResponseHead { status: .Ok, fields: Fields {} }
+                    )
+                    absorb network.finish(incoming.request, Fields {})
+                }
+                ResponseEnded(_) -> ended = true
+                ResponseHead(_) -> {}
+                ResponseBody(_) -> {}
+                SessionOpened(_) -> {}
+                StreamOpened(_) -> {}
+                StreamData(_) -> {}
+                StreamEnded(_) -> {}
+                Datagram(_) -> {}
+                SessionDraining(_) -> {}
+                SessionClosed(_) -> {}
+            }
+        }
+    }
+    expect!((heard) == ("1048576 true"))
+    expect!((ended) == (true))
+}
+

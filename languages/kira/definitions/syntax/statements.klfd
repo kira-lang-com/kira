@@ -1,0 +1,411 @@
+// Statements. Kira has no terminator: a statement ends where its form ends.
+
+extend Parser {
+    function statement(borrow mut self) -> Result<Int, Failure> {
+        let start = current().span
+        if at(.Let) || at(.Var) {
+            if peek(1).kind == .LeftParen { return destructuringGroup() }
+            return binding()
+        }
+        if at(.If) { return ifStatement() }
+        if at(.While) { return whileStatement() }
+        if at(.For) { return forStatement() }
+        if at(.Match) { return matchStatement() }
+        if eat(.Return) {
+            var value: Optional<Int> = .None
+            if startsExpression() && onSameLine(start, current().span) {
+                let origin = atOrigin()
+                let returned = try expression()
+                value = .Some(returned)
+                if origin { value = .Some(originReturned(returned, spanFrom(start))) }
+            }
+            return .Ok(tree.addStatement(.Return(value), spanFrom(start)))
+        }
+        if eat(.Break) { return .Ok(tree.addStatement(.Break, start)) }
+        if eat(.Continue) { return .Ok(tree.addStatement(.Continue, start)) }
+        if at(.Attempt) { return attemptStatement() }
+        if atLog() { return logStatement() }
+        if atAbsorb() { return absorbStatement() }
+        var target = 0
+        if eat(.Try) {
+            let tried = try binary(11)
+            if atWord("otherwise") { return otherwiseStatement(start, tried) }
+            target = tree.addExpression(.Try(tried), spanFrom(start))
+        } else {
+            target = try expression()
+        }
+        if eat(.Equals) {
+            let value = try expression()
+            return .Ok(tree.addStatement(.Assignment(target, value), spanFrom(start)))
+        }
+        match compoundOperator() {
+            Some(operator) -> {
+                advance()
+                advance()
+                let value = try expression()
+                return .Ok(tree.addStatement(.CompoundAssignment(operator, target, value), spanFrom(start)))
+            }
+            None -> {}
+        }
+        // `i++` and `i--` are `i += 1` and `i -= 1`.
+        match stepOperator() {
+            Some(operator) -> {
+                let first = advance().span
+                let one = tree.addExpression(.IntegerLiteral(1, false), first.to(advance().span))
+                return .Ok(tree.addStatement(.CompoundAssignment(operator, target, one), spanFrom(start)))
+            }
+            None -> {}
+        }
+        return .Ok(tree.addStatement(.Evaluation(target), spanFrom(start)))
+    }
+
+    // `let` and `var` need an initializer: definite initialization begins at
+    // the declaration.
+    function binding(borrow mut self) -> Result<Int, Failure> {
+        let start = current().span
+        let bound = try readBinding()
+        return .Ok(tree.addStatement(.Binding(bound), spanFrom(start)))
+    }
+
+    // A statement list's next entries: a destructuring binding is several, so
+    // its names stay in scope for the rest of the list.
+    function statements(borrow mut self) -> Result<[Int], Failure> {
+        if (at(.Let) || at(.Var)) && peek(1).kind == .LeftParen { return destructuringBinding() }
+        return .Ok([try statement()])
+    }
+
+    // A destructuring binding where only one statement fits, such as a match
+    // arm: its bindings live in their own scope.
+    function destructuringGroup(borrow mut self) -> Result<Int, Failure> {
+        let start = current().span
+        let bound = try destructuringBinding()
+        let condition = tree.addExpression(.BooleanLiteral(true), start)
+        return .Ok(tree.addStatement(.If(condition, bound, []), spanFrom(start)))
+    }
+
+    // `let (a, b) = pair` binds a hidden copy of the tuple, then each name to
+    // its element, as `for (a, b) in` does. `var` makes every name mutable.
+    function destructuringBinding(borrow mut self) -> Result<[Int], Failure> {
+        let start = current().span
+        let mutable = advance().kind == .Var
+        try expect(.LeftParen)
+        var names: [Identifier] = [macroName(try identifier(.ExpectedMemberName))]
+        while eat(.Comma) { names.append(macroName(try identifier(.ExpectedMemberName))) }
+        try expect(.RightParen)
+        var annotation: Optional<Int> = .None
+        if eat(.Colon) { annotation = .Some(tree.addTypeReference(try typeReference())) }
+        try expectAs(.Equals, .MissingInitializer)
+        let value = try expression()
+        let temporary = Identifier { text = joinText(["__tuple_", decimalText(start.start)]), span = start }
+        var bound = [tree.addStatement(.Binding(BindingStatement {
+            mutable = false, name = temporary, annotation = annotation, prefix = .None, value = value
+        }), spanFrom(start))]
+        for index in 0..names.count {
+            let base = tree.addExpression(.Name(temporary), start)
+            let field = Identifier { text = joinText(["item", decimalText(index)]), span = names[index].span }
+            let element = tree.addExpression(.Member(base, field), names[index].span)
+            bound.append(tree.addStatement(.Binding(BindingStatement {
+                mutable = mutable, name = names[index], annotation = .None, prefix = .None, value = element
+            }), names[index].span))
+        }
+        return .Ok(bound)
+    }
+
+    function readBinding(borrow mut self) -> Result<BindingStatement, Failure> {
+        let mutable = advance().kind == .Var
+        let name = macroName(try identifier(.ExpectedMemberName))
+        var annotation: Optional<Int> = .None
+        var prefix: Optional<BindingPrefix> = .None
+        var moves = false
+        if eat(.Colon) {
+            if atWord("move") && typeStartsAt(1) {
+                advance()
+                moves = true
+            } else {
+                prefix = bindingPrefix()
+            }
+            annotation = .Some(tree.addTypeReference(try typeReference()))
+        }
+        try expectAs(.Equals, .MissingInitializer)
+        let start = current().span
+        var value = try expression()
+        if moves { value = tree.addExpression(.Transfer(.Move, value), spanFrom(start)) }
+        return .Ok(BindingStatement { mutable = mutable, name = name, annotation = annotation, prefix = prefix, value = value })
+    }
+
+    // Each word is a prefix only before a type, so a type or binding named
+    // `borrow` still reads as one.
+    function bindingPrefix(borrow mut self) -> Optional<BindingPrefix> {
+        let span = current().span
+        var mode: BindingMode = .Copied
+        if atWord("borrow") && peek(1).kind == .Identifier && text(peek(1).span) == "mut" && typeStartsAt(2) {
+            advance()
+            mode = .MutablyBorrowed
+        } else if atWord("borrow") && typeStartsAt(1) {
+            mode = .Borrowed
+        } else if !(atWord("copy") && typeStartsAt(1)) {
+            return .None
+        }
+        advance()
+        return .Some(BindingPrefix { mode = mode, span = spanFrom(span) })
+    }
+
+    function typeStartsAt(borrow self, offset: Int) -> Bool {
+        let kind = peek(offset).kind
+        return kind == .Identifier || kind == .LeftBracket || kind == .LeftParen
+    }
+
+    // `else if` nests: the else branch is a block holding the inner `if`.
+    function ifStatement(borrow mut self) -> Result<Int, Failure> {
+        let start = try expect(.If)
+        let condition = try expressionWith(false)
+        let thenBody = try block()
+        var elseBody: [Int] = []
+        if eat(.Else) {
+            if at(.If) {
+                elseBody.append(try ifStatement())
+            } else {
+                elseBody = try block()
+            }
+        }
+        return .Ok(tree.addStatement(.If(condition, thenBody, elseBody), spanFrom(start.span)))
+    }
+
+    function whileStatement(borrow mut self) -> Result<Int, Failure> {
+        let start = try expect(.While)
+        let condition = try expressionWith(false)
+        let body = try block()
+        return .Ok(tree.addStatement(.While(condition, body), spanFrom(start.span)))
+    }
+
+    // `for name in low..high` walks the half-open range, evaluating both
+    // bounds once.
+    function forStatement(borrow mut self) -> Result<Int, Failure> {
+        let start = try expect(.For)
+        if at(.LeftParen) { return tupleForStatement(start.span) }
+        let name = macroName(try identifier(.ExpectedLoopVariable))
+        try expect(.In)
+        let low = try expressionWith(false)
+        if !at(.DotDot) {
+            let body = try block()
+            return .Ok(tree.addStatement(.ForEach(name, low, body), spanFrom(start.span)))
+        }
+        advance()
+        let high = try expressionWith(false)
+        let body = try block()
+        return .Ok(tree.addStatement(.For(name, low, high, body), spanFrom(start.span)))
+    }
+
+    function tupleForStatement(borrow mut self, start: Span) -> Result<Int, Failure> {
+        try expect(.LeftParen)
+        var names: [Identifier] = [try identifier(.ExpectedLoopVariable)]
+        while eat(.Comma) { names.append(try identifier(.ExpectedLoopVariable)) }
+        try expect(.RightParen)
+        try expect(.In)
+        let source = try expressionWith(false)
+        match tree.expressions[source].kind {
+            MethodCall(receiver, method, arguments) -> {
+                if method.text == "enumerated" && arguments.count == 0 && names.count == 2 {
+                    return enumeratedFor(start, names, receiver)
+                }
+            }
+            IntegerLiteral -> {}
+            FloatLiteral -> {}
+            BooleanLiteral -> {}
+            StringLiteral -> {}
+            ArrayLiteral -> {}
+            Index -> {}
+            Transfer -> {}
+            Labelled -> {}
+            TypeQuery -> {}
+            Name -> {}
+            Member -> {}
+            Quote -> {}
+            ExpandedMacro -> {}
+            MacroCall -> {}
+            Call -> {}
+            GenericCall -> {}
+            IndirectCall -> {}
+            Lambda -> {}
+            KeyPath -> {}
+            Task -> {}
+            Try -> {}
+            Variant -> {}
+            StructLiteral -> {}
+            Unary -> {}
+            Binary -> {}
+            Conditional -> {}
+            MatchValue -> {}
+            Content -> {}
+        }
+        let temporary = Identifier { text = joinText(["__tuple_", decimalText(start.start)]), span = start }
+        var bindings: [Int] = []
+        for index in 0..names.count {
+            let base = tree.addExpression(.Name(temporary), start)
+            let field = Identifier { text = joinText(["item", decimalText(index)]), span = names[index].span }
+            let value = tree.addExpression(.Member(base, field), names[index].span)
+            bindings.append(tree.addStatement(.Binding(BindingStatement {
+                mutable = false, name = names[index], annotation = .None, prefix = .None, value = value
+            }), names[index].span))
+        }
+        for statement in try block() { bindings.append(statement) }
+        return .Ok(tree.addStatement(.ForEach(temporary, source, bindings), spanFrom(start)))
+    }
+
+    function enumeratedFor(borrow mut self, start: Span, names: [Identifier], source: Int) -> Result<Int, Failure> {
+        let saved = Identifier { text = joinText(["__enumerated_", decimalText(start.start)]), span = start }
+        let binding = tree.addStatement(.Binding(BindingStatement {
+            mutable = false, name = saved, annotation = .None, prefix = .None, value = source
+        }), start)
+        let base = tree.addExpression(.Name(saved), start)
+        let count = tree.addExpression(.Member(base, Identifier { text = "count", span = start }), start)
+        let index = tree.addExpression(.Name(names[0]), names[0].span)
+        let element = tree.addExpression(.Index(base, index), names[1].span)
+        var body = [tree.addStatement(.Binding(BindingStatement {
+            mutable = false, name = names[1], annotation = .None, prefix = .None, value = element
+        }), names[1].span)]
+        for statement in try block() { body.append(statement) }
+        let zero = tree.addExpression(.IntegerLiteral(0, false), start)
+        let loop = tree.addStatement(.For(names[0], zero, count, body), spanFrom(start))
+        let condition = tree.addExpression(.BooleanLiteral(true), start)
+        return .Ok(tree.addStatement(.If(condition, [binding, loop], []), spanFrom(start)))
+    }
+
+    // Arms name a variant unqualified and take one statement or a block.
+    function matchStatement(borrow mut self) -> Result<Int, Failure> {
+        let start = try expect(.Match)
+        let subject = try expressionWith(false)
+        let arms = try matchArms()
+        return .Ok(tree.addStatement(.Match(subject, arms), spanFrom(start.span)))
+    }
+
+    // A `match` used as a value: each arm's value is its expression, or the
+    // expression its block ends with.
+    function matchExpression(borrow mut self) -> Result<Int, Failure> {
+        let start = try expect(.Match)
+        let subject = try expressionWith(false)
+        let arms = try matchArms()
+        return .Ok(tree.addExpression(.MatchValue(subject, arms), spanFrom(start.span)))
+    }
+
+    // `{ pattern -> body ... }`, a body being a block or one statement. An
+    // arm may list several patterns, `A, B ->`, and takes a value any of them
+    // matches.
+    function matchArms(borrow mut self) -> Result<[MatchArm], Failure> {
+        try expect(.LeftBrace)
+        var arms: [MatchArm] = []
+        while !at(.RightBrace) {
+            let first = try armPattern()
+            var binding: Optional<Identifier> = .None
+            if first.pattern.isVariant() && eat(.LeftParen) {
+                binding = .Some(macroName(try identifier(.ExpectedPayloadBinding)))
+                try expect(.RightParen)
+            }
+            var alternatives: [ArmAlternative] = []
+            while eat(.Comma) {
+                alternatives.append(try armPattern())
+            }
+            try expect(.Arrow)
+            // An `Error` arm takes a failure apart: a `return .Error` in it
+            // converts that failure.
+            let failing = first.pattern.isVariant() && first.variant.text == "Error"
+            if failing { handling += 1 }
+            var body: [Int] = []
+            if at(.LeftBrace) {
+                body = try block()
+            } else {
+                body.append(try statement())
+            }
+            if failing { handling -= 1 }
+            arms.append(MatchArm { variant = first.variant, binding = binding, pattern = first.pattern, alternatives = alternatives, body = body })
+        }
+        try expect(.RightBrace)
+        return .Ok(arms)
+    }
+
+    // One pattern: a variant name, `true` or `false`, an integer or an
+    // integer range, a string, or `else`.
+    function armPattern(borrow mut self) -> Result<ArmAlternative, Failure> {
+        let start = current().span
+        if at(.Identifier) || at(.Type) {
+            return .Ok(ArmAlternative { variant = try identifier(.ExpectedArmVariant), pattern = .Variant })
+        }
+        var pattern: ArmPattern = .Otherwise
+        if eat(.Else) {
+            pattern = .Otherwise
+        } else if eat(.True) {
+            pattern = .Boolean(true)
+        } else if eat(.False) {
+            pattern = .Boolean(false)
+        } else if at(.StringLiteral) {
+            let literal = advance().span
+            pattern = .TextLiteral(tree.addExpression(.StringLiteral(stringLiteralText(text(literal))), literal))
+        } else if atDecimalPattern() {
+            let low = try decimalBound()
+            pattern = .Decimal(low)
+            if eat(.DotDot) { pattern = .DecimalRange(low, try decimalBound()) }
+        } else if atIntegerPattern() {
+            let low = try integerPattern()
+            pattern = .Integer(low)
+            if eat(.DotDot) { pattern = .Range(low, try integerPattern()) }
+        } else {
+            return .Error(failure(.ExpectedArmVariant))
+        }
+        return .Ok(ArmAlternative { variant = Identifier { text = "", span = spanFrom(start) }, pattern = pattern })
+    }
+
+    function atIntegerPattern(borrow self) -> Bool {
+        return at(.IntegerLiteral) || (at(.Minus) && peek(1).kind == .IntegerLiteral)
+    }
+
+    function atDecimalPattern(borrow self) -> Bool {
+        if at(.FloatLiteral) { return true }
+        return at(.Minus) && peek(1).kind == .FloatLiteral
+    }
+
+    // The digits a decimal literal is written with, its sign and its point kept
+    // so that the text is the number: `-0.50` reads as fifty hundredths of a
+    // negative, which is not the same value as `-0.5` written twice over. The
+    // far end of a range is the same number and may be written whole, as
+    // `20.25..30` is what it means.
+    function decimalBound(borrow mut self) -> Result<String, Failure> {
+        if !atDecimalPattern() && !atIntegerPattern() { return .Error(failure(.ExpectedArmVariant)) }
+        var written = ""
+        if eat(.Minus) { written = "-" }
+        let literal = advance().span
+        return .Ok(joinText([written, text(literal)]))
+    }
+
+    function integerPattern(borrow mut self) -> Result<Int, Failure> {
+        if !atIntegerPattern() { return .Error(failure(.ExpectedArmVariant)) }
+        let negative = eat(.Minus)
+        let value = try integerValue(advance().span)
+        if negative { return .Ok(0 - value) }
+        return .Ok(value)
+    }
+
+    // Whether two tokens sit on one source line.
+//
+// A statement that continues onto the next line is a different statement, and
+// the grammar has to see that. A bare `return` at the end of a `match` arm is
+// the case that needs it: the next arm starts with a variant name, which
+// `startsExpression` reads as an expression, so `return` used to take the
+// following arm's variant as the value it returned and the arm after that was
+// parsed from the middle of a pattern.
+function onSameLine(borrow self, left: Span, right: Span) -> Bool {
+    if right.start < left.end { return true }
+    let between = utf8Slice(source, left.end, right.start)
+    for offset in 0..utf8Count(between) {
+        if utf8Byte(between, offset) == asciiNewline { return false }
+    }
+    return true
+}
+
+function startsExpression(borrow self) -> Bool {
+        let kind = current().kind
+        return kind == .Identifier || kind == .IntegerLiteral || kind == .FloatLiteral
+            || kind == .StringLiteral || kind == .True || kind == .False || kind == .Minus
+            || kind == .Bang || kind == .Tilde || kind == .LeftParen || kind == .LeftBracket
+            || kind == .LeftBrace || kind == .Dot || kind == .Try || kind == .Match
+    }
+}

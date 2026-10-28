@@ -1,0 +1,388 @@
+// Generic enums are instantiated at their use sites before name resolution.
+// That keeps the checked program and its KIR types concrete.
+
+function instantiateGenericEnums(move tree: SyntaxTree) -> SyntaxTree {
+    var references: [TypeReference] = []
+    for structure in tree.structs {
+        for field in structure.fields {
+            appendTypeReferences(references, field.annotation)
+        }
+        for method in structure.methods {
+            appendFunctionReferences(references, method)
+        }
+    }
+    for enumeration in tree.enums {
+        appendEnumReferences(references, enumeration)
+    }
+    // A block on a concrete type is declared once types resolve, so its
+    // methods' signatures are read here, before then.
+    for extension in tree.extensions {
+        for method in extension.methods {
+            appendFunctionReferences(references, method)
+        }
+    }
+    for declared in tree.functions {
+        appendFunctionReferences(references, declared)
+        appendTypeReferences(references, functionReferenceType(declared))
+        appendTypeReferences(references, taskReferenceType(declared))
+    }
+    for alias in tree.aliases {
+        if alias.genericParameters.count == 0 { appendTypeReferences(references, alias.target) }
+    }
+    if tree.limitedReferences {
+        for global in tree.globals {
+            match global.binding.annotation {
+                Some(annotation) -> appendTypeReferences(references, tree.typeReferences[annotation])
+                None -> {}
+            }
+        }
+        for functionDeclaration in tree.functions { appendBodyReferences(tree, references, functionDeclaration.body) }
+        for structure in tree.structs {
+            for method in structure.methods { appendBodyReferences(tree, references, method.body) }
+            for field in structure.fields { match field.initial { Some(value) -> appendExpressionReferences(tree, references, value) None -> {} } }
+        }
+        for enumeration in tree.enums {
+            for method in enumeration.methods { appendBodyReferences(tree, references, method.body) }
+        }
+        for extension in tree.extensions {
+            for method in extension.methods { appendBodyReferences(tree, references, method.body) }
+        }
+        for global in tree.globals { appendExpressionReferences(tree, references, global.binding.value) }
+    }
+    var canonical: [TypeReference] = []
+    for reference in references { appendCanonicalInstances(canonical, tree.aliases, reference) }
+    if !tree.limitedReferences {
+        // Every annotation and type query the program writes, then the
+        // types its literals construct.
+        for reference in tree.typeReferences { appendInstanceReferences(canonical, tree.aliases, reference) }
+        for expression in tree.expressions {
+            match expression.kind.constructedType() {
+                Some(target) -> appendInstanceReferences(canonical, tree.aliases, target)
+                None -> {}
+            }
+        }
+    }
+    for reference in ownNamedInstances(tree) { appendCanonicalInstances(canonical, tree.aliases, reference) }
+    canonical = addChannelTypeReferences(canonical)
+    return mintDeclaredInstances(move tree, canonical)
+}
+
+// Every instance the program names, and then every instance those instances
+// name in turn: an instance's fields, ancestors and method signatures are
+// written in the template, where a type parameter stands for the argument bound
+// to it, so the instance an instance needs is only known once its own arguments
+// are. Analysis reads a checked program whose types are all declared, so they
+// are all minted here, before it runs.
+function mintDeclaredInstances(move tree: SyntaxTree, canonical: [TypeReference]) -> SyntaxTree {
+    var pending = canonical
+    var prepared = move tree
+    var instances = emptyNameSet()
+    for structure in prepared.structs { instances.insert(structure.name.text) }
+    for enumeration in prepared.enums { instances.insert(enumeration.name.text) }
+    let parameters = typeParameterNames(prepared)
+    let closure = closureTemplate(prepared.structs)
+    let scopes = typeParameterScopes(prepared)
+    var read = 0
+    while read < pending.count {
+        // The program's own references are as written, so a name a template
+        // binds is its parameter there even when a type shares the spelling;
+        // a minted instance's references are already substituted, but are
+        // still as its template wrote them, so an alias there, as
+        // `KeyPath<Values, Value>` is in a field, names the instance it
+        // stands for only once it is resolved.
+        let written = read < canonical.count
+        var reference = pending[read]
+        if !written { reference = canonicalAliasReference(prepared.aliases, reference, 0) }
+        read += 1
+        // Most references name an instance already declared.
+        if reference.arguments.count == 0 || instances.contains(reference.instanceName) { continue }
+        if mentionsTypeParameter(prepared, reference, parameters) { continue }
+        if written && namesBoundParameter(reference, scopes) { continue }
+        // A template naming ever larger versions of itself has no instance
+        // set; every program writes fewer than this many nestings.
+        if nesting(reference) > 32 { continue }
+        if reference.name.text == "Closure" {
+            match closure {
+                Some(template) -> {
+                    instances.insert(reference.instanceName)
+                    let declared = specializeClosure(template, reference, instanceSuffix(reference.instanceName))
+                    prepared.structs.append(declared)
+                    appendStructReferences(pending, declared)
+                }
+                None -> {}
+            }
+            continue
+        }
+        match genericEnum(prepared.genericEnums, reference.name.text) {
+            Some(template) -> {
+                if reference.arguments.count != template.genericParameters.count { continue }
+                instances.insert(reference.instanceName)
+                let declared = specializeEnum(template, reference, instanceSuffix(reference.instanceName))
+                prepared.enums.append(declared)
+                appendEnumReferences(pending, declared)
+            }
+            None -> {
+                match genericStruct(prepared.genericStructs, reference.name.text) {
+                    Some(template) -> {
+                        if reference.arguments.count != template.genericParameters.count { continue }
+                        instances.insert(reference.instanceName)
+                        let declared = specializeStruct(template, reference, instanceSuffix(reference.instanceName))
+                        prepared.structs.append(declared)
+                        appendStructReferences(pending, declared)
+                    }
+                    None -> {}
+                }
+            }
+        }
+    }
+    return prepared
+}
+
+// Every instance an instance names in its own fields, its parents and the
+// signatures of its methods, which its template wrote with type parameters.
+function appendStructReferences(references: borrow mut [TypeReference], declared: StructDeclaration) {
+    for ancestor in declared.ancestors { appendTypeReferences(references, ancestor) }
+    for field in declared.fields { appendTypeReferences(references, field.annotation) }
+    for method in declared.methods { appendFunctionReferences(references, method) }
+}
+
+// Every name a generic declaration gives a type parameter. A reference that
+// mentions one is written inside a template, and its instances are minted as
+// the template's own are, once its parameters are bound.
+function typeParameterNames(tree: SyntaxTree) -> [String] {
+    var names: [String] = []
+    for template in tree.genericStructs {
+        for parameter in template.genericParameters { names.append(parameter.text) }
+    }
+    for template in tree.genericEnums {
+        for parameter in template.genericParameters { names.append(parameter.text) }
+    }
+    for template in tree.genericFunctions {
+        for parameter in template.typeParameters { names.append(parameter.text) }
+    }
+    for declared in tree.traits {
+        for parameter in declared.genericParameters { names.append(parameter.text) }
+    }
+    for alias in tree.aliases {
+        for parameter in alias.genericParameters { names.append(parameter.text) }
+    }
+    return names
+}
+
+function mentionsTypeParameter(tree: SyntaxTree, reference: TypeReference, parameters: [String]) -> Bool {
+    if reference.arguments.count == 0 && reference.qualifier.isNone() && hasBoundName(parameters, reference.name.text)
+        && !hasTypeInstance(tree, reference.name.text) && builtinType(reference.name.text).isNone() {
+        return true
+    }
+    // `Value.ID`: an associated type of a type parameter.
+    match reference.qualifier {
+        Some(qualifier) -> {
+            if hasBoundName(parameters, qualifier.text) && !hasTypeInstance(tree, qualifier.text) { return true }
+        }
+        None -> {}
+    }
+    for argument in reference.arguments {
+        if mentionsTypeParameter(tree, argument, parameters) { return true }
+    }
+    return false
+}
+
+// Whether `reference`, where it is written, names a type parameter the
+// declaration around it binds.
+function namesBoundParameter(reference: TypeReference, scopes: borrow [ParameterScope]) -> Bool {
+    if reference.arguments.count == 0 && reference.qualifier.isNone()
+        && hasBoundName(scopedParameters(scopes, reference.name.span), reference.name.text) {
+        return true
+    }
+    match reference.qualifier {
+        Some(qualifier) -> {
+            if hasBoundName(scopedParameters(scopes, qualifier.span), qualifier.text) { return true }
+        }
+        None -> {}
+    }
+    for argument in reference.arguments {
+        if namesBoundParameter(argument, scopes) { return true }
+    }
+    return false
+}
+
+// Whether `reference` or one of its arguments is a bare name in `names`.
+function mentionsName(reference: TypeReference, names: [String]) -> Bool {
+    if reference.arguments.count == 0 && reference.qualifier.isNone() && hasBoundName(names, reference.name.text) {
+        return true
+    }
+    for argument in reference.arguments {
+        if mentionsName(argument, names) { return true }
+    }
+    return false
+}
+
+function appendFunctionReferences(references: borrow mut [TypeReference], declared: FunctionDeclaration) {
+    // A generic method's signature names its own type parameters, which are
+    // no types yet: each instance it is minted as brings its own.
+    if declared.typeParameters.count > 0 { return }
+    for parameter in declared.parameters {
+        appendTypeReferences(references, parameter.annotation)
+    }
+    match declared.result {
+        Some(result) -> appendTypeReferences(references, result)
+        None -> {}
+    }
+}
+
+function appendEnumReferences(references: borrow mut [TypeReference], declared: EnumDeclaration) {
+    for case in declared.cases {
+        match case.payload {
+            Some(payload) -> appendTypeReferences(references, payload)
+            None -> {}
+        }
+    }
+    for method in declared.methods { appendFunctionReferences(references, method) }
+}
+
+// The instances `reference` and each type argument in it name, aliases
+// resolved, in the order the references are written.
+function appendInstanceReferences(instances: borrow mut [TypeReference], aliases: [AliasDeclaration], reference: TypeReference) {
+    appendCanonicalInstances(instances, aliases, reference)
+    for argument in reference.arguments { appendInstanceReferences(instances, aliases, argument) }
+}
+
+// The instances `reference` names once its aliases are resolved. Only a
+// reference with arguments, or one naming an alias, can name one; the rest
+// are not even resolved.
+function appendCanonicalInstances(instances: borrow mut [TypeReference], aliases: [AliasDeclaration], reference: TypeReference) {
+    if reference.arguments.count == 0 && !namesAlias(aliases, reference.name.text) { return }
+    appendArgumentInstances(instances, canonicalAliasReference(aliases, reference, 0))
+}
+
+function appendArgumentInstances(instances: borrow mut [TypeReference], reference: TypeReference) {
+    if reference.arguments.count == 0 { return }
+    instances.append(reference)
+    for argument in reference.arguments { appendArgumentInstances(instances, argument) }
+}
+
+function namesAlias(aliases: [AliasDeclaration], name: String) -> Bool {
+    for alias in aliases {
+        if alias.name.text == name { return true }
+    }
+    return false
+}
+
+function appendTypeReferences(references: borrow mut [TypeReference], reference: TypeReference) {
+    references.append(reference)
+    for argument in reference.arguments {
+        appendTypeReferences(references, argument)
+    }
+}
+
+function genericEnum(templates: [EnumDeclaration], name: String) -> Optional<EnumDeclaration> {
+    for template in templates {
+        if template.name.text == name { return .Some(template) }
+    }
+    return .None
+}
+
+function hasTypeInstance(tree: SyntaxTree, name: String) -> Bool {
+    for structure in tree.structs {
+        if structure.name.text == name { return true }
+    }
+    for enumeration in tree.enums {
+        if enumeration.name.text == name { return true }
+    }
+    return false
+}
+
+function genericStruct(templates: [StructDeclaration], name: String) -> Optional<StructDeclaration> {
+    for template in templates {
+        if template.name.text == name { return .Some(template) }
+    }
+    return .None
+}
+
+function specializeEnum(template: EnumDeclaration, reference: TypeReference, suffix: Int) -> EnumDeclaration {
+    var cases: [CaseDeclaration] = []
+    for case in template.cases {
+        var payload: Optional<TypeReference> = .None
+        match case.payload {
+            Some(payloadType) -> {
+                payload = .Some(substituteGenericReference(payloadType, template.genericParameters, reference.arguments))
+            }
+            None -> {}
+        }
+        cases.append(CaseDeclaration { name = case.name, payload = payload, initial = case.initial })
+    }
+    return EnumDeclaration {
+        name = Identifier { text = reference.instanceName, span = template.name.span },
+        genericParameters = [],
+        typeArguments = reference.arguments,
+        baseNameSpan = template.baseNameSpan,
+        specialized = true,
+        typeSuffix = suffix,
+        cases = cases,
+        methods = specializeMethods(template.methods, template.genericParameters, reference.arguments),
+        existential = false
+    }
+}
+
+function substituteAll(references: [TypeReference], parameters: [Identifier], arguments: [TypeReference]) -> [TypeReference] {
+    var substituted: [TypeReference] = []
+    for reference in references { substituted.append(substituteGenericReference(reference, parameters, arguments)) }
+    return substituted
+}
+
+// A template's methods with its type parameters replaced in their signatures.
+function specializeMethods(methods: [FunctionDeclaration], parameters: [Identifier], arguments: [TypeReference]) -> [FunctionDeclaration] {
+    var specialized: [FunctionDeclaration] = []
+    for method in methods {
+        var methodParameters: [Parameter] = []
+        for parameter in method.parameters {
+            methodParameters.append(Parameter {
+                name = parameter.name, mode = parameter.mode, copies = parameter.copies, initial = parameter.initial,
+                annotation = substituteGenericReference(parameter.annotation, parameters, arguments)
+            })
+        }
+        var result: Optional<TypeReference> = .None
+        match method.result {
+            Some(reference) -> result = .Some(substituteGenericReference(reference, parameters, arguments))
+            None -> {}
+        }
+        specialized.append(FunctionDeclaration {
+            name = method.name, annotations = method.annotations, receiver = method.receiver,
+            parameters = methodParameters, result = result, body = method.body, span = method.span,
+            typeParameters = method.typeParameters, scope = method.scope.within(parameters, arguments)
+        })
+    }
+    return specialized
+}
+
+// An instance of a generic struct names its template in `genericBase`; an
+// instance of a generic class stays a class.
+function specializeStruct(template: StructDeclaration, reference: TypeReference, suffix: Int) -> StructDeclaration {
+    var base = template.name.text
+    if template.genericBase == "Class" || template.genericBase == "Construct" { base = template.genericBase }
+    var fields: [FieldDeclaration] = []
+    for field in template.fields {
+        fields.append(FieldDeclaration {
+            name = field.name,
+            mutable = field.mutable,
+            annotation = substituteGenericReference(field.annotation, template.genericParameters, reference.arguments),
+            initial = field.initial,
+            annotations = field.annotations,
+            inferred = field.inferred,
+            span = field.span
+        })
+    }
+    return StructDeclaration {
+        name = Identifier { text = reference.instanceName, span = template.name.span },
+        genericParameters = [],
+        typeArguments = reference.arguments,
+        callableModes = [],
+        ancestors = substituteAll(template.ancestors, template.genericParameters, reference.arguments),
+        genericBase = base,
+        baseNameSpan = template.baseNameSpan,
+        specialized = true,
+        typeSuffix = suffix,
+        fields = fields,
+        methods = specializeMethods(template.methods, template.genericParameters, reference.arguments)
+    }
+}

@@ -1,0 +1,1100 @@
+// The module's RIDL surface (KLF-RIDL sections 20 and 24): what a `public`
+// declaration offers a caller in another module or another language.
+//
+// Lowering writes it into the KIR module as attributes. `ridl.module` names
+// the module. `ridl.surface` holds the `.ridl` text: the public functions,
+// the methods of the public structs and enums, every struct and enum those
+// name, and the public `let`s whose values are constants. One `ridl.entry`
+// per function maps its RIDL path to the KIR function that implements it and
+// to how that function takes its values, so
+// the engine can build the entry a RIDL caller reaches. A declaration RIDL
+// cannot carry is left out with a comment saying why (section 20.9).
+// `ridl.contract` is the `.ridl` text the module publishes: the same, except
+// that a type another module declares is imported from it and never declared
+// again (section 27.7). The surface keeps it, as the engine lays it out.
+
+let ridlSurfaceAttribute = 4
+let ridlEntryAttribute = 5
+let ridlModuleAttribute = 6
+let ridlTypeAttribute = 7
+let ridlImportAttribute = 8
+let ridlImportEntryAttribute = 9
+let ridlContractAttribute = 10
+
+struct RidlSurface {
+    let program: CheckedProgram
+    // The structs and enums the surface names, in the order it met them.
+    var nominals: [Type]
+    var functions: [String]
+    var methods: [String]
+    var methodOwners: [String]
+    var skipped: [String]
+    // The public aliases, written `type Name = Type`: no ABI effect, so they
+    // only give a reader the name (section 20.3).
+    var aliases: [String]
+    var entries: [String]
+    var paths: [String]
+    // Every struct or enum type the surface spells, with its spelling.
+    var spelled: [Type]
+    var spellings: [String]
+    // The generic declarations the surface's named instances are laid out
+    // from, by their index in `program.ridlTemplates`, each with an instance
+    // whose conformances it shares (section 23.5).
+    var templates: [Int] = []
+    var templateInstances: [Type] = []
+    // The spellings of the instances that own methods: the surface extends
+    // each instance, and the contract its generic declaration, whose methods
+    // `genericMethods` writes under `genericOwners`.
+    var instanceOwners: [String] = []
+    var genericMethods: [String] = []
+    var genericOwners: [String] = []
+
+    // The RIDL spelling of `valueType`, or none when RIDL cannot carry it.
+    function typeText(borrow mut self, valueType: Type) -> Optional<String> {
+        let kind = valueType.kind
+        if kind == .Integer { return integerText(valueType) }
+        if kind == .Floating {
+            if valueType.bits == 32 { return .Some("F32") }
+            if valueType.bits == 64 { return .Some("F64") }
+            return .None
+        }
+        if kind == .Boolean { return .Some("Bool") }
+        if kind == .Pointer { return .Some("RawPtr") }
+        if kind == .Structure { return spell(valueType, structText(valueType)) }
+        if kind == .Enumeration { return spell(valueType, enumText(valueType)) }
+        return .None
+    }
+
+    // The spelling of `valueType`, which was the sized number `sized` when
+    // that is not empty. A sized number is a RIDL type of its own, spelled by
+    // its name and never as an alias of `Number` (sections 20.2 and 27.5).
+    // Its layout is `Number`'s (section 21.1), which the `struct Number` the
+    // words name declares.
+    function sizedText(borrow mut self, valueType: Type, sized: String) -> Optional<String> {
+        let words = typeText(valueType)
+        if utf8Count(sized) == 0 || words.isNone() { return words }
+        return .Some(sized)
+    }
+
+    // The spelling of type argument `index` of `types`, whose sized names
+    // are `sized`.
+    function argumentText(borrow mut self, types: borrow [Type], sized: borrow [String], index: Int) -> Optional<String> {
+        if index < sized.count { return sizedText(types[index], sized[index]) }
+        return typeText(types[index])
+    }
+
+    function spell(borrow mut self, valueType: Type, text: Optional<String>) -> Optional<String> {
+        match text {
+            Some(spelling) -> {
+                for known in spellings { if known == spelling { return text } }
+                spelled.append(valueType)
+                spellings.append(spelling)
+            }
+            None -> {}
+        }
+        return text
+    }
+
+    function structText(borrow mut self, valueType: Type) -> Optional<String> {
+        let structure = program.structs[valueType.declaration]
+        if structure.name.text == "String" { return .Some("String") }
+        if structure.genericBase == "Array" {
+            if structure.typeArguments.count != 1 { return .None }
+            match argumentText(structure.typeArguments, structure.argumentSizedNames, 0) {
+                Some(element) -> return .Some(joinText(["[", element, "]"]))
+                None -> return .None
+            }
+        }
+        // A closure is RIDL's two words, code and a context box (section
+        // 21.8). A RIDL function type gives its parameters no convention, so
+        // every one is owned (appendix A.2): a closure that borrows one has
+        // no RIDL form. `Void` is written as its result, since `()` alone is
+        // the empty tuple.
+        if structure.genericBase == "Closure" { return closureText(structure) }
+        // A class crosses as an opaque struct (section 21.5): one pointer to
+        // its box, which carries the descriptor that copies and destroys it,
+        // so its fields stay the defining module's.
+        if structure.genericBase == "Class" {
+            if structure.specialized { return .None }
+            remember(valueType)
+            return .Some(structName(valueType))
+        }
+        // A crossing family's value is a trait object of the RIDL trait the
+        // family is (sections 21.7 and 27.7), which the surface declares.
+        if structure.genericBase == "Witnessed" {
+            remember(valueType)
+            return .Some(ridlName(structure.name.text))
+        }
+        // A distinct is a struct of its one `raw` field: the same layout as
+        // its representation, under its own name.
+        // A construct declaration is a struct of its members.
+        let wrapsOne = structure.genericBase == "Distinct"
+        let plain = structure.genericBase == "" || structure.genericBase == "Construct"
+        if structure.specialized && (plain || templateOf(structure).isSome()) { return instanceText(valueType) }
+        if structure.specialized || !plain && !wrapsOne { return .None }
+        match structure.shape {
+            Plain -> {}
+            CLayout -> return .None
+            CUnion -> return .None
+            CArray(count) -> return .None
+            Callback -> return .None
+            CPointer(target) -> return .None
+        }
+        match structure.name.text {
+            "Any" -> return .None
+            else -> {}
+        }
+        for field in structure.fields {
+            if !exportableField(field.valueType) { return .None }
+        }
+        remember(valueType)
+        return .Some(structName(valueType))
+    }
+
+    // A named instance of a generic declaration, `Holder<Number>`, which
+    // the surface writes with the declaration it is laid out from.
+    function instanceText(borrow mut self, valueType: Type) -> Optional<String> {
+        let structure = program.structs[valueType.declaration]
+        var template = 0
+        match templateOf(structure) {
+            Some(found) -> template = found
+            None -> return .None
+        }
+        for field in structure.fields {
+            if !exportableField(field.valueType) { return .None }
+        }
+        var parts: [String] = [ridlName(program.ridlTemplates[template].name), "<"]
+        for index in 0..structure.typeArguments.count {
+            if index > 0 { parts.append(", ") }
+            match argumentText(structure.typeArguments, structure.argumentSizedNames, index) {
+                Some(text) -> parts.append(text)
+                None -> return .None
+            }
+        }
+        parts.append(">")
+        rememberTemplate(template, valueType)
+        return .Some(joinText(parts))
+    }
+
+    // Template `template` for the surface to declare, with an instance of
+    // it whose conformances it writes, or an invalid type when a template
+    // names it and no instance is spelled.
+    function rememberTemplate(borrow mut self, template: Int, instance: Type) {
+        for index in 0..templates.count {
+            if templates[index] == template {
+                if templateInstances[index].kind != .Structure { templateInstances[index] = instance }
+                return
+            }
+        }
+        templates.append(template)
+        templateInstances.append(instance)
+    }
+
+    // The generic declaration named `name`.
+    function ridlTemplateNamed(borrow self, name: String) -> Optional<Int> {
+        let wanted = ridlName(name)
+        for index in 0..program.ridlTemplates.count {
+            if ridlName(program.ridlTemplates[index].name) == wanted { return .Some(index) }
+        }
+        return .None
+    }
+
+    // The generic declaration `structure`, an instance, was made from.
+    function templateOf(borrow self, structure: StructType) -> Optional<Int> {
+        if !structure.specialized { return .None }
+        let name = ridlName(templateName(structure.name.text))
+        for index in 0..program.ridlTemplates.count {
+            let template = program.ridlTemplates[index]
+            if ridlName(template.name) == name && template.parameters.count == structure.typeArguments.count { return .Some(index) }
+        }
+        return .None
+    }
+
+    // Pieces of a generic declaration's text, each type spelled.
+    function piecesText(borrow mut self, pieces: borrow [RidlPiece]) -> Optional<String> {
+        var parts: [String] = []
+        for piece in pieces {
+            match piece {
+                Written(text) -> parts.append(text)
+                Generic(name) -> {
+                    match ridlTemplateNamed(name) {
+                        Some(template) -> {
+                            rememberTemplate(template, Type.invalid())
+                            parts.append(ridlName(program.ridlTemplates[template].name))
+                        }
+                        None -> return .None
+                    }
+                }
+                Resolved(leaf) -> {
+                    match typeText(leaf) {
+                        Some(text) -> parts.append(text)
+                        None -> return .None
+                    }
+                }
+            }
+        }
+        return .Some(joinText(parts))
+    }
+
+    // A generic declaration as RIDL writes it, `struct Holder<Value>`, with
+    // the conformances its instances have and, in a contract, an
+    // `@Instance` per named instance the module exports (section 20.7).
+    function templateText(borrow mut self, index: Int, contract: Bool) -> String {
+        let template = program.ridlTemplates[templates[index]]
+        let name = joinText([ridlName(template.name), "<", joinWith(template.parameters, ", "), ">"])
+        var lines: [String] = []
+        if contract {
+            for arguments in template.instances {
+                var texts: [String] = []
+                for argument in arguments {
+                    match piecesText([argument]) {
+                        Some(text) -> texts.append(text)
+                        None -> {}
+                    }
+                }
+                if texts.count == arguments.count { lines.append(joinText(["@Instance(", joinWith(texts, ", "), ")"])) }
+            }
+        }
+        lines.append(joinText(["struct ", name, " {"]))
+        for field in template.fields {
+            match piecesText(field.pieces) {
+                Some(text) -> lines.append(joinText(["    let ", field.name, ": ", text]))
+                None -> {}
+            }
+        }
+        lines.append("}")
+        if templateInstances[index].kind != .Structure { return joinLines(lines) }
+        let instance = program.structs[templateInstances[index].declaration]
+        for ancestor in instance.ancestors {
+            match witnessedNamed(program, ancestor) {
+                Some(traitType) -> {
+                    match typeText(traitType) {
+                        Some(text) -> lines.append(joinText(["extend ", name, ": ", utf8Slice(text, 4, utf8Count(text))]))
+                        None -> {}
+                    }
+                }
+                None -> {}
+            }
+        }
+        return joinLines(lines)
+    }
+
+    // The method `name` of the generic declaration instance `owner` was
+    // made from, as the contract writes it, receiving `self` as `receiver`
+    // says, or empty when the declaration has no such method RIDL can write.
+    function genericMethodText(borrow mut self, owner: Type, name: String, receiver: String) -> String {
+        match templateOf(program.structs[owner.declaration]) {
+            Some(template) -> {
+                for method in program.ridlTemplates[template].methods {
+                    if method.name != name { continue }
+                    var parameters: [String] = []
+                    if utf8Count(receiver) > 0 { parameters.append(receiver) }
+                    for parameter in method.parameters {
+                        match piecesText(parameter.pieces) {
+                            Some(text) -> parameters.append(joinText([parameter.name, ": ", conventionText(parameter.mode, text)]))
+                            None -> return ""
+                        }
+                    }
+                    var result = ""
+                    if method.result.count > 0 {
+                        match piecesText(method.result) {
+                            Some(text) -> result = joinText([" -> ", text])
+                            None -> return ""
+                        }
+                    }
+                    return joinText(["function ", name, "(", joinWith(parameters, ", "), ")", result])
+                }
+                return ""
+            }
+            None -> return ""
+        }
+    }
+
+    function closureText(borrow mut self, closure: StructType) -> Optional<String> {
+        let count = closure.typeArguments.count
+        if count == 0 { return .None }
+        for mode in closure.callableModes {
+            if mode != .Owned { return .None }
+        }
+        var parts: [String] = ["("]
+        for index in 0..count - 1 {
+            if index > 0 { parts.append(", ") }
+            match argumentText(closure.typeArguments, closure.argumentSizedNames, index) {
+                Some(text) -> parts.append(text)
+                None -> return .None
+            }
+        }
+        parts.append(") -> ")
+        let result = closure.typeArguments[count - 1]
+        if result.kind == .Void {
+            parts.append("Void")
+        } else {
+            match argumentText(closure.typeArguments, closure.argumentSizedNames, count - 1) {
+                Some(text) -> parts.append(text)
+                None -> return .None
+            }
+        }
+        return .Some(joinText(parts))
+    }
+
+    // A `Number` crosses as the two words it is, under its own name: the
+    // `.ridl` declares `struct Number` for the layout, and a Kira binding
+    // reads it as the builtin.
+    function structName(borrow self, valueType: Type) -> String {
+        if program.isNumberWords(valueType) { return "Number" }
+        return ridlName(program.structs[valueType.declaration].name.text)
+    }
+
+    // The RIDL spelling of a function's declared result. `Void` appears only
+    // as a result (section 20.2), so a failing function answering nothing is
+    // `Result<Void, E>` (section 20.6) and nothing else spells `Void`.
+    function resultText(borrow mut self, result: Type) -> Optional<String> {
+        if result.kind != .Enumeration { return typeText(result) }
+        let enumeration = program.enums[result.declaration]
+        if !startsWithText(enumeration.name.text, "Result<") || enumeration.typeArguments.count != 2 {
+            return typeText(result)
+        }
+        if enumeration.typeArguments[0].kind != .Void { return typeText(result) }
+        match argumentText(enumeration.typeArguments, enumeration.argumentSizedNames, 1) {
+            Some(failure) -> return .Some(joinText(["Result<Void, ", failure, ">"]))
+            None -> return .None
+        }
+    }
+
+    function enumText(borrow mut self, valueType: Type) -> Optional<String> {
+        let enumeration = program.enums[valueType.declaration]
+        let name = enumeration.name.text
+        if startsWithText(name, "Optional<") && enumeration.typeArguments.count == 1 {
+            match argumentText(enumeration.typeArguments, enumeration.argumentSizedNames, 0) {
+                Some(wrapped) -> return .Some(joinText(["Optional<", wrapped, ">"]))
+                None -> return .None
+            }
+        }
+        if startsWithText(name, "Result<") && enumeration.typeArguments.count == 2 {
+            match argumentText(enumeration.typeArguments, enumeration.argumentSizedNames, 0) {
+                Some(value) -> {
+                    match argumentText(enumeration.typeArguments, enumeration.argumentSizedNames, 1) {
+                        Some(failure) -> return .Some(joinText(["Result<", value, ", ", failure, ">"]))
+                        None -> return .None
+                    }
+                }
+                None -> return .None
+            }
+        }
+        if enumeration.specialized || enumeration.existential { return .None }
+        // A recursive case holds its payload behind a pointer, which RIDL's
+        // enum layout (section 21.3) does not.
+        for recursive in program.recursiveCases[valueType.declaration] {
+            if recursive { return .None }
+        }
+        for variant in enumeration.variants {
+            match variant.payload {
+                Some(payload) -> { if !exportableField(payload) { return .None } }
+                None -> {}
+            }
+        }
+        remember(valueType)
+        return .Some(ridlName(name))
+    }
+
+    // Whether a field or payload of this type can be spelled. A struct or
+    // enum is taken as spellable here and judged when it is written, which
+    // keeps a type that names itself through an array from looping.
+    function exportableField(borrow self, valueType: Type) -> Bool {
+        let kind = valueType.kind
+        if kind == .Integer { return integerText(valueType).isSome() }
+        if kind == .Floating { return valueType.bits == 32 || valueType.bits == 64 }
+        if kind == .Boolean || kind == .Pointer { return true }
+        if kind == .Structure {
+            let structure = program.structs[valueType.declaration]
+            if structure.name.text == "String" { return true }
+            if structure.genericBase == "Array" { return structure.typeArguments.count == 1 && exportableField(structure.typeArguments[0]) }
+            // A closure that borrows a parameter has no RIDL form (see
+            // `closureText`), and a struct missing a field has another layout.
+            if structure.genericBase == "Closure" {
+                if structure.typeArguments.count == 0 { return false }
+                for mode in structure.callableModes {
+                    if mode != .Owned { return false }
+                }
+                for index in 0..structure.typeArguments.count {
+                    let argument = structure.typeArguments[index]
+                    if index == structure.typeArguments.count - 1 && argument.kind == .Void { continue }
+                    if !exportableField(argument) { return false }
+                }
+                return true
+            }
+            if templateOf(structure).isSome() { return true }
+            return !structure.specialized && (structure.genericBase == "" || structure.genericBase == "Distinct" || structure.genericBase == "Class"
+                || structure.genericBase == "Construct" || structure.genericBase == "Witnessed")
+        }
+        if kind == .Enumeration { return !program.enums[valueType.declaration].existential }
+        return false
+    }
+
+    function remember(borrow mut self, valueType: Type) {
+        for known in nominals {
+            if known.kind == valueType.kind && known.declaration == valueType.declaration { return }
+        }
+        nominals.append(valueType)
+    }
+
+    // One function, or one method of `owner`, in RIDL declaration syntax.
+    function addFunction(borrow mut self, index: Int) {
+        let checked = program.functions[index]
+        var name = unoverloadedName(checked.memberName)
+        if utf8Count(checked.ridlImport) > 0 { name = checked.ridlName }
+        if utf8Count(name) == 0 { name = checked.symbol }
+        // A class keeps each method a second time under the name of the class
+        // that declares it, `Base.method`, for a call that names the base.
+        // The method crosses once, under its own name.
+        for index in 0..utf8Count(name) {
+            if utf8Byte(name, index) == 46 { return }
+        }
+        var ownerName = ""
+        match checked.owner {
+            Some(owner) -> {
+                match typeText(owner) {
+                    Some(text) -> ownerName = text
+                    None -> {
+                        skipped.append(joinText(["// ", checked.symbol, ": its type (`", skippedTypeName(program, owner), "`) has no RIDL form"]))
+                        return
+                    }
+                }
+            }
+            None -> {}
+        }
+        // An instance's methods are under its spelling without spaces,
+        // `Pair<Number,String>`, however its arguments are spelled.
+        var path = name
+        if utf8Count(ownerName) > 0 { path = joinText([ownerName, ".", name]) }
+        match checked.owner {
+            Some(owner) -> {
+                if owner.kind == .Structure && templateOf(program.structs[owner.declaration]).isSome() { path = withoutSpaces(path) }
+            }
+            None -> {}
+        }
+        for known in paths {
+            if known == path {
+                skipped.append(joinText(["// ", checked.symbol, ": RIDL has no overloads, and `", path, "` is taken"]))
+                return
+            }
+        }
+        // The value or address each parameter arrives as in the KIR
+        // function, and `r` first when the result is written through an
+        // address the caller passes.
+        var shape: [String] = []
+        if checked.result.isAggregate() { shape.append("r") }
+        for position in checked.captures.count..checked.parameterCount {
+            let local = checked.locals[position]
+            if local.byReference || local.valueType.isAggregate() { shape.append("a") } else { shape.append("v") }
+        }
+        var declared = ""
+        match signatureText(index, name, true) {
+            Some(text) -> declared = text
+            None -> return
+        }
+        paths.append(path)
+        entries.append(joinText([path, "\t", checked.symbol, "\t", joinText(shape)]))
+        if utf8Count(ownerName) > 0 {
+            methods.append(declared)
+            methodOwners.append(ownerName)
+            match checked.owner {
+                Some(owner) -> {
+                    if owner.kind == .Structure && templateOf(program.structs[owner.declaration]).isSome() {
+                        addGenericMethod(owner, ownerName, name, index)
+                    }
+                }
+                None -> {}
+            }
+        } else {
+            functions.append(declared)
+        }
+    }
+
+    // Method `name`, function `index`, of the instance `owner` spelled
+    // `ownerName`: the contract writes it once in the generic declaration's
+    // `extend`, which every instance shares.
+    function addGenericMethod(borrow mut self, owner: Type, ownerName: String, name: String, index: Int) {
+        var seen = false
+        for known in instanceOwners { if known == ownerName { seen = true } }
+        if !seen { instanceOwners.append(ownerName) }
+        let template = program.ridlTemplates[templateOf(program.structs[owner.declaration]).unwrap()]
+        let generic = joinText([ridlName(template.name), "<", joinWith(template.parameters, ", "), ">"])
+        let checked = program.functions[index]
+        var receiver = ""
+        let first = checked.captures.count
+        if first < checked.parameterCount && checked.locals[first].name == "self" { receiver = conventionText(checked.locals[first].passingMode, "self") }
+        let text = genericMethodText(owner, name, receiver)
+        if utf8Count(text) == 0 { return }
+        for position in 0..genericMethods.count {
+            if genericOwners[position] == generic && genericMethods[position] == text { return }
+        }
+        genericMethods.append(text)
+        genericOwners.append(generic)
+    }
+
+    // Function `index` in RIDL declaration syntax under `name`, or none when
+    // RIDL cannot carry it, which `report` adds a comment for.
+    function signatureText(borrow mut self, index: Int, name: String, report: Bool) -> Optional<String> {
+        let checked = program.functions[index]
+        var parts: [String] = ["function ", name, "("]
+        var first = true
+        var slot = 0
+        for position in checked.captures.count..checked.parameterCount {
+            let local = checked.locals[position]
+            if !first { parts.append(", ") }
+            first = false
+            if position == 0 && local.name == "self" && checked.owner.isSome() {
+                parts.append(conventionText(local.passingMode, "self"))
+                continue
+            }
+            let initial = parameterDefault(index, slot)
+            slot += 1
+            match sizedText(local.valueType, local.sizedName) {
+                Some(text) -> parts.append(joinText([local.name, ": ", conventionText(local.passingMode, text), initial]))
+                None -> {
+                    if report {
+                        skipped.append(joinText(["// ", checked.symbol, ": parameter `", local.name, "` (`", skippedTypeName(program, local.valueType), "`) has no RIDL form"]))
+                    }
+                    return .None
+                }
+            }
+        }
+        parts.append(")")
+        if checked.result.kind != .Void {
+            let result = utf8Count(checked.resultSizedName) > 0 ? sizedText(checked.result, checked.resultSizedName) : resultText(checked.result)
+            match result {
+                Some(text) -> parts.append(joinText([" -> ", text]))
+                None -> {
+                    if report {
+                        skipped.append(joinText(["// ", checked.symbol, ": its result (`", skippedTypeName(program, checked.result), "`) has no RIDL form"]))
+                    }
+                    return .None
+                }
+            }
+        }
+        return .Some(joinText(parts))
+    }
+
+    // A crossing family as the RIDL trait it is (sections 20.3 and 27.7):
+    // its members, ordered by name so every module that writes the trait
+    // gives each the same witness-table entry (section 23.2), and an
+    // `extend` holding the members whose defaults the trait's module
+    // exports.
+    function traitText(borrow mut self, valueType: Type) -> String {
+        let name = program.structs[valueType.declaration].name.text
+        let family = ridlName(utf8Slice(name, 4, utf8Count(name)))
+        var members = witnessMembers(program, valueType.declaration)
+        var lines: [String] = [joinText(["trait ", family, " {"])]
+        var defaults: [String] = []
+        for index in members {
+            let checked = program.functions[index]
+            match signatureText(index, checked.memberName, false) {
+                Some(text) -> {
+                    lines.append(joinText(["    ", text]))
+                    if checked.witness == "default" { defaults.append(joinText(["    ", text])) }
+                }
+                None -> lines.append(joinText(["    // ", checked.memberName, ": no RIDL form"]))
+            }
+        }
+        lines.append("}")
+        if defaults.count > 0 {
+            lines.append(joinText(["extend ", family, " {"]))
+            for text in defaults { lines.append(text) }
+            lines.append("}")
+        }
+        return joinLines(lines)
+    }
+
+    // A struct or enum, with its fields or cases. Writing one can name
+    // another, so the caller writes until no new one appears.
+    function declarationText(borrow mut self, valueType: Type) -> String {
+        var lines: [String] = []
+        var conformances: [String] = []
+        if valueType.kind == .Structure {
+            let structure = program.structs[valueType.declaration]
+            if structure.genericBase == "Class" { return joinText(["struct ", structName(valueType)]) }
+            if structure.genericBase == "Witnessed" { return traitText(valueType) }
+            lines.append(joinText(["struct ", structName(valueType), " {"]))
+            for index in 0..structure.fields.count {
+                let field = structure.fields[index]
+                match sizedText(field.valueType, field.sizedName) {
+                    Some(text) -> {
+                        let initial = contractDefault(valueType.declaration, index)
+                        if utf8Count(initial) > 0 {
+                            lines.append(joinText(["    let ", field.name.text, ": ", text, " = ", initial]))
+                        } else {
+                            lines.append(joinText(["    let ", field.name.text, ": ", text]))
+                        }
+                    }
+                    None -> {}
+                }
+            }
+            // A declaration seen through crossing families conforms to the
+            // traits they are.
+            for ancestor in structure.ancestors {
+                match witnessedNamed(program, ancestor) {
+                    Some(traitType) -> {
+                        match typeText(traitType) {
+                            Some(text) -> conformances.append(joinText(["extend ", structName(valueType), ": ", utf8Slice(text, 4, utf8Count(text))]))
+                            None -> {}
+                        }
+                    }
+                    None -> {}
+                }
+            }
+        } else {
+            let enumeration = program.enums[valueType.declaration]
+            if enumeration.open { lines.append("@Open") }
+            lines.append(joinText(["enum ", ridlName(enumeration.name.text), " {"]))
+            for variant in enumeration.variants {
+                match variant.payload {
+                    Some(payload) -> {
+                        match sizedText(payload, variant.sizedName) {
+                            Some(text) -> lines.append(joinText(["    ", variant.name.text, "(", text, ")"]))
+                            None -> {}
+                        }
+                    }
+                    None -> lines.append(joinText(["    ", variant.name.text]))
+                }
+            }
+        }
+        lines.append("}")
+        for conformance in conformances { lines.append(conformance) }
+        return joinLines(lines)
+    }
+
+    // The default the contract writes for field `field` of struct
+    // `structure`, or empty (section 20.3).
+    function contractDefault(borrow self, structure: Int, field: Int) -> String {
+        if structure >= program.contractDefaults.count { return "" }
+        let texts = program.contractDefaults[structure]
+        if field >= texts.count { return "" }
+        return writtenDefault(texts[field])
+    }
+
+    // ` = default` for parameter `slot` after the receiver of function
+    // `callee`, or empty when the contract writes none for it.
+    function parameterDefault(borrow self, callee: Int, slot: Int) -> String {
+        if callee >= program.parameterDefaults.count { return "" }
+        let texts = program.parameterDefaults[callee]
+        if slot >= texts.count { return "" }
+        let text = writtenDefault(texts[slot])
+        if utf8Count(text) == 0 { return "" }
+        return joinText([" = ", text])
+    }
+
+    // `text`, a default, unless it names a constant the surface does not
+    // write.
+    function writtenDefault(borrow self, text: String) -> String {
+        for global in program.surfaceGlobals {
+            if program.globals[global].name.text == text && program.contractConstant(global).isNone() { return "" }
+        }
+        return text
+    }
+
+    // The module that declares `valueType`, when it is not this one and not
+    // Foundation, whose types every module writes in place.
+    function owningModule(borrow self, valueType: Type) -> String {
+        let file = typeNameSpan(program, valueType).file
+        for source in program.sources {
+            if source.file == file {
+                if source.module <= 0 || source.module >= program.moduleNames.count { return "" }
+                let name = program.moduleNames[source.module]
+                if name == "Foundation" { return "" }
+                return name
+            }
+        }
+        return ""
+    }
+
+    // The module that declares the source `file`, empty for this one; a
+    // template's, as `owningModule` is a type's.
+    function templateModule(borrow self, file: Int) -> String {
+        for source in program.sources {
+            if source.file == file {
+                if source.module <= 0 || source.module >= program.moduleNames.count { return "" }
+                return program.moduleNames[source.module]
+            }
+        }
+        return ""
+    }
+
+    // Whether Foundation declares `valueType`. A contract names Foundation's
+    // types and never declares them: it imports Foundation, as it imports any
+    // module whose types it takes (section 27.7 rule 6). The surface the
+    // engine lays out declares them.
+    function foundationType(borrow self, valueType: Type) -> Bool {
+        let file = typeNameSpan(program, valueType).file
+        for source in program.sources {
+            if source.file == file {
+                if source.module <= 0 || source.module >= program.moduleNames.count { return false }
+                return program.moduleNames[source.module] == "Foundation"
+            }
+        }
+        return false
+    }
+
+    // The surface as `.ridl` text. As the module's contract, a type another
+    // module declares is imported from it instead.
+    function text(borrow mut self, contract: Bool) -> String {
+        var blocks: [String] = []
+        var imports: [String] = []
+        var namesFoundation = false
+        // Writing a declaration can name a struct or enum not yet met, which
+        // `remember` appends, so the count is read again on every pass.
+        var written = 0
+        var templatesWritten = 0
+        while written < nominals.count || templatesWritten < templates.count {
+            if written >= nominals.count {
+                let file = program.ridlTemplates[templates[templatesWritten]].file
+                let owner = contract ? templateModule(file) : ""
+                if contract && owner == "Foundation" {
+                    namesFoundation = true
+                } else if utf8Count(owner) == 0 {
+                    blocks.append(templateText(templatesWritten, contract))
+                } else {
+                    var seen = false
+                    for known in imports { if known == owner { seen = true } }
+                    if !seen { imports.append(owner) }
+                }
+                templatesWritten += 1
+                continue
+            }
+            let owner = contract ? owningModule(nominals[written]) : ""
+            if contract && foundationType(nominals[written]) {
+                // Named, never declared: the contract imports Foundation.
+                namesFoundation = true
+            } else if utf8Count(owner) == 0 {
+                blocks.append(declarationText(nominals[written]))
+            } else {
+                var seen = false
+                for known in imports { if known == owner { seen = true } }
+                if !seen { imports.append(owner) }
+            }
+            written += 1
+        }
+        for alias in aliases { blocks.append(alias) }
+        for declared in functions { blocks.append(declared) }
+        var owners: [String] = []
+        for owner in methodOwners {
+            var seen = false
+            for known in owners { if known == owner { seen = true } }
+            if !seen { owners.append(owner) }
+        }
+        for owner in owners {
+            // A contract extends the generic declaration, below, and never
+            // one instance of it.
+            var instance = false
+            for known in instanceOwners { if known == owner { instance = true } }
+            if contract && instance { continue }
+            var lines: [String] = [joinText(["extend ", owner, " {"])]
+            for index in 0..methods.count {
+                if methodOwners[index] == owner { lines.append(joinText(["    ", methods[index]])) }
+            }
+            lines.append("}")
+            blocks.append(joinLines(lines))
+        }
+        if contract {
+            var generics: [String] = []
+            for owner in genericOwners {
+                var seen = false
+                for known in generics { if known == owner { seen = true } }
+                if !seen { generics.append(owner) }
+            }
+            for owner in generics {
+                var lines: [String] = [joinText(["extend ", owner, " {"])]
+                for index in 0..genericMethods.count {
+                    if genericOwners[index] == owner { lines.append(joinText(["    ", genericMethods[index]])) }
+                }
+                lines.append("}")
+                blocks.append(joinLines(lines))
+            }
+        }
+        for line in skipped { blocks.append(line) }
+        var parts: [String] = []
+        if namesFoundation { parts.append("import Foundation\n") }
+        for owner in imports { parts.append(joinText(["import ", owner, "\n"])) }
+        if namesFoundation || imports.count > 0 { parts.append("\n") }
+        for block in blocks {
+            parts.append(block)
+            parts.append("\n\n")
+        }
+        return joinText(parts)
+    }
+}
+
+// Writes the module's surface, one entry per function in it, and per type it
+// spells the function a RIDL descriptor destroys a value with (section 23.1).
+// A program with no public declaration gets none of them. Runs once the value
+// helpers are declared, since a destroy function calls one.
+function declareRidlSurface(builder: KirModuleBuilder, program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder]) -> Bool {
+    var surface = RidlSurface {
+        program = program, nominals = [], functions = [], methods = [], methodOwners = [], skipped = [], aliases = [], entries = [], paths = [],
+        spelled = [], spellings = []
+    }
+    for publicType in program.surfaceTypes {
+        match surface.typeText(publicType) {
+            Some(text) -> {}
+            None -> surface.skipped.append(joinText(["// ", ridlName(surfaceTypeName(program, publicType)), ": its fields have no RIDL form"]))
+        }
+    }
+    for index in 0..program.surfaceAliasNames.count {
+        let name = ridlName(program.surfaceAliasNames[index])
+        match surface.typeText(program.surfaceAliasTypes[index]) {
+            Some(text) -> surface.aliases.append(joinText(["type ", name, " = ", text]))
+            None -> surface.skipped.append(joinText(["// ", name, ": its target has no RIDL form"]))
+        }
+    }
+    for index in 0..program.functions.count {
+        if program.functions[index].exported { surface.addFunction(index) }
+    }
+    // A public `let` with a constant value crosses as a RIDL `let`, its
+    // namespace path kept, so a caller writes the value in where it reads it.
+    var constants: [String] = []
+    for global in program.surfaceGlobals {
+        let name = program.globals[global].name.text
+        match program.contractConstant(global) {
+            Some(literal) -> {
+                match surface.typeText(program.globals[global].valueType) {
+                    Some(text) -> constants.append(joinText(["let ", name, ": ", text, " = ", literal, "\n\n"]))
+                    None -> surface.skipped.append(joinText(["// ", name, ": its type has no RIDL form"]))
+                }
+            }
+            None -> surface.skipped.append(joinText(["// ", name, ": not a constant RIDL can write"]))
+        }
+    }
+    if surface.nominals.count == 0 && surface.paths.count == 0 && surface.skipped.count == 0 && surface.aliases.count == 0 && constants.count == 0 { return false }
+    moduleAttribute(builder, program.moduleName, ridlModuleAttribute)
+    moduleAttribute(builder, joinText([surface.text(false), joinText(constants)]), ridlSurfaceAttribute)
+    moduleAttribute(builder, joinText([surface.text(true), joinText(constants)]), ridlContractAttribute)
+    for entry in surface.entries { moduleAttribute(builder, entry, ridlEntryAttribute) }
+    defineRidlBuffers(builder, program, types, functions)
+    declareRidlTypes(builder, program, types, surface.spelled, surface.spellings, "__klf_ridl_destroy_")
+    return true
+}
+
+// Per type in `spelled`, spelled as `spellings` says, a `ridl.type`
+// attribute naming the function a RIDL descriptor destroys a value with
+// (section 23.1), defined under `prefix` when the value holds anything to
+// release.
+function declareRidlTypes(builder: KirModuleBuilder, program: CheckedProgram, types: KirTypes, spelled: borrow [Type], spellings: borrow [String], prefix: String) {
+    for index in 0..spelled.count {
+        let spelling = spellings[index]
+        var destroy = ""
+        if needsArrayCleanup(program, spelled[index]) {
+            destroy = joinText([prefix, symbolText(spelling)])
+            defineRidlDestroy(builder, program, types, spelled[index], destroy)
+        }
+        moduleAttribute(builder, joinText([spelling, "\t", destroy]), ridlTypeAttribute)
+    }
+}
+
+// Per module the program imports from with `@Ridl`, the `.ridl` text of what
+// it declares, `ridl.import` as "Module<tab>text", and one `ridl.import.entry`
+// per function, "Module<tab>path<tab>symbol<tab>shape", so the engine can
+// build the adapter from Kira's convention to the module's `ridlcc` entry.
+// The adapter adopts the buffers a result brings, so it needs the buffer
+// functions the surface defines, and defines them when there is no surface.
+// Answers whether the buffer functions are defined.
+function declareRidlImports(builder: KirModuleBuilder, program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder], buffersDefined: Bool) -> Bool {
+    var modules: [String] = []
+    for checked in program.functions {
+        if utf8Count(checked.ridlImport) == 0 || callsWitness(program, checked) { continue }
+        var seen = false
+        for known in modules { if known == checked.ridlImport { seen = true } }
+        if !seen { modules.append(checked.ridlImport) }
+    }
+    if modules.count > 0 && !buffersDefined { defineRidlBuffers(builder, program, types, functions) }
+    for module in modules {
+        var surface = RidlSurface {
+            program = program, nominals = [], functions = [], methods = [], methodOwners = [], skipped = [], aliases = [], entries = [], paths = [],
+            spelled = [], spellings = []
+        }
+        for index in 0..program.functions.count {
+            if program.functions[index].ridlImport == module && !callsWitness(program, program.functions[index]) { surface.addFunction(index) }
+        }
+        moduleAttribute(builder, joinText([module, "\t", surface.text(false)]), ridlImportAttribute)
+        for entry in surface.entries { moduleAttribute(builder, joinText([module, "\t", entry]), ridlImportEntryAttribute) }
+    }
+    return buffersDefined || modules.count > 0
+}
+
+// `destroy(object, descriptor)`: what a RIDL descriptor's `destroy` reaches,
+// running the type's own destroy helper on the value at `object`.
+function defineRidlDestroy(builder: KirModuleBuilder, program: CheckedProgram, types: KirTypes, valueType: Type, name: String) {
+    let span = program.named(typeNameSpan(program, valueType))
+    let signature = kir_signature_new(builder, span.start, span.end, types.unit)
+    for index in 0..utf8Count(name) { kir_signature_name_byte(signature, utf8Byte(name, index)) }
+    kir_signature_parameter(signature, types.pointer)
+    kir_signature_parameter(signature, types.pointer)
+    kir_signature_export(signature)
+    let destroy = kir_signature_define(signature)
+    destroy.switchTo(destroy.entryBlock())
+    destroy.argument(destroy.pointer(destroy.typedMemory(destroy.parameter(0), types.of(valueType))))
+    destroy.callVoid(types.destructors[types.helperIndex(program, valueType)])
+    destroy.returnVoid()
+}
+
+// The functions an entry adopts a buffer another language owns with
+// (section 21.4): `__klf_ridl_buffer_ops()`, the `BufferOps` Kira's own
+// buffers carry, which tells them apart, and `__klf_ridl_buffer_allocate(n)`,
+// a Kira buffer of `n` bytes. Kira frees a buffer as its own, so one whose
+// `ops` differ is copied into a Kira buffer before Kira holds it. And
+// `__klf_ridl_buffer_unique(data)`, whether nothing else holds a Kira buffer:
+// Kira shares an array until it is written, so one it hands over that it
+// still shares is copied first, as an owned buffer is its receiver's alone.
+// And `__klf_ridl_box_copy(box)`, a second holder of a box: Kira counts the
+// holders of its boxes, so a copied trait object or closure shares its box
+// (section 27, rule 7) and the box is held once more.
+function defineRidlBuffers(builder: KirModuleBuilder, program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder]) {
+    if program.arrayFunctions.count == 0 || types.arrayOpsGlobals.count == 0 { return }
+    let span = program.named(program.functions[program.arrayFunctions[0]].name)
+    let ops = kir_signature_new(builder, span.start, span.end, types.pointer)
+    let opsName = "__klf_ridl_buffer_ops"
+    for index in 0..utf8Count(opsName) { kir_signature_name_byte(ops, utf8Byte(opsName, index)) }
+    kir_signature_export(ops)
+    let reading = kir_signature_define(ops)
+    reading.switchTo(reading.entryBlock())
+    let address = kir_value_global_address(reading, types.arrayOpsGlobals[0])
+    reading.returnValue(reading.convert(convertBitcast, reading.pointer(address), types.pointer))
+    let allocate = kir_signature_new(builder, span.start, span.end, types.pointer)
+    let allocateName = "__klf_ridl_buffer_allocate"
+    for index in 0..utf8Count(allocateName) { kir_signature_name_byte(allocate, utf8Byte(allocateName, index)) }
+    kir_signature_parameter(allocate, types.integer64)
+    kir_signature_export(allocate)
+    let allocating = kir_signature_define(allocate)
+    allocating.switchTo(allocating.entryBlock())
+    allocating.argument(allocating.parameter(0))
+    allocating.returnValue(allocating.call(functions[program.arrayFunctions[0]], types.pointer))
+    let unique = kir_signature_new(builder, span.start, span.end, types.boolean)
+    let uniqueName = "__klf_ridl_buffer_unique"
+    for index in 0..utf8Count(uniqueName) { kir_signature_name_byte(unique, utf8Byte(uniqueName, index)) }
+    kir_signature_parameter(unique, types.pointer)
+    kir_signature_export(unique)
+    let testing = kir_signature_define(unique)
+    testing.switchTo(testing.entryBlock())
+    testing.argument(testing.parameter(0))
+    testing.returnValue(testing.call(functions[program.arrayFunctions[6]], types.boolean))
+    let sharing = kir_signature_new(builder, span.start, span.end, types.pointer)
+    let shareName = "__klf_ridl_box_copy"
+    for index in 0..utf8Count(shareName) { kir_signature_name_byte(sharing, utf8Byte(shareName, index)) }
+    kir_signature_parameter(sharing, types.pointer)
+    kir_signature_export(sharing)
+    let copying = kir_signature_define(sharing)
+    copying.switchTo(copying.entryBlock())
+    copying.argument(copying.parameter(0))
+    copying.returnValue(copying.call(functions[program.arrayFunctions[2]], types.pointer))
+}
+
+function typeNameSpan(program: CheckedProgram, valueType: Type) -> Span {
+    if valueType.kind == .Structure { return program.structs[valueType.declaration].baseNameSpan }
+    return program.enums[valueType.declaration].baseNameSpan
+}
+
+// The name a skipped entry's comment gives the type RIDL could not carry.
+function skippedTypeName(program: CheckedProgram, valueType: Type) -> String {
+    if valueType.kind == .Structure || valueType.kind == .Enumeration { return surfaceTypeName(program, valueType) }
+    if valueType.kind == .Decimal { return "Decimal" }
+    if valueType.kind == .Floating { return "Float" }
+    return "Invalid"
+}
+
+function surfaceTypeName(program: CheckedProgram, valueType: Type) -> String {
+    if valueType.kind == .Structure { return program.structs[valueType.declaration].name.text }
+    return program.enums[valueType.declaration].name.text
+}
+
+// A spelling as part of a symbol: every byte that is not a letter or a digit
+// becomes `_`.
+function symbolText(text: String) -> String {
+    var parts: [String] = []
+    var start = 0
+    for index in 0..utf8Count(text) {
+        let byte = utf8Byte(text, index)
+        let letter = byte >= 65 && byte <= 90 || byte >= 97 && byte <= 122
+        let digit = byte >= 48 && byte <= 57
+        if !letter && !digit {
+            parts.append(utf8Slice(text, start, index))
+            parts.append("_")
+            start = index + 1
+        }
+    }
+    parts.append(utf8Slice(text, start, utf8Count(text)))
+    return joinText(parts)
+}
+
+function integerText(valueType: Type) -> Optional<String> {
+    let prefix = valueType.signed ? "I" : "U"
+    let bits = valueType.bits
+    if bits == 8 { return .Some(joinText([prefix, "8"])) }
+    if bits == 16 { return .Some(joinText([prefix, "16"])) }
+    if bits == 32 { return .Some(joinText([prefix, "32"])) }
+    if bits == 64 { return .Some(joinText([prefix, "64"])) }
+    if bits == 128 { return .Some(joinText([prefix, "128"])) }
+    return .None
+}
+
+function conventionText(mode: PassingMode, text: String) -> String {
+    match mode {
+        Owned -> return text
+        Borrowed -> return joinText(["borrow ", text])
+        MutablyBorrowed -> return joinText(["borrow mut ", text])
+    }
+}
+
+// A Kira type name as a RIDL identifier (section 24.1): the `#` suffix that
+// tells apart same-named types of different modules goes, since a surface
+// names only its own module's, and a namespace's `.` becomes `_`.
+function ridlName(name: String) -> String {
+    var parts: [String] = []
+    var start = 0
+    var end = utf8Count(name)
+    for index in 0..utf8Count(name) {
+        let byte = utf8Byte(name, index)
+        if byte == 35 {
+            end = index
+            break
+        }
+        if byte == 46 {
+            parts.append(utf8Slice(name, start, index))
+            parts.append("_")
+            start = index + 1
+        }
+    }
+    parts.append(utf8Slice(name, start, end))
+    return joinText(parts)
+}
+
+// The name a function was declared under: an overloaded one's member name
+// spells its parameter types after a `$` each, and RIDL has no overloads, so
+// the surface takes the name and the second declaration is skipped as taken.
+function unoverloadedName(member: String) -> String {
+    for index in 0..utf8Count(member) {
+        if utf8Byte(member, index) == 36 { return utf8Slice(member, 0, index) }
+    }
+    return member
+}
+
+// `text` with every space taken out.
+function withoutSpaces(text: String) -> String {
+    var parts: [String] = []
+    var start = 0
+    for index in 0..utf8Count(text) {
+        if utf8Byte(text, index) == 32 {
+            parts.append(utf8Slice(text, start, index))
+            start = index + 1
+        }
+    }
+    parts.append(utf8Slice(text, start, utf8Count(text)))
+    return joinText(parts)
+}
+
+function joinLines(lines: [String]) -> String {
+    var parts: [String] = []
+    for index in 0..lines.count {
+        if index > 0 { parts.append("\n") }
+        parts.append(lines[index])
+    }
+    return joinText(parts)
+}

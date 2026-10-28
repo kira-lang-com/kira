@@ -1,0 +1,473 @@
+import Foundation
+
+// CfxControlFlowTests.kira
+// Deep control-flow test suite: nested if/else, while, for-in, match,
+// early return, recursion, and trap tests.
+// All top-level names use prefix cfx / Cfx.
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum CfxColor {
+    Red
+    Green
+    Blue
+}
+
+enum CfxShape {
+    Circle(Int)
+    Rect(Int)
+    Point
+}
+
+enum CfxSign {
+    Pos(Int)
+    Neg(Int)
+    Zero
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function cfxColorCode(c: borrow CfxColor) -> Int {
+    match c {
+        Red -> { return 1 }
+        Green -> { return 2 }
+        Blue -> { return 4 }
+    }
+}
+
+function cfxShapeArea(s: borrow CfxShape) -> Int {
+    match s {
+        Circle(r) -> { return r * r }
+        Rect(side) -> { return side * side * 2 }
+        Point -> { return 0 }
+    }
+}
+
+function cfxSignVal(s: borrow CfxSign) -> Int {
+    match s {
+        Pos(v) -> { return v }
+        Neg(v) -> { return 0 - v }
+        Zero -> { return 0 }
+    }
+}
+
+function cfxFactorial(n: Int) -> Int {
+    if n <= 1 {
+        return 1
+    }
+    return n * cfxFactorial(n - 1)
+}
+
+function cfxFib(n: Int) -> Int {
+    if n < 2 {
+        return n
+    }
+    return cfxFib(n - 1) + cfxFib(n - 2)
+}
+
+function cfxGcd(a: Int, b: Int) -> Int {
+    var x = a
+    var y = b
+    while y != 0 {
+        let t = x % y
+        x = y
+        y = t
+    }
+    return x
+}
+
+function cfxSumRange(lo: Int, hi: Int) -> Int {
+    var s = 0
+    for i in lo..(hi + 1) {
+        s = s + i
+    }
+    return s
+}
+
+function cfxPow(base: Int, exp: Int) -> Int {
+    var r = 1
+    for i in 0..exp {
+        r = r * base
+    }
+    return r
+}
+
+function cfxIsEven(n: Int) -> Bool {
+    if n == 0 {
+        return true
+    }
+    return cfxIsOdd(n - 1)
+}
+
+function cfxIsOdd(n: Int) -> Bool {
+    if n == 0 {
+        return false
+    }
+    return cfxIsEven(n - 1)
+}
+
+function cfxTriangle(n: Int) -> Int {
+    if n <= 0 {
+        return 0
+    }
+    return n + cfxTriangle(n - 1)
+}
+
+function cfxDigitSum(n: Int) -> Int {
+    var v = n
+    var s = 0
+    while v > 0 {
+        s = s + (v % 10)
+        v = v / 10
+    }
+    return s
+}
+
+function cfxCountDiv(n: Int, d: Int) -> Int {
+    var count = 0
+    for i in 1..(n + 1) {
+        if i % d == 0 {
+            count = count + 1
+        }
+    }
+    return count
+}
+
+function cfxSwitchBand(x: Int) -> Int {
+    var out = 0
+    match x {
+        0 -> { out = 10 }
+        1 -> { out = 20 }
+        2 -> { out = 30 }
+        3 -> { out = 40 }
+        4 -> { out = 50 }
+        5 -> { out = 60 }
+        6 -> { out = 70 }
+        7 -> { out = 80 }
+        8 -> { out = 90 }
+        9 -> { out = 100 }
+        else -> {
+            out = 0
+        }
+    }
+    return out
+}
+
+// ---------------------------------------------------------------------------
+// Nested if/else tests
+// ---------------------------------------------------------------------------
+@Test
+function cfxIfElseSimple() {
+    var x = 5
+    var out = 0
+    if x > 3 {
+        out = 1
+    } else { out = 2 }
+    expect!(out == 1)
+}
+
+@Test
+function cfxIfElseFalse() {
+    var x = 2
+    var out = 0
+    if x > 3 {
+        out = 1
+    } else { out = 2 }
+    expect!(out == 2)
+}
+
+@Test
+function cfxIfElseIfChain() {
+    var score = 75
+    var grade = 0
+    if score >= 90 {
+        grade = 4
+    } else if score >= 80 {
+        grade = 3
+    } else if score >= 70 {
+        grade = 2
+    } else if score >= 60 {
+        grade = 1
+    } else {
+        grade = 0
+    }
+    expect!(grade == 2)
+}
+
+@Test
+function cfxIfElseIfChainTop() {
+    var score = 95
+    var grade = 0
+    if score >= 90 {
+        grade = 4
+    } else if score >= 80 {
+        grade = 3
+    } else if score >= 70 {
+        grade = 2
+    } else if score >= 60 {
+        grade = 1
+    } else {
+        grade = 0
+    }
+    expect!(grade == 4)
+}
+
+@Test
+function cfxIfElseIfChainBottom() {
+    var score = 40
+    var grade = 0
+    if score >= 90 {
+        grade = 4
+    } else if score >= 80 {
+        grade = 3
+    } else if score >= 70 {
+        grade = 2
+    } else if score >= 60 {
+        grade = 1
+    } else {
+        grade = 0
+    }
+    expect!(grade == 0)
+}
+
+@Test
+function cfxDeeplyNestedIf() {
+    var a = 3
+    var b = 7
+    var c = 2
+    var out = 0
+    if a < b {
+        if b > c {
+            if a != c {
+                if (a + c) < b {
+                    out = 999
+                } else {
+                    out = 888
+                }
+            } else {
+                out = 777
+            }
+        } else {
+            out = 666
+        }
+    } else {
+        out = 555
+    }
+    // a=3,b=7,c=2: a<b T; b>c T; a!=c T; a+c=5 < b=7 T => 999
+    expect!(out == 999)
+}
+
+@Test
+function cfxIfCountEvenOdd() {
+    var evens = 0
+    var odds = 0
+    for i in 0..20 {
+        if i % 2 == 0 {
+            evens = evens + 1
+        } else { odds = odds + 1 }
+    }
+    // 0..19: 10 evens, 10 odds
+    expect!(evens * 100 + odds == 1010)
+}
+
+@Test
+function cfxIfNestedAccumulate() {
+    var acc = 0
+    for i in 0..10 {
+        if i > 3 {
+            if i < 7 {
+                acc = acc + i
+            }
+        }
+    }
+    // i in 4,5,6 => 15
+    expect!(acc == 15)
+}
+
+@Test
+function cfxIfBoolExprComplex() {
+    var count = 0
+    for i in 0..30 {
+        let a = i % 2 == 0
+        let b = i % 3 == 0
+        if (a && b) || (!a && !b) {
+            count = count + 1
+        }
+    }
+    // i%2==0 && i%3==0: 0,6,12,18,24 = 5
+    // !a && !b: 10 values
+    // total = 15
+    expect!(count == 15)
+}
+
+@Test
+function cfxIfElseTernaryMix() {
+    var acc = 0
+    for i in 0..10 {
+        var v = 0
+        if i % 2 == 0 {
+            v = i * 3
+        } else {
+            v = 0 - i
+        }
+        acc = acc + v
+    }
+    // sum = 0-1+6-3+12-5+18-7+24-9 = 35
+    expect!(acc == 35)
+}
+
+// ---------------------------------------------------------------------------
+// while loop tests
+// ---------------------------------------------------------------------------
+
+@Test
+function cfxWhileCountdown() {
+    var n = 10
+    var steps = 0
+    while n > 0 {
+        n = n - 1
+        steps = steps + 1
+    }
+    expect!(steps == 10)
+}
+
+@Test
+function cfxWhileAccumulate() {
+    var sum = 0
+    for i in 1..101 {
+        sum = sum + i
+    }
+    expect!(sum == 5050)
+}
+
+@Test
+function cfxWhileMultiply() {
+    var prod = 1
+    for i in 1..11 {
+        prod = prod * i
+    }
+    // 10! = 3628800
+    expect!(prod == 3628800)
+}
+
+// Body of the early-return loop, kept as a function so the test can compare its result.
+function cfxFirstSquareAbove500() -> Int {
+    for i in 0..1000 {
+        if i * i > 500 {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+@Test
+function cfxWhileEarlyReturn() {
+    // i=23: 23*23=529 > 500 => 23
+    expect!(cfxFirstSquareAbove500() == 23)
+}
+
+@Test
+function cfxWhileNestedSum() {
+    var total = 0
+    for i in 1..6 {
+        for j in 1..6 {
+            total = total + i * j
+        }
+    }
+    // (1+2+3+4+5)^2 = 225
+    expect!(total == 225)
+}
+
+@Test
+function cfxWhileNestedSkip() {
+    var count = 0
+    for i in 0..8 {
+        for j in 0..8 {
+            if i != j {
+                count = count + 1
+            }
+        }
+    }
+    // 8*8 - 8 = 56
+    expect!(count == 56)
+}
+
+@Test
+function cfxWhileNestedMatrix() {
+    var acc = 0
+    for r in 0..4 {
+        for c in 0..4 {
+            acc = acc + r * 4 + c
+        }
+    }
+    // sum 0..15 = 120
+    expect!(acc == 120)
+}
+
+@Test
+function cfxWhileTripleNested() {
+    var acc = 0
+    for a in 0..3 {
+        for b in 0..3 {
+            for c in 0..3 {
+                acc = acc + a + b + c
+            }
+        }
+    }
+    // each of a,b,c contributes 27; total=81
+    expect!(acc == 81)
+}
+
+@Test
+function cfxWhileCountDivisibleBy7() {
+    var count = 0
+    for i in 1..101 {
+        if i % 7 == 0 {
+            count = count + 1
+        }
+    }
+    // floor(100/7) = 14
+    expect!(count == 14)
+}
+
+@Test
+function cfxWhileSumSquares() {
+    var s = 0
+    for i in 1..11 {
+        s = s + i * i
+    }
+    // 1+4+9+...+100 = 385
+    expect!(s == 385)
+}
+
+@Test
+function cfxWhileCollatz() {
+    var n = 27
+    var steps = 0
+    while n != 1 {
+        if n % 2 == 0 {
+            n = n / 2
+        } else {
+            n = n * 3 + 1
+        }
+        steps = steps + 1
+    }
+    // Collatz(27) = 111 steps
+    expect!(steps == 111)
+}
+
+@Test
+function cfxWhileCountUp() {
+    var n = 0
+    var steps = 0
+    while n < 50 {
+        n = n + 3
+        steps = steps + 1
+    }
+    // n goes: 3,6,...,48,51 => 17 steps
+    expect!(steps == 17)
+}

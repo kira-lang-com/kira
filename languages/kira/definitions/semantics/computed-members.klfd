@@ -1,0 +1,149 @@
+// Computed members: methods read and assigned as properties.
+//
+// A computed member's getter is the zero-parameter method tagged `Computed`
+// that a read of the member calls. One written with a `set` accessor also has
+// a setter, a method of the same name tagged `ComputedSetter` taking the
+// value, which an assignment to the member calls in place of a write: the
+// member stores nothing, so there is no place to write.
+
+// A computed member a place is reached through, and the setter that stores
+// it.
+struct ComputedPlace {
+    let member: Int
+    let setter: Int
+}
+
+extend Checker {
+    // The getter of the computed member `name` of a struct or enum.
+    function computedMember(borrow self, owner: Type, name: String) -> Optional<Int> {
+        return accessorNamed(owner, name, .Computed)
+    }
+
+    // The setter of the computed member `name` of a struct or enum.
+    function computedSetter(borrow self, owner: Type, name: String) -> Optional<Int> {
+        return accessorNamed(owner, name, .ComputedSetter)
+    }
+
+    // The method of `owner` called `name` that carries `accessor`; a getter
+    // and its setter share the name and differ in what they take.
+    function accessorNamed(borrow self, owner: Type, name: String, accessor: Attribute) -> Optional<Int> {
+        if owner.kind != .Structure && owner.kind != .Enumeration { return .None }
+        for target in declarations.overloadsOf(.Some(owner), name) {
+            if hasAttribute(declarations.signatures[target].declaration.annotations, accessor) { return .Some(target) }
+        }
+        return .None
+    }
+
+    // The getter of the receiver's computed member called `name`, named
+    // bare.
+    function bareComputedMember(borrow self, name: String) -> Optional<Int> {
+        match bareReceiver() {
+            Some(receiver) -> return computedMember(locals[receiver].valueType, name)
+            None -> return .None
+        }
+    }
+
+    // The setter an assignment to `place` calls, when `place` reads a
+    // computed member that has one.
+    function computedWrite(borrow self, place: Int) -> Optional<Int> {
+        match program.expressions[place].operation.invocation() {
+            Some(read) -> {
+                let getter = declarations.signatures[read.target]
+                if !hasAttribute(getter.declaration.annotations, .Computed) { return .None }
+                match getter.owner {
+                    Some(owner) -> return computedSetter(owner, getter.name.text)
+                    None -> return .None
+                }
+            }
+            None -> return .None
+        }
+    }
+
+    // The computed member a place is reached through and the setter that
+    // stores it, when writing the place writes part of that member's value:
+    // `pair.a`, `items[0]`. A class member is written through the reference
+    // the getter answers, so the path stops there.
+    function computedRoot(borrow self, place: Int) -> Optional<ComputedPlace> {
+        match computedWrite(place) {
+            Some(setter) -> return .Some(ComputedPlace { member = place, setter = setter })
+            None -> {}
+        }
+        match program.expressions[place].operation.placePart() {
+            Field(step) -> {
+                if program.structs[typeOf(step.base).declaration].genericBase == "Class" { return .None }
+                return computedRoot(step.base)
+            }
+            Element(step) -> return computedRoot(step.base)
+            Whole -> return .None
+        }
+    }
+
+    // `place`, written in place where it may be, or else through the computed
+    // member it is part of: the member's value is read into a binding before
+    // the write, the place rebased onto that binding, and the binding handed to
+    // the setter after it. `before` and `after` gather those statements.
+    function writableThrough(borrow mut self, place: Int, before: borrow mut [Int], after: borrow mut [Int]) -> Int {
+        match computedRoot(place) {
+            Some(found) -> {
+                let member = found.member
+                let setter = found.setter
+                let span = program.expressions[member].span
+                let valueType = typeOf(member)
+                let held = declareLocal(joinText(["__computed#", decimalText(member)]), valueType, true, false)
+                before.append(program.addStatement(.Declare(held, member)))
+                var receiver: Optional<Int> = .None
+                match program.expressions[member].operation.invocation() {
+                    Some(read) -> receiver = .Some(read.arguments[0])
+                    None -> {}
+                }
+                let stored = add(.Transfer(.Copy, add(.Read(held), valueType, span)), valueType, span)
+                after.append(program.addStatement(.Evaluate(callChecked(setter, receiver, [stored], span))))
+                return rebasedPlace(place, member, add(.Read(held), valueType, span))
+            }
+            None -> return place
+        }
+    }
+
+    // `place` with the step that read `member` replaced by `replacement`.
+    function rebasedPlace(borrow mut self, place: Int, member: Int, replacement: Int) -> Int {
+        if place == member { return replacement }
+        let span = program.expressions[place].span
+        match program.expressions[place].operation.placePart() {
+            Field(step) -> return add(.Member(rebasedPlace(step.base, member, replacement), step.part), typeOf(place), span)
+            Element(step) -> return add(.ArrayIndex(rebasedPlace(step.base, member, replacement), step.part), typeOf(place), span)
+            Whole -> return place
+        }
+    }
+
+    // `value` with the computed members it writes through read before it and
+    // stored after it, when `before` gathered any.
+    function writtenBack(borrow mut self, value: Int, before: [Int], after: [Int], span: Span) -> Int {
+        if before.count == 0 { return value }
+        var statements = before
+        let valueType = typeOf(value)
+        if valueType.equals(Type.void()) {
+            statements.append(program.addStatement(.Evaluate(value)))
+            for statement in after { statements.append(statement) }
+            return add(.Sequence(statements, add(.Integer(0), Type.int(), span)), Type.void(), span)
+        }
+        let result = declareLocal(joinText(["__written#", decimalText(value)]), valueType, false, false)
+        statements.append(program.addStatement(.Declare(result, value)))
+        for statement in after { statements.append(statement) }
+        return add(.Sequence(statements, add(.Transfer(.Copy, add(.Read(result), valueType, span)), valueType, span)), valueType, span)
+    }
+
+    // `member = value` through the setter: called on the receiver the getter
+    // read the member from, with the value checked as an assignment checks
+    // one, so it is handed over as an assignment hands it.
+    function assignedThrough(borrow mut self, setter: Int, place: Int, value: Int) -> CheckedStatement {
+        let span = program.expressions[place].span
+        var receiver: Optional<Int> = .None
+        match program.expressions[place].operation.invocation() {
+            Some(read) -> receiver = .Some(read.arguments[0])
+            None -> {}
+        }
+        let valueType = declarations.signatures[setter].parameters[declarations.signatures[setter].parameters.count - 1].valueType
+        let assigned = coerce(expression(value, .Some(valueType)), valueType, .AssignmentTypeMismatch)
+        return .Evaluate(callChecked(setter, receiver, [assigned], span))
+    }
+}

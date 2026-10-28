@@ -1,0 +1,124 @@
+import Foundation
+
+// Writing HTTP/3 messages: a client's requests, a server's responses, their
+// bodies and trailers, and GOAWAY.
+
+extend Http3Session {
+    // A request on a new stream, its body following through `sendData`
+    // unless `finish` ends it here.
+    function sendRequest(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        head: borrow RequestHead,
+        finish: Bool
+    ) -> Result<QuicStreamNumber, Http3Problem> {
+        if role != .Client { return .Error(.WrongRole) }
+        let lines = try requestLines(head) otherwise return .Error(.Invalid(.MessageError))
+        let id = match quic.openStream(.Bidirectional) {
+            Ok(value) -> value
+            Error(problem) -> return .Error(.Stream(problem))
+        }
+        messages.append(MessageStream { id: id, incoming: .Response })
+        try sendStream(
+            quic,
+            StreamBytes {
+                id: id,
+                bytes: http3Frame(.Headers, encodeFieldSection(lines)),
+                finish: finish
+            }
+        )
+        return .Ok(id)
+    }
+
+    // The head of the response on the request stream `id`; an
+    // informational status may come before the final one.
+    function respond(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        id: QuicStreamNumber,
+        head: borrow ResponseHead
+    ) -> Result<Void, Http3Problem> {
+        if role != .Server { return .Error(.WrongRole) }
+        let lines = try responseLines(head) otherwise return .Error(.Invalid(.MessageError))
+        return sendStream(
+            quic,
+            StreamBytes {
+                id: id,
+                bytes: http3Frame(.Headers, encodeFieldSection(lines)),
+                finish: false
+            }
+        )
+    }
+
+    function sendData(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        id: QuicStreamNumber,
+        bytes: borrow [UN8],
+        finish: Bool
+    ) -> Result<Void, Http3Problem> {
+        if bytes.count == 0 {
+            return sendStream(quic, StreamBytes { id: id, bytes: [], finish: finish })
+        }
+        return sendStream(
+            quic,
+            StreamBytes { id: id, bytes: http3Frame(.Data, bytes), finish: finish }
+        )
+    }
+
+    // Trailers, which end the message.
+    function sendTrailers(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        id: QuicStreamNumber,
+        fields: borrow Fields
+    ) -> Result<Void, Http3Problem> {
+        var lines: [Field] = []
+        try appendRegular(lines, fields) otherwise return .Error(.Invalid(.MessageError))
+        return sendStream(
+            quic,
+            StreamBytes {
+                id: id,
+                bytes: http3Frame(.Headers, encodeFieldSection(lines)),
+                finish: true
+            }
+        )
+    }
+
+    function sendStream(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        out: borrow StreamBytes
+    ) -> Result<Void, Http3Problem> {
+        return match quic.write(out.id, out.bytes, out.finish) {
+            Ok -> .Ok
+            Error(problem) -> .Error(.Stream(problem))
+        }
+    }
+
+    // A server's GOAWAY: requests on streams from `first` on are not
+    // served (RFC 9114 section 5.2).
+    function goaway(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        first: QuicStreamNumber
+    ) -> Result<Void, Http3Problem> {
+        let id = match control {
+            Some(value) -> value
+            None -> return .Error(.Stream(.NotWritable))
+        }
+        var payload = WireWriter {}
+        payload.writeVarint(first.raw)
+        return sendStream(
+            quic,
+            StreamBytes { id: id, bytes: http3Frame(.Goaway, payload.bytes), finish: false }
+        )
+    }
+}
+
+// Bytes for a stream, and whether they end it.
+struct StreamBytes {
+    let id: QuicStreamNumber
+    let bytes: [UN8]
+    let finish: Bool
+}

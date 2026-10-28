@@ -1,0 +1,477 @@
+import Foundation
+
+// The text form: a Kira value literal. `.None` is null, a number is its
+// exact decimal, bytes are `0x` and lowercase hex, an object is
+// `Type { name: value, … }` or a bare `{ … }`, and a case is `.Name` or
+// `.Name(payload, …)`.
+
+// The characters the text form is spelled with.
+@Open
+enum KtenMark: UN8 {
+    Tab = 0x09
+    Newline = 0x0A
+    VerticalTab = 0x0B
+    FormFeed = 0x0C
+    Return = 0x0D
+    Space = 0x20
+    Quote = 0x22
+    LeftParen = 0x28
+    RightParen = 0x29
+    Comma = 0x2C
+    Minus = 0x2D
+    Dot = 0x2E
+    Zero = 0x30
+    Colon = 0x3A
+    LeftBracket = 0x5B
+    Backslash = 0x5C
+    RightBracket = 0x5D
+    LetterN = 0x6E
+    LetterR = 0x72
+    LetterT = 0x74
+    LetterX = 0x78
+    LeftBrace = 0x7B
+    RightBrace = 0x7D
+}
+
+namespace KtenText {
+    let hexDigits: String = "0123456789abcdef"
+    let nibble: Number = 16
+}
+
+extend Kten {
+    // The text form.
+    function written(borrow self) -> String {
+        return match self {
+            Null -> ".None"
+            Bool(flag) -> flag ? "true" : "false"
+            Number(number) -> String(number)
+            Text(text) -> ktenQuoted(text)
+            Bytes(raw) -> ktenHexText(raw)
+            List(items) -> "[\(ktenListText(items))]"
+            Object(object) -> ktenObjectText(object)
+            Case(variant) -> ktenCaseText(variant)
+        }
+    }
+}
+
+namespace KtenLines {
+    let indent: String = "    "
+}
+
+extend Kten {
+    // The text form laid out for a person to read and a diff to follow: an
+    // object or list that holds another object or list puts each field or
+    // element on a line of its own, indented under it; anything smaller stays
+    // on one line, as `written()` writes it. It parses to the same value.
+    function writtenLines(borrow self) -> String {
+        return ktenLines(self, "")
+    }
+}
+
+// Whether `value` is laid out over several lines: it holds an object or a
+// list.
+function ktenSpreads(value: borrow Kten) -> Bool {
+    return match value {
+        List(items) -> ktenAnyNested(items)
+        Object(object) -> {
+            var values: [Kten] = []
+            for field in object.fields { values.append(copy field.value) }
+            ktenAnyNested(values)
+        }
+        Case(variant) -> ktenAnyNested(variant.payload)
+        Null, Bool, Number, Text, Bytes -> false
+    }
+}
+
+function ktenAnyNested(values: borrow [Kten]) -> Bool {
+    for value in values {
+        match value {
+            List, Object -> return true
+            Case(variant) -> if ktenAnyNested(variant.payload) { return true }
+            // A scalar sits on its line.
+            Null, Bool, Number, Text, Bytes -> {}
+        }
+    }
+    return false
+}
+
+function ktenLines(value: borrow Kten, margin: borrow String) -> String {
+    if !ktenSpreads(value) { return value.written() }
+    let inner = margin + KtenLines.indent
+    return match value {
+        List(items) -> {
+            var lines: [String] = []
+            for item in items { lines.append(inner + ktenLines(item, inner)) }
+            "[\n\(joined(lines, ",\n"))\n\(margin)]"
+        }
+        Object(object) -> ktenObjectLines(object, margin)
+        Case(variant) -> {
+            var lines: [String] = []
+            for item in variant.payload { lines.append(ktenLines(item, margin)) }
+            ".\(variant.name)(\(joined(lines, ", ")))"
+        }
+        Null, Bool, Number, Text, Bytes -> value.written()
+    }
+}
+
+function ktenObjectLines(object: borrow KtenObject, margin: borrow String) -> String {
+    let inner = margin + KtenLines.indent
+    var lines: [String] = []
+    for field in object.fields {
+        lines.append("\(inner)\(field.name): \(ktenLines(field.value, inner))")
+    }
+    let body = "{\n\(joined(lines, ",\n"))\n\(margin)}"
+    return match object.tag {
+        Some(tag) -> "\(tag) \(body)"
+        None -> body
+    }
+}
+
+function ktenListText(items: borrow [Kten]) -> String {
+    var parts: [String] = []
+    for item in items { parts.append(item.written()) }
+    return joined(parts, ", ")
+}
+
+function ktenObjectText(object: borrow KtenObject) -> String {
+    var parts: [String] = []
+    for field in object.fields { parts.append(" \(field.name): \(field.value.written())") }
+    let body = "{\(joined(parts, ",")) }"
+    return match object.tag {
+        Some(tag) -> "\(tag) \(body)"
+        None -> body
+    }
+}
+
+function ktenCaseText(variant: borrow KtenCase) -> String {
+    if variant.payload.count == 0 { return ".\(variant.name)" }
+    return ".\(variant.name)(\(ktenListText(variant.payload)))"
+}
+
+function ktenHexText(raw: borrow [UN8]) -> String {
+    var parts = ["0x"]
+    for byte in raw {
+        let value = Number(byte)
+        let high = trunc(value / KtenText.nibble)
+        let low = value % KtenText.nibble
+        parts.append(KtenText.hexDigits.substring(high, high + 1))
+        parts.append(KtenText.hexDigits.substring(low, low + 1))
+    }
+    return joined(parts, "")
+}
+
+// `text` in quotes. Runs between escapes are copied whole, so a multi-byte
+// character passes through as itself.
+function ktenQuoted(text: borrow String) -> String {
+    var parts = ["\""]
+    var cut = 0
+    for index in 0..text.count {
+        let escape = match fromCode<KtenMark>(UN8(text.byteAt(index))) {
+            Quote -> "\\\""
+            Backslash -> "\\\\"
+            Newline -> "\\n"
+            Return -> "\\r"
+            Tab -> "\\t"
+            else -> ""
+        }
+        if escape.count > 0 {
+            parts.append(text.substring(cut, index))
+            parts.append(escape)
+            cut = index + 1
+        }
+    }
+    parts.append(text.substring(cut, text.count))
+    parts.append("\"")
+    return joined(parts, "")
+}
+
+/// Why text is not a Kten value. Each position is a byte offset.
+public enum KtenParseFailure {
+    /// A character that the text form does not allow here. Carries its position.
+    Unexpected(Number)
+    /// A quoted text that never ends. Carries a byte offset.
+    UnterminatedText(Number)
+    /// A backslash escape the text form does not know. Carries its position.
+    UnknownEscape(Number)
+    /// A number that is not a decimal. Carries the text.
+    NotANumber(String)
+    /// Bytes written as `0x` with an odd number of hexadecimal digits. Carries the position.
+    OddHexDigits(Number)
+    /// The values nest deeper than the reader allows.
+    TooDeep
+    /// A whole value, then more text. Carries a byte offset.
+    Trailing(Number)
+}
+
+/// The value `text` spells, and nothing after it but space.
+public function parseKten(text: borrow String) -> Result<Kten, KtenParseFailure> {
+    var reader = KtenTextReader { text: copy text }
+    let value = try reader.value()
+    reader.skipSpace()
+    if reader.at < text.count { return .Error(.Trailing(reader.at)) }
+    return .Ok(value)
+}
+
+function isKtenNameByte(byte: Number) -> Bool {
+    return match byte {
+        0x30..0x3A, 0x41..0x5B, 0x61..0x7B, 0x5F -> true
+        else -> false
+    }
+}
+
+function isKtenDigit(byte: Number) -> Bool {
+    return match byte {
+        0x30..0x3A -> true
+        else -> false
+    }
+}
+
+struct KtenTextReader {
+    let text: String
+    var at: Number = 0
+    var depth: Number = 0
+
+    function peek(borrow self) -> Number? {
+        if at >= text.count { return .None }
+        return .Some(Number(text.byteAt(at)))
+    }
+
+    function peekMark(borrow self) -> KtenMark? {
+        return match peek() {
+            Some(byte) -> .Some(fromCode<KtenMark>(UN8(byte)))
+            None -> .None
+        }
+    }
+
+    function skipSpace(borrow mut self) {
+        while true {
+            match peekMark() {
+                Some(mark) -> match mark {
+                    Space, Tab, Newline, Return, VerticalTab, FormFeed -> at += 1
+                    else -> return
+                }
+                None -> return
+            }
+        }
+    }
+
+    function eat(borrow mut self, mark: KtenMark) -> Bool {
+        skipSpace()
+        if peekMark() != .Some(mark) { return false }
+        at += 1
+        return true
+    }
+
+    function expectMark(borrow mut self, mark: KtenMark) -> Result<Void, KtenParseFailure> {
+        if !eat(mark) { return .Error(.Unexpected(at)) }
+        return .Ok
+    }
+
+    function name(borrow mut self) -> String {
+        let start = at
+        while true {
+            match peek() {
+                Some(byte) -> {
+                    if !isKtenNameByte(byte) { break }
+                    at += 1
+                }
+                None -> break
+            }
+        }
+        return text.substring(start, at)
+    }
+
+    function value(borrow mut self) -> Result<Kten, KtenParseFailure> {
+        if depth >= KtenLimit.depth { return .Error(.TooDeep) }
+        depth += 1
+        let read = valueBody()
+        depth -= 1
+        return read
+    }
+
+    function valueBody(borrow mut self) -> Result<Kten, KtenParseFailure> {
+        skipSpace()
+        let byte = match peek() {
+            Some(found) -> found
+            None -> return .Error(.Unexpected(at))
+        }
+        return match fromCode<KtenMark>(byte) {
+            Quote -> string()
+            LeftBracket -> list()
+            LeftBrace -> bare()
+            Dot -> variant()
+            Minus -> number()
+            else -> isKtenDigit(byte) ? number() : word()
+        }
+    }
+
+    function string(borrow mut self) -> Result<Kten, KtenParseFailure> {
+        let opened = at
+        at += 1
+        var parts: [String] = []
+        var cut = at
+        while at < text.count {
+            match fromCode<KtenMark>(UN8(text.byteAt(at))) {
+                Quote -> {
+                    parts.append(text.substring(cut, at))
+                    at += 1
+                    return .Ok(.Text(joined(parts, "")))
+                }
+                Backslash -> {
+                    parts.append(text.substring(cut, at))
+                    parts.append(try escaped())
+                    cut = at
+                }
+                else -> at += 1
+            }
+        }
+        return .Error(.UnterminatedText(opened))
+    }
+
+    // The character a backslash at `at` stands for; `at` moves past both.
+    function escaped(borrow mut self) -> Result<String, KtenParseFailure> {
+        let start = at
+        at += 1
+        let mark = match peekMark() {
+            Some(found) -> found
+            None -> return .Error(.UnterminatedText(start))
+        }
+        at += 1
+        return match mark {
+            LetterN -> .Ok("\n")
+            LetterR -> .Ok("\r")
+            LetterT -> .Ok("\t")
+            Quote -> .Ok("\"")
+            Backslash -> .Ok("\\")
+            else -> .Error(.UnknownEscape(start))
+        }
+    }
+
+    // A decimal, or bytes when it opens `0x`.
+    function number(borrow mut self) -> Result<Kten, KtenParseFailure> {
+        if peekMark() == .Some(.Zero) && at + 1 < text.count {
+            if fromCode<KtenMark>(UN8(text.byteAt(at + 1))) == .LetterX { return hex() }
+        }
+        let start = at
+        if peekMark() == .Some(.Minus) { at += 1 }
+        while true {
+            match peek() {
+                Some(byte) -> {
+                    if !isKtenDigit(byte) && fromCode<KtenMark>(byte) != .Dot { break }
+                    at += 1
+                }
+                None -> break
+            }
+        }
+        let written = text.substring(start, at)
+        return match parseNumber(written) {
+            Some(value) -> .Ok(.Number(value))
+            None -> .Error(.NotANumber(written))
+        }
+    }
+
+    function hex(borrow mut self) -> Result<Kten, KtenParseFailure> {
+        at += 2
+        var raw: [UN8] = []
+        while true {
+            let high = match hexAt(at) {
+                Some(value) -> value
+                None -> break
+            }
+            let low = match hexAt(at + 1) {
+                Some(value) -> value
+                None -> return .Error(.OddHexDigits(at))
+            }
+            raw.append(UN8(high * KtenText.nibble + low))
+            at += 2
+        }
+        return .Ok(.Bytes(raw))
+    }
+
+    function hexAt(borrow self, index: Number) -> Number? {
+        if index >= text.count { return .None }
+        return match hexDigitValue(text.byteAt(index)) {
+            Some(value) -> .Some(Number(value))
+            None -> .None
+        }
+    }
+
+    function list(borrow mut self) -> Result<Kten, KtenParseFailure> {
+        at += 1
+        var items: [Kten] = []
+        if eat(.RightBracket) { return .Ok(.List(items)) }
+        while true {
+            let item = try value()
+            items.append(item)
+            if !eat(.Comma) {
+                try expectMark(.RightBracket)
+                break
+            }
+            // A comma may close the list as well as separate it.
+            if eat(.RightBracket) { break }
+        }
+        return .Ok(.List(items))
+    }
+
+    function bare(borrow mut self) -> Result<Kten, KtenParseFailure> {
+        at += 1
+        let fields = try fields()
+        return .Ok(.Object(KtenObject { fields: fields }))
+    }
+
+    // Fields up to the closing brace, which a trailing comma may precede.
+    function fields(borrow mut self) -> Result<[KtenField], KtenParseFailure> {
+        var fields: [KtenField] = []
+        while true {
+            if eat(.RightBrace) { break }
+            skipSpace()
+            let name = name()
+            if name.count == 0 { return .Error(.Unexpected(at)) }
+            try expectMark(.Colon)
+            let value = try value()
+            fields.append(KtenField { name: name, value: value })
+            if !eat(.Comma) {
+                try expectMark(.RightBrace)
+                break
+            }
+        }
+        return .Ok(fields)
+    }
+
+    // `.Name` or `.Name(payload, …)`; `.None` is null.
+    function variant(borrow mut self) -> Result<Kten, KtenParseFailure> {
+        at += 1
+        let name = name()
+        if name.count == 0 { return .Error(.Unexpected(at)) }
+        var payload: [Kten] = []
+        if eat(.LeftParen) {
+            while !eat(.RightParen) {
+                let item = try value()
+                payload.append(item)
+                if !eat(.Comma) {
+                    try expectMark(.RightParen)
+                    break
+                }
+            }
+        }
+        if name == "None" && payload.count == 0 { return .Ok(.Null) }
+        return .Ok(.Case(KtenCase { name: name, payload: payload }))
+    }
+
+    // `true`, `false`, or a tagged object.
+    function word(borrow mut self) -> Result<Kten, KtenParseFailure> {
+        let name = name()
+        return match name {
+            "true" -> .Ok(.Bool(true))
+            "false" -> .Ok(.Bool(false))
+            else -> tagged(name)
+        }
+    }
+
+    function tagged(borrow mut self, tag: borrow String) -> Result<Kten, KtenParseFailure> {
+        if tag.count == 0 { return .Error(.Unexpected(at)) }
+        try expectMark(.LeftBrace)
+        let fields = try fields()
+        return .Ok(.Object(KtenObject { tag: .Some(copy tag), fields: fields }))
+    }
+}

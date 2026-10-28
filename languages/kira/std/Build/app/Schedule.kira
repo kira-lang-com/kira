@@ -1,0 +1,527 @@
+import Foundation
+import Kten
+
+// Running the graph (DESIGN.md section 6.2): from the requested steps back to
+// the actions they need, each started once its inputs exist, at most
+// `-jobs` commands at once. Native actions run on the scheduler's own
+// thread between waits.
+
+namespace BuildExit {
+    let success: Number = 0
+    let failed: Number = 1
+    // The command line or the graph is wrong; nothing ran.
+    let usage: Number = 2
+}
+
+// Whether an action can start.
+enum ActionReadiness {
+    Ready
+    NotYet
+    // An input failed, or was never made.
+    Blocked
+    // `-dry-run`: an input would be made by an action that would run.
+    Unknown
+}
+
+extend Graph {
+    // Runs what the command line asks for and answers the build's exit
+    // status. A build program's `main` returns it.
+    function run(borrow self) -> Number {
+        var wrong = copy request.problems
+        for problem in problems { wrong.append(copy problem) }
+        let names = chosenNames()
+        let rest = stepArguments()
+        if wrong.count == 0 && names.count == 0 && rest.count > 0 {
+            wrong.append("there is no step or option \(rest[0]); `kira build` lists them")
+        }
+        if wrong.count > 0 {
+            for problem in wrong { printError("kira build: \(problem)") }
+            return BuildExit.usage
+        }
+        let state = joinPath(root, ".kira-build")
+        // One run at a time works in the project's state. The lock is let go
+        // once the chosen steps are placed, before any of them runs: a step
+        // that runs a long time, such as a booted machine, leaves the state
+        // to the next build.
+        var lock: FileHandle? = .None
+        if request.clean || (names.count > 0 && !request.graph) {
+            match lockState(state) {
+                Ok(held) -> lock = .Some(held)
+                Error(failure) -> {
+                    printError("kira build: \(failureText(failure))")
+                    return BuildExit.failed
+                }
+            }
+        }
+        if request.clean {
+            match clearState(state) {
+                Ok -> {}
+                Error(failure) -> {
+                    printError("kira build: \(failureText(failure))")
+                    return BuildExit.failed
+                }
+            }
+        }
+        if names.count == 0 {
+            if request.graph {
+                var every: [Bool] = []
+                for _ in 0..actions.count { every.append(true) }
+                printGraph(every)
+            } else if !request.clean {
+                listSteps()
+            }
+            return BuildExit.success
+        }
+        var chosen: [Number] = []
+        for name in names {
+            for index in 0..steps.count {
+                if steps[index].name == name { chosen.append(index) }
+            }
+        }
+        let needed = neededActions(chosen)
+        if request.graph {
+            printGraph(needed)
+            return BuildExit.success
+        }
+        let store = match openStore() {
+            Ok(opened) -> opened
+            Error(failure) -> {
+                printError("kira build: \(failureText(failure))")
+                return BuildExit.failed
+            }
+        }
+        // While the mark is held no other build sweeps the shared cache.
+        let mark = match store.markRunning(root) {
+            Ok(held) -> held
+            Error(failure) -> {
+                printError("kira build: \(failureText(failure))")
+                return BuildExit.failed
+            }
+        }
+        var engine = Engine {
+            root: copy root,
+            state: copy state,
+            store: store,
+            request: copy request,
+            cache: loadStatCache(joinPath(state, "status"))
+        }
+        let built = engine.build(self, needed, chosen)
+        engine.saveCache()
+        engine.dropStale(self)
+        if request.dryRun { return BuildExit.success }
+        if !built {
+            engine.store.sweep(root, state, mark)
+            return BuildExit.failed
+        }
+        var runs: [StepRun] = []
+        for index in chosen {
+            match engine.placeChosen(self, steps[index]) {
+                Ok(placed) -> runs.append(placed)
+                Error(status) -> return status
+            }
+        }
+        engine.store.sweep(root, state, mark)
+        match lock {
+            Some(held) -> {
+                match held.close() {
+                    Ok -> {}
+                    Error(failure) -> absorb failure
+                }
+            }
+            None -> {}
+        }
+        for (position, index) in chosen.enumerated() {
+            let status = match steps[index].run {
+                Some(work) -> work(runs[position])
+                None -> BuildExit.success
+            }
+            if status != BuildExit.success { return status }
+        }
+        return BuildExit.success
+    }
+
+    // Per action, whether a step in `chosen` needs it.
+    function neededActions(borrow self, chosen: borrow [Number]) -> [Bool] {
+        var needed: [Bool] = []
+        for _ in 0..actions.count { needed.append(false) }
+        var pending: [Number] = []
+        for index in chosen {
+            for artifact in steps[index].produces {
+                match producer(artifact) {
+                    Some(action) -> pending.append(action)
+                    None -> {}
+                }
+            }
+        }
+        while pending.count > 0 {
+            let action = pending[pending.count - 1]
+            pending = pending.prefix(pending.count - 1)
+            if needed[action] { continue }
+            needed[action] = true
+            for input in inputsOf(action) {
+                match producer(input) {
+                    Some(source) -> pending.append(source)
+                    None -> {}
+                }
+            }
+        }
+        return needed
+    }
+}
+
+extend Engine {
+    // Removes the last runs and logs of labels the graph no longer has.
+    function dropStale(borrow self, graph: borrow Graph) {
+        var known = Map<String, Bool>()
+        for action in graph.actions {
+            let name = pathSafe(actionLabel(action))
+            known.set(name + ".out", true)
+            known.set(name + ".err", true)
+            known.set(move name, true)
+        }
+        for kept in ["last", "logs"] {
+            let directory = joinPath(state, kept)
+            let names = match listDirectory(directory) {
+                Ok(listing) -> copy listing.entries
+                Error(failure) -> {
+                    absorb failure
+                    continue
+                }
+            }
+            for name in names {
+                if known.value(name).or(false) { continue }
+                match removePath(joinPath(directory, name)) {
+                    Ok -> {}
+                    Error(failure) -> absorb failure
+                }
+            }
+        }
+    }
+
+    function saveCache(borrow self) {
+        if !cache.changed { return }
+        match makePathTree(state) {
+            Ok -> {}
+            Error(failure) -> return
+        }
+        // What the build writes is never committed.
+        match writeFile(joinPath(state, ".gitignore"), "*\n") {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+        match writeFileBytes(joinPath(state, "status"), cache.encoded()) {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+    }
+
+    // Runs every action `needed` marks, answering whether all of them
+    // succeeded.
+    function build(
+        borrow mut self,
+        graph: borrow Graph,
+        needed: borrow [Bool],
+        chosen: borrow [Number]
+    ) -> Bool {
+        var total = 0
+        for action in 0..graph.actions.count {
+            phases.append(needed[action] ? ActionPhase.Waiting : ActionPhase.Unneeded)
+            keys.append("")
+            tools.append("")
+            stageTools.append([])
+            if needed[action] { total += 1 }
+        }
+        for _ in 0..graph.origins.count { made.append(.None) }
+        // Sources first: every one a needed action or a chosen step reads.
+        var sources: [Artifact] = []
+        for action in 0..graph.actions.count {
+            if needed[action] {
+                for input in graph.inputsOf(action) { sources.append(input) }
+            }
+        }
+        for index in chosen {
+            for artifact in graph.steps[index].produces { sources.append(artifact) }
+        }
+        for artifact in sources {
+            if made[artifact.id].isSome() || graph.producer(artifact).isSome() { continue }
+            match prepareSource(graph, artifact) {
+                Ok -> {}
+                Error(failure) -> {
+                    print("FAILED \(graph.artifactName(artifact)): \(failureText(failure))")
+                    return false
+                }
+            }
+        }
+        let jobs = request.jobs == 0 ? processorCount() : request.jobs
+        var running: [RunningCommand] = []
+        var started = 0
+        var failures = 0
+        while true {
+            var moved = true
+            while moved {
+                moved = false
+                for action in 0..graph.actions.count {
+                    if failures > 0 && !request.keepGoing { break }
+                    match phases[action] {
+                        Waiting -> {}
+                        Unneeded, Running, Ran, Cached, Failed, Blocked, WouldRun -> continue
+                    }
+                    match readiness(graph, action) {
+                        Ready -> {}
+                        NotYet -> continue
+                        Blocked -> {
+                            phases[action] = .Blocked
+                            moved = true
+                            continue
+                        }
+                        Unknown -> {
+                            phases[action] = .WouldRun
+                            print("would run \(actionLabel(graph.actions[action]))")
+                            moved = true
+                            continue
+                        }
+                    }
+                    let command = match graph.actions[action] {
+                        Run(run) -> true
+                        Native(native) -> false
+                    }
+                    if command && running.count >= jobs { continue }
+                    // One command at a time in a workspace.
+                    if workspaceBusy(graph, action, running) { continue }
+                    moved = true
+                    match actionKey(graph, action) {
+                        Ok(key) -> keys[action] = key
+                        Error(failure) -> {
+                            fail(graph, action, failure, "", "")
+                            failures += 1
+                            continue
+                        }
+                    }
+                    // A record is a hit while every path it discovered is
+                    // as it was.
+                    match cachedAction(graph, action, keys[action]) {
+                        Some(cached) -> {
+                            keys[action] = copy cached.key
+                            produced(graph, action, cached.record)
+                            phases[action] = .Cached
+                            remember(graph, action)
+                            continue
+                        }
+                        None -> {}
+                    }
+                    let label = actionLabel(graph.actions[action])
+                    if request.dryRun {
+                        phases[action] = .WouldRun
+                        print("would run \(label)")
+                        if request.explain { print("  \(explanation(graph, action))") }
+                        continue
+                    }
+                    started += 1
+                    print("[\(started)/\(total)] \(label)")
+                    if request.explain { print("  \(explanation(graph, action))") }
+                    let place = match prepareWork(graph, action, !command) {
+                        Ok(prepared) -> prepared
+                        Error(failure) -> {
+                            fail(graph, action, failure, "", "")
+                            failures += 1
+                            continue
+                        }
+                    }
+                    if command {
+                        match startCommand(graph, action, copy place, 0) {
+                            Ok(child) -> {
+                                running.append(move child)
+                                phases[action] = .Running
+                            }
+                            Error(failure) -> {
+                                fail(graph, action, failure, "", "")
+                                failures += 1
+                            }
+                        }
+                    } else {
+                        let ran = match runNative(graph, action, place) {
+                            Ok(copied) -> finish(graph, action, place, copied)
+                            Error(failure) -> .Error(failure)
+                        }
+                        match ran {
+                            Ok -> {}
+                            Error(failure) -> {
+                                fail(graph, action, failure, "", place.directory)
+                                failures += 1
+                            }
+                        }
+                    }
+                }
+            }
+            if running.count == 0 { break }
+            let ended = match waitAnyChild(.None) {
+                Some(child) -> child
+                None -> continue
+            }
+            var still: [RunningCommand] = []
+            for entry in running {
+                if entry.child.id != ended.id {
+                    still.append(entry)
+                    continue
+                }
+                let exit = match entry.child.wait() {
+                    Ok(status) -> status
+                    Error(failure) -> ChildExit.Signalled(-1)
+                }
+                match entry.child.release() {
+                    Ok -> {}
+                    Error(failure) -> absorb failure
+                }
+                // A stage that succeeded starts the next, and the command
+                // goes on running.
+                var following = false
+                match exit {
+                    Status(
+                        code
+                    ) -> following = code == 0 && entry.stage < stageTools[entry.action].count
+                    Signalled(signal) -> {}
+                }
+                if following {
+                    match startCommand(graph, entry.action, copy entry.place, entry.stage + 1) {
+                        Ok(child) -> still.append(move child)
+                        Error(failure) -> {
+                            fail(graph, entry.action, failure, entry.line, entry.place.directory)
+                            failures += 1
+                        }
+                    }
+                    continue
+                }
+                let outcome = exitOutcome(exit, graph, entry)
+                match outcome {
+                    Ok -> {
+                        if request.verbose {
+                            print("  \(entry.line)")
+                            reportOutput(actionLabel(graph.actions[entry.action]))
+                        }
+                    }
+                    Error(failure) -> {
+                        fail(graph, entry.action, failure, entry.line, entry.place.directory)
+                        failures += 1
+                    }
+                }
+            }
+            running = still
+        }
+        var blocked = 0
+        for phase in phases {
+            match phase {
+                Blocked, Waiting -> blocked += 1
+                Unneeded, Running, Ran, Cached, Failed, WouldRun -> {}
+            }
+        }
+        if failures > 0 {
+            print("kira build: \(failures) failed, \(blocked) not run")
+        }
+        return failures == 0 && blocked == 0
+    }
+
+    // What a command's end means: it succeeded once it exited with 0 and its
+    // outputs are kept.
+    function exitOutcome(
+        borrow mut self,
+        exit: borrow ChildExit,
+        graph: borrow Graph,
+        entry: borrow RunningCommand
+    ) -> Result<Void, BuildFailure> {
+        match exit {
+            Status(code) -> {
+                if code == 0 {
+                    let none: [CopiedFile] = []
+                    return finish(graph, entry.action, entry.place, none)
+                }
+                return .Error(.Failed("exited with status \(code)"))
+            }
+            Signalled(signal) -> return .Error(.Failed("was ended by signal \(signal)"))
+        }
+    }
+
+    function readiness(borrow self, graph: borrow Graph, action: Number) -> ActionReadiness {
+        var waiting = false
+        var unknown = false
+        for input in graph.inputsOf(action) {
+            if made[input.id].isSome() { continue }
+            match graph.producer(input) {
+                Some(producer) -> match phases[producer] {
+                    Failed, Blocked -> return .Blocked
+                    WouldRun -> unknown = true
+                    Unneeded, Waiting, Running, Ran, Cached -> waiting = true
+                }
+                None -> return .Blocked
+            }
+        }
+        if waiting { return .NotYet }
+        if unknown { return .Unknown }
+        return .Ready
+    }
+
+    // Keeps what `action` produced in its working directory, which goes.
+    function finish(
+        borrow mut self,
+        graph: borrow Graph,
+        action: Number,
+        place: borrow WorkPlace,
+        copied: borrow [CopiedFile]
+    ) -> Result<Void, BuildFailure> {
+        let collected = match collectOutputs(graph, action, place, copied) {
+            Ok(outputs) -> outputs
+            Error(failure) -> return .Error(failure)
+        }
+        let discovered = match discover(graph, action, place) {
+            Ok(found) -> found
+            Error(failure) -> return .Error(failure)
+        }
+        let record = ActionRecord { outputs: copy collected.outputs, discovered: discovered }
+        keys[action] = try keepActionVariant(keys[action], record)
+        produced(graph, action, record)
+        phases[action] = .Ran
+        remember(graph, action)
+        return clearPath(place.directory)
+    }
+
+    function remember(borrow self, graph: borrow Graph, action: Number) {
+        match keepLast(graph, action) {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+    }
+
+    function fail(
+        borrow mut self,
+        graph: borrow Graph,
+        action: Number,
+        failure: borrow BuildFailure,
+        command: borrow String,
+        directory: borrow String
+    ) {
+        phases[action] = .Failed
+        reportFailure(graph, action, failure, command, directory)
+    }
+
+}
+
+// Whether a running command holds the workspace `action` runs in.
+function workspaceBusy(
+    graph: borrow Graph,
+    action: Number,
+    running: borrow [RunningCommand]
+) -> Bool {
+    let name = match graph.actions[action] {
+        Run(command) -> copy command.workspace
+        Native(native) -> ""
+    }
+    if name.count == 0 { return false }
+    for entry in running {
+        match graph.actions[entry.action] {
+            Run(command) -> {
+                if command.workspace == name { return true }
+            }
+            Native(native) -> {}
+        }
+    }
+    return false
+}

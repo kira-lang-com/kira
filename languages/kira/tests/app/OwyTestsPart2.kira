@@ -1,0 +1,376 @@
+import Foundation
+
+// Migrated from tests/pass/run/ownership_* and consuming_* corpus cases.
+// See tests-kik/corpus/ownership-b/SKIPPED.md for cases that depend on
+// @Widget body/children builder syntax and could not be reduced.
+
+// ---- ownership_recursive_closure_tree_parity ----
+
+struct OwyClosureNode13 {
+    let id: Int
+    let onPress: (Int) -> Int
+    let children: [OwyClosureNode13]
+}
+
+function owyMakeAdder13(base: Int) -> (Int) -> Int {
+    return { n in
+        return base + n
+    }
+}
+
+function owyMakeLeaf13(id: Int) -> OwyClosureNode13 {
+    return OwyClosureNode13 { id: id, onPress: owyMakeAdder13(id), children: [] }
+}
+
+function owyMakeBranch13(id: Int) -> OwyClosureNode13 {
+    var children: [OwyClosureNode13] = []
+    children.append(owyMakeLeaf13(id + 10))
+    children.append(owyMakeLeaf13(id + 20))
+    return OwyClosureNode13 { id: id, onPress: owyMakeAdder13(id), children: move children }
+}
+
+function owyMakeTree13(seed: Int) -> OwyClosureNode13 {
+    var children: [OwyClosureNode13] = []
+    children.append(owyMakeBranch13(seed + 100))
+    children.append(owyMakeBranch13(seed + 200))
+    return OwyClosureNode13 { id: seed, onPress: owyMakeAdder13(seed), children: move children }
+}
+
+function owyVisit13(node: borrow OwyClosureNode13) -> Int {
+    var total = node.onPress(1)
+    for i in 0..node.children.count {
+        total = total + owyVisit13(node.children[i])
+    }
+    return total
+}
+
+@Test
+function owyRecursiveClosureTreeParity() {
+    var total = 0
+    for rebuild in 0..20 {
+        let tree = owyMakeTree13(rebuild)
+        total = total + owyVisit13(tree)
+    }
+    let got = total
+    expect!(got == 20670)
+}
+
+// ---- ownership_string_deep_value_parity ----
+
+struct OwyLabel14 {
+    var text: String = ""
+    var hits: Int = 0
+}
+
+struct OwyPanel14 {
+    var title: String = ""
+    var label: OwyLabel14 = OwyLabel14 {}
+}
+
+enum OwyMessage14 {
+    Note(String)
+    Empty
+}
+
+function owyDescribe14(name: String) -> String {
+    return "name:" + name
+}
+
+function owyPickBranch14(flag: Bool) -> String {
+    var s = "init"
+    if flag {
+        s = "left-" + "branch"
+    } else {
+        s = "right-" + "branch"
+    }
+    return s
+}
+
+function owyLabelText14(l: borrow OwyLabel14) -> String {
+    return l.text
+}
+
+function owyUnwrap14(m: OwyMessage14) -> String {
+    match m {
+        Note(text) -> { return text }
+        Empty -> { return "empty" }
+    }
+    return "unreachable"
+}
+
+@Test
+function owyStringDeepValueParity() {
+    var okCount = 0
+    var panel = OwyPanel14 {}
+    for i in 0..10 {
+        panel.title = "frame-" + "title"
+        panel.label.text = owyDescribe14("inner")
+        panel.label.hits = panel.label.hits + 1
+    }
+    if panel.title == "frame-title" {
+        okCount = okCount + 1
+    }
+    if panel.label.text == "name:inner" {
+        okCount = okCount + 1
+    }
+    if owyLabelText14(panel.label) == "name:inner" {
+        okCount = okCount + 1
+    }
+
+    let snapshot = panel.title
+    panel.title = "replaced"
+    if snapshot == "frame-title" {
+        okCount = okCount + 1
+    }
+    if panel.title == "replaced" {
+        okCount = okCount + 1
+    }
+
+    var names: [String] = []
+    for j in 0..10 {
+        names.append("n" + "x")
+    }
+    names[0] = "first-" + "slot"
+    if names[0] == "first-slot" {
+        okCount = okCount + 1
+    }
+    names[0] = "overwritten"
+    if names[0] == "overwritten" {
+        okCount = okCount + 1
+    }
+    if names[1] == "nx" {
+        okCount = okCount + 1
+    }
+    if names.count == 10 {
+        okCount = okCount + 1
+    }
+
+    let m: OwyMessage14 = .Note("payload-" + "text")
+    if owyUnwrap14(move m) == "payload-text" {
+        okCount = okCount + 1
+    }
+
+    if owyPickBranch14(true) == "left-branch" {
+        okCount = okCount + 1
+    }
+    if owyPickBranch14(false) == "right-branch" {
+        okCount = okCount + 1
+    }
+
+    var acc = ""
+    for k in 0..5 {
+        acc = acc + names[0] + "-" + panel.title
+    }
+    if acc != "" {
+        okCount = okCount + 1
+    }
+    let got = okCount
+    expect!(got == 13)
+}
+
+// ---- ownership_struct_param_move_into_array_parity ----
+
+struct OwyItem15 {
+    let v: Int
+}
+
+function owyAppendItem15(items: borrow mut [OwyItem15], item: OwyItem15) {
+    var out = items
+    out.append(move item)
+}
+
+function owyBuild15(n: Int) -> [OwyItem15] {
+    var items: [OwyItem15] = []
+    for i in 0..n {
+        owyAppendItem15(items, OwyItem15 { v: i * 2 })
+    }
+    return items
+}
+
+@Test
+function owyStructParamMoveIntoArrayParity() {
+    var total = 0
+    for frame in 0..3 {
+        let items = owyBuild15(3)
+        for i in 0..items.count {
+            total = total + items[i].v
+        }
+    }
+    let got = total
+    expect!(got == 18)
+}
+
+// ---- ownership_temporary_move_ok ----
+
+struct OwyMesh16 {
+    let id: Int
+}
+
+function owyMakeMesh16() -> OwyMesh16 {
+    return OwyMesh16 { id: 11 }
+}
+
+function owyConsume16(mesh: OwyMesh16) -> Int {
+    return mesh.id
+}
+
+@Test
+function owyTemporaryMoveOk() {
+    let got = owyConsume16(owyMakeMesh16())
+    expect!(got == 11)
+}
+
+// ---- ownership_trivial_value_no_move ----
+
+function owyAdd17(a: Int, b: Int) -> Int {
+    return a + b
+}
+
+@Test
+function owyTrivialValueNoMove() {
+    let x = 1
+    let y = owyAdd17(x, x)
+    let got = y
+    expect!(got == 2)
+}
+
+// ---- partial_move_disjoint_fields ----
+
+struct OwyPair18 {
+    let a: [Int]
+    let b: [Int]
+}
+
+function owySink18(values: [Int]) -> Int {
+    var sum = 0
+    for index in 0..values.count {
+        sum = sum + values[index]
+    }
+    return sum
+}
+
+function owyConsume18(pair: OwyPair18) -> Int {
+    let left = owySink18(move pair.a)
+    let right = owySink18(move pair.b)
+    return left + right
+}
+
+@Test
+function owyPartialMoveDisjointFields() {
+    let pair = OwyPair18 { a: [1, 2, 3], b: [10, 20] }
+    let got = owyConsume18(move pair)
+    expect!(got == 36)
+}
+
+// ---- mid_ir_disjoint_struct_field_borrows ----
+
+struct OwyCell19 { var value: Int }
+struct OwyPairCell19 { var left: OwyCell19 var right: OwyCell19 }
+
+function owyUpdateBoth19(a: borrow mut OwyCell19, b: borrow mut OwyCell19) {
+    a.value = a.value + 10
+    b.value = b.value + 20
+}
+
+@Test
+function owyMidIrDisjointStructFieldBorrows() {
+    var pair = OwyPairCell19 { left: OwyCell19 { value: 1 }, right: OwyCell19 { value: 2 } }
+    owyUpdateBoth19(pair.left, pair.right)
+    let got = pair.left.value * 100 + pair.right.value
+    expect!(got == 1122)
+}
+
+// ---- consuming_nested_field_receiver_parity ----
+
+construct OwyWidget23 {
+    @Required let body: Any OwyWidget23
+
+    function render() -> [String] {
+        return body.render()
+    }
+}
+
+construct OwyLeaf23(text: String) extends OwyWidget23 {
+    function render() -> [String] {
+        return [text]
+    }
+}
+
+struct OwyInner23 {
+    var child: some OwyWidget23
+}
+
+struct OwyOuter23 {
+    var inner: OwyInner23
+}
+
+function owyBuild23(tag: Int) -> some OwyWidget23 {
+    return OwyLeaf23(text: "n")
+}
+
+function owyConsume23(outer: OwyOuter23) -> Int {
+    let lines = outer.inner.child.render()
+    return lines.count
+}
+
+@Test
+function owyConsumingNestedFieldReceiverParity() {
+    var total = 0
+    for round in 0..10 {
+        let outer = OwyOuter23 { inner: OwyInner23 { child: owyBuild23(round) } }
+        total = total + owyConsume23(move outer)
+    }
+    let got = total
+    expect!(got == 10)
+}
+
+// ---- consuming_nested_indexed_receiver_parity ----
+
+construct OwyWidget24 {
+    @Required let body: Any OwyWidget24
+
+    function render() -> [String] {
+        return body.render()
+    }
+}
+
+construct OwyLeaf24(text: String) extends OwyWidget24 {
+    function render() -> [String] {
+        return [text]
+    }
+}
+
+function owyBuild24(tag: Int) -> some OwyWidget24 {
+    return OwyLeaf24(text: "n")
+}
+
+struct OwyInner24 {
+    var children: [some OwyWidget24]
+}
+
+struct OwyOuter24 {
+    var inner: OwyInner24
+}
+
+function owyRenderNested24(outer: OwyOuter24) -> Int {
+    var total = 0
+    for i in 0..outer.inner.children.count {
+        let lines = outer.inner.children[i].render()
+        total = total + lines.count
+    }
+    return total
+}
+
+@Test
+function owyConsumingNestedIndexedReceiverParity() {
+    var total = 0
+    for round in 0..10 {
+        var kids: [some OwyWidget24] = []
+        kids.append(owyBuild24(round))
+        kids.append(owyBuild24(round + 1))
+        let outer = OwyOuter24 { inner: OwyInner24 { children: move kids } }
+        total = total + owyRenderNested24(move outer)
+    }
+    let got = total
+    expect!(got == 20)
+}

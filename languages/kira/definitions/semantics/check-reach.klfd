@@ -1,0 +1,306 @@
+// Which bodies a check visits. It starts from the program's own functions,
+// or from the functions a compile-time evaluation runs, and follows what
+// each checked body names. Checking a call can mint a generic instance, whose
+// body is checked in turn; a lambda, task or global initializer is complete
+// when it is made, so it is only followed.
+
+function checkRoots(program: CheckedProgram, declarations: Declarations, evaluated: Optional<[String]>) -> [Int] {
+    var roots = implicitRoots(program)
+    match evaluated {
+        Some(symbols) -> {
+            for index in 0..program.functions.count {
+                for symbol in symbols { if program.functions[index].symbol == symbol { roots.append(index) } }
+            }
+        }
+        None -> {
+            // Functions past the declared ones, such as the global
+            // initializer and closures, are reached from what names them.
+            for index in 0..declarations.signatures.count {
+                let file = declarations.signatures[index].name.span.file
+                if program.builtElsewhere(index) { continue }
+                // A unit another unit calls into, or a library, builds all it
+                // declares, but a generic instance's methods only once named.
+                let everything = (program.library || program.dependencyRoot(index)) && !instanceMethod(program, declarations, index)
+                if everything || program.functions[index].entry || ownDeclaration(declarations, file) || witnessSignature(declarations, index) { roots.append(index) }
+            }
+        }
+    }
+    if program.dependencyUnit { return roots }
+    match program.globalInitializer {
+        Some(initializer) -> roots.append(initializer)
+        None -> {}
+    }
+    for root in lazyGlobalInitializers(program) { roots.append(root) }
+    // An evaluation registers no exit function (globals.klfd), so an evaluation's roots take
+    // none: following a separate package's exit function would reach callees this unit never declares.
+    if evaluated.isNone() {
+        for exit in program.exitFunctions { roots.append(exit) }
+    }
+    for root in dispatchRoots(program) { roots.append(root) }
+    // The methods the program's unit dispatches for the packages built
+    // apart, whose signatures its dispatchers take.
+    for index in 0..program.classFallbacks.count {
+        if program.classFallbacks[index] { roots.append(index) }
+    }
+    return roots
+}
+
+// Per declared function, whether a separate package declares it. A method
+// a family gives a declaration is written in the family's package but
+// belongs to the declaration's, so a method is apart only when the type it
+// belongs to is too, or its body was left to its own unit (`Elsewhere`): a
+// consumer's `extend` of this unit's type, a family's included.
+// Whether the parser skipped the body of declaration `index`, leaving it to the
+// unit of the package that declares it.
+function skippedBody(declarations: Declarations, index: Int) -> Bool {
+    if index >= declarations.signatures.count { return false }
+    return hasAttribute(declarations.signatures[index].declaration.annotations, .Elsewhere)
+}
+
+function apartFunctions(declarations: Declarations) -> [Bool] {
+    var apart: [Bool] = []
+    for signature in declarations.signatures {
+        let separate = separateDeclaration(declarations, signature.name.span.file)
+        apart.append(separate && (ownerApart(declarations, signature.owner) || hasAttribute(signature.declaration.annotations, .Elsewhere)))
+    }
+    return apart
+}
+
+// Per declared function, whether it is a method of a class a package built
+// apart declares, its own template rather than a generic class's instance:
+// a call through such a class in that package's unit reaches the classes
+// that unit sees, and any other is the program's (`classCall`).
+function classFallbackFunctions(tree: borrow SyntaxTree, declarations: Declarations) -> [Bool] {
+    var fallbacks: [Bool] = []
+    for signature in declarations.signatures {
+        var fallback = false
+        match signature.owner {
+            Some(owner) -> {
+                if owner.kind == .Structure && signature.member != "drop" {
+                    let declared = declarations.structs[owner.declaration]
+                    fallback = declared.genericBase == "Class" && !declared.specialized && builtApart(tree, declarations, declared.name.span.file)
+                }
+            }
+            None -> {}
+        }
+        fallbacks.append(fallback)
+    }
+    return fallbacks
+}
+
+function ownerApart(declarations: Declarations, owner: Optional<Type>) -> Bool {
+    match owner {
+        Some(ownerType) -> {
+            if ownerType.kind == .Structure { return separateDeclaration(declarations, declarations.structs[ownerType.declaration].name.span.file) }
+            if ownerType.kind == .Enumeration { return separateDeclaration(declarations, declarations.enums[ownerType.declaration].name.span.file) }
+            return true
+        }
+        None -> return true
+    }
+}
+
+// Per declared function, whether a unit of its own package defines it: one
+// a separate package declares, unless a generic type's instance owns it,
+// which belongs to no package and is built by every unit that names it, or
+// it runs at compile time, which needs its body where it is called. A member
+// of a family a package built apart declares is the program's own unit's
+// (`family-dispatch.klfd`), and so is a `@TypeTable` function: its rows are
+// the types the program's unit has seen (`descriptors.klfd`).
+function elsewhereFunctions(declarations: Declarations, apart: [Bool], dispatchers: [Bool], dependencyUnit: Bool) -> [Bool] {
+    var elsewhere: [Bool] = []
+    for index in 0..declarations.signatures.count {
+        let signature = declarations.signatures[index]
+        let comptime = hasAttribute(signature.declaration.annotations, .Comptime)
+        if dispatchers[index] || hasAttribute(signature.declaration.annotations, .TypeTable) {
+            elsewhere.append(dependencyUnit)
+        } else {
+            elsewhere.append(apart[index] && !instanceMember(declarations, signature) && !comptime)
+        }
+    }
+    return elsewhere
+}
+
+// What the program's own unit defines for the members of the families
+// packages built apart declare: each member, and every method and default
+// it calls.
+function dispatchRoots(program: CheckedProgram) -> [Int] {
+    var roots: [Int] = []
+    for dispatch in program.familyDispatches {
+        roots.append(dispatch.dispatcher)
+        for target in dispatch.targets { if target >= 0 { roots.append(target) } }
+        if dispatch.fallback >= 0 { roots.append(dispatch.fallback) }
+    }
+    return roots
+}
+
+// The modules of the packages built apart that see `Any`: its own, and every
+// one depending on it.
+function boxingModules(tree: borrow SyntaxTree, declarations: Declarations) -> [String] {
+    var modules: [String] = []
+    for structType in declarations.structs {
+        if structType.name.text != "Any" || structType.specialized { continue }
+        let position = declarations.sourcePosition(structType.name.span.file)
+        if position < 0 { continue }
+        let any = declarations.sources[position].module
+        for index in 0..tree.modules.count {
+            let module = tree.modules[index]
+            if !module.separate { continue }
+            var sees = index == any
+            for library in module.libraries { if library == any { sees = true } }
+            if sees { modules.append(module.name) }
+        }
+    }
+    return modules
+}
+
+function separateDeclaration(declarations: Declarations, file: Int) -> Bool {
+    let position = declarations.sourcePosition(file)
+    if position < 0 { return false }
+    return declarations.modules[declarations.sources[position].module].separate
+}
+
+function instanceMember(declarations: Declarations, signature: Signature) -> Bool {
+    match signature.owner {
+        Some(owner) -> {
+            if owner.kind == .Structure { return declarations.structs[owner.declaration].specialized }
+            if owner.kind == .Enumeration { return declarations.enums[owner.declaration].specialized }
+            return false
+        }
+        None -> return false
+    }
+}
+
+// Whether a witness table or a trait object's call reaches signature
+// `index` whatever the program names: a member of a crossing family's trait
+// object, whose every member the trait the program writes lists, or a
+// function a table names (`witnesses.klfd`). Each carries its role; a
+// method an `extend` of the family adds is reached as any function is.
+function witnessSignature(declarations: Declarations, index: Int) -> Bool {
+    return hasAttribute(declarations.signatures[index].declaration.annotations, .Witness)
+}
+
+// Whether `file` belongs to the program being built rather than a package it
+// depends on.
+function ownDeclaration(declarations: Declarations, file: Int) -> Bool {
+    let position = declarations.sourcePosition(file)
+    if position < 0 { return true }
+    return declarations.modules[declarations.sources[position].module].package == ""
+}
+
+struct CheckQueue {
+    var functions: [Int]
+    var checkable: [Bool]
+    var scanned: Int
+}
+
+extend Checker {
+    function checkReached(borrow mut self, roots: [Int], sourceCount: Int) {
+        var queue = CheckQueue { functions = roots, checkable = [], scanned = 0 }
+        for index in 0..sourceCount { queue.checkable.append(true) }
+        // The instance methods a library or a dependency unit minted before
+        // the check began wait to be named, as later ones do (`checkRoots`).
+        if program.library || program.dependencyUnit {
+            for index in 0..sourceCount {
+                if index < declarations.signatures.count && instanceMethod(program, declarations, index) { deferredMinted.append(index) }
+            }
+        }
+        queue = gathered(move queue)
+        var checked: [Bool] = []
+        var visited = 0
+        while visited < queue.functions.count {
+            let next = queue.functions[visited]
+            visited += 1
+            while checked.count < program.functions.count { checked.append(false) }
+            if checked[next] { continue }
+            checked[next] = true
+            // A body the parser skipped (`@Elsewhere`) is another unit's to check, so this
+            // unit never checks it, even where the package it is in is not apart here.
+            if program.builtElsewhere(next) || skippedBody(declarations, next) {
+                declareParameters(next)
+            } else if next < queue.checkable.count && queue.checkable[next] {
+                checkFunction(next)
+            }
+            queue = gathered(move queue)
+            while checked.count < program.functions.count { checked.append(false) }
+            for again in rechecks {
+                if checked[again] {
+                    checked[again] = false
+                    queue.functions.append(again)
+                }
+            }
+            rechecks = []
+        }
+        // A deferred minted method nothing named is never checked; a library
+        // build, which lowers every function it has, leaves it out.
+        for minted in deferredMinted {
+            if minted < checked.count && checked[minted] { continue }
+            while program.uncheckedMinted.count <= minted { program.uncheckedMinted.append(false) }
+            program.uncheckedMinted[minted] = true
+        }
+        deferredMinted = []
+    }
+
+    // `queue` with what the expressions added since its last scan name, and
+    // the generic instances minted meanwhile.
+    function gathered(borrow mut self, move queue: CheckQueue) -> CheckQueue {
+        var next = move queue
+        for index in next.scanned..program.expressions.count {
+            for target in operationTargets(program, members, program.expressions[index].operation) { next.functions.append(target) }
+        }
+        next.scanned = program.expressions.count
+        while next.checkable.count < program.functions.count { next.checkable.append(false) }
+        for minted in pending {
+            next.checkable[minted] = true
+            if checkedWhenMinted(minted) { next.functions.append(minted) } else { deferredMinted.append(minted) }
+        }
+        pending = []
+        return next
+    }
+
+    // Whether a minted function is checked as soon as it exists rather than
+    // once a checked body names it. A method of a generic type's instance
+    // waits to be named: `Optional<Value>.or` copies its value, so checking
+    // it for an instance whose payload runs `drop` would refuse a method
+    // nobody calls. What lowering reaches without a name stays eager: `drop`,
+    // the methods of a class or of an instance that claims a trait, and a
+    // method a family's witness table or dispatcher names, such as the
+    // `describe` of `Picker<String>` when `Picker` is a generic construct of
+    // a family a package built apart declares (`family-dispatch.klfd`).
+    function checkedWhenMinted(borrow self, minted: Int) -> Bool {
+        let signature = declarations.signatures[minted]
+        match signature.owner {
+            Some(owner) -> {
+                if signature.member == "drop" || isClassType(program, owner) || witnessSignature(declarations, minted) { return true }
+                for conformance in tree.conformances {
+                    if isCompilerKnownTrait(conformance.traitName.name.text) || !isTemplateReference(tree, conformance.owner) { continue }
+                    if instanceArguments(declarations, owner, conformance.owner.name.text).isSome() { return true }
+                }
+                return false
+            }
+            None -> return true
+        }
+    }
+}
+
+// A method of a generic struct's or enum's instance, other than its
+// `drop`: a library checks it once a body names it, as a program does,
+// since `Optional<Value>.or` copies and a payload may run `drop`.
+function instanceMethod(program: CheckedProgram, declarations: Declarations, index: Int) -> Bool {
+    let signature = declarations.signatures[index]
+    match signature.owner {
+        Some(owner) -> {
+            if signature.member == "drop" || isClassType(program, owner) { return false }
+            if owner.kind == .Structure { return program.structs[owner.declaration].typeArguments.count > 0 }
+            if owner.kind == .Enumeration { return program.enums[owner.declaration].typeArguments.count > 0 }
+            return false
+        }
+        None -> return false
+    }
+}
+
+extend CheckedProgram {
+    // A generic instance's method nothing named, so never checked.
+    function neverChecked(borrow self, index: Int) -> Bool {
+        return index < uncheckedMinted.count && uncheckedMinted[index]
+    }
+}

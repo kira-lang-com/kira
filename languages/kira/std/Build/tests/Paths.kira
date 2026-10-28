@@ -1,0 +1,37 @@
+import Foundation
+
+// Paths: joining, the parent and last name of a path, names made safe for a
+// target, and whether a path lies under another.
+
+@Test
+function pathsJoinWithOneSeparator() {
+    expect!((joinPath("a", "b")) == "a/b")
+    expect!((joinPath("a/", "b")) == "a/b")
+    expect!((joinPath("a", "/b")) == "/b")
+}
+
+@Test
+function parentAndLastNameOfAPath() {
+    expect!((parentPath("a/b/c")) == "a/b")
+    expect!((parentPath("/a")) == "/")
+    expect!((parentPath("a")) == ".")
+    expect!((lastName("a/b/c")) == "c")
+}
+
+@Test
+function namesAreMadeSafeForATarget() {
+    expect!((pathSafe("compile Shop (x86)")) == "compile_Shop__x86_")
+}
+
+@Test
+function placeablePathsStayInsideTheirRoot() {
+    expect!((String(placeablePath("lib/x"))) == "true")
+    expect!((String(placeablePath("../x"))) == "false")
+    expect!((String(placeablePath("outputs/x"))) == "false")
+}
+
+@Test
+function pathUnderRequiresAWholeComponent() {
+    expect!((String(pathUnder("a/b", "a"))) == "true")
+    expect!((String(pathUnder("ab", "a"))) == "false")
+}

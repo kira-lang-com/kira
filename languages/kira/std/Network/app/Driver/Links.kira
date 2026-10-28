@@ -1,0 +1,391 @@
+import Foundation
+
+// TCP connections, with TLS over them unless they are cleartext, each
+// carrying HTTP/1.1 (DESIGN.md section 7.4). The poller reports edges, so
+// every readiness drains the socket both ways until it would block.
+
+struct TcpLink {
+    // The poller token, and the key requests name the link by.
+    let id: Number
+    let socket: TcpStream
+    var tls: TlsStream?
+    // The key a client link serves requests for; empty on a server.
+    let origin: String
+    let server: ServerId?
+    let peer: String
+    var reader: Http1Reader
+    // Bytes for the socket that it has not taken yet.
+    var outgoing: [UN8] = []
+    // The socket can be written: a client's connect finished.
+    var writable: Bool = false
+    // A client's request on the wire, until its response ends.
+    var current: RequestId? = .None
+    // A response ended on it, so it was good, and a request waiting when
+    // it closes deserves a new connection rather than a failure.
+    var answered: Bool = false
+    // Bytes came from the peer.
+    var heard: Bool = false
+    // The peer said `connection: close`: no further message.
+    var closeAfter: Bool = false
+    // Close once `outgoing` is sent.
+    var finishing: Bool = false
+    var closed: Bool = false
+}
+
+// A TCP listener serving HTTP/1.1 for one server.
+struct TcpListening {
+    let socket: TcpListener
+    let token: Number
+    let server: ServerId
+    let identity: TlsServerIdentity
+    // Each response advertises HTTP/3 on this port when the server speaks it.
+    let altService: String?
+}
+
+namespace LinkLimit {
+    let receiveRoom: Number = 65536
+    let backlog: Number = 128
+    let alpn: String = "http/1.1"
+}
+
+extend Network {
+    function linkIndex(borrow self, key: Number) -> Number? {
+        for (index, link) in links.enumerated() {
+            if link.id == key { return .Some(index) }
+        }
+        return .None
+    }
+
+    // A readiness for a link or a listener; false when the token is
+    // neither.
+    function takeTcpReadiness(borrow mut self, token: Number, event: borrow NetEvent) -> Bool {
+        for index in 0..listeners.count {
+            if listeners[index].token == token {
+                acceptLinks(index)
+                return true
+            }
+        }
+        let index = match linkIndex(token) {
+            Some(value) -> value
+            None -> return false
+        }
+        // A connect that fails reports an error or a hang-up before the
+        // socket was ever writable.
+        if !links[index].writable && (event.failed() || event.closed()) {
+            closeLink(index, .Connect(.Refused))
+            return true
+        }
+        if event.writable() { links[index].writable = true }
+        if event.readable() || event.closed() { drainLink(index) }
+        if event.failed() && !links[index].closed { closeLink(index, .Closed) }
+        if !links[index].closed { flushLink(index) }
+        return true
+    }
+
+    function acceptLinks(borrow mut self, listener: Number) {
+        while true {
+            let next = listeners[listener].socket.accept()
+            let accepted = match next {
+                Ok(value) -> value
+                Error(failure) -> {
+                    absorb failure
+                    return
+                }
+            }
+            let token = takeToken()
+            match poller.watch(accepted.stream.handle, .Both, token) {
+                Ok -> {}
+                Error(failure) -> {
+                    absorb failure
+                    match accepted.stream.close() {
+                        Ok -> {}
+                        Error(failure) -> absorb failure
+                    }
+                    continue
+                }
+            }
+            let tls = tlsServer(
+                TlsServerSettings {
+                    carrier: .Records,
+                    identity: copy listeners[listener].identity,
+                    protocols: [LinkLimit.alpn]
+                }
+            )
+            links.append(
+                TcpLink {
+                    id: token,
+                    socket: accepted.stream,
+                    tls: .Some(tls),
+                    origin: "",
+                    server: .Some(listeners[listener].server),
+                    peer: copy accepted.peer,
+                    reader: http1Reader(.Request, "https"),
+                    writable: true
+                }
+            )
+        }
+    }
+
+    // A client link to `peer`; TLS names `host` unless `secure` is off.
+    function openLink(
+        borrow mut self,
+        key: borrow String,
+        host: borrow String,
+        peer: borrow String,
+        secure: Bool
+    ) -> Result<Number, HttpFailure> {
+        let socket = match connectTcp(peer) {
+            Ok(value) -> value
+            Error(failure) -> return .Error(.Connect(failure))
+        }
+        let token = takeToken()
+        match poller.watch(socket.handle, .Both, token) {
+            Ok -> {}
+            Error(failure) -> {
+                match socket.close() {
+                    Ok -> {}
+                    Error(failure) -> absorb failure
+                }
+                return .Error(.Connect(failure))
+            }
+        }
+        var tls: TlsStream? = .None
+        var outgoing: [UN8] = []
+        if secure {
+            let settings = TlsClientSettings {
+                carrier: .Records,
+                serverName: copy host,
+                protocols: [LinkLimit.alpn],
+                seconds: floor(unixMillis() / DriverLimit.millisecondsPerSecond),
+                anchors: copy options.anchors
+            }
+            var stream = match tlsClient(move settings) {
+                Ok(value) -> value
+                Error(alert) -> {
+                    match socket.close() {
+                        Ok -> {}
+                        Error(failure) -> absorb failure
+                    }
+                    return .Error(.Tls(alert))
+                }
+            }
+            outgoing = stream.transmit()
+            tls = .Some(stream)
+        }
+        links.append(
+            TcpLink {
+                id: token,
+                socket: socket,
+                tls: tls,
+                origin: copy key,
+                server: .None,
+                peer: copy peer,
+                reader: http1Reader(.Response, secure ? "https" : "http"),
+                outgoing: outgoing
+            }
+        )
+        return .Ok(token)
+    }
+
+    // Whether the link can carry HTTP: TLS finished, or none at all.
+    function linkOpen(borrow self, index: Number) -> Bool {
+        return match links[index].tls {
+            Some(stream) -> stream.isOpen()
+            None -> true
+        }
+    }
+
+    function drainLink(borrow mut self, index: Number) {
+        while !links[index].closed {
+            let received = links[index].socket.receive(LinkLimit.receiveRoom)
+            let bytes = match received {
+                Ok(value) -> value
+                Error(failure) -> {
+                    match failure {
+                        WouldBlock -> {}
+                        // Nothing came yet, so the connection never stood.
+                        Refused, Unreachable, AddressInUse, InvalidHandle, InvalidAddress, TimedOut, Reset, NotFound, Io -> {
+                            let ended: HttpFailure = links[index].heard ? .Closed : .Connect(
+                                copy failure
+                            )
+                            closeLink(index, move ended)
+                        }
+                    }
+                    return
+                }
+            }
+            if bytes.count == 0 { return linkEnded(index) }
+            links[index].heard = true
+            takeLinkBytes(index, bytes)
+        }
+    }
+
+    // TCP bytes through TLS, then into HTTP/1.1.
+    function takeLinkBytes(borrow mut self, index: Number, bytes: borrow [UN8]) {
+        let wasOpen = linkOpen(index)
+        var plain = copy bytes
+        match links[index].tls {
+            Some(stream) -> {
+                var tls = stream
+                let outcome = tls.receive(bytes)
+                links[index].outgoing.appendAll(tls.transmit())
+                plain = tls.read()
+                links[index].tls = .Some(tls)
+                match outcome {
+                    Ok -> {}
+                    Error(alert) -> {
+                        flushLink(index)
+                        return closeLink(index, .Tls(alert))
+                    }
+                }
+            }
+            None -> {}
+        }
+        if !wasOpen && linkOpen(index) && links[index].server.isNone() { startLink(index) }
+        if plain.count == 0 { return }
+        match links[index].reader.feed(plain) {
+            Ok -> takeHttp1(index)
+            Error(failure) -> {
+                takeHttp1(index)
+                closeLink(index, http1Failure(failure))
+            }
+        }
+    }
+
+    // The peer closed its side: a message running to the close ends.
+    function linkEnded(borrow mut self, index: Number) {
+        match links[index].reader.finish() {
+            Ok -> {
+                takeHttp1(index)
+                closeLink(index, .Closed)
+            }
+            Error(failure) -> {
+                takeHttp1(index)
+                closeLink(index, http1Failure(failure))
+            }
+        }
+    }
+
+    // HTTP bytes for the link, through TLS when it has it.
+    function sendOnLink(
+        borrow mut self,
+        index: Number,
+        bytes: borrow [UN8]
+    ) -> Result<Void, HttpFailure> {
+        match links[index].tls {
+            Some(stream) -> {
+                var tls = stream
+                match tls.write(bytes) {
+                    Ok -> {}
+                    Error(alert) -> return .Error(.Tls(alert))
+                }
+                links[index].outgoing.appendAll(tls.transmit())
+                links[index].tls = .Some(tls)
+            }
+            None -> links[index].outgoing.appendAll(bytes)
+        }
+        return .Ok
+    }
+
+    // Sends what link `index` has queued, each send starting where the last
+    // stopped, and drops what went out once, when the socket takes no more.
+    function flushLink(borrow mut self, index: Number) {
+        if !links[index].writable || links[index].closed { return }
+        var offset: Number = 0
+        while offset < links[index].outgoing.count {
+            let sent = links[index].socket.sendFrom(links[index].outgoing, offset)
+            match sent {
+                Ok(count) -> offset += count
+                Error(failure) -> {
+                    match failure {
+                        WouldBlock -> {
+                            links[index].outgoing = byteRun(
+                                links[index].outgoing,
+                                offset,
+                                links[index].outgoing.count
+                            )
+                        }
+                        // Nothing came yet, so the connection never stood.
+                        Refused, Unreachable, AddressInUse, InvalidHandle, InvalidAddress, TimedOut, Reset, NotFound, Io -> {
+                            let ended: HttpFailure = links[index].heard ? .Closed : .Connect(
+                                copy failure
+                            )
+                            closeLink(index, move ended)
+                        }
+                    }
+                    return
+                }
+            }
+        }
+        links[index].outgoing = []
+        if links[index].finishing { closeLink(index, .Closed) }
+    }
+
+    // Closes link `index`; requests it carried end with `failure`, and
+    // those still waiting for it go to a new connection.
+    function closeLink(borrow mut self, index: Number, failure: HttpFailure) {
+        if links[index].closed { return }
+        log warn(
+            category: NetworkLog.Session,
+            "link closed with a failure",
+            link: index,
+            failure: failure
+        )
+        links[index].closed = true
+        match links[index].tls {
+            Some(stream) -> {
+                var tls = stream
+                tls.close()
+                absorb links[index].socket.send(tls.transmit())
+            }
+            None -> {}
+        }
+        absorb links[index].socket.close()
+        let key = links[index].id
+        match links[index].current {
+            Some(id) -> {
+                match requestIndex(id) {
+                    Some(request) -> endRequest(request, Fields {}, .Some(copy failure))
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+        var kept: [ServerRequest] = []
+        for request in served {
+            if request.session != key { kept.append(copy request) }
+        }
+        served = kept
+        var waiting: [RequestId] = []
+        for position in 0..requests.count {
+            if requests[position].session == .Some(key) {
+                requests[position].session = .None
+                waiting.append(requests[position].id)
+            }
+        }
+        let retry = links[index].answered
+        for id in waiting {
+            if retry {
+                routeRequest(id)
+            } else {
+                endRequestId(id, .Some(copy failure))
+            }
+        }
+    }
+
+    function sweepLinks(borrow mut self) {
+        var kept: [TcpLink] = []
+        for link in links {
+            if !link.closed { kept.append(copy link) }
+        }
+        links = kept
+    }
+}
+
+function http1Failure(failure: borrow Http1Failure) -> HttpFailure {
+    return match failure {
+        Malformed -> .Protocol(code(Http3Error.MessageError))
+        TooLarge -> .TooLarge(Http1.headLimit)
+        Incomplete -> .Closed
+    }
+}

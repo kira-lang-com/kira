@@ -1,0 +1,666 @@
+// `Number`, the exact decimal. The checker calls these for its operators and
+// conversions. Sums, differences, products and orderings that stay within one
+// word are done here; the rest goes to the `klfsvc_number` service, numbered as
+// it numbers its operations.
+
+// The two words a `Number` is: `mantissa * 10^-scale`, the scale at most
+// eighteen and without trailing fractional zeros. The mantissa is 65 bits,
+// every `Int` and every `U64`. One that fits an `Int` is the first word, and
+// the second is the scale. One past it sets `NumberWord.extended` in the second
+// word, and the first holds its low 64 bits: a `U64` past `Int`'s largest as
+// those bits, a mantissa below `Int`'s smallest as that `U64` less 2^64.
+// Such a value always goes through the service.
+struct NumberWords {
+    let mantissa: Int
+    let scale: Int
+}
+
+namespace NumberWord {
+    // The bit of the second word set when the mantissa does not fit an `Int`.
+    let extended: Int = 256
+    // The most fractional digits a number keeps.
+    let scale: Int = 18
+    // The bits of the second word that hold the scale.
+    let scaleBits: Int = 255
+    // The second word the service answers with when an operation failed: this
+    // plus the failure's code.
+    let failed: Int = 32
+}
+
+// The service's operations, as `klfsvc_number` numbers them. The checker
+// passes the code. The math functions follow from `Math`, each at its
+// `MathOperation` code past it, so the set is open here.
+@Open
+enum NumberOperation: Int {
+    Add = 0
+    Subtract = 1
+    Multiply = 2
+    Divide = 3
+    Negate = 4
+    Order = 5
+    ToInt = 7
+    FromFloat = 8
+    ToFloat = 9
+    ToUnsigned = 10
+    And = 11
+    Or = 12
+    Xor = 13
+    ShiftLeft = 14
+    ShiftRight = 15
+    Math = 32
+    // `MathOperation.Remainder` past `Math`, the code `%` is checked to.
+    Remainder = 58
+}
+
+// Why the service refused an operation, by the code it answers.
+@Open
+enum NumberFailure: Int {
+    Overflow = 1
+    DivideByZero = 2
+    NotANumber = 3
+    OutsideDomain = 4
+}
+
+// One operation on two numbers' words. The answer's first word comes back;
+// `kernelNumberSecond` hands over the second, a scale, or 32 plus an error
+// code in its low byte.
+@Service("klfsvc_number")
+function kernelNumber(operation: Int, left: Int, leftScale: Int, right: Int, rightScale: Int) -> Int
+
+@Service("klfsvc_number_second")
+function kernelNumberSecond() -> Int
+
+function numberFailed(failure: NumberFailure) {
+    numberFailedOn(failure, "")
+}
+
+// The failure, and after it `detail`, the operation that failed and on what,
+// when the caller knows: an overflow alone names neither.
+function numberFailedOn(failure: NumberFailure, detail: borrow String) {
+    let said = match failure {
+        DivideByZero -> "Number divided by zero"
+        NotANumber -> "text does not read as a Number"
+        OutsideDomain -> "Number outside the operation's domain"
+        // An unknown code is a failure this Foundation predates; the
+        // mantissa overflowing is the one left.
+        else -> "Number overflowed its mantissa"
+    }
+    printError(detail.isEmpty() ? said : said + ": " + detail)
+    runtimeTrap()
+}
+
+// `a` and `b` as the failure shows them, read from their words without the
+// service, which has just failed.
+function numberWordsShown(words: borrow NumberWords) -> String {
+    let scale = words.scale & NumberWord.scaleBits
+    if scale == 0 { return "\(words.mantissa)" }
+    return "\(words.mantissa)e-\(scale)"
+}
+
+// The operation `operation` codes, by name where it has one.
+function numberOperationShown(operation: Int) -> String {
+    if operation >= code(NumberOperation.Math) {
+        return "math function \(operation - code(NumberOperation.Math))"
+    }
+    return traceText(fromCode<NumberOperation>(operation))
+}
+
+function serviceWord(
+    operation: borrow NumberOperation,
+    a: borrow NumberWords,
+    b: borrow NumberWords
+) -> Int {
+    return kernelNumber(code(operation), a.mantissa, a.scale, b.mantissa, b.scale)
+}
+
+// The service's answer whose first word is `first`.
+function numberAnswer(first: Int) -> Number {
+    let second = kernelNumberSecond()
+    let low = second & NumberWord.scaleBits
+    if low >= NumberWord.failed { numberFailed(fromCode<NumberFailure>(low - NumberWord.failed)) }
+    return numberFromWords(NumberWords(first, second))
+}
+
+// The answer to `operation` on `a` and `b`, whose first word is `first`; a
+// failure names the operation and both operands.
+function numberAnswerOf(
+    first: Int,
+    operation: Int,
+    a: borrow NumberWords,
+    b: borrow NumberWords
+) -> Number {
+    let second = kernelNumberSecond()
+    let low = second & NumberWord.scaleBits
+    if low >= NumberWord.failed {
+        numberFailedOn(
+            fromCode<NumberFailure>(low - NumberWord.failed),
+            "\(numberOperationShown(operation)) of \(numberWordsShown(a)) and \(numberWordsShown(b))"
+        )
+    }
+    return numberFromWords(NumberWords(first, second))
+}
+
+function numberService(operation: Int, left: Number, right: Number) -> Number {
+    let a = numberWords(left)
+    let b = numberWords(right)
+    return numberAnswerOf(
+        kernelNumber(operation, a.mantissa, a.scale, b.mantissa, b.scale),
+        operation,
+        a,
+        b
+    )
+}
+
+// `mantissa * 10^-scale` with its trailing fractional zeros shed.
+function numberShed(mantissa: Int, scale: Int) -> Number {
+    var m = mantissa
+    var s = scale
+    while s > 0 && m % 10 == 0 {
+        m = m / 10
+        s = s - 1
+    }
+    return numberFromWords(NumberWords(m, s))
+}
+
+// `operation`, the checker's code for a `NumberOperation`, on two numbers.
+// Counters, offsets, indexes and sizes are whole: their sums, differences,
+// products and exact quotients and remainders that stay within one word are
+// done here, without the aligning, long division and shedding a fraction
+// needs. This path is inlined at each operator, where `operation` is a
+// constant and only its own arm is left.
+function numberArithmetic(operation: Int, left: Number, right: Number) -> Number {
+    let a = numberWords(left)
+    let b = numberWords(right)
+    if (a.scale | b.scale) == 0 {
+        let x = a.mantissa
+        let y = b.mantissa
+        match fromCode<NumberOperation>(operation) {
+            Add -> {
+                let sum = wrappingAdd(x, y)
+                // The sum overflowed when both operands have the sign it lacks.
+                if ((x ^ sum) & (y ^ sum)) >= 0 { return numberFromWords(NumberWords(sum, 0)) }
+            }
+            Subtract -> {
+                let difference = wrappingSub(x, y)
+                if ((x ^ y) & (x ^ difference)) >= 0 {
+                    return numberFromWords(NumberWords(difference, 0))
+                }
+            }
+            Multiply -> {
+                if within(x, NumberWhole.factor) && within(y, NumberWhole.factor) {
+                    return numberFromWords(NumberWords(x * y, 0))
+                }
+            }
+            Remainder -> {
+                if y != 0 && y != -1 { return numberFromWords(NumberWords(x % y, 0)) }
+            }
+            Divide -> {
+                if y != 0 && y != -1 && x % y == 0 {
+                    return numberFromWords(NumberWords(x / y, 0))
+                }
+            }
+            // Bits and shifts, and the service's own operations.
+            else -> {}
+        }
+    }
+    return numberArithmeticWorked(operation, a.mantissa, a.scale, b.mantissa, b.scale)
+}
+
+// Every case the whole-number path above leaves, kept apart so that path
+// stays small enough to inline at each operator. It takes the words, not the
+// structs, so the inlined path keeps them in registers.
+function numberArithmeticWorked(
+    operation: Int,
+    leftMantissa: Int,
+    leftScale: Int,
+    rightMantissa: Int,
+    rightScale: Int
+) -> Number {
+    let named = fromCode<NumberOperation>(operation)
+    let a = NumberWords(leftMantissa, leftScale)
+    let b = NumberWords(rightMantissa, rightScale)
+    match numberInWord(named, a, b) {
+        Some(answer) -> return answer
+        None -> return numberAnswerOf(serviceWord(named, a, b), operation, a, b)
+    }
+}
+
+// The answer when it fits a word, worked out without the service. An
+// extended mantissa's second word is past the largest scale, so it never
+// matches a scale here.
+function numberInWord(
+    operation: borrow NumberOperation,
+    a: borrow NumberWords,
+    b: borrow NumberWords
+) -> Number? {
+    let sameScale = a.scale == b.scale && a.scale <= NumberWord.scale
+    let whole = (a.scale | b.scale) == 0
+    match operation {
+        Add, Subtract -> {
+            if a.scale > NumberWord.scale || b.scale > NumberWord.scale { return .None }
+            match numberAligned(a, b) {
+                Some(aligned) -> return numberSum(operation, aligned)
+                None -> return .None
+            }
+        }
+        Divide -> {
+            if a.scale > NumberWord.scale || b.scale > NumberWord.scale { return .None }
+            return numberQuotient(a, b)
+        }
+        Remainder -> {
+            if a.scale > NumberWord.scale || b.scale > NumberWord.scale { return .None }
+            return numberRemainder(a, b)
+        }
+        Multiply -> {
+            let bound = NumberWhole.factor
+            if a.scale + b.scale > NumberWord.scale || !within(a.mantissa, bound) || !within(
+                b.mantissa,
+                bound
+            ) { return .None }
+            return .Some(numberShed(a.mantissa * b.mantissa, a.scale + b.scale))
+        }
+        And, Or, Xor -> {
+            if !whole { return .None }
+            return .Some(numberBits(operation, a, b))
+        }
+        ShiftLeft -> {
+            if !whole || b.mantissa < 0 || b.mantissa >= 63 { return .None }
+            let shifted = a.mantissa << b.mantissa
+            if shifted >> b.mantissa != a.mantissa { return .None }
+            return .Some(numberFromWords(NumberWords(shifted, 0)))
+        }
+        ShiftRight -> {
+            if !whole || b.mantissa < 0 || b.mantissa >= 64 { return .None }
+            return .Some(numberFromWords(NumberWords(a.mantissa >> b.mantissa, 0)))
+        }
+        // The rest always go to the service.
+        else -> return .None
+    }
+}
+
+function within(value: Int, bound: Int) -> Bool {
+    return value <= bound && value >= 0 - bound
+}
+
+namespace NumberWhole {
+    // Two factors within this bound, the square root of `Int`'s largest,
+    // make a product that fits a word.
+    let factor: Int = 3037000499
+}
+
+// The largest magnitude that takes one more decimal digit within a word.
+namespace NumberDigit {
+    let room: Int = 922337203685477579
+}
+
+function magnitude(value: Int) -> Int {
+    if value < 0 { return 0 - value }
+    return value
+}
+
+// `mantissa * 10^digits`, when it fits a word.
+function scaledUp(mantissa: Int, digits: Int) -> Int? {
+    var scaled = mantissa
+    for _ in 0..digits {
+        if !within(scaled, NumberDigit.room) { return .None }
+        scaled = scaled * 10
+    }
+    return .Some(scaled)
+}
+
+// Both mantissas at the wider scale, as the service aligns them, and that
+// scale; none when either leaves a word. `max` and `min` take numbers, so
+// this file compares by hand.
+function numberAligned(a: borrow NumberWords, b: borrow NumberWords) -> (Int, Int, Int)? {
+    var scale = a.scale
+    if b.scale > scale { scale = b.scale }
+    match scaledUp(a.mantissa, scale - a.scale) {
+        Some(left) -> {
+            match scaledUp(b.mantissa, scale - b.scale) {
+                Some(right) -> return .Some((left, right, scale))
+                None -> return .None
+            }
+        }
+        None -> return .None
+    }
+}
+
+// The sum or difference of two aligned mantissas, when it fits a word.
+function numberSum(operation: borrow NumberOperation, aligned: borrow (Int, Int, Int)) -> Number? {
+    let (left, right, scale) = aligned
+    if operation == .Add {
+        let sum = wrappingAdd(left, right)
+        // The sum overflowed when both operands have the sign it lacks.
+        if ((left ^ sum) & (right ^ sum)) < 0 { return .None }
+        return .Some(numberShed(sum, scale))
+    }
+    let difference = wrappingSub(left, right)
+    if ((left ^ right) & (left ^ difference)) < 0 { return .None }
+    return .Some(numberShed(difference, scale))
+}
+
+// `a % b` as the service takes it: both mantissas at the wider scale, the
+// remainder of their truncated quotient, with the dividend's sign.
+function numberRemainder(a: borrow NumberWords, b: borrow NumberWords) -> Number? {
+    match numberAligned(a, b) {
+        Some(aligned) -> return alignedRemainder(aligned)
+        None -> return .None
+    }
+}
+
+function alignedRemainder(aligned: borrow (Int, Int, Int)) -> Number? {
+    let (left, right, scale) = aligned
+    // Zero is the service's failure to report; a divisor of one leaves
+    // nothing, and taking it from `Int`'s smallest would overflow.
+    if right == 0 { return .None }
+    if right == 1 || right == -1 { return .Some(numberFromWords(NumberWords(0, 0))) }
+    return .Some(numberShed(left % right, scale))
+}
+
+// `a / b` as the service divides: the quotient at the largest scale, rounded
+// half-to-even once, its trailing zeros shed. Digits come one at a time by long
+// division of the magnitudes; a quotient or remainder that would leave a word
+// goes to the service, which then answers the same way at that scale or one
+// below it.
+function numberQuotient(a: borrow NumberWords, b: borrow NumberWords) -> Number? {
+    let smallest = 0 - 9223372036854775807 - 1
+    if b.mantissa == 0 || a.mantissa == smallest || b.mantissa == smallest { return .None }
+    let divisor = magnitude(b.mantissa)
+    if divisor > NumberDigit.room { return .None }
+    let dividend = magnitude(a.mantissa)
+    // The dividend shifts by this many digits so the quotient lands at the
+    // largest scale.
+    let digits = b.scale - a.scale + NumberWord.scale
+    var quotient = dividend / divisor
+    var remainder = dividend % divisor
+    var left = digits
+    while left > 0 && remainder != 0 {
+        if quotient > NumberDigit.room { return .None }
+        let carried = remainder * 10
+        quotient = quotient * 10 + carried / divisor
+        remainder = carried % divisor
+        left = left - 1
+    }
+    // An exact quotient's remaining digits are zeros, shed down to scale zero
+    // and appended past it.
+    var shed = left
+    if shed > NumberWord.scale { shed = NumberWord.scale }
+    match scaledUp(quotient, left - shed) {
+        Some(whole) -> quotient = whole
+        None -> return .None
+    }
+    // Half rounds to the even quotient: the remainder against what is left of
+    // the divisor, which cannot overflow as doubling it could.
+    let rest = divisor - remainder
+    if remainder > rest || (remainder == rest && quotient % 2 != 0) {
+        if quotient == 9223372036854775807 { return .None }
+        quotient = quotient + 1
+    }
+    if (a.mantissa < 0) != (b.mantissa < 0) { quotient = 0 - quotient }
+    return .Some(numberShed(quotient, NumberWord.scale - shed))
+}
+
+// The 65th bit of a whole number's mantissa, its sign: the top bit of the
+// first word, flipped when the mantissa is extended.
+function numberHighBit(words: borrow NumberWords) -> Int {
+    if (words.mantissa < 0) != (words.scale == NumberWord.extended) { return 1 }
+    return 0
+}
+
+// `&`, `|` or `^` on two whole numbers, as on 65-bit two's complement
+// integers: the first words and the 65th bits each combine on their own.
+function numberBits(
+    operation: borrow NumberOperation,
+    a: borrow NumberWords,
+    b: borrow NumberWords
+) -> Number {
+    match operation {
+        Or -> return numberJoin(a.mantissa | b.mantissa, numberHighBit(a) | numberHighBit(b))
+        Xor -> return numberJoin(a.mantissa ^ b.mantissa, numberHighBit(a) ^ numberHighBit(b))
+        // `numberInWord` passes only the three bit operations.
+        else -> return numberJoin(a.mantissa & b.mantissa, numberHighBit(a) & numberHighBit(b))
+    }
+}
+
+// The whole number whose low 64 bits are `low` and whose 65th is `high`.
+function numberJoin(low: Int, high: Int) -> Number {
+    if (high == 1) != (low < 0) { return numberFromWords(NumberWords(low, NumberWord.extended)) }
+    return numberFromWords(NumberWords(low, 0))
+}
+
+// `~n` on a whole number.
+function numberComplement(value: Number) -> Number {
+    let words = numberWords(value)
+    if (words.scale & NumberWord.scaleBits) != 0 { numberFailed(.OutsideDomain) }
+    return numberJoin(~words.mantissa, 1 - numberHighBit(words))
+}
+
+function numberNegate(value: Number) -> Number {
+    let words = numberWords(value)
+    if words.scale > NumberWord.scale || words.mantissa == 0 - 9223372036854775807 - 1 {
+        return numberAnswer(serviceWord(.Negate, words, NumberWords(0, 0)))
+    }
+    return numberFromWords(NumberWords(0 - words.mantissa, words.scale))
+}
+
+// Whether a number is below zero. An extended mantissa's first word holds only
+// its low 64 bits, whose top bit is set past `Int`'s largest and clear below
+// its smallest, so its sign is the opposite of that word's.
+function numberNegative(value: Number) -> Bool {
+    let words = numberWords(value)
+    let extended = (words.scale & NumberWord.extended) != 0
+    return (words.mantissa < 0) != extended
+}
+
+function numberOrder(left: Number, right: Number) -> Int {
+    let a = numberWords(left)
+    let b = numberWords(right)
+    if a.scale == b.scale && a.scale <= NumberWord.scale {
+        if a.mantissa < b.mantissa { return -1 }
+        if a.mantissa > b.mantissa { return 1 }
+        return 0
+    }
+    return serviceWord(.Order, a, b)
+}
+
+function numberFromInt(value: Int) -> Number {
+    return numberFromWords(NumberWords(value, 0))
+}
+
+function numberToInt(value: Number) -> Int {
+    let words = numberWords(value)
+    // An index or a count is whole, so that case is tested first.
+    if words.scale == 0 { return words.mantissa }
+    if words.scale > NumberWord.scale {
+        let integer = serviceWord(.ToInt, words, NumberWords(0, 0))
+        if kernelNumberSecond() != 0 {
+            numberFailedOn(.Overflow, "\(numberWordsShown(words)) does not fit an Int")
+        }
+        return integer
+    }
+    var divisor: Int = 1
+    for _ in 0..words.scale { divisor = divisor * 10 }
+    return words.mantissa / divisor
+}
+
+// A `U64`'s bits as an `Int`'s, and back. A conversion traps outside the
+// target's range, so the top bit moves by hand.
+function numberWordOfBits(bits: U64) -> Int {
+    if bits < U64(9223372036854775807) + U64(1) { return Int(bits) }
+    return Int(bits - U64(9223372036854775807) - U64(1)) - 9223372036854775807 - 1
+}
+
+function numberBitsOfWord(word: Int) -> U64 {
+    if word >= 0 { return U64(word) }
+    return U64(word + 9223372036854775807 + 1) + U64(9223372036854775807) + U64(1)
+}
+
+function numberFromUnsigned(value: U64) -> Number {
+    let word = numberWordOfBits(value)
+    if word < 0 { return numberFromWords(NumberWords(word, NumberWord.extended)) }
+    return numberFromWords(NumberWords(word, 0))
+}
+
+// The integer part, truncated toward zero; a negative one traps.
+function numberToUnsigned(value: Number) -> U64 {
+    let words = numberWords(value)
+    if words.scale == 0 && words.mantissa >= 0 { return U64(words.mantissa) }
+    if words.scale == NumberWord.extended && words.mantissa < 0 {
+        return numberBitsOfWord(words.mantissa)
+    }
+    let bits = serviceWord(.ToUnsigned, words, NumberWords(0, 0))
+    if kernelNumberSecond() != 0 {
+        numberFailedOn(
+            .OutsideDomain,
+            "\(numberWordsShown(words)) is no unsigned integer: it is negative or too large"
+        )
+    }
+    return numberBitsOfWord(bits)
+}
+
+namespace NumberRange {
+    // Past this a float's integer part leaves the extended mantissa.
+    let float: Float = 10000000000000000000.0
+}
+
+// The nearest decimal to the float's binary value. The service reads the
+// float's magnitude, whose bits fit an `Int`.
+function numberFromFloat(value: Float) -> Number {
+    // Infinity and NaN have no decimal, and neither has a float past the
+    // mantissa's range; the failure says which float it was.
+    if value != value || abs(value) > NumberRange.float {
+        numberFailedOn(.Overflow, "the Float \(value) is no Number")
+    }
+    let magnitude = numberAnswer(
+        serviceWord(.FromFloat, NumberWords(Int(floatToBits(abs(value))), 0), NumberWords(0, 0))
+    )
+    if value < 0.0 { return numberNegate(magnitude) }
+    return magnitude
+}
+
+// The nearest float, rounded once.
+function numberToFloat(value: Number) -> Float {
+    let words = numberWords(value)
+    if words.scale > NumberWord.scale {
+        return bitsToFloat(numberBitsOfWord(serviceWord(.ToFloat, words, NumberWords(0, 0))))
+    }
+    var magnitude = words.mantissa
+    if magnitude < 0 { magnitude = 0 - magnitude }
+    // A mantissa under 2^53 and a power of ten up to 10^18 are exact
+    // floats, so their quotient rounds once.
+    if magnitude < 9007199254740992 {
+        var divisor: Float = 1.0
+        for _ in 0..words.scale { divisor = divisor * 10.0 }
+        return Float(words.mantissa) / divisor
+    }
+    let bits = serviceWord(.ToFloat, NumberWords(magnitude, words.scale), NumberWords(0, 0))
+    let float = bitsToFloat(U64(bits))
+    if words.mantissa < 0 { return 0.0 - float }
+    return float
+}
+
+// `Number(text)`, which traps on text that is no number. Text read from a
+// file or a peer goes through `parseNumber` instead.
+function numberFromString(text: String) -> Number {
+    match parseNumber(text) {
+        Some(value) -> return value
+        None -> {
+            numberFailed(.NotANumber)
+            return numberFromInt(0)
+        }
+    }
+}
+
+// An optional sign, digits, and an optional `.` with more digits, or `.None`
+// for any other text. The digits gather below zero, where the mantissa reaches
+// one further; past an `Int` they gather as a `Number`, whose mantissa reaches
+// a `U64`.
+function parseNumber(text: borrow String) -> Number? {
+    var mantissa: Int = 0
+    var wide = numberFromInt(0)
+    var widened = false
+    var scale: Int = 0
+    var fraction = false
+    var digits: Int = 0
+    var negative = false
+    for index in 0..text.count {
+        let byte = Int(storedByte(text, index))
+        if index == 0 && (byte == 45 || byte == 43) {
+            negative = byte == 45
+            continue
+        }
+        if byte == 46 && !fraction {
+            fraction = true
+            continue
+        }
+        if byte < 48 || byte > 57 { return .None }
+        let digit = byte - 48
+        if !widened && (
+            mantissa < 0 - 922337203685477580 || (mantissa == 0 - 922337203685477580 && digit > 8)
+        ) {
+            widened = true
+            wide = numberFromInt(mantissa)
+        }
+        if widened {
+            wide = numberArithmetic(
+                code(NumberOperation.Subtract),
+                numberArithmetic(code(NumberOperation.Multiply), wide, numberFromInt(10)),
+                numberFromInt(digit)
+            )
+        } else {
+            mantissa = mantissa * 10 - digit
+        }
+        digits += 1
+        if fraction { scale += 1 }
+    }
+    if digits == 0 || scale > NumberWord.scale { return .None }
+    // `Int`'s smallest has no positive.
+    if !widened && !negative && mantissa == 0 - 9223372036854775807 - 1 {
+        widened = true
+        wide = numberFromInt(mantissa)
+    }
+    if !widened {
+        if !negative { return .Some(numberShed(0 - mantissa, scale)) }
+        return .Some(numberShed(mantissa, scale))
+    }
+    if !negative { wide = numberNegate(wide) }
+    if scale == 0 { return .Some(wide) }
+    var divisor: Int = 1
+    for _ in 0..scale { divisor = divisor * 10 }
+    return .Some(numberArithmetic(code(NumberOperation.Divide), wide, numberFromInt(divisor)))
+}
+
+// The shortest exact decimal: a `-` when negative, the integer digits, and a
+// `.` with the fractional ones when there are any.
+function numberToString(value: Number) -> String {
+    let words = numberWords(value)
+    let scale = words.scale & NumberWord.scaleBits
+    let mantissa = words.mantissa
+    var negative = mantissa < 0
+    var digits = ""
+    if words.scale > NumberWord.scale {
+        // Past `Int`: a positive mantissa is the first word's bits, and a
+        // negative one 2^64 less them.
+        negative = mantissa >= 0
+        if !negative {
+            digits = stringFromUnsigned(numberBitsOfWord(mantissa))
+        } else if mantissa == 0 {
+            digits = "18446744073709551616"
+        } else {
+            digits = stringFromUnsigned(numberBitsOfWord(0 - mantissa))
+        }
+    } else {
+        if scale == 0 { return String(mantissa) }
+        digits = String(mantissa)
+        if negative { digits = slice(digits, 1, digits.count) }
+    }
+    if scale == 0 {
+        if negative { return "-" + digits }
+        return digits
+    }
+    while digits.count <= scale { digits = "0" + digits }
+    let point = digits.count - scale
+    var text = slice(digits, 0, point) + "." + slice(digits, point, digits.count)
+    if negative { text = "-" + text }
+    return text
+}

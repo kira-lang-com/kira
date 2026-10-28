@@ -1,0 +1,356 @@
+import Foundation
+
+// Unpacking archives into a directory. Every path stays inside it: a `..`
+// fails the archive, and so does an entry under a symbolic link the archive
+// made, which could lead anywhere. Directories get their permission bits
+// last, so a read-only one does not stop what goes inside it.
+
+/// What an archive is, for `extractArchive`.
+public enum ArchiveFormat {
+    /// A tar archive, uncompressed.
+    Tar
+    /// A tar archive compressed with gzip.
+    TarGzip
+    /// A tar archive compressed with xz.
+    TarXz
+    /// A tar archive compressed with Zstandard.
+    TarZstd
+    /// An ar archive, as a Debian package is.
+    Ar
+}
+
+/// How a single file is compressed, for `decompressFile`.
+public enum Compression {
+    /// Compressed with gzip.
+    Gzip
+    /// Compressed with xz.
+    Xz
+    /// Compressed with Zstandard.
+    Zstd
+}
+
+/// The archive at `from`, unpacked into the directory `root`, which is made when it is missing.
+public function extractArchive(
+    from: borrow String,
+    format: ArchiveFormat,
+    root: borrow String
+) -> Result<Void, ArchiveFailure> {
+    let none: [String] = []
+    return extractArchiveExcept(from, format, root, none)
+}
+
+/// The archive at `from`, unpacked into the directory `root` but for the entries at or under each of `excluding`, which are passed over.
+public function extractArchiveExcept(
+    from: borrow String,
+    format: ArchiveFormat,
+    root: borrow String,
+    excluding: borrow [String]
+) -> Result<Void, ArchiveFailure> {
+    if !isDirectory(root) {
+        match makeDirectory(root) {
+            Ok -> {}
+            Error(failure) -> return .Error(.Files("cannot make \(root): \(traceText(failure))"))
+        }
+    }
+    var target = UnpackTarget { root: copy root, excluding: copy excluding }
+    let unpacked = match format {
+        Ar -> unpackAr(from, target)
+        Tar -> match fileFeed(from) {
+            Ok(feed) -> unpackTar(move feed, target)
+            Error(failure) -> .Error(failure)
+        }
+        TarGzip -> match readArchiveFile(from) {
+            Ok(bytes) -> match decompressGzip(move bytes) {
+                Ok(tar) -> unpackTar(heldFeed(move tar), target)
+                Error(failure) -> .Error(failure)
+            }
+            Error(failure) -> .Error(failure)
+        }
+        TarXz -> match feedXz(from) {
+            Ok(feed) -> unpackTar(move feed, target)
+            Error(failure) -> .Error(failure)
+        }
+        TarZstd -> match feedZstd(from) {
+            Ok(feed) -> unpackTar(move feed, target)
+            Error(failure) -> .Error(failure)
+        }
+    }
+    match unpacked {
+        Ok -> {}
+        Error(failure) -> return .Error(failure)
+    }
+    return target.finish()
+}
+
+/// The file at `from` decompressed into the new file `to`, answering its length.
+public function decompressFile(
+    from: borrow String,
+    compression: Compression,
+    to: borrow String
+) -> Result<UNumber, ArchiveFailure> {
+    var sink = match createArchiveSink(to) {
+        Ok(created) -> created
+        Error(failure) -> return .Error(failure)
+    }
+    var feed = match compression {
+        Gzip -> match readArchiveFile(from) {
+            Ok(bytes) -> match decompressGzip(move bytes) {
+                Ok(whole) -> heldFeed(move whole)
+                Error(failure) -> return .Error(failure)
+            }
+            Error(failure) -> return .Error(failure)
+        }
+        Xz -> match feedXz(from) {
+            Ok(made) -> made
+            Error(failure) -> return .Error(failure)
+        }
+        Zstd -> match feedZstd(from) {
+            Ok(made) -> made
+            Error(failure) -> return .Error(failure)
+        }
+    }
+    while true {
+        match feed.want(1) {
+            Ok(more) -> {
+                if !more { break }
+            }
+            Error(failure) -> return .Error(failure)
+        }
+        match feed.pass(feed.buffer.count - feed.at, sink, from) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+    }
+    return sink.finish()
+}
+
+// The directory being unpacked into, and what is in it so far.
+struct UnpackTarget {
+    let root: String
+    // The paths whose entries, and every entry under them, are passed over.
+    let excluding: [String] = []
+    // Each directory's permission bits, set when unpacking ends.
+    var directories: Map<String, UNumber> = Map<String, UNumber>()
+    var links: Set<String> = Set<String>()
+    var files: Set<String> = Set<String>()
+
+    // The full path of the entry `path`, with the directories above it made
+    // and whatever was at it before gone; a directory stays when `keeping`.
+    function prepare(
+        borrow mut self,
+        path: borrow String,
+        keeping: Bool
+    ) -> Result<String, ArchiveFailure> {
+        let parts = path.split("/")
+        var above = ""
+        for index in 0..(parts.count - 1) {
+            above = above.count == 0 ? copy parts[index] : above + "/" + parts[index]
+            if links.contains(above) {
+                return .Error(.Malformed("\(path) lies under the symbolic link \(above)"))
+            }
+            if directories.contains(above) { continue }
+            let full = underRoot(root, above)
+            if pathExists(full) {
+                return .Error(.Malformed("\(path) lies under the file \(above)"))
+            }
+            match makeDirectory(full) {
+                Ok -> {}
+                Error(failure) -> return .Error(
+                    .Files("cannot make \(full): \(traceText(failure))")
+                )
+            }
+            directories.set(copy above, 493)
+        }
+        let full = underRoot(root, path)
+        if directories.contains(path) {
+            if keeping { return .Ok(full) }
+            return .Error(.Malformed("\(path) is a directory and something else"))
+        }
+        if links.contains(path) || files.contains(path) {
+            match removePath(full) {
+                Ok -> {}
+                Error(failure) -> return .Error(
+                    .Files("cannot replace \(full): \(traceText(failure))")
+                )
+            }
+            let _ = links.remove(path)
+            let _ = files.remove(path)
+        } else if pathExists(full) {
+            // Something this archive did not put at the path is there: an
+            // entry before it whose name differs only in case, on a
+            // filesystem that does not tell case apart.
+            return .Error(
+                .Malformed(
+                    "\(path) is the path of an entry before it on this filesystem, which folds case"
+                )
+            )
+        }
+        return .Ok(full)
+    }
+
+    // Whether the entry `path` is passed over.
+    function excludes(borrow self, path: borrow String) -> Bool {
+        for excluded in excluding {
+            if path == excluded || path.startsWith(excluded + "/") { return true }
+        }
+        return false
+    }
+
+    function directory(
+        borrow mut self,
+        path: borrow String,
+        mode: UNumber
+    ) -> Result<Void, ArchiveFailure> {
+        let full = match prepare(path, true) {
+            Ok(made) -> made
+            Error(failure) -> return .Error(failure)
+        }
+        if !directories.contains(path) {
+            match makeDirectory(full) {
+                Ok -> {}
+                Error(failure) -> return .Error(
+                    .Files("cannot make \(full): \(traceText(failure))")
+                )
+            }
+        }
+        directories.set(copy path, mode)
+        return .Ok
+    }
+
+    // A file of the next `size` bytes of `feed`.
+    function file(
+        borrow mut self,
+        path: borrow String,
+        mode: UNumber,
+        feed: borrow mut ByteFeed,
+        size: Number
+    ) -> Result<Void, ArchiveFailure> {
+        let full = match prepare(path, false) {
+            Ok(made) -> made
+            Error(failure) -> return .Error(failure)
+        }
+        var sink = match createArchiveSink(full) {
+            Ok(created) -> created
+            Error(failure) -> return .Error(failure)
+        }
+        match feed.pass(size, sink, path) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        match sink.finish() {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        return placed(path, full, mode)
+    }
+
+    // A file holding `bytes`.
+    function heldFile(
+        borrow mut self,
+        path: borrow String,
+        mode: UNumber,
+        bytes: borrow [UN8]
+    ) -> Result<Void, ArchiveFailure> {
+        let full = match prepare(path, false) {
+            Ok(made) -> made
+            Error(failure) -> return .Error(failure)
+        }
+        match writeFileBytes(full, bytes) {
+            Ok -> {}
+            Error(failure) -> return .Error(.Files("cannot write \(full): \(traceText(failure))"))
+        }
+        return placed(path, full, mode)
+    }
+
+    function placed(
+        borrow mut self,
+        path: borrow String,
+        full: borrow String,
+        mode: UNumber
+    ) -> Result<Void, ArchiveFailure> {
+        match setFileMode(full, mode) {
+            Ok -> {}
+            Error(failure) -> return .Error(
+                .Files("cannot set the mode of \(full): \(traceText(failure))")
+            )
+        }
+        files.insert(copy path)
+        return .Ok
+    }
+
+    function link(
+        borrow mut self,
+        path: borrow String,
+        target: borrow String
+    ) -> Result<Void, ArchiveFailure> {
+        let full = match prepare(path, false) {
+            Ok(made) -> made
+            Error(failure) -> return .Error(failure)
+        }
+        match makeSymbolicLink(target, full) {
+            Ok -> {}
+            Error(failure) -> return .Error(.Files("cannot link \(full): \(traceText(failure))"))
+        }
+        links.insert(copy path)
+        return .Ok
+    }
+
+    // A second file with the contents of the file `from` unpacked before:
+    // a hard link, made a copy so the tree holds files alone.
+    function hardLink(
+        borrow mut self,
+        path: borrow String,
+        from: borrow String,
+        mode: UNumber
+    ) -> Result<Void, ArchiveFailure> {
+        if !files.contains(from) {
+            return .Error(
+                .Malformed("\(path) is a hard link to \(from), which is no file before it")
+            )
+        }
+        let full = match prepare(path, false) {
+            Ok(made) -> made
+            Error(failure) -> return .Error(failure)
+        }
+        match copyFile(underRoot(root, from), full) {
+            Ok -> {}
+            Error(failure) -> return .Error(.Files("cannot copy to \(full): \(traceText(failure))"))
+        }
+        return placed(path, full, mode)
+    }
+
+    // Gives each directory its permission bits, those deepest first.
+    function finish(borrow self) -> Result<Void, ArchiveFailure> {
+        let paths = directories.keys().sorted(
+            { left, right in return orderStrings(left, right) > 0 }
+        )
+        for path in paths {
+            let full = underRoot(root, path)
+            match setFileMode(full, directories.value(path).or(493)) {
+                Ok -> {}
+                Error(failure) -> return .Error(
+                    .Files("cannot set the mode of \(full): \(traceText(failure))")
+                )
+            }
+        }
+        return .Ok
+    }
+}
+
+// An entry's path as it is unpacked: `/`-separated with no empty or `.`
+// parts; nothing for the archive's root, and a failure for a path that
+// climbs with `..`.
+function unpackedPath(raw: borrow String) -> Result<String?, ArchiveFailure> {
+    var kept: [String] = []
+    for part in raw.split("/") {
+        if part.count == 0 || part == "." { continue }
+        if part == ".." { return .Error(.Malformed("the entry \(raw) climbs out with ..")) }
+        kept.append(part)
+    }
+    if kept.count == 0 { return .Ok(.None) }
+    return .Ok(.Some(joined(kept, "/")))
+}
+
+function underRoot(root: borrow String, path: borrow String) -> String {
+    return root + "/" + path
+}

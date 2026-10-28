@@ -1,0 +1,40 @@
+import Testing
+
+// The programs of `corpus/idiomatic.klfd` that compile without Foundation and
+// are rejected for using a name the language reserves.
+
+@Test
+function rejectsNativeFunctions() {
+    expect!(!compiles("""
+        @Native
+        function operation() {}
+
+        @Main
+        function main() {}
+        """))
+    expect!(diagnosed(2098, 2, 0))
+}
+
+@Test
+function rejectsMethodsNamedLikeBuiltins() {
+    expect!(!compiles("""
+        struct Point { let x: Int }
+        extend Point {
+            function hash() -> Int { return x }
+        }
+        @Main function main() -> Int { return 0 }
+        """))
+    expect!(diagnosed(2099, 3, 0))
+}
+
+@Test
+function rejectsBindingsHidingBuiltins() {
+    expect!(!compiles("""
+        enum Tone { Red Blue }
+        @Main function main() -> Int {
+            let code = 7
+            return code(Tone.Blue)
+        }
+        """))
+    expect!(diagnosed(2099, 4, 0))
+}

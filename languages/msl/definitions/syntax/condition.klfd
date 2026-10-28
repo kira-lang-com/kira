@@ -1,0 +1,156 @@
+// `#if` conditions: C's integer expressions over 64-bit values. `defined
+// NAME` and `defined(NAME)` are read first; then macros expand, and a word
+// left over is 0, `true` being 1, as C++ preprocessing has it.
+
+extend Preprocessor {
+    function evaluateCondition(borrow mut self, line: [Token], span: Span) -> Result<Int, Failure> {
+        let bad = Failure { diagnostic = .BadCondition, span = span }
+        var resolved: [Token] = []
+        var index = 0
+        while index < line.count {
+            let token = line[index]
+            if token.kind == .Word && token.text == "defined" {
+                var name = index + 1
+                let parenthesized = name < line.count && line[name].kind == .LeftParen
+                if parenthesized { name += 1 }
+                if name >= line.count || line[name].kind != .Word { return .Error(bad) }
+                var after = name + 1
+                if parenthesized {
+                    if after >= line.count || line[after].kind != .RightParen { return .Error(bad) }
+                    after += 1
+                }
+                var value = "0"
+                if macroNamed(line[name].text) >= 0 { value = "1" }
+                resolved.append(Token { kind = .IntegerLiteral, text = value, span = token.span, lineStart = false })
+                index = after
+            } else {
+                resolved.append(token)
+                index += 1
+            }
+        }
+        let start = output.count
+        for token in resolved {
+            expand(token, [])
+        }
+        var expanded: [Token] = []
+        for position in start..output.count {
+            expanded.append(output[position])
+        }
+        var kept: [Token] = []
+        for position in 0..start {
+            kept.append(output[position])
+        }
+        output = kept
+        expanded.append(Token { kind = .End, text = "", span = span, lineStart = false })
+        var reader = ConditionReader { tokens = expanded, position = 0, bad = bad }
+        let value = try reader.ternary()
+        if reader.tokens[reader.position].kind != .End { return .Error(bad) }
+        return .Ok(value)
+    }
+}
+
+struct ConditionReader {
+    let tokens: [Token]
+    var position: Int
+    let bad: Failure
+
+    function at(borrow self, kind: TokenKind) -> Bool {
+        return tokens[position].kind == kind
+    }
+
+    function eat(borrow mut self, kind: TokenKind) -> Bool {
+        if !at(kind) { return false }
+        position += 1
+        return true
+    }
+
+    function ternary(borrow mut self) -> Result<Int, Failure> {
+        let condition = try binary(1)
+        if !eat(.Question) { return .Ok(condition) }
+        let accept = try ternary()
+        if !eat(.Colon) { return .Error(bad) }
+        let reject = try ternary()
+        if condition != 0 { return .Ok(accept) }
+        return .Ok(reject)
+    }
+
+    function binary(borrow mut self, floor: Int) -> Result<Int, Failure> {
+        var left = try unary()
+        while true {
+            let precedence = conditionPrecedence(tokens[position].kind)
+            if precedence < floor || precedence == 0 { return .Ok(left) }
+            let operator = tokens[position].kind
+            position += 1
+            let right = try binary(precedence + 1)
+            left = try apply(operator, left, right)
+        }
+        return .Ok(left)
+    }
+
+    function apply(borrow self, operator: TokenKind, left: Int, right: Int) -> Result<Int, Failure> {
+        if operator == .PipePipe { return .Ok(truth(left != 0 || right != 0)) }
+        if operator == .AmpersandAmpersand { return .Ok(truth(left != 0 && right != 0)) }
+        if operator == .Pipe { return .Ok(left | right) }
+        if operator == .Caret { return .Ok(left ^ right) }
+        if operator == .Ampersand { return .Ok(left & right) }
+        if operator == .EqualEqual { return .Ok(truth(left == right)) }
+        if operator == .BangEqual { return .Ok(truth(left != right)) }
+        if operator == .Less { return .Ok(truth(left < right)) }
+        if operator == .LessEqual { return .Ok(truth(left <= right)) }
+        if operator == .Greater { return .Ok(truth(left > right)) }
+        if operator == .GreaterEqual { return .Ok(truth(left >= right)) }
+        if operator == .LessLess { return .Ok(left << right) }
+        if operator == .GreaterGreater { return .Ok(left >> right) }
+        if operator == .Plus { return .Ok(left + right) }
+        if operator == .Minus { return .Ok(left - right) }
+        if operator == .Star { return .Ok(left * right) }
+        if right == 0 { return .Error(bad) }
+        if operator == .Slash { return .Ok(left / right) }
+        return .Ok(left % right)
+    }
+
+    function unary(borrow mut self) -> Result<Int, Failure> {
+        if eat(.Bang) { return .Ok(truth((try unary()) == 0)) }
+        if eat(.Minus) { return .Ok(0 - (try unary())) }
+        if eat(.Plus) { return unary() }
+        if eat(.Tilde) { return .Ok(-1 - (try unary())) }
+        if eat(.LeftParen) {
+            let inner = try ternary()
+            if !eat(.RightParen) { return .Error(bad) }
+            return .Ok(inner)
+        }
+        let token = tokens[position]
+        if token.kind == .Word {
+            position += 1
+            if token.text == "true" { return .Ok(1) }
+            return .Ok(0)
+        }
+        if token.kind == .IntegerLiteral {
+            position += 1
+            match integerValue(token.text) {
+                Some(literal) -> return .Ok(literal.value)
+                None -> return .Error(bad)
+            }
+        }
+        return .Error(bad)
+    }
+}
+
+function truth(holds: Bool) -> Int {
+    if holds { return 1 }
+    return 0
+}
+
+function conditionPrecedence(kind: TokenKind) -> Int {
+    if kind == .PipePipe { return 1 }
+    if kind == .AmpersandAmpersand { return 2 }
+    if kind == .Pipe { return 3 }
+    if kind == .Caret { return 4 }
+    if kind == .Ampersand { return 5 }
+    if kind == .EqualEqual || kind == .BangEqual { return 6 }
+    if kind == .Less || kind == .LessEqual || kind == .Greater || kind == .GreaterEqual { return 7 }
+    if kind == .LessLess || kind == .GreaterGreater { return 8 }
+    if kind == .Plus || kind == .Minus { return 9 }
+    if kind == .Star || kind == .Slash || kind == .Percent { return 10 }
+    return 0
+}

@@ -1,0 +1,199 @@
+import Foundation
+
+// Writing tar in the POSIX ustar format (IEEE 1003.1, pax): a 512-byte
+// header per entry, its contents padded to a block, two zero blocks at the
+// end, and the whole a run of 10240-byte records. A path ustar cannot hold
+// in its name and prefix, a link target past 100 bytes and a size past 11
+// octal digits go in a pax extended header before the entry.
+
+namespace TarWriting {
+    // The bytes a record holds: 20 blocks, the default blocking factor.
+    let record: Number = 10240
+    let ownerAt: Number = 108
+    let groupAt: Number = 116
+    let timeAt: Number = 136
+    let versionAt: Number = 263
+    let majorAt: Number = 329
+    let minorAt: Number = 337
+    // The largest size 11 octal digits hold.
+    let largestSize: Number = 8589934591
+}
+
+/// A writer of a tar archive in the POSIX ustar format, with pax extended headers where ustar cannot hold an entry.
+public struct TarWriter {
+    /// Where the archive's bytes go.
+    var sink: ArchiveSink
+
+    /// Adds a directory at `path` with permission bits `mode`.
+    function addDirectory(
+        borrow mut self,
+        path: borrow String,
+        mode: UNumber
+    ) -> Result<Void, ArchiveFailure> {
+        let empty: [UN8] = []
+        return addEntry(path + "/", TarType.directory, mode, "", empty)
+    }
+
+    /// Adds a file at `path` with permission bits `mode` and the contents `bytes`.
+    function addFile(
+        borrow mut self,
+        path: borrow String,
+        mode: UNumber,
+        bytes: borrow [UN8]
+    ) -> Result<Void, ArchiveFailure> {
+        return addEntry(path, TarType.file, mode, "", bytes)
+    }
+
+    /// Adds a symbolic link at `path` pointing to `target`.
+    function addLink(
+        borrow mut self,
+        path: borrow String,
+        target: borrow String
+    ) -> Result<Void, ArchiveFailure> {
+        let empty: [UN8] = []
+        return addEntry(path, TarType.symbolicLink, 511, target, empty)
+    }
+
+    /// Writes the two zero blocks that end the archive, and the rest of the last record, then closes the file and answers its length.
+    function finish(borrow mut self) -> Result<UNumber, ArchiveFailure> {
+        for each in 0..(2 * TarFormat.block) { sink.appendByte(0) }
+        while sink.count() % TarWriting.record != 0 { sink.appendByte(0) }
+        return sink.finish()
+    }
+
+    /// Writes one entry: its pax extended header when it needs one, its 512-byte header, then its contents padded to a block.
+    function addEntry(
+        borrow mut self,
+        path: borrow String,
+        type: Number,
+        mode: UNumber,
+        target: borrow String,
+        bytes: borrow [UN8]
+    ) -> Result<Void, ArchiveFailure> {
+        let name = path.utf8()
+        let link = target.utf8()
+        var records: [UN8] = []
+        let split = ustarSplit(name)
+        if split < -1 { records.appendAll(paxRecord("path", path)) }
+        if link.count > TarFormat.nameSize { records.appendAll(paxRecord("linkpath", target)) }
+        if bytes.count > TarWriting.largestSize {
+            records.appendAll(paxRecord("size", String(bytes.count)))
+        }
+        if records.count > 0 {
+            let lastSlash = match path.lastIndexOf("/") {
+                Some(slash) -> slash + 1 == path.count ? path.substring(0, slash) : copy path
+                None -> copy path
+            }
+            let short = lastName(lastSlash).utf8().prefix(TarFormat.nameSize - 11)
+            let paxName = joinedBytes("PaxHeaders/".utf8(), short)
+            sink.append(tarHeader(paxName, -1, TarType.paxEntry, 420, records.count, "".utf8()))
+            sink.append(records)
+            padToBlock(sink)
+        }
+        let header = tarHeader(
+            name,
+            split,
+            type,
+            mode,
+            bytes.count > TarWriting.largestSize ? 0 : bytes.count,
+            link.prefix(TarFormat.nameSize)
+        )
+        sink.append(header)
+        sink.append(bytes)
+        padToBlock(sink)
+        return sink.spill()
+    }
+}
+
+/// A tar writer writing the file `path`, which must not exist yet.
+public function createTarWriter(path: borrow String) -> Result<TarWriter, ArchiveFailure> {
+    return match createArchiveSink(path) {
+        Ok(sink) -> .Ok(TarWriter { sink: sink })
+        Error(failure) -> .Error(failure)
+    }
+}
+
+// Where ustar splits `name` into its prefix and name: -1 when the name field
+// holds it whole, the index of the `/` it splits at, or -2 when it fits
+// neither way.
+function ustarSplit(name: borrow [UN8]) -> Number {
+    let nameSize = TarFormat.nameSize
+    if name.count <= nameSize { return -1 }
+    var at: Number = name.count - nameSize - 1
+    while at < name.count - 1 && at <= TarFormat.prefixSize {
+        if at > 0 && name[at] == 47 { return at }
+        at += 1
+    }
+    return -2
+}
+
+// A ustar header for `name`, split at `split` as `ustarSplit` answers or
+// cut to its name field at -2, owned by 0 and dated 0.
+function tarHeader(
+    name: borrow [UN8],
+    split: Number,
+    type: Number,
+    mode: UNumber,
+    size: Number,
+    link: borrow [UN8]
+) -> [UN8] {
+    var header: [UN8] = []
+    for each in 0..TarFormat.block { header.append(0) }
+    if split >= 0 {
+        putBytes(header, TarFormat.prefixAt, byteRun(name, 0, split))
+        putBytes(header, TarFormat.nameAt, byteRun(name, split + 1, name.count))
+    } else {
+        putBytes(header, TarFormat.nameAt, name.prefix(TarFormat.nameSize))
+    }
+    putOctal(header, TarFormat.modeAt, 8, Number(mode) & TarFormat.permissionBits)
+    putOctal(header, TarWriting.ownerAt, 8, 0)
+    putOctal(header, TarWriting.groupAt, 8, 0)
+    putOctal(header, TarFormat.sizeAt, 12, size)
+    putOctal(header, TarWriting.timeAt, 12, 0)
+    header[TarFormat.typeAt] = UN8(type)
+    putBytes(header, TarFormat.linkAt, link)
+    putBytes(header, TarFormat.magicAt, "ustar".utf8())
+    putBytes(header, TarWriting.versionAt, "00".utf8())
+    putOctal(header, TarWriting.majorAt, 8, 0)
+    putOctal(header, TarWriting.minorAt, 8, 0)
+    // The checksum is the sum of the header's bytes with its own field as
+    // spaces, in six digits, a zero byte and a space.
+    for index in 0..8 { header[TarFormat.checksumAt + index] = 32 }
+    var sum: Number = 0
+    for byte in header { sum += Number(byte) }
+    putOctal(header, TarFormat.checksumAt, 7, sum)
+    return header
+}
+
+// `value` in octal over `count - 1` digits at `at`, then a zero byte.
+function putOctal(header: borrow mut [UN8], at: Number, count: Number, value: Number) {
+    for index in 0..(count - 1) {
+        header[at + index] = UN8(48 + ((value >> (3 * (count - 2 - index))) & 7))
+    }
+    header[at + count - 1] = 0
+}
+
+function putBytes(header: borrow mut [UN8], at: Number, bytes: borrow [UN8]) {
+    for index in 0..bytes.count { header[at + index] = bytes[index] }
+}
+
+// A pax record: its length in decimal, counting itself, then ` key=value`
+// and a newline.
+function paxRecord(key: borrow String, value: borrow String) -> [UN8] {
+    let rest = " \(key)=\(value)\n".utf8()
+    var length = rest.count + 1
+    while String(length).count + rest.count > length { length += 1 }
+    return joinedBytes(String(length).utf8(), rest)
+}
+
+function padToBlock(sink: borrow mut ArchiveSink) {
+    while sink.count() % TarFormat.block != 0 { sink.appendByte(0) }
+}
+
+// The last name of `path`.
+function lastName(path: borrow String) -> String {
+    return match path.lastIndexOf("/") {
+        Some(slash) -> path.substring(slash + 1, path.count)
+        None -> copy path
+    }
+}

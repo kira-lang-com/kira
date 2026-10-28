@@ -1,0 +1,22 @@
+// A `borrow mut [T]` parameter of a function in the module's surface crosses
+// RIDL as two words, the elements and their count, and cannot change length
+// (KLF-RIDL section 21.4): a caller in another module never sees a length the
+// callee gave it. Assigning the parameter a whole array or appending to it
+// is reported (3405); its elements may still be written.
+
+extend Checker {
+    // Reports `place`, the checked place an assignment or an `append`
+    // writes, when it is a whole `borrow mut` array parameter of an
+    // exported function.
+    function checkCrossingArrayLength(borrow self, place: Int, span: Span) {
+        match program.expressions[place].operation.readLocal() {
+            Some(local) -> {
+                if locals[local].passingMode != .MutablyBorrowed { return }
+                if !isArrayType(program, locals[local].valueType) { return }
+                if !isPublic(signature()) { return }
+                report(.CrossingArrayLength, span)
+            }
+            None -> {}
+        }
+    }
+}

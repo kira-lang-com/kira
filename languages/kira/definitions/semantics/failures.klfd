@@ -1,0 +1,245 @@
+struct ErrorHandlerSpec {
+    let local: Int
+    var errorType: Type
+    let depth: Int
+}
+
+function resultTypes(program: CheckedProgram, valueType: Type) -> Optional<ResultTypes> {
+    if valueType.kind != .Enumeration { return .None }
+    let declared = program.enums[valueType.declaration]
+    if declared.variants.count != 2 { return .None }
+    if declared.variants[0].name.text != "Ok" || declared.variants[1].name.text != "Error" { return .None }
+    match declared.variants[0].payload {
+        Some(value) -> {
+            match declared.variants[1].payload {
+                Some(error) -> return .Some(ResultTypes { value = value, error = error })
+                None -> return .None
+            }
+        }
+        None -> {
+            match declared.variants[1].payload {
+                Some(error) -> return .Some(ResultTypes { value = Type.void(), error = error })
+                None -> return .None
+            }
+        }
+    }
+}
+
+// The value an optional value holds: an enum of `None` and `Some(Value)`, as
+// Foundation's `Optional` is.
+function optionalPayload(program: CheckedProgram, valueType: Type) -> Optional<Type> {
+    if valueType.kind != .Enumeration { return .None }
+    let declared = program.enums[valueType.declaration]
+    if declared.variants.count != 2 { return .None }
+    match declared.variant("None") {
+        Some(absent) -> { if declared.variants[absent].payload.isSome() { return .None } }
+        None -> return .None
+    }
+    match declared.variant("Some") {
+        Some(present) -> return declared.variants[present].payload
+        None -> return .None
+    }
+}
+
+struct ResultTypes {
+    let value: Type
+    let error: Type
+}
+
+extend Checker {
+    function checkTry(borrow mut self, operand: Int, span: Span) -> Int {
+        if !tryAllowed {
+            report(.TryOutsideResult, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        match tree.expressions[operand].kind {
+            TypeQuery(mode, value, target) -> {
+                if mode == .Cast { return checkTriedCast(value, tree.typeReferences[target], span) }
+            }
+            ExpandedMacro -> {}
+            MacroCall -> {}
+            Quote -> {}
+            IntegerLiteral -> {}
+            FloatLiteral -> {}
+            BooleanLiteral -> {}
+            StringLiteral -> {}
+            ArrayLiteral -> {}
+            Index -> {}
+            Transfer -> {}
+            Labelled -> {}
+            Name -> {}
+            Member -> {}
+            Call -> {}
+            GenericCall -> {}
+            MethodCall -> {}
+            IndirectCall -> {}
+            Lambda -> {}
+            KeyPath -> {}
+            Task -> {}
+            Try -> {}
+            Variant -> {}
+            StructLiteral -> {}
+            Unary -> {}
+            Binary -> {}
+            Conditional -> {}
+            MatchValue -> {}
+            Content -> {}
+        }
+        let saved = tryAllowed
+        tryAllowed = false
+        let checked = expression(operand, .None)
+        tryAllowed = saved
+        match resultTypes(program, typeOf(checked)) {
+            Some(carried) -> {
+                if carried.error.kind != .Enumeration {
+                    // A failure that is no enum has no cases for an `attempt`
+                    // to match, but a function failing with that very type
+                    // passes it up as it is.
+                    if passesUp(carried.error) { return add(.Try(checked, .None), carried.value, span) }
+                    report(.TryNeedsResult, span)
+                    return add(.Integer(0), Type.invalid(), span)
+                }
+                return add(.Try(checked, failureLocal(carried.error, span)), carried.value, span)
+            }
+            None -> {
+                if !typeOf(checked).isInvalid() { report(.TryNeedsResult, span) }
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+
+    // `try value as T`: the cast, failing with `TypeCastError` rather than
+    // trapping when the `Any` holds another type.
+    function checkTriedCast(borrow mut self, value: Int, reference: TypeReference, span: Span) -> Int {
+        let target = resolveType(reference)
+        let saved = tryAllowed
+        tryAllowed = false
+        let checked = expression(value, .None)
+        tryAllowed = saved
+        let actual = typeOf(checked)
+        if actual.isInvalid() || target.isInvalid() { return add(.Integer(0), Type.invalid(), span) }
+        if !isAnyType(program, actual) {
+            report(.TryNeedsResult, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        var failure = Type.invalid()
+        for index in 0..declarations.enums.count {
+            let declared = declarations.enums[index]
+            if declared.name.text == "TypeCastError" && libraryDeclaration(declarations, declared.name.span.file) {
+                failure = Type.enumeration(index)
+            }
+        }
+        if failure.isInvalid() || handlers.count == 0 {
+            report(.TryOutsideResult, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        return add(.UnboxAny(checked, internAnyType(target), failureLocal(failure, span)), target, span)
+    }
+
+    // Whether a `try` here, outside any `attempt`, can return `failure` as the
+    // function's own failure.
+    function passesUp(borrow self, failure: Type) -> Bool {
+        if handlers.count != 1 || handlers[0].depth != -1 { return false }
+        match resultTypes(program, signature().result) {
+            Some(carried) -> return carried.error.equals(failure)
+            None -> return false
+        }
+    }
+
+    // The local a failing `try` stores its failure in. An `attempt` handles
+    // one enum. A function passes each enum up through its own local, and
+    // `from` converts it to the function's failure on the way out.
+    function failureLocal(borrow mut self, failure: Type, span: Span) -> Optional<Int> {
+        if handlers.count == 0 {
+            report(.TryOutsideResult, span)
+            return .None
+        }
+        let index = handlers.count - 1
+        if handlers[index].errorType.isInvalid() {
+            handlers[index].errorType = failure
+            locals[handlers[index].local].valueType = failure
+            return .Some(handlers[index].local)
+        }
+        if handlers[index].errorType.equals(failure) { return .Some(handlers[index].local) }
+        if handlers[index].depth != -1 {
+            report(.MixedTryFailures, span)
+            return .Some(handlers[index].local)
+        }
+        for handler in propagated {
+            if handler.errorType.equals(failure) { return .Some(handler.local) }
+        }
+        let local = declareLocal("__propagated_error", failure, false, false)
+        propagated.append(ErrorHandlerSpec { local = local, errorType = failure, depth = -1 })
+        return .Some(local)
+    }
+
+    function checkAttempt(borrow mut self, body: [Int], arms: [MatchArm], span: Span) -> CheckedStatement {
+        let local = declareLocal("__error#handle", Type.invalid(), false, false)
+        handlers.append(ErrorHandlerSpec { local = local, errorType = Type.invalid(), depth = scopes.count })
+        let checkedBody = block(body)
+        let errorType = handlers[handlers.count - 1].errorType
+        var outer: [ErrorHandlerSpec] = []
+        for index in 0..handlers.count - 1 { outer.append(handlers[index]) }
+        handlers = outer
+        if errorType.kind != .Enumeration {
+            report(.AttemptNeedsTry, span)
+            return .Evaluate(add(.Integer(0), Type.invalid(), span))
+        }
+        let matched = program.enums[errorType.declaration]
+        var covered: [Int] = []
+        var checkedArms: [CheckedArm] = []
+        // A handler runs after a `try` partway through the body, so it starts
+        // from every move the body may have made.
+        let afterBody = movedNow()
+        var paths: [[Bool]] = []
+        if !leaves(checkedBody) { paths.append(afterBody) }
+        for arm in arms {
+            match matched.variant(arm.variant.text) {
+                Some(variant) -> {
+                    if contains(covered, variant) { report(.DuplicateHandle, arm.variant.span) }
+                    covered.append(variant)
+                    restoreMoved(afterBody)
+                    let checkedArm = checkArm(arm, matched.variants[variant], variant)
+                    if !leaves(checkedArm.body) { paths.append(movedNow()) }
+                    checkedArms.append(checkedArm)
+                }
+                None -> report(.UnknownHandle, arm.variant.span)
+            }
+        }
+        joinMoved(paths, afterBody)
+        for variant in 0..matched.variants.count {
+            if !contains(covered, variant) { report(.MissingHandleCase, span) break }
+        }
+        let subject = add(.Read(local), errorType, span)
+        return .Attempt(checkedBody, local, subject, checkedArms)
+    }
+}
+
+extend Checker {
+    // A `match` on a result keeps the failure: its `Error` arm binds it, as
+    // `Error(e)`, rather than `Error`, `Error(_)` or an `else` dropping it.
+    function checkFailureKept(borrow mut self, subjectType: Type, arms: [MatchArm], covered: [Int], span: Span) {
+        if resultTypes(program, subjectType).isNone() { return }
+        for arm in arms {
+            match arm.pattern {
+                Variant -> {
+                    if arm.variant.text != "Error" { continue }
+                    match arm.binding {
+                        Some(name) -> { if name.text == "_" { report(.DiscardedFailure, arm.variant.span) } }
+                        None -> report(.DiscardedFailure, arm.variant.span)
+                    }
+                }
+                Otherwise -> { if !contains(covered, 1) { report(.DiscardedFailure, arm.variant.span) } }
+                // A fallback's fallen side records the failure it lets go.
+                Kept -> {}
+                Fallen -> {}
+                Integer -> {}
+                Boolean -> {}
+                Range -> {}
+                Decimal -> {}
+                DecimalRange -> {}
+                TextLiteral -> {}
+            }
+        }
+    }
+}

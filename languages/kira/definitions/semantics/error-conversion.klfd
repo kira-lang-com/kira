@@ -1,0 +1,42 @@
+extend Checker {
+    function propagatedBody(borrow mut self, body: [Int], handler: ErrorHandlerSpec, result: Type, span: Span) -> CheckedStatement {
+        let subject = add(.Read(handler.local), handler.errorType, span)
+        let destination = resultTypes(program, result).unwrap().error
+        var arms: [CheckedArm] = []
+        let source = program.enums[handler.errorType.declaration]
+        for index in 0..source.variants.count {
+            let variant = source.variants[index]
+            var binding: Optional<Int> = .None
+            var payload: Optional<Int> = .None
+            match variant.payload {
+                Some(valueType) -> {
+                    let local = declareLocal("__propagated_payload", valueType, false, false)
+                    binding = .Some(local)
+                    payload = .Some(add(.Read(local), valueType, span))
+                }
+                None -> {}
+            }
+            let original = add(.Tagged(index, payload), handler.errorType, span)
+            let converted = convertedError(original, destination, span)
+            let returned = add(.Tagged(1, .Some(converted)), result, span)
+            arms.append(CheckedArm {
+                variant = index, binding = binding, body = [program.addStatement(.Return(.Some(returned)))],
+                literal = .None, value = .None, also = [], ranges = [], texts = [], decimals = [], decimalRanges = []
+            })
+        }
+        return .Attempt(body, handler.local, subject, arms)
+    }
+
+    function convertedError(borrow mut self, value: Int, destination: Type, span: Span) -> Int {
+        if typeOf(value).equals(destination) { return value }
+        // `from` may be overloaded, one per failure it converts.
+        for target in declarations.overloadsOf(.Some(destination), "from") {
+            let parameters = declarations.signatures[target].parameters
+            if parameters.count == 1 && parameters[0].valueType.equals(typeOf(value)) {
+                return callChecked(target, .None, [value], span)
+            }
+        }
+        report(.MixedTryFailures, span)
+        return add(.Integer(0), Type.invalid(), span)
+    }
+}

@@ -1,0 +1,427 @@
+// The `@FFI.*` type forms in the checker. `@FFI.Struct` and `@FFI.Union`
+// are C-layout types; `@FFI.Array`, `@FFI.Callback` and `@FFI.Pointer`
+// reach their storage through the field the parser gave them, `elements`,
+// `pointer` and `address`. A literal
+// of any of them starts from zero: a field it leaves out takes its type's
+// zero, and an array's elements take theirs to the declared extent.
+
+enum ForeignShape {
+    Plain
+    CLayout
+    CUnion
+    CArray(Int)
+    Callback
+    // The struct the pointer's `target` names, or none for an opaque one.
+    CPointer(Optional<Int>)
+}
+
+// Each struct an `@FFI.*` type form rides takes its shape.
+function applyForeignShapes(declarations: borrow mut Declarations, tree: SyntaxTree) {
+    for marked in tree.foreignTypes {
+        let mark = tree.foreignMarks[marked.mark]
+        for index in declarations.structsAt(marked.name.span) {
+            declarations.structs[index].shape = foreignShape(mark, tree.structs[index].fields, pointerTarget(declarations, mark))
+        }
+    }
+}
+
+// The struct an `@FFI.Pointer` names as its `target`.
+function pointerTarget(declarations: Declarations, mark: ForeignMark) -> Optional<Int> {
+    match markField(mark, "target") {
+        Some(field) -> {
+            match field.value {
+                Named(target) -> {
+                    match declarations.typeNamed(target.instanceName) {
+                        Some(named) -> {
+                            if named.kind == .Structure { return .Some(named.declaration) }
+                        }
+                        None -> {}
+                    }
+                }
+                Word -> {}
+                Count -> {}
+                Listed -> {}
+            }
+        }
+        None -> {}
+    }
+    return .None
+}
+
+// What a type form makes of its struct; a form that rides a function, and
+// one whose body or annotation does not describe C storage, leaves it plain
+// for the checker to refuse.
+function foreignShape(mark: ForeignMark, fields: [FieldDeclaration], target: Optional<Int>) -> ForeignShape {
+    match mark.form {
+        Struct -> return .CLayout
+        Union -> return .CUnion
+        Array -> {
+            if fields.count != 1 || fields[0].name.text != "elements" { return .Plain }
+            match markField(mark, "count") {
+                Some(field) -> {
+                    match field.value {
+                        Count(count) -> {
+                            if count > 0 { return .CArray(count) }
+                            return .Plain
+                        }
+                        Word -> return .Plain
+                        Named -> return .Plain
+                        Listed -> return .Plain
+                    }
+                }
+                None -> return .Plain
+            }
+        }
+        Callback -> return .Callback
+        Extern -> return .Plain
+        Address -> return .Plain
+        Syscall -> return .Plain
+        Variadic -> return .Plain
+        Pointer -> {
+            if fields.count != 1 || fields[0].name.text != "address" { return .Plain }
+            return .CPointer(target)
+        }
+        Alias -> {
+            if fields.count == 0 { return .CLayout }
+            return .Plain
+        }
+    }
+}
+
+function isForeignShaped(structure: StructType) -> Bool {
+    match structure.shape {
+        Plain -> return false
+        CLayout -> return true
+        CUnion -> return true
+        CArray -> return true
+        Callback -> return true
+        CPointer -> return true
+    }
+}
+
+function isUnionShape(shape: ForeignShape) -> Bool {
+    match shape {
+        CUnion -> return true
+        Plain -> return false
+        CLayout -> return false
+        CArray -> return false
+        Callback -> return false
+        CPointer -> return false
+    }
+}
+
+function cArrayElementType(program: CheckedProgram, valueType: Type) -> Type {
+    let elements = program.structs[valueType.declaration].fields[0].valueType
+    return program.structs[elements.declaration].typeArguments[0]
+}
+
+function noFieldBits(declarations: Declarations) -> [[Int]] {
+    var bits: [[Int]] = []
+    for _ in declarations.structs {
+        let none: [Int] = []
+        bits.append(none)
+    }
+    return bits
+}
+
+function noPointerFrees(declarations: Declarations) -> [Int] {
+    var frees: [Int] = []
+    for _ in declarations.structs { frees.append(0 - 1) }
+    return frees
+}
+
+// What an `@FFI.Pointer`'s `ownership:` says, `borrowed` when it is not
+// written.
+function pointerOwnership(mark: ForeignMark) -> String {
+    match markField(mark, "ownership") {
+        Some(field) -> {
+            match field.value {
+                Word(word) -> return word.text
+                Count -> return ""
+                Named -> return ""
+                Listed -> return ""
+            }
+        }
+        None -> return "borrowed"
+    }
+}
+
+function isCStringType(program: CheckedProgram, valueType: Type) -> Bool {
+    if valueType.kind != .Structure { return false }
+    return program.structs[valueType.declaration].name.text == "CString"
+}
+
+extend Checker {
+    // An `@FFI.*` type form whose storage the annotation does not describe:
+    // an array or callback with fields of its own, an array without an
+    // element type or a positive count.
+    function checkForeignTypeForms(borrow mut self) {
+        for marked in tree.foreignTypes {
+            let mark = tree.foreignMarks[marked.mark]
+            if mark.form != .Callback { continue }
+            match declarations.typeDeclaredAt(marked.name) {
+                Some(named) -> {
+                    if named.kind == .Structure { program.callbackContexts[named.declaration] = callbackContext(mark) }
+                }
+                None -> {}
+            }
+        }
+        for marked in tree.foreignTypes {
+            let mark = tree.foreignMarks[marked.mark]
+            if isCallableForm(mark.form) {
+                report(.ForeignFormPosition, mark.span)
+                continue
+            }
+            match declarations.typeDeclaredAt(marked.name) {
+                Some(named) -> {
+                    if named.kind != .Structure { continue }
+                    match mark.form {
+                        Array -> {
+                            match program.structs[named.declaration].shape {
+                                CArray -> {}
+                                Plain -> report(.ForeignTypeShape, mark.block)
+                                CLayout -> {}
+                                CUnion -> {}
+                                Callback -> {}
+                                CPointer -> {}
+                            }
+                        }
+                        Callback -> {
+                            let fields = program.structs[named.declaration].fields
+                            var count = 1
+                            if markField(mark, "context").isSome() { count = 2 }
+                            if fields.count != count || fields[0].name.text != "pointer" { report(.ForeignTypeShape, mark.block) }
+                            match markField(mark, "context") {
+                                Some(field) -> {
+                                    if program.callbackContexts[named.declaration] < 0 { report(.ForeignCallbackContext, field.span) }
+                                }
+                                None -> {}
+                            }
+                        }
+                        Struct -> checkCMembers(named.declaration, false)
+                        Union -> checkCMembers(named.declaration, true)
+                        Pointer -> {
+                            let fields = program.structs[named.declaration].fields
+                            if fields.count != 1 || fields[0].name.text != "address" { report(.ForeignTypeShape, mark.block) }
+                            checkPointerOwnership(named.declaration, mark)
+                        }
+                        Alias -> {
+                            var opaque = false
+                            match foreignAliasTarget(mark) {
+                                Some(target) -> opaque = target.name.text == program.structs[named.declaration].name.text && target.qualifier.isNone() && target.arguments.count == 0 && program.structs[named.declaration].fields.count == 0
+                                None -> {}
+                            }
+                            if !opaque { report(.ForeignTypeShape, mark.block) }
+                        }
+                        Extern -> {}
+                        Address -> {}
+                        Syscall -> {}
+                        Variadic -> {}
+                    }
+                }
+                None -> {}
+            }
+        }
+    }
+
+    // A bit-field is an integer member of an `@FFI.Struct`, as wide as its
+    // type at most.
+    function checkFieldBits(borrow mut self) {
+        for bits in tree.fieldBits {
+            var placed = false
+            for owner in 0..program.structs.count {
+                let fields = program.structs[owner].fields
+                for index in 0..fields.count {
+                    if !fields[index].name.span.same(bits.field) { continue }
+                    let valueType = fields[index].valueType
+                    var cLayout = false
+                    match program.structs[owner].shape {
+                        CLayout -> cLayout = true
+                        Plain -> {}
+                        CUnion -> {}
+                        CArray -> {}
+                        Callback -> {}
+                        CPointer -> {}
+                    }
+                    if !cLayout || valueType.kind != .Integer || bits.width < 1 || bits.width > valueType.bits { continue }
+                    if program.fieldBits[owner].count == 0 {
+                        var widths: [Int] = []
+                        for _ in fields { widths.append(0) }
+                        program.fieldBits[owner] = widths
+                    }
+                    program.fieldBits[owner][index] = bits.width
+                    placed = true
+                }
+            }
+            if !placed { report(.ForeignBitField, bits.span) }
+        }
+    }
+
+    // `ownership:` is `borrowed`, `unmanaged` or `owned`; an owned pointer
+    // names the C function that frees it, which takes the pointer and returns
+    // nothing, and a value of it calls that function when it is dropped.
+    function checkPointerOwnership(borrow mut self, pointer: Int, mark: ForeignMark) {
+        let owned = pointerOwnership(mark) == "owned"
+        match markField(mark, "ownership") {
+            Some(field) -> {
+                match pointerOwnership(mark) {
+                    "borrowed", "unmanaged", "owned" -> {}
+                    else -> report(.ForeignPointerOwnership, field.span)
+                }
+            }
+            None -> {}
+        }
+        match markField(mark, "free") {
+            Some(field) -> {
+                if !owned {
+                    report(.ForeignPointerOwnership, field.key.span)
+                    return
+                }
+                match field.value {
+                    Word(name) -> {
+                        match freeFunction(pointer, name) {
+                            Some(target) -> program.pointerFrees[pointer] = target
+                            None -> report(.ForeignPointerFree, name.span)
+                        }
+                    }
+                    Count -> report(.ForeignPointerFree, field.span)
+                    Named -> report(.ForeignPointerFree, field.span)
+                    Listed -> report(.ForeignPointerFree, field.span)
+                }
+            }
+            None -> {
+                if owned { report(.ForeignPointerFree, mark.block) }
+            }
+        }
+    }
+
+    function freeFunction(borrow self, pointer: Int, name: Identifier) -> Optional<Int> {
+        match declarations.findFunction(.None, name.text) {
+            Some(target) -> {
+                let signature = declarations.signatures[target]
+                match foreignMarkIndex(tree, signature.declaration.annotations) {
+                    Some(markIndex) -> {
+                        if tree.foreignMarks[markIndex].form != .Extern { return .None }
+                    }
+                    None -> return .None
+                }
+                if signature.parameters.count != 1 || !signature.result.equals(Type.void()) { return .None }
+                let taken = signature.parameters[0].valueType
+                if taken.equals(Type.pointer()) || taken.equals(Type.structure(pointer)) { return .Some(target) }
+                return .None
+            }
+            None -> return .None
+        }
+    }
+
+    // Each member of a C struct or union is a type C lays out. A union's
+    // members overlap, so each is one whose bytes are already C's.
+    function checkCMembers(borrow mut self, owner: Int, overlaid: Bool) {
+        for field in program.structs[owner].fields {
+            if !isCMember(field.valueType, overlaid) { report(.ForeignMemberType, field.name.span) }
+        }
+    }
+
+    function isCMember(borrow self, valueType: Type, overlaid: Bool) -> Bool {
+        match valueType.kind {
+            Integer -> return true
+            Decimal -> return false
+            Floating -> return true
+            Boolean -> return true
+            Pointer -> return true
+            Invalid -> return true
+            Void -> return false
+            Enumeration -> {
+                if overlaid { return false }
+                for variant in program.enums[valueType.declaration].variants {
+                    if variant.payload.isSome() { return false }
+                }
+                return true
+            }
+            Structure -> {
+                let structure = program.structs[valueType.declaration]
+                if isCStringType(program, valueType) { return true }
+                if structure.genericBase == "Distinct" { return isCMember(structure.fields[0].valueType, overlaid) }
+                match structure.shape {
+                    CLayout -> {
+                        if !overlaid { return true }
+                        for field in structure.fields {
+                            if !isCMember(field.valueType, true) { return false }
+                        }
+                        return true
+                    }
+                    CUnion -> return true
+                    CArray -> {
+                        if overlaid { return false }
+                        return isCMember(cArrayElementType(program, valueType), false)
+                    }
+                    Callback -> return program.callbackContexts[valueType.declaration] < 0
+                    CPointer -> return true
+                    Plain -> return false
+                }
+            }
+        }
+    }
+
+    // The value a field of a C-layout type takes when a literal leaves it
+    // out: its type's zero, and for an array's `elements` that zero to the
+    // declared extent.
+    function foreignFieldZero(borrow mut self, owner: Int, field: Field, span: Span) -> Int {
+        match program.structs[owner].shape {
+            CArray(count) -> {
+                let element = program.structs[field.valueType.declaration].typeArguments[0]
+                var elements: [Int] = []
+                for _ in 0..count { elements.append(zeroOrReport(element, span)) }
+                return add(.ArrayLiteral(elements), field.valueType, span)
+            }
+            Plain -> return zeroOrReport(field.valueType, span)
+            CLayout -> return zeroOrReport(field.valueType, span)
+            CUnion -> return zeroOrReport(field.valueType, span)
+            Callback -> return zeroOrReport(field.valueType, span)
+            CPointer -> return zeroOrReport(field.valueType, span)
+        }
+    }
+
+    function zeroOrReport(borrow mut self, valueType: Type, span: Span) -> Int {
+        match zeroValue(valueType, span) {
+            Some(zero) -> return zero
+            None -> {
+                report(.ForeignNoZero, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+
+    // A type's C zero: 0, 0.0, false and a null pointer for the scalars, a
+    // C-layout value zeroed field by field, and an empty array. Any other
+    // type has none.
+    function zeroValue(borrow mut self, valueType: Type, span: Span) -> Optional<Int> {
+        match valueType.kind {
+            Integer -> return .Some(add(.Integer(0), valueType, span))
+            Decimal -> return .Some(numberValue(0, 0, span))
+            Floating -> return .Some(add(.Convert(add(.Integer(0), Type.int(), span)), valueType, span))
+            Boolean -> return .Some(add(.Boolean(false), valueType, span))
+            Pointer -> return .Some(add(.Convert(add(.Integer(0), Type.int(), span)), valueType, span))
+            Structure -> {
+                let structure = program.structs[valueType.declaration]
+                if isForeignShaped(structure) { return .Some(assembleStruct(valueType.declaration, structure.name, [], span)) }
+                if isArrayType(program, valueType) { return .Some(add(.ArrayLiteral([]), valueType, span)) }
+                return .None
+            }
+            Enumeration -> return .None
+            Void -> return .None
+            Invalid -> return .Some(add(.Integer(0), Type.invalid(), span))
+        }
+    }
+
+    // A `String` where a `CString` is expected: a NUL-terminated copy.
+    function cStringOf(borrow mut self, text: Int, target: Type, span: Span) -> Int {
+        match declarations.findFunction(.None, "cStringFrom") {
+            Some(convert) -> return add(.Call(convert, [text]), target, span)
+            None -> {
+                report(.UndefinedFunction, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+}

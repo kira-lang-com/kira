@@ -1,0 +1,275 @@
+function findProceduralMacro(tree: SyntaxTree, name: Identifier) -> Optional<ProceduralMacroDeclaration> {
+    for declared in tree.proceduralMacros {
+        if declared.name.text == name.text { return .Some(declared) }
+    }
+    return .None
+}
+
+// Which expressions stand as a statement of their own, by index: a macro call
+// there expands to statements, anywhere else to the expression it evaluates
+// to. Read once for a round's calls, which all come before it: an expansion
+// adds statements of its own, and none that stands for an earlier expression.
+function statementExpressions(tree: SyntaxTree) -> [Bool] {
+    var standing: [Bool] = []
+    for index in 0..tree.expressions.count { standing.append(false) }
+    for statement in tree.statements {
+        match statement.kind {
+            Evaluation(value) -> standing[value] = true
+            Binding -> {}
+            Assignment -> {}
+            CompoundAssignment -> {}
+            If -> {}
+            While -> {}
+            For -> {}
+            ForEach -> {}
+            Match -> {}
+            Attempt -> {}
+            Return -> {}
+            Break -> {}
+            Continue -> {}
+        }
+    }
+    return standing
+}
+
+// Procedural macros expand to a fixpoint: an expansion may write further
+// annotated declarations and macro calls, which the next round expands, up
+// to a depth that turns a macro producing itself into an error.
+let macroDepthLimit = 64
+
+function expandProceduralMacros(session: Session, unit: Unit, tree: SyntaxTree) -> Result<SyntaxTree, Failure> {
+    var expanded = tree
+    var templates: [MacroTemplate] = []
+    var scanned = 0
+    for round in 0..macroDepthLimit {
+        let annotated = expanded.annotated
+        let invocations = expanded.sourceInvocations
+        let first = scanned
+        scanned = expanded.expressions.count
+        if annotated.count == 0 && invocations.count == 0 && !pendingMacroCall(expanded, first) {
+            return runCollectors(session, unit, expanded)
+        }
+        expanded.annotated = []
+        expanded.sourceInvocations = []
+        templates = withTemplates(expanded, annotated, templates)
+        let batch = evaluateMacroBatch(session, unit, expanded, plannedMacroJobs(expanded, annotated, templates, invocations, first, scanned))
+        for declaration in annotated {
+            expanded = try expandAnnotated(session, unit, move expanded, batch, declaration, templates)
+        }
+        for invocation in invocations {
+            match findProceduralMacro(expanded, invocation.name) {
+                Some(declared) -> {
+                    try callableMacro(declared, invocation.name.span)
+                    let file = try evaluateSourceMacro(session, unit, expanded, batch, declared, invocation.input, invocation.span)
+                    expanded = try parseGenerated(session, move expanded, file, invocation.span)
+                }
+                None -> return .Error(Failure { diagnostic = .MacroUnknown, span = invocation.name.span })
+            }
+        }
+        expanded = try expandMacroCalls(session, unit, move expanded, batch, first, scanned)
+    }
+    return .Error(Failure { diagnostic = .MacroDepthLimit, span = pendingMacroSpan(expanded, scanned) })
+}
+
+// Only a `function` macro is called; the others annotate a declaration.
+function callableMacro(declared: ProceduralMacroDeclaration, span: Span) -> Result<Bool, Failure> {
+    match declared.kind {
+        MacroFunction -> return .Ok(true)
+        MacroDerive -> return .Error(Failure { diagnostic = .MacroNotDerive, span = span })
+        MacroAttribute -> return .Error(Failure { diagnostic = .MacroNotDerive, span = span })
+        MacroWrapper -> return .Error(Failure { diagnostic = .MacroNotDerive, span = span })
+        MacroCollector -> return .Error(Failure { diagnostic = .MacroNotDerive, span = span })
+    }
+}
+
+function parseGenerated(session: Session, move tree: SyntaxTree, file: Int, origin: Span) -> Result<SyntaxTree, Failure> {
+    match macroSourceUnit(tree, origin.file) {
+        Some(context) -> {
+            var parsed = try parseFile(move tree, fileText(session, file as SourceFile), file, context.module)
+            parsed.sources[parsed.sources.count - 1].imports = context.imports
+            return .Ok(parsed)
+        }
+        None -> return .Error(Failure { diagnostic = .OutsideSubset, span = origin })
+    }
+}
+
+function macroCallName(expression: Expression) -> Optional<Identifier> {
+    match expression.kind {
+        MacroCall(name, arguments, input) -> return .Some(name)
+        ExpandedMacro -> return .None
+        Quote -> return .None
+        IntegerLiteral -> return .None
+        FloatLiteral -> return .None
+        BooleanLiteral -> return .None
+        StringLiteral -> return .None
+        ArrayLiteral -> return .None
+        Index -> return .None
+        Transfer -> return .None
+        Labelled -> return .None
+        TypeQuery -> return .None
+        Name -> return .None
+        Member -> return .None
+        Call -> return .None
+        GenericCall -> return .None
+        MethodCall -> return .None
+        IndirectCall -> return .None
+        Lambda -> return .None
+        KeyPath -> return .None
+        Task -> return .None
+        Try -> return .None
+        Variant -> return .None
+        StructLiteral -> return .None
+        Unary -> return .None
+        Binary -> return .None
+        Conditional -> return .None
+        MatchValue -> return .None
+        Content -> return .None
+    }
+}
+
+function pendingMacroCall(tree: SyntaxTree, first: Int) -> Bool {
+    for index in first..tree.expressions.count {
+        match macroCallName(tree.expressions[index]) {
+            Some(name) -> {
+                if name.text == "ksl" || name.text == "klist" || name.text == "sourceDigest" || findProceduralMacro(tree, name).isSome() { return true }
+            }
+            None -> {}
+        }
+    }
+    return false
+}
+
+function pendingMacroSpan(tree: SyntaxTree, first: Int) -> Span {
+    if tree.annotated.count > 0 { return tree.annotated[0].span }
+    if tree.sourceInvocations.count > 0 { return tree.sourceInvocations[0].span }
+    for index in first..tree.expressions.count {
+        if macroCallName(tree.expressions[index]).isSome() { return tree.expressions[index].span }
+    }
+    return Span { file = 0, start = 0, end = 0 }
+}
+
+// Expands the procedural macro calls among the expressions from `first` up
+// to `end`, each in place: as statements where it stands as one, otherwise
+// as the expression it evaluates to. Expanding a call within the program
+// macros run in changes that program, so the batch serves no later call.
+function expandMacroCalls(session: Session, unit: Unit, move tree: SyntaxTree, batch: MacroBatch, first: Int, end: Int) -> Result<SyntaxTree, Failure> {
+    var expanded = move tree
+    var batched = batch
+    var klists = emptyKlistDocuments()
+    let standing = statementExpressions(expanded)
+    for index in first..end {
+        let expression = expanded.expressions[index]
+        match macroCallName(expression) {
+            Some(name) -> {
+                if name.text == "ksl" {
+                    let input = macroWrittenInput(expression)
+                    let file = try expandKslArtifact(session, expanded, input, expression.span)
+                    expanded = try expandMacroFile(session, move expanded, index, standing[index], file)
+                    continue
+                }
+                if name.text == "klist" {
+                    let file = try klists.expand(session, expanded, macroWrittenInput(expression), expression.span)
+                    expanded = try expandMacroFile(session, move expanded, index, standing[index], file)
+                    continue
+                }
+                if name.text == "sourceDigest" {
+                    let file = try expandSourceDigest(session, expanded, macroWrittenInput(expression), expression.span)
+                    expanded = try expandMacroFile(session, move expanded, index, standing[index], file)
+                    continue
+                }
+                match findProceduralMacro(expanded, name) {
+                    Some(declared) -> {
+                        try callableMacro(declared, name.span)
+                        batched = callBatch(session, unit, expanded, batched, index, end)
+                        expanded = try expandMacroCall(session, unit, move expanded, batched, declared, index, standing[index])
+                        if macroEvaluatorFile(expanded, batched, expression.span.file) { batched.current = false }
+                    }
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+    }
+    return .Ok(expanded)
+}
+
+// The batch for the macro calls among the expressions from `first` up to
+// `end`: `batch` while the program it ran is still the one they run in, and
+// otherwise one evaluated for them now. The round's declarations expand
+// before its calls, and a call expanded within the program changes it, so
+// without this every later call would be evaluated alone.
+function callBatch(session: Session, unit: Unit, tree: SyntaxTree, batch: MacroBatch, first: Int, end: Int) -> MacroBatch {
+    if batch.current && sameInts(batch.key, macroEvaluatorKey(tree, batch.expansions)) { return batch }
+    return evaluateMacroBatch(session, unit, tree, plannedMacroJobs(tree, [], [], [], first, end))
+}
+
+function expandMacroCall(session: Session, unit: Unit, move tree: SyntaxTree, batch: MacroBatch, declared: ProceduralMacroDeclaration, index: Int, statement: Bool) -> Result<SyntaxTree, Failure> {
+    let expression = tree.expressions[index]
+    let input = macroWrittenInput(expression)
+    let file = try evaluateSourceMacro(session, unit, tree, batch, declared, input, expression.span)
+    return expandMacroFile(session, move tree, index, statement, file)
+}
+
+function macroWrittenInput(expression: Expression) -> String {
+    var input = ""
+    match expression.kind {
+        MacroCall(name, arguments, written) -> input = written
+        ExpandedMacro -> {}
+        Quote -> {}
+        IntegerLiteral -> {}
+        FloatLiteral -> {}
+        BooleanLiteral -> {}
+        StringLiteral -> {}
+        ArrayLiteral -> {}
+        Index -> {}
+        Transfer -> {}
+        Labelled -> {}
+        TypeQuery -> {}
+        Name -> {}
+        Member -> {}
+        Call -> {}
+        GenericCall -> {}
+        MethodCall -> {}
+        IndirectCall -> {}
+        Lambda -> {}
+        KeyPath -> {}
+        Task -> {}
+        Try -> {}
+        Variant -> {}
+        StructLiteral -> {}
+        Unary -> {}
+        Binary -> {}
+        Conditional -> {}
+        MatchValue -> {}
+        Content -> {}
+    }
+    return input
+}
+
+function expandMacroFile(session: Session, move tree: SyntaxTree, index: Int, statement: Bool, file: Int) -> Result<SyntaxTree, Failure> {
+    let expression = tree.expressions[index]
+    let text = fileText(session, file as SourceFile)
+    var parser = Parser {
+        source = text, tokens = try lex(text, file), position = 0,
+        tree = move tree, imports = [], structLiterals = true, quotes = false, macroNames = [], handling = 0
+    }
+    var body: [Int] = []
+    var result: Optional<Int> = .None
+    if statement {
+        while !parser.at(.End) {
+            for entry in try parser.statements() { body.append(entry) }
+        }
+    } else {
+        result = .Some(try parser.expression())
+        try parser.expect(.End)
+    }
+    var expanded = move parser.tree
+    expanded.expressions[index] = Expression { kind = .ExpandedMacro(body, result), span = expression.span }
+    match macroSourceUnit(expanded, expression.span.file) {
+        Some(context) -> expanded.sources.append(SourceUnit {
+            file = file, module = context.module, hash = sourceHash(text), imports = context.imports, generated = true
+        })
+        None -> return .Error(Failure { diagnostic = .OutsideSubset, span = expression.span })
+    }
+    return .Ok(expanded)
+}

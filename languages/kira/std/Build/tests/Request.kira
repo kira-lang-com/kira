@@ -1,0 +1,49 @@
+import Foundation
+
+// The command line: the words it keeps, the options it reads, and the
+// problems it reports for words it cannot read.
+
+@Test
+function commandLineKeepsItsWordsAndFlags() {
+    let request = parseRequest(
+        ["site", "-target", "x86_64", "-profile=release", "-j4", "-keep-going", "show", "a", "-b"]
+    )
+    expect!((joined(request.arguments, ",")) == "site,-target,x86_64,-profile=release,show,a,-b")
+    expect!((String(request.jobs)) == "4")
+    expect!((String(request.keepGoing)) == "true")
+    expect!((String(request.problems.count)) == "0")
+}
+
+@Test
+function optionsTakeTheirArguments() {
+    var graph = Graph {
+        project: "site",
+        root: "/",
+        request: parseRequest(
+            ["site", "-target", "x86_64", "show", "-profile=release", "a", "-b"]
+        )
+    }
+    let target = graph.option(Choice { name: "target", summary: "the target", fallback: "" })
+    let profile = graph.option(Choice { name: "profile", summary: "the profile", fallback: "" })
+    graph.step(Step { name: "site", summary: "the site", produces: [] })
+    graph.step(Step { name: "show", summary: "shows it", produces: [] })
+    expect!((copy target) == "x86_64")
+    expect!((copy profile) == "release")
+    expect!((joined(graph.chosenNames(), ",")) == "site,show")
+    expect!((joined(graph.stepArguments(), ",")) == "a,-b")
+    expect!((joined(graph.passed("show"), ",")) == "a,-b")
+    expect!((String(graph.requested("show"))) == "true")
+}
+
+@Test
+function wrongCommandLinesAreReported() {
+    var graph = Graph {
+        project: "site",
+        root: "/",
+        request: parseRequest(["--x", "-jobs", "0", "-name"])
+    }
+    let name = graph.option(Choice { name: "name", summary: "a name", fallback: "" })
+    var problems = copy graph.request.problems
+    for problem in graph.problems { problems.append(copy problem) }
+    expect!((joined(problems, "; ")) == "a flag takes one dash: -x; -jobs takes a whole number from 1, not 0; -name needs a value")
+}

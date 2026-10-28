@@ -1,0 +1,147 @@
+extend FunctionLowering {
+    function rawCopyForeign(borrow self, expression: Int, symbol: String) -> Optional<Invocation> {
+        match program.expressions[expression].operation.invocation() {
+            Some(call) -> {
+                match program.functions[call.target].foreign {
+                    Some(index) -> {
+                        let foreign = program.foreignFunctions[index]
+                        if runtimeForeign(program, foreign) && foreign.symbol == symbol { return .Some(call) }
+                    }
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+        return .None
+    }
+
+    function rawCopyProduct(borrow self, expression: Int, local: Int, width: Int) -> Bool {
+        var operand = expression
+        match program.expressions[operand].operation.rawCopyOperands(.Conversion) {
+            Some(conversion) -> {
+                let from = program.typeOf(conversion.left)
+                let to = program.typeOf(operand)
+                if !from.equals(Type.int()) || to.kind != .Integer || to.bits != 64 { return false }
+                operand = conversion.left
+            }
+            None -> {}
+        }
+        match program.expressions[operand].operation.rawCopyOperands(.Multiply) {
+            Some(product) -> {
+                if !program.typeOf(operand).equals(Type.int()) || !arrayFillRead(product.left, local) { return false }
+                match program.expressions[product.right].operation.integer() {
+                    Some(value) -> return value == width
+                    None -> return false
+                }
+            }
+            None -> return false
+        }
+    }
+
+    function lowerRawArrayCopy(borrow mut self, statements: [Int], position: Int) -> Bool {
+        if position < 3 { return false }
+        var count = RawCopyDeclaration { local = -1, value = -1 }
+        var destination = count
+        var counter = -1
+        var loop = RawCopyLoop { condition = -1, body = [] }
+        match program.statements[statements[position - 3]].rawCopyDeclaration() {
+            Some(declaration) -> count = declaration
+            None -> return false
+        }
+        match program.statements[statements[position - 2]].rawCopyDeclaration() {
+            Some(declaration) -> destination = declaration
+            None -> return false
+        }
+        match zeroCounterDeclaration(program.statements[statements[position - 1]]) {
+            Some(local) -> counter = local
+            None -> return false
+        }
+        match program.statements[statements[position]].rawCopyLoop() {
+            Some(found) -> loop = found
+            None -> return false
+        }
+        if loop.body.count != 2 || !unitCounterStep(program.statements[loop.body[1]], counter) { return false }
+        if !checked.locals[count.local].valueType.equals(Type.int()) || checked.locals[count.local].mutable || checked.locals[count.local].cell || checked.locals[count.local].byReference { return false }
+        if checked.locals[destination.local].mutable || checked.locals[destination.local].cell || checked.locals[destination.local].byReference || checked.locals[destination.local].valueType.kind != .Pointer { return false }
+        if !checked.locals[counter].valueType.equals(Type.int()) || checked.locals[counter].cell || checked.locals[counter].byReference { return false }
+        match program.expressions[loop.condition].operation.rawCopyOperands(.Less) {
+            Some(comparison) -> {
+                if !arrayFillRead(comparison.left, counter) || !arrayFillRead(comparison.right, count.local) { return false }
+            }
+            None -> return false
+        }
+        var source = -1
+        match program.expressions[count.value].operation.rawCopyOperands(.Member) {
+            Some(member) -> {
+                if member.right != 1 { return false }
+                match program.expressions[member.left].operation.readLocal() {
+                    Some(local) -> source = local
+                    None -> return false
+                }
+            }
+            None -> return false
+        }
+        if source >= checked.parameterCount || checked.locals[source].mutable || checked.locals[source].cell { return false }
+        if checked.locals[source].passingMode != .Borrowed { return false }
+        let arrayType = checked.locals[source].valueType
+        if !isArrayType(program, arrayType) { return false }
+        let element = program.structs[arrayType.declaration].typeArguments[0]
+        if element.isAggregate() || needsArrayCleanup(program, element) { return false }
+        var symbol = ""
+        match element.kind {
+            Integer -> {
+                if element.signed { return false }
+                if element.bits == 8 { symbol = "kira_dynamic_write_u8_at" }
+                if element.bits == 32 { symbol = "kira_dynamic_write_u32_at" }
+                if element.bits == 64 { symbol = "kira_dynamic_write_u64_at" }
+            }
+            Decimal -> return false
+            Floating -> { if element.bits == 32 { symbol = "kira_dynamic_write_f32_at" } }
+            Boolean -> return false
+            Pointer -> return false
+            Void -> return false
+            Structure -> return false
+            Enumeration -> return false
+            Invalid -> return false
+        }
+        if symbol == "" { return false }
+        let width = types.byteSize(element)
+        match rawCopyForeign(destination.value, "kira_dynamic_alloc") {
+            Some(call) -> { if call.arguments.count != 1 || !rawCopyProduct(call.arguments[0], count.local, width) { return false } }
+            None -> return false
+        }
+        var write = Invocation { target = -1, arguments = [] }
+        match program.statements[loop.body[0]].rawCopyEvaluation() {
+            Some(expression) -> {
+                match rawCopyForeign(expression, symbol) {
+                    Some(call) -> write = call
+                    None -> return false
+                }
+            }
+            None -> return false
+        }
+        if write.arguments.count != 3 || !arrayFillRead(write.arguments[0], destination.local) || !rawCopyProduct(write.arguments[1], counter, width) { return false }
+        var foreignIndex = -1
+        match program.functions[write.target].foreign {
+            Some(index) -> foreignIndex = index
+            None -> return false
+        }
+        let foreign = program.foreignFunctions[foreignIndex]
+        if !foreign.parameterTypes[2].equals(element) || !program.typeOf(write.arguments[2]).equals(element) { return false }
+        match program.expressions[write.arguments[2]].operation.rawCopyOperands(.Element) {
+            Some(index) -> { if !arrayFillRead(index.left, source) || !arrayFillRead(index.right, counter) { return false } }
+            None -> return false
+        }
+        let length = kir.load(storage[count.local])
+        let copyBlock = kir.block()
+        let done = kir.block()
+        kir.branchIf(kir.compare(kirPredicate(.Greater, true), length, kir.integer(types.integer64, 0)), copyBlock, done)
+        enter(copyBlock)
+        let bytes = kir.binary(kirOperator(.Multiply, true), true, true, length, kir.integer(types.integer64, width))
+        kir.copyRaw(arrayData(storage[source], arrayType), kir.load(storage[destination.local]), bytes)
+        kir.store(length, storage[counter])
+        flowInto(done)
+        enter(done)
+        return true
+    }
+}

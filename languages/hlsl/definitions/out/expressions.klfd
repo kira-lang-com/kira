@@ -1,0 +1,364 @@
+// HLSL expressions: matrix products through `mul` on the transposed
+// spelling, per-component selects, and texture methods.
+
+function hlslBinary(op: String) -> String {
+    match op {
+        "add" -> return "+"
+        "subtract" -> return "-"
+        "multiply" -> return "*"
+        "divide" -> return "/"
+        "modulo" -> return "%"
+        "equal" -> return "=="
+        "not_equal" -> return "!="
+        "less" -> return "<"
+        "less_equal" -> return "<="
+        "greater" -> return ">"
+        "greater_equal" -> return ">="
+        "and" -> return "&"
+        "inclusive_or" -> return "|"
+        "exclusive_or" -> return "^"
+        "logical_and" -> return "&&"
+        "logical_or" -> return "||"
+        "shift_left" -> return "<<"
+        "shift_right" -> return ">>"
+        else -> return op
+    }
+}
+
+extend TextOut {
+    function dialectLiteral(borrow self, table: String, owner: Int, index: Int) -> String {
+        let value = text(table, owner, index, "literal")
+        let scalar = text(table, owner, index, "scalar")
+        if scalar == "bool" { return value }
+        if scalar == "i32" {
+            if value == "-2147483648" { return "(-2147483647 - 1)" }
+            return signedText(value)
+        }
+        if scalar == "u32" { return joinText([value, "u"]) }
+        if scalar == "i64" { return signedText(joinText([value, "L"])) }
+        if scalar == "u64" { return joinText([value, "uL"]) }
+        if scalar == "f32" {
+            if !flag(table, owner, index, "finite") {
+                return joinText(["asfloat(", decimalText(field(table, owner, index, "bits")), "u)"])
+            }
+            return signedText(floatOf(table, owner, index))
+        }
+        if scalar == "f16" { return signedText(joinText([floatOf(table, owner, index), "h"])) }
+        return signedText(joinText([text(table, owner, index, "float"), "L"]))
+    }
+
+    function dialectCompose(borrow self, typeIndex: Int, parts: [String]) -> String {
+        let shape = typeKind(typeIndex)
+        if shape == "struct" { return structValue(typeIndex, parts) }
+        if shape == "array" { return joinText(["{ ", joinWith(parts, ", "), " }"]) }
+        var written = hlslType(typeIndex)
+        if failedText(written) { written = "" }
+        return joinText([written, "(", joinWith(parts, ", "), ")"])
+    }
+
+    function lanesOf(borrow self, expression: Int) -> Int {
+        if typeKindOf(expression) == "vector" { return typeField(typeOf(expression), "lanes") }
+        return 0
+    }
+
+    // `T(f(a.x, b.x), f(a.y, b.y), ...)`: a component-wise operation HLSL
+    // has no operator for in every language version.
+    function perComponent(borrow self, expression: Int, lanes: Int, before: String, a: String, middle: String,
+        b: String, after: String) -> String {
+        var parts: [String] = []
+        for lane in 0..lanes {
+            let c = laneText(lane)
+            parts.append(joinText([before, a, ".", c, middle, b, ".", c, after]))
+        }
+        return joinText([resultType(expression), "(", joinWith(parts, ", "), ")"])
+    }
+
+    function hlslBinaryExpression(borrow self, expression: Int) -> String {
+        let left = operandOf(expression, "left")
+        let right = operandOf(expression, "right")
+        let a = operand(left)
+        let b = operand(right)
+        let op = text("expressions", current, expression, "op")
+        let leftShape = typeKindOf(left)
+        let rightShape = typeKindOf(right)
+        if op == "multiply" && (leftShape == "matrix" || rightShape == "matrix")
+            && leftShape != "scalar" && rightShape != "scalar" {
+            return joinText(["mul(", b, ", ", a, ")"])
+        }
+        let boolean = scalarOf(left) == "bool"
+        var lanes = lanesOf(left)
+        if lanes == 0 { lanes = lanesOf(right) }
+        if boolean && lanes > 0 && (op == "logical_and" || op == "and") {
+            return perComponent(expression, lanes, "(", a, " && ", b, ")")
+        }
+        if boolean && lanes > 0 && (op == "logical_or" || op == "inclusive_or") {
+            return perComponent(expression, lanes, "(", a, " || ", b, ")")
+        }
+        if boolean && op == "exclusive_or" { return joinText(["(", a, " != ", b, ")"]) }
+        if boolean && op == "and" { return joinText(["(", a, " && ", b, ")"]) }
+        if boolean && op == "inclusive_or" { return joinText(["(", a, " || ", b, ")"]) }
+        return joinText(["(", a, " ", hlslBinary(op), " ", b, ")"])
+    }
+
+    function hlslSelect(borrow self, expression: Int) -> String {
+        let condition = operandOf(expression, "condition")
+        let c = operand(condition)
+        let a = operand(operandOf(expression, "accept"))
+        let r = operand(operandOf(expression, "reject"))
+        let lanes = lanesOf(condition)
+        if lanes == 0 { return joinText(["(", c, " ? ", a, " : ", r, ")"]) }
+        var parts: [String] = []
+        for lane in 0..lanes {
+            let x = laneText(lane)
+            parts.append(joinText(["(", c, ".", x, " ? ", a, ".", x, " : ", r, ".", x, ")"]))
+        }
+        return joinText([resultType(expression), "(", joinWith(parts, ", "), ")"])
+    }
+
+    function hlslDerivative(borrow self, expression: Int) -> String {
+        let value = operand(operandOf(expression, "expr"))
+        let control = text("expressions", current, expression, "control")
+        var suffix = ""
+        if control == "coarse" {
+            suffix = "_coarse"
+        } else if control == "fine" {
+            suffix = "_fine"
+        }
+        let axis = text("expressions", current, expression, "axis")
+        if axis == "x" { return joinText(["ddx", suffix, "(", value, ")"]) }
+        if axis == "y" { return joinText(["ddy", suffix, "(", value, ")"]) }
+        if utf8Count(suffix) == 0 { return joinText(["fwidth(", value, ")"]) }
+        return joinText(["(abs(ddx", suffix, "(", value, ")) + abs(ddy", suffix, "(", value, ")))"])
+    }
+
+    function hlslBitcast(borrow self, expression: Int) -> String {
+        let value = operand(operandOf(expression, "expr"))
+        let shape = scalarKind(scalarOf(expression))
+        if shape == "float" { return joinText(["asfloat(", value, ")"]) }
+        if shape == "uint" { return joinText(["asuint(", value, ")"]) }
+        if shape == "sint" { return joinText(["asint(", value, ")"]) }
+        return joinText([resultType(expression), "(", value, ")"])
+    }
+
+    function hlslSample(borrow self, expression: Int) -> String {
+        let texture = operand(operandOf(expression, "image"))
+        let coordinate = operandOf(expression, "coordinate")
+        var point = operand(coordinate)
+        let arrayIndex = operandOf(expression, "array_index")
+        if arrayIndex >= 0 {
+            var size = lanesOf(coordinate)
+            if size == 0 { size = 1 }
+            point = joinText(["float", decimalText(size + 1), "(", point, ", float(", operand(arrayIndex), "))"])
+        }
+        var arguments: [String] = [operand(operandOf(expression, "sampler")), point]
+        let referenceIndex = operandOf(expression, "depth_ref")
+        var reference = ""
+        if referenceIndex >= 0 { reference = operand(referenceIndex) }
+        let gather = operandOf(expression, "gather")
+        let level = text("expressions", current, expression, "level")
+        var method = ""
+        if gather >= 0 && referenceIndex >= 0 {
+            arguments.append(reference)
+            method = "GatherCmp"
+        } else if gather >= 0 {
+            let channels: [String] = ["Red", "Green", "Blue", "Alpha"]
+            method = joinText(["Gather", channels[gather % 4]])
+        } else if referenceIndex >= 0 && level == "zero" {
+            arguments.append(reference)
+            method = "SampleCmpLevelZero"
+        } else if referenceIndex >= 0 {
+            arguments.append(reference)
+            method = "SampleCmp"
+        } else if level == "auto" {
+            method = "Sample"
+        } else if level == "zero" {
+            arguments.append("0.0")
+            method = "SampleLevel"
+        } else if level == "exact" {
+            arguments.append(operand(operandOf(expression, "level_value")))
+            method = "SampleLevel"
+        } else if level == "bias" {
+            arguments.append(operand(operandOf(expression, "level_value")))
+            method = "SampleBias"
+        } else {
+            arguments.append(operand(operandOf(expression, "gradient_x")))
+            arguments.append(operand(operandOf(expression, "gradient_y")))
+            method = "SampleGrad"
+        }
+        let offset = operandOf(expression, "offset")
+        if offset >= 0 { arguments.append(operand(offset)) }
+        return joinText([texture, ".", method, "(", joinWith(arguments, ", "), ")"])
+    }
+
+    // The integer coordinate of a load or store, with the array layer and,
+    // for sampled textures, the mip level.
+    function texelCoordinate(borrow self, coordinate: Int, arrayIndex: Int, level: String) -> String {
+        var size = lanesOf(coordinate)
+        if size == 0 { size = 1 }
+        var parts: [String] = [operand(coordinate)]
+        if arrayIndex >= 0 { parts.append(operand(arrayIndex)) }
+        if utf8Count(level) > 0 { parts.append(level) }
+        let total = size + parts.count - 1
+        if total == 1 { return joinText(["int(", parts[0], ")"]) }
+        return joinText(["int", decimalText(total), "(", joinWith(parts, ", "), ")"])
+    }
+
+    function hlslLoad(borrow self, expression: Int) -> String {
+        let image = operandOf(expression, "image")
+        let texture = operand(image)
+        let imageType = typeOf(image)
+        let coordinate = operandOf(expression, "coordinate")
+        let arrayIndex = operandOf(expression, "array_index")
+        if typeText(imageType, "class") == "storage" {
+            return joinText([texture, "[", texelCoordinate(coordinate, arrayIndex, ""), "]"])
+        }
+        if flag("types", -1, imageType, "multisampled") {
+            let sampleIndex = operandOf(expression, "sample")
+            var sample = "0"
+            if sampleIndex >= 0 { sample = operand(sampleIndex) }
+            let at = texelCoordinate(coordinate, arrayIndex, "")
+            return joinText([texture, ".Load(", at, ", int(", sample, "))"])
+        }
+        let levelIndex = operandOf(expression, "level_value")
+        var level = "0"
+        if levelIndex >= 0 { level = joinText(["int(", operand(levelIndex), ")"]) }
+        return joinText([texture, ".Load(", texelCoordinate(coordinate, arrayIndex, level), ")"])
+    }
+
+    function hlslAccessIndex(borrow self, expression: Int) -> String {
+        let base = operandOf(expression, "base")
+        let index = operandOf(expression, "index")
+        let baseText = operand(base)
+        var baseType = typeOf(base)
+        if typeKind(baseType) == "pointer" { baseType = typeField(baseType, "base") }
+        let shape = typeKind(baseType)
+        if shape == "struct" { return joinText([baseText, ".", memberName(baseType, index)]) }
+        if shape == "vector" { return joinText([baseText, ".", laneText(index)]) }
+        return joinText([baseText, "[", decimalText(index), "]"])
+    }
+
+    // A buffer holding one value is a structured buffer of one element.
+    function globalText(borrow self, global: Int) -> String {
+        let name = globalNames[global]
+        if text("globals", -1, global, "space") == "storage"
+            && typeKind(field("globals", -1, global, "type")) != "array" {
+            return joinText([name, "[0]"])
+        }
+        return name
+    }
+
+    function dialectExpression(borrow self, expression: Int) -> String {
+        let which = expressionKind(expression)
+        match which {
+            "literal" -> return dialectLiteral("expressions", current, expression)
+            "constant" -> return constantNames[operandOf(expression, "constant")]
+            "override" -> {
+                refuse("a kept override")
+                return ""
+            }
+            "zero" -> {
+                let zero = zeroText(typeOf(expression))
+                if failedText(zero) {
+                    refuse(failureText(zero))
+                    return ""
+                }
+                return zero
+            }
+            "compose" -> {
+                var parts: [String] = []
+                let items = fieldCount("expressions", current, expression, "items")
+                for at in 0..items {
+                    parts.append(operand(fieldItem("expressions", current, expression, "items", at)))
+                }
+                let shape = typeKindOf(expression)
+                if shape == "struct" { return structValue(typeOf(expression), parts) }
+                if shape == "array" { return joinText(["{ ", joinWith(parts, ", "), " }"]) }
+                return joinText([resultType(expression), "(", joinWith(parts, ", "), ")"])
+            }
+            "access" -> return joinText([operand(operandOf(expression, "base")), "[",
+                operand(operandOf(expression, "index")), "]"])
+            "access_index" -> return hlslAccessIndex(expression)
+            "splat" -> return joinText(["((", resultType(expression), ")(", operand(operandOf(expression, "value")),
+                "))"])
+            "swizzle" -> return joinText([operand(operandOf(expression, "vector")), ".",
+                text("expressions", current, expression, "pattern")])
+            "arg" -> return argumentNames[operandOf(expression, "argument")]
+            "global" -> return globalText(operandOf(expression, "global"))
+            "local" -> return localNames[operandOf(expression, "local")]
+            "load" -> return operand(operandOf(expression, "pointer"))
+            "image_sample" -> return hlslSample(expression)
+            "image_load" -> return hlslLoad(expression)
+            "image_query" -> return hlslQuery(expression)
+            "unary" -> {
+                let value = operand(operandOf(expression, "expr"))
+                let op = text("expressions", current, expression, "op")
+                if op == "negate" { return joinText(["(-", value, ")"]) }
+                if op == "not" { return joinText(["(!", value, ")"]) }
+                return joinText(["(~", value, ")"])
+            }
+            "binary" -> return hlslBinaryExpression(expression)
+            "select" -> return hlslSelect(expression)
+            "derivative" -> return hlslDerivative(expression)
+            "relational" -> {
+                let value = operand(operandOf(expression, "argument"))
+                let fun = text("expressions", current, expression, "fun")
+                if fun == "is_nan" { return joinText(["isnan(", value, ")"]) }
+                if fun == "is_inf" { return joinText(["isinf(", value, ")"]) }
+                return joinText([fun, "(", value, ")"])
+            }
+            "math" -> return hlslMath(expression)
+            "convert" -> return joinText([resultType(expression), "(", operand(operandOf(expression, "expr")), ")"])
+            "bitcast" -> return hlslBitcast(expression)
+            "array_length" -> return arrayLength(operandOf(expression, "pointer"))
+            else -> return joinText(["_ksir_unset", decimalText(expression)])
+        }
+    }
+
+    function dialectTemporary(borrow self, name: String, expression: Int, value: String) -> String {
+        var declared = ""
+        if flag("expressions", current, expression, "shaped") {
+            declared = joinText([resultType(expression), " ", name])
+        } else {
+            declared = commentedText(declaredText(typeOf(expression), name))
+        }
+        return joinText([declared, " = ", value, ";"])
+    }
+
+    function dialectNativeLoop(borrow self) -> Bool {
+        return false
+    }
+
+    function dialectCaseBreak(borrow self) -> Bool {
+        return true
+    }
+
+    function dialectCaseLabel(borrow self, value: String) -> String {
+        return cLabel(value)
+    }
+
+    function dialectKeepsArgument(borrow self, expression: Int) -> Bool {
+        return true
+    }
+
+    function dialectArgument(borrow self, expression: Int) -> String {
+        return operand(expression)
+    }
+
+    function dialectCallArguments(borrow self, callee: Int) -> [String] {
+        return []
+    }
+
+    // A struct or array value is a brace list, which HLSL takes only in a
+    // declaration.
+    function dialectBakeAlways(borrow self, expression: Int) -> Bool {
+        let which = expressionKind(expression)
+        if which != "compose" && which != "zero" { return false }
+        let shape = typeKindOf(expression)
+        return shape == "struct" || shape == "array"
+    }
+
+    function dialectLineDirective(borrow self, file: Int, lineNumber: Int) -> String {
+        if !dialect.debug || lineNumber == 0 { return "" }
+        return joinText(["#line ", decimalText(lineNumber), " ", quotedText(textItem("unit", -1, 0, "files", file))])
+    }
+}

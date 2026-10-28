@@ -1,0 +1,324 @@
+// The state machine of an `async function` (semantics/async.klfd).
+//
+// The resume function keeps everything that outlives a suspension in its
+// frame, one heap block laid out as a KIR record while the body is lowered:
+// word 0 is the resume point, then every slot the body asks for -- bindings,
+// their drop flags, temporaries -- in the order it asks. Its two parameters
+// stay on the stack: they are this poll's frame pointer and context.
+//
+// The entry block reads the resume point and jumps: 0 to the start of the
+// body, `k` to just after the `k`th await, `-2 - k` to the block that
+// destroys what is live at that await, anything else (a finished body) to a
+// trap. Nothing but slots crosses a suspension -- the checker made every
+// await the whole value of a statement -- so the blocks after one never use a
+// value computed before it, except the loop bounds below, which a framed
+// body keeps in slots too.
+//
+// A new frame is zeroed: every drop flag starts clear and every cell
+// pointer null, with no stores on entry that a resumed poll would repeat.
+
+// Where an async function's frame keeps what it is started with.
+struct AsyncFrameLayout {
+    let resume: Int
+    let record: KirType
+    let size: Int
+    // The field of each of F's parameters, in order, and of its drop flag
+    // (-1 for a value with nothing to destroy).
+    let parameterFields: [Int]
+    let parameterFlags: [Int]
+}
+
+extend FunctionLowering {
+    function framed(borrow self) -> Bool {
+        return frameBase.isSome()
+    }
+
+    // Storage for one value: a stack slot, or in a framed body the frame's
+    // next field. Callers are in the entry block, as they are for slots, so
+    // every field address dominates the body.
+    function storageSlot(borrow mut self, valueType: KirType) -> KirAddress {
+        match frameBase {
+            Some(base) -> {
+                match frameRecord {
+                    Some(record) -> {
+                        let name = program.named(checked.name)
+                        types.module.addRecordField(record, name.start, name.end, valueType)
+                        let field = kir.field(base, frameFields, valueType)
+                        frameFields += 1
+                        return field
+                    }
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+        return kir.slot(valueType)
+    }
+
+    // The frame, addressed from the resume function's first parameter once
+    // that is bound; field 0 is the resume point.
+    function openFrame(borrow mut self) {
+        if frameBase.isSome() { return }
+        match frameRecord {
+            Some(record) -> {
+                let name = program.named(checked.name)
+                types.module.addRecordField(record, name.start, name.end, types.integer64)
+                frameBase = .Some(kir.typedMemory(kir.load(storage[0]), record))
+                frameFields = 1
+            }
+            None -> {}
+        }
+    }
+
+    function resumePoint(borrow mut self) -> KirAddress {
+        match frameBase {
+            Some(base) -> return kir.field(base, 0, types.integer64)
+            None -> {
+                abort()
+                return kir.slot(types.integer64)
+            }
+        }
+    }
+
+    function resultAddress(borrow mut self) -> KirAddress {
+        match result {
+            Some(destination) -> return destination
+            None -> {
+                abort()
+                return kir.slot(types.integer64)
+            }
+        }
+    }
+
+    function resumeSpec(borrow self) -> AsyncResume {
+        match checked.asyncResume {
+            Some(spec) -> return spec
+            None -> {
+                abort()
+                return AsyncResume { output = Type.int(), returnsNothing = true, parameters = 0 }
+            }
+        }
+    }
+
+    function pollVariant(borrow self, pollType: Type, name: String) -> Int {
+        match program.enums[pollType.declaration].variant(name) {
+            Some(variant) -> return variant
+            None -> {
+                abort()
+                return 0
+            }
+        }
+    }
+
+    // Lowers this resume function and answers where its frame keeps F's
+    // parameters, for F's own body to start it.
+    function lowerAsyncResume(borrow mut self, index: Int) -> AsyncFrameLayout {
+        let name = program.named(checked.name)
+        let record = types.module.declareRecordSpecialization(name.start, name.end, ridlLayout, generatedSuffix(types.module, "async frame", checked.symbol))
+        frameRecord = .Some(record)
+        lowerBody()
+        var parameterFields: [Int] = []
+        var parameterFlags: [Int] = []
+        for local in 2..(2 + resumeSpec().parameters) {
+            parameterFields.append(frameLocals[local])
+            parameterFlags.append(frameFlags[local])
+        }
+        return AsyncFrameLayout {
+            resume = index, record = record, size = kir_type_size(types.module, record),
+            parameterFields = parameterFields, parameterFlags = parameterFlags
+        }
+    }
+
+    // The start of a framed body. F's parameters are already in the frame,
+    // their drop flags raised by `startFrame`, so a drop before the first
+    // poll destroys them.
+    function asyncPrologue(borrow mut self) {
+        cancelPoints.append(cancelPoint())
+    }
+
+    // A block that destroys every value tracked here, marks the body finished
+    // and answers `Pending`, for dropping the future while it waits here.
+    function cancelPoint(borrow mut self) -> KirBlockBuilder {
+        let savedBlock = current
+        let savedOpen = open
+        let block = kir.block()
+        enter(block)
+        cleanupValues()
+        kir.store(kir.integer(types.integer64, -1), resumePoint())
+        kir.inject(resultAddress(), pollVariant(checked.result, "Pending"))
+        kir.returnVoid()
+        kir.switchTo(savedBlock)
+        current = savedBlock
+        open = savedOpen
+        return block
+    }
+
+    // The entry block's jump to where the frame says to go on.
+    function asyncDispatch(borrow mut self, body: KirBlockBuilder) {
+        let state = kir.load(resumePoint())
+        asyncCase(state, 0, body)
+        for point in 0..resumePoints.count { asyncCase(state, point + 1, resumePoints[point]) }
+        for point in 0..cancelPoints.count { asyncCase(state, -2 - point, cancelPoints[point]) }
+        let report = TrapReport {
+            code = "KLF-RT-0001",
+            headline = "an async function resumed at a state it does not have",
+            label = "in this program",
+            note = "the frame of an `async function` names the point it resumes at; this one names none of them",
+            help = "this is a compiler bug, not a fault in the program: report it with the async function's source"
+        }
+        trapReported(program.functions[0].name, report, [])
+    }
+
+    function asyncCase(borrow mut self, state: KirValue, value: Int, target: KirBlockBuilder) {
+        let next = kir.block()
+        kir.branchIf(kir.compare(kirPredicate(.Equal, true), state, kir.integer(types.integer64, value)), target, next)
+        kir.switchTo(next)
+    }
+
+    // `return`, or the end of the body: `Ready` with the value, everything
+    // the body holds destroyed, and the resume point marked finished. The
+    // value is computed before the result is addressed, since it may itself
+    // be an await whose blocks the address would not dominate.
+    function asyncReturn(borrow mut self, returned: Optional<Int>) {
+        let spec = resumeSpec()
+        let ready = pollVariant(checked.result, "Ready")
+        let outputType = types.of(spec.output)
+        if spec.returnsNothing {
+            match returned {
+                Some(expression) -> evaluate(expression)
+                None -> {}
+            }
+            if !open { return }
+            kir.store(kir.integer(outputType, 0), kir.payload(resultAddress(), ready, outputType))
+        } else {
+            match returned {
+                Some(expression) -> {
+                    if spec.output.isAggregate() {
+                        let held = temporary(spec.output)
+                        write(expression, held)
+                        if !open { return }
+                        moveValue(held, kir.payload(resultAddress(), ready, outputType), spec.output)
+                        forgetTracked(held)
+                    } else {
+                        let computed = value(expression)
+                        if !open { return }
+                        kir.store(computed, kir.payload(resultAddress(), ready, outputType))
+                    }
+                }
+                None -> {}
+            }
+        }
+        kir.inject(resultAddress(), ready)
+        cleanupValues()
+        kir.store(kir.integer(types.integer64, -1), resumePoint())
+        kir.returnVoid()
+        open = false
+    }
+
+    // `future.await`: poll the future held in `future`; `Pending` leaves with
+    // the resume point at this await, `Ready` moves the value out and
+    // destroys the finished future. Answers storage holding the value.
+    function suspendOn(borrow mut self, future: Int, poll: Int, output: Type) -> KirAddress {
+        let point = resumePoints.count + 1
+        let cancel = cancelPoint()
+        kir.store(kir.integer(types.integer64, point), resumePoint())
+        let resumed = kir.block()
+        kir.branch(resumed)
+        enter(resumed)
+        resumePoints.append(resumed)
+        cancelPoints.append(cancel)
+        let pollType = program.functions[poll].result
+        let polled = temporary(pollType)
+        kir.argument(kir.pointer(polled))
+        kir.argument(kir.pointer(storage[future]))
+        kir.argument(kir.pointer(storage[1]))
+        kir.callVoid(functions[poll])
+        markInitialized(polled)
+        let readyBlock = kir.block()
+        let pendingBlock = kir.block()
+        let ready = pollVariant(pollType, "Ready")
+        kir.switchCase(ready, readyBlock)
+        kir.switchCase(pollVariant(pollType, "Pending"), pendingBlock)
+        kir.switchEnum(polled)
+        open = false
+        enter(pendingBlock)
+        forgetTracked(polled)
+        kir.inject(resultAddress(), pollVariant(checked.result, "Pending"))
+        kir.returnVoid()
+        open = false
+        enter(readyBlock)
+        // A `Void` future's `Ready` carries nothing: the await's value is a
+        // flag no one reads, since the frame has no field of type unit.
+        if output.equals(Type.void()) {
+            let flag = temporary(Type.boolean())
+            kir.store(kir.integer(types.boolean, 0), flag)
+            forgetTracked(polled)
+            releaseTracked(storage[future])
+            return flag
+        }
+        let held = temporary(output)
+        let payload = kir.payload(polled, ready, types.of(output))
+        if output.isAggregate() {
+            moveValue(payload, held, output)
+        } else {
+            kir.store(kir.load(payload), held)
+        }
+        markInitialized(held)
+        forgetTracked(polled)
+        releaseTracked(storage[future])
+        return held
+    }
+
+    // F's body: a zeroed frame of the resume function's size, F's parameters
+    // moved into it, and the `Async` that owns it.
+    function startFrame(borrow mut self, resume: Int, asyncType: Type) -> KirAddress {
+        var found: Optional<AsyncFrameLayout> = .None
+        for layout in types.asyncFrames {
+            if layout.resume == resume { found = .Some(layout) }
+        }
+        match found {
+            Some(layout) -> {
+                let size = kir.integer(types.integer64, layout.size)
+                let frame = kir.allocateRaw(size, kir.integer(types.integer64, 16))
+                kir.setBytes(frame, kir.integer(types.integer8, 0), size)
+                let record = kir.typedMemory(frame, layout.record)
+                for index in 0..layout.parameterFields.count {
+                    let localType = checked.locals[index].valueType
+                    let destination = kir.field(record, layout.parameterFields[index], types.of(localType))
+                    if localType.isAggregate() {
+                        moveValue(storage[index], destination, localType)
+                        forgetTracked(storage[index])
+                    } else {
+                        kir.store(kir.load(storage[index]), destination)
+                    }
+                    if layout.parameterFlags[index] >= 0 {
+                        kir.store(kir.integer(types.boolean, 1), kir.field(record, layout.parameterFlags[index], types.boolean))
+                    }
+                }
+                let header = temporary(asyncType)
+                kir.store(frame, kir.field(header, 0, types.pointer))
+                let closureType = program.structs[asyncType.declaration].fields[1].valueType
+                let reference = functionReference(resume, closureType)
+                moveValue(reference, kir.field(header, 1, types.of(closureType)), closureType)
+                forgetTracked(reference)
+                markInitialized(header)
+                return header
+            }
+            None -> {
+                abort()
+                return temporary(asyncType)
+            }
+        }
+    }
+
+    function asyncAddress(borrow mut self, step: AsyncStep, index: Int, valueType: Type) -> KirAddress {
+        match step {
+            Start(resume) -> return startFrame(resume, valueType)
+            Suspend(future, poll) -> return suspendOn(future, poll, valueType)
+        }
+    }
+
+    function asyncValue(borrow mut self, step: AsyncStep, index: Int, valueType: Type) -> KirValue {
+        return kir.load(asyncAddress(step, index, valueType))
+    }
+}

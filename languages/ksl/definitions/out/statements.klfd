@@ -1,0 +1,512 @@
+// Function bodies. KSL has `let`, assignment, `if`, `while` and `return`;
+// everything else is rewritten into those or refused.
+//
+// A loop KSL wrote itself, `while c { body }`, has the shape KSL lowers it
+// to and is written back as that. Any other loop runs while a flag holds:
+// `break` clears it, `continue` sets a second flag, and the statements that
+// would have been skipped are guarded by both. A switch becomes a chain of
+// `if`s over its selector, with a flag only when a `break` leaves a case
+// early.
+
+extend KslOut {
+    function uniqueName(borrow self, wanted: String, used: [String]) -> String {
+        var candidate = wanted
+        var suffix = 1
+        while contains(used, candidate) {
+            candidate = joinText([wanted, "_", decimalText(suffix)])
+            suffix += 1
+        }
+        return candidate
+    }
+
+    function prepareFunction(borrow mut self, index: Int) {
+        argumentNames = []
+        localNames = []
+        bound = []
+        inPlace = []
+        depth = 0
+        var used: [String] = []
+        let arguments = count("arguments", index)
+        for position in 0..arguments {
+            var name = text("arguments", index, position, "name")
+            if utf8Count(name) == 0 { name = joinText(["_a", decimalText(position)]) }
+            let chosen = uniqueName(kslName(name), used)
+            used.append(chosen)
+            argumentNames.append(chosen)
+        }
+        let locals = count("locals", index)
+        for position in 0..locals {
+            var name = text("locals", index, position, "name")
+            if utf8Count(name) == 0 { name = joinText(["_l", decimalText(position)]) }
+            let chosen = uniqueName(kslName(name), used)
+            used.append(chosen)
+            localNames.append(chosen)
+        }
+        let expressions = count("expressions", index)
+        for position in 0..expressions {
+            bound.append(false)
+            inPlace.append(false)
+        }
+    }
+
+    // Every local is declared first, so that each assignment below writes
+    // the one variable: KSL's `let` would declare another.
+    function writeBody(borrow mut self, index: Int, result: Int) {
+        let entry = kind("functions", -1, index) == "entry"
+        if entry && !plainInput(index) { unpackInput(index) }
+        let wrapped = entry && !plainOutput(index)
+        let locals = count("locals", index)
+        for position in 0..locals {
+            let localType = field("locals", index, position, "type")
+            var declaration = joinText(["let ", localNames[position], ": ", typeName(localType, -1)])
+            let init = field("locals", index, position, "init")
+            if init >= 0 { declaration = joinText([declaration, " = ", expression(init)]) }
+            line(declaration)
+        }
+        // A zero struct or matrix is a variable nothing writes.
+        let expressions = count("expressions", index)
+        for position in 0..expressions {
+            if expressionKind(position) == "zero" && utf8Count(zeroText(typeOf(position))) == 0 {
+                line(joinText(["let ", temporaryName(position), ": ", typeName(typeOf(position), position)]))
+                bound[position] = true
+            }
+        }
+        let body = field("functions", -1, index, "body")
+        writeBlock(body, 0)
+        if result >= 0 && !endsInReturn(body) {
+            // KSL wants a `return` at the end even where KSIR cannot reach.
+            var zero = zeroText(result)
+            if wrapped {
+                line(joinText(["let _zero: ", outputName(index)]))
+                zero = "_zero"
+            } else if utf8Count(zero) == 0 {
+                line(joinText(["let _zero: ", typeName(result, -1)]))
+                zero = "_zero"
+            }
+            line(joinText(["return ", zero]))
+        }
+    }
+
+    function endsInReturn(borrow self, block: Int) -> Bool {
+        let statements = count("statements", block)
+        if statements == 0 { return false }
+        return kind("statements", block, statements - 1) == "return"
+    }
+
+    // Writes the statements of `block` from `start`. After one that may
+    // leave the enclosing loop or switch, the rest is guarded.
+    function writeBlock(borrow mut self, block: Int, start: Int) {
+        let statements = count("statements", block)
+        var guards = 0
+        var reachable = true
+        for position in start..statements {
+            if reachable {
+                let which = kind("statements", block, position)
+                writeStatement(block, position, which)
+                if which == "return" || which == "break" || which == "continue" || which == "kill" {
+                    reachable = false
+                } else if position + 1 < statements && escapes(block, position) {
+                    let guard = aliveGuard()
+                    if utf8Count(guard) > 0 {
+                        line(joinText(["if ", guard, " {"]))
+                        indent += 1
+                        guards += 1
+                    }
+                }
+            }
+        }
+        for level in 0..guards {
+            indent -= 1
+            line("}")
+        }
+    }
+
+    // What holds while no open loop or switch has been left.
+    function aliveGuard(borrow self) -> String {
+        var parts: [String] = []
+        for position in 0..depth {
+            let open = constructs[position]
+            if open.isLoop && open.flagged { parts.append(joinText(["_loop", decimalText(open.id)])) }
+            if open.isLoop && open.skips { parts.append(joinText(["!_skip", decimalText(open.id)])) }
+            if !open.isLoop && open.flagged { parts.append(joinText(["_switch", decimalText(open.id)])) }
+        }
+        return joinWith(parts, " && ")
+    }
+
+    function enter(borrow mut self, open: Breakable) {
+        if depth < constructs.count {
+            constructs[depth] = open
+        } else {
+            constructs.append(open)
+        }
+        depth += 1
+    }
+
+    // Whether statement `position` may leave the innermost loop or switch.
+    function escapes(borrow self, block: Int, position: Int) -> Bool {
+        let which = kind("statements", block, position)
+        if which == "break" || which == "continue" { return true }
+        if which == "block" { return blockLeaves(field("statements", block, position, "body"), false) }
+        if which == "if" {
+            return blockLeaves(field("statements", block, position, "accept"), false)
+                || blockLeaves(field("statements", block, position, "reject"), false)
+        }
+        if which == "switch" { return casesLeave(block, position) }
+        return false
+    }
+
+    // Whether `block` holds a `continue`, or with `breaks` a `break`, that
+    // reaches past it. A nested loop keeps both; a switch keeps its breaks.
+    function blockLeaves(borrow self, block: Int, continuesOnly: Bool) -> Bool {
+        let statements = count("statements", block)
+        for position in 0..statements {
+            let which = kind("statements", block, position)
+            if which == "continue" { return true }
+            if which == "break" && !continuesOnly { return true }
+            if which == "block" && blockLeaves(field("statements", block, position, "body"), continuesOnly) {
+                return true
+            }
+            if which == "if" {
+                if blockLeaves(field("statements", block, position, "accept"), continuesOnly) { return true }
+                if blockLeaves(field("statements", block, position, "reject"), continuesOnly) { return true }
+            }
+            if which == "switch" && casesLeave(block, position) { return true }
+        }
+        return false
+    }
+
+    function casesLeave(borrow self, block: Int, position: Int) -> Bool {
+        let cases = fieldCount("statements", block, position, "case_block")
+        for at in 0..cases {
+            if blockLeaves(fieldItem("statements", block, position, "case_block", at), true) { return true }
+        }
+        return false
+    }
+
+    function writeStatement(borrow mut self, block: Int, position: Int, which: String) {
+        match which {
+            "emit" -> writeEmit(field("statements", block, position, "first"), field("statements", block, position, "last"))
+            "block" -> {
+                line("{")
+                indent += 1
+                writeBlock(field("statements", block, position, "body"), 0)
+                indent -= 1
+                line("}")
+            }
+            "if" -> writeIf(block, position)
+            "switch" -> writeSwitch(block, position)
+            "loop" -> writeLoop(block, position)
+            "break" -> writeBreak()
+            "continue" -> writeContinue()
+            "return" -> {
+                let value = field("statements", block, position, "value")
+                if value >= 0 && kind("functions", -1, current) == "entry" && !plainOutput(current) {
+                    writeOutputReturn(expression(value))
+                } else if value >= 0 {
+                    line(joinText(["return ", expression(value)]))
+                } else {
+                    line("return")
+                }
+            }
+            "store" -> line(joinText([
+                expression(field("statements", block, position, "pointer")), " = ",
+                expression(field("statements", block, position, "value"))
+            ]))
+            "image_store" -> {
+                if field("statements", block, position, "array_index") >= 0 { refuse("store to an image array", -1) }
+                line(joinText([
+                    "store(", expression(field("statements", block, position, "image")), ", ",
+                    expression(field("statements", block, position, "coordinate")), ", ",
+                    expression(field("statements", block, position, "value")), ")"
+                ]))
+            }
+            "atomic" -> writeAtomic(block, position)
+            "call" -> writeCall(block, position)
+            else -> refuse(joinText(["`", which, "` statement"]), -1)
+        }
+    }
+
+    function writeEmit(borrow mut self, first: Int, last: Int) {
+        let end = last + 1
+        for index in first..end {
+            if !inPlace[index] {
+                if expressionKind(index) == "select" {
+                    writeSelect(index)
+                } else if field("expressions", current, index, "bake") == 1 {
+                    line(joinText(["let ", temporaryName(index), " = ", expression(index)]))
+                    bound[index] = true
+                }
+            }
+        }
+    }
+
+    // KSL has no `select`: its operands are evaluated already, so an `if`
+    // choosing between them means the same.
+    function writeSelect(borrow mut self, index: Int) {
+        let condition = operand(index, "condition")
+        if kind("types", -1, typeOf(condition)) != "scalar" { refuse("select by lanes", index) }
+        let name = temporaryName(index)
+        let accept = expression(operand(index, "accept"))
+        let reject = expression(operand(index, "reject"))
+        line(joinText(["let ", name, ": ", typeName(typeOf(index), index)]))
+        line(joinText(["if ", expression(condition), " {"]))
+        line(joinText(["    ", name, " = ", accept]))
+        line("} else {")
+        line(joinText(["    ", name, " = ", reject]))
+        line("}")
+        bound[index] = true
+    }
+
+    function writeIf(borrow mut self, block: Int, position: Int) {
+        let reject = field("statements", block, position, "reject")
+        line(joinText(["if ", expression(field("statements", block, position, "condition")), " {"]))
+        indent += 1
+        writeBlock(field("statements", block, position, "accept"), 0)
+        indent -= 1
+        if count("statements", reject) > 0 {
+            line("} else {")
+            indent += 1
+            writeBlock(reject, 0)
+            indent -= 1
+        }
+        line("}")
+    }
+
+    function writeBreak(borrow mut self) {
+        let open = constructs[depth - 1]
+        if !open.flagged { return }
+        if open.isLoop {
+            line(joinText(["_loop", decimalText(open.id), " = false"]))
+        } else {
+            line(joinText(["_switch", decimalText(open.id), " = false"]))
+        }
+    }
+
+    function writeContinue(borrow mut self) {
+        var target = -1
+        for position in 0..depth {
+            if constructs[position].isLoop { target = constructs[position].id }
+        }
+        line(joinText(["_skip", decimalText(target), " = true"]))
+    }
+
+    function writeLoop(borrow mut self, block: Int, position: Int) {
+        let body = field("statements", block, position, "body")
+        let continuing = field("statements", block, position, "continuing")
+        let breakIf = field("statements", block, position, "break_if")
+        let id = nextId
+        nextId += 1
+        let guarded = guardStatement(body)
+        if guarded >= 0 && count("statements", continuing) == 0 && breakIf < 0 {
+            writeWhile(body, guarded, id)
+            return
+        }
+        let skips = blockLeaves(body, true)
+        let flag = joinText(["_loop", decimalText(id)])
+        line(joinText(["let ", flag, " = true"]))
+        line(joinText(["while ", flag, " {"]))
+        indent += 1
+        if skips { line(joinText(["let _skip", decimalText(id), " = false"])) }
+        let saved = depth
+        enter(Breakable { isLoop = true, id = id, flagged = true, skips = skips })
+        writeBlock(body, 0)
+        depth = saved
+        if count("statements", continuing) > 0 || breakIf >= 0 {
+            line(joinText(["if ", flag, " {"]))
+            indent += 1
+            writeBlock(continuing, 0)
+            if breakIf >= 0 {
+                line(joinText(["if ", expression(breakIf), " {"]))
+                line(joinText(["    ", flag, " = false"]))
+                line("}")
+            }
+            indent -= 1
+            line("}")
+        }
+        indent -= 1
+        line("}")
+    }
+
+    // The position of the `if c { break }` KSL's `while` starts with, after
+    // the emits that compute `c`, when the rest of the body never leaves
+    // and those emits feed nothing but `c`; else -1.
+    function guardStatement(borrow mut self, body: Int) -> Int {
+        let statements = count("statements", body)
+        var at = 0
+        while at < statements && kind("statements", body, at) == "emit" {
+            at += 1
+        }
+        if at >= statements || kind("statements", body, at) != "if" { return -1 }
+        let accept = field("statements", body, at, "accept")
+        let reject = field("statements", body, at, "reject")
+        if count("statements", reject) != 0 || count("statements", accept) != 1 { return -1 }
+        if kind("statements", accept, 0) != "break" { return -1 }
+        let rest = at + 1
+        for position in rest..statements {
+            if escapes(body, position) { return -1 }
+        }
+        let condition = field("statements", body, at, "condition")
+        var uses: [Int] = []
+        let expressions = count("expressions", current)
+        for position in 0..expressions {
+            uses.append(0)
+        }
+        countUses(condition, uses)
+        uses[condition] = uses[condition] + 1
+        for position in 0..at {
+            let first = field("statements", body, position, "first")
+            let end = field("statements", body, position, "last") + 1
+            for index in first..end {
+                if uses[index] != field("expressions", current, index, "ref_count") { return -1 }
+                if expressionKind(index) == "select" { return -1 }
+            }
+        }
+        return at
+    }
+
+    // Counts each use of an expression by another under `root`, each
+    // reader once.
+    function countUses(borrow self, root: Int, uses: borrow mut [Int]) {
+        for read in operandsOf(root) {
+            uses[read] = uses[read] + 1
+            if uses[read] == 1 { countUses(read, uses) }
+        }
+    }
+
+    function writeWhile(borrow mut self, body: Int, guarded: Int, id: Int) {
+        for position in 0..guarded {
+            let first = field("statements", body, position, "first")
+            let end = field("statements", body, position, "last") + 1
+            for index in first..end {
+                inPlace[index] = true
+            }
+        }
+        let stop = field("statements", body, guarded, "condition")
+        var condition = ""
+        if expressionKind(stop) == "unary" && text("expressions", current, stop, "op") == "not" {
+            condition = expression(operand(stop, "expr"))
+        } else {
+            condition = joinText(["!", expression(stop)])
+        }
+        line(joinText(["while ", condition, " {"]))
+        indent += 1
+        let saved = depth
+        enter(Breakable { isLoop = true, id = id, flagged = false, skips = false })
+        writeBlock(body, guarded + 1)
+        depth = saved
+        indent -= 1
+        line("}")
+    }
+
+    function writeSwitch(borrow mut self, block: Int, position: Int) {
+        let id = nextId
+        nextId += 1
+        let selector = joinText(["_selector", decimalText(id)])
+        line(joinText(["let ", selector, " = ", expression(field("statements", block, position, "selector"))]))
+        let cases = fieldCount("statements", block, position, "case_block")
+        var flagged = false
+        for at in 0..cases {
+            if leavesEarly(fieldItem("statements", block, position, "case_block", at), true) { flagged = true }
+        }
+        if flagged { line(joinText(["let _switch", decimalText(id), " = true"])) }
+        let saved = depth
+        enter(Breakable { isLoop = false, id = id, flagged = flagged, skips = false })
+        var pending: [String] = []
+        var opened = false
+        var fallback = -1
+        for at in 0..cases {
+            let value = textItem("statements", block, position, "case_value", at)
+            let body = fieldItem("statements", block, position, "case_block", at)
+            let falls = fieldItem("statements", block, position, "case_fall", at) == 1
+            if falls && count("statements", body) > 0 { refuse("switch case that falls through after statements", -1) }
+            if value == "default" {
+                if falls { refuse("default case that falls through", -1) }
+                fallback = body
+            } else {
+                pending.append(joinText([selector, " == ", caseText(value)]))
+                if !falls {
+                    var opening = "} else if "
+                    if !opened { opening = "if " }
+                    line(joinText([opening, joinWith(pending, " || "), " {"]))
+                    pending = []
+                    opened = true
+                    indent += 1
+                    writeBlock(body, 0)
+                    indent -= 1
+                }
+            }
+        }
+        if fallback >= 0 {
+            if opened { line("} else {") } else { line("{") }
+            indent += 1
+            writeBlock(fallback, 0)
+            indent -= 1
+            opened = true
+        }
+        if opened { line("}") }
+        depth = saved
+    }
+
+    // `3i32` as `3`, `3u32` as `UInt(3)`.
+    function caseText(borrow mut self, value: String) -> String {
+        let length = utf8Count(value)
+        let digits = utf8Slice(value, 0, length - 3)
+        let scalar = utf8Slice(value, length - 3, length)
+        return literalText(digits, scalar, -1, true)
+    }
+
+    // Whether a `break` in `block` leaves a case before its end: one that is
+    // not the case's last statement.
+    function leavesEarly(borrow self, block: Int, top: Bool) -> Bool {
+        let statements = count("statements", block)
+        for position in 0..statements {
+            let which = kind("statements", block, position)
+            if which == "break" && !(top && position + 1 == statements) { return true }
+            if which == "block" && leavesEarly(field("statements", block, position, "body"), false) { return true }
+            if which == "if" {
+                if leavesEarly(field("statements", block, position, "accept"), false) { return true }
+                if leavesEarly(field("statements", block, position, "reject"), false) { return true }
+            }
+        }
+        return false
+    }
+
+    function writeAtomic(borrow mut self, block: Int, position: Int) {
+        let fun = text("statements", block, position, "fun")
+        let pointer = field("statements", block, position, "pointer")
+        let resultIndex = field("statements", block, position, "result")
+        if fun != "add" || field("statements", block, position, "compare") >= 0 {
+            refuse(joinText(["atomic `", fun, "`"]), -1)
+            return
+        }
+        if expressionKind(pointer) != "access" || expressionKind(operand(pointer, "base")) != "global" {
+            refuse("atomic on anything but a storage array element", -1)
+            return
+        }
+        let call = joinText([
+            "atomicAdd(", expression(operand(pointer, "base")), ", ", expression(operand(pointer, "index")), ", ",
+            expression(field("statements", block, position, "value")), ")"
+        ])
+        bindResult(resultIndex, call)
+    }
+
+    function writeCall(borrow mut self, block: Int, position: Int) {
+        var arguments: [String] = []
+        let total = fieldCount("statements", block, position, "arguments")
+        for at in 0..total {
+            arguments.append(expression(fieldItem("statements", block, position, "arguments", at)))
+        }
+        let callee = functionNames[field("statements", block, position, "function")]
+        let call = joinText([callee, "(", joinWith(arguments, ", "), ")"])
+        bindResult(field("statements", block, position, "result"), call)
+    }
+
+    function bindResult(borrow mut self, resultIndex: Int, call: String) {
+        if resultIndex < 0 {
+            line(call)
+            return
+        }
+        line(joinText(["let ", temporaryName(resultIndex), " = ", call]))
+        bound[resultIndex] = true
+    }
+}

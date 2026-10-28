@@ -1,0 +1,97 @@
+// The functions an operation names: the one it calls, refers to, closes
+// over or spawns, and for a class call every override it may run, since the
+// receiver's class decides which.
+function operationTargets(program: CheckedProgram, members: borrow mut MemberIndex, operation: Operation) -> [Int] {
+    var targets: [Int] = []
+    match operation.namedFunction() {
+        Some(target) -> targets.append(target)
+        None -> {}
+    }
+    match operation.dispatchedMember() {
+        Some(target) -> {
+            for index in members.implementations(program, program.functions[target].memberName) { targets.append(index) }
+        }
+        None -> {}
+    }
+    return targets
+}
+
+// Each function filed by the part of its symbol after the last `.`, so the
+// overrides a class call may run are read from one bucket rather than every
+// function. Functions added since the last lookup are filed at the next.
+struct MemberIndex {
+    var buckets: [[Int]]
+    var indexed: Int
+
+    // Every function whose symbol ends in `.` and `member`, in order.
+    function implementations(borrow mut self, program: CheckedProgram, member: String) -> [Int] {
+        for index in indexed..program.functions.count {
+            buckets[memberBucket(program.functions[index].symbol)].append(index)
+        }
+        indexed = program.functions.count
+        let suffix = joinText([".", member])
+        var found: [Int] = []
+        for index in buckets[memberBucket(member)] {
+            if endsWithText(program.functions[index].symbol, suffix) { found.append(index) }
+        }
+        return found
+    }
+}
+
+function emptyMemberIndex() -> MemberIndex {
+    return MemberIndex { buckets = emptyNameIndex(), indexed = 0 }
+}
+
+// The bucket of the part of `symbol` after its last `.`.
+function memberBucket(symbol: String) -> Int {
+    var start = 0
+    for offset in 0..utf8Count(symbol) {
+        if utf8Byte(symbol, offset) == 46 { start = offset + 1 }
+    }
+    var hash = 0
+    for offset in start..utf8Count(symbol) { hash = (hash * 31 + utf8Byte(symbol, offset)) % 65521 }
+    return hash % functionBuckets
+}
+
+// The functions lowering calls on its own: the array, string, task and
+// channel runtime, and every type's drop.
+function implicitRoots(program: CheckedProgram) -> [Int] {
+    var roots: [Int] = []
+    for index in 0..program.functions.count {
+        let symbol = program.functions[index].symbol
+        if symbol == "nativeStateRetain" { roots.append(index) }
+        // The native-state hooks C code linked with the program calls.
+        if program.nativeLibraries.count > 0 && (symbol == "nativeStateRetainToken" || symbol == "nativeStateReleaseToken") { roots.append(index) }
+    }
+    for root in program.arrayFunctions { roots.append(root) }
+    for root in program.stringFunctions { roots.append(root) }
+    for root in program.numberFunctions { roots.append(root) }
+    for root in program.taskFunctions { roots.append(root) }
+    for root in program.channelFunctions { roots.append(root) }
+    for root in program.traceRoots { roots.append(root) }
+    for drop in program.dropFunctions {
+        if drop >= 0 { roots.append(drop) }
+    }
+    for root in program.foreignHelpers { roots.append(root) }
+    for free in program.pointerFrees {
+        if free >= 0 { roots.append(free) }
+    }
+    return roots
+}
+
+function startsWithText(text: String, prefix: String) -> Bool {
+    if utf8Count(text) < utf8Count(prefix) { return false }
+    for offset in 0..utf8Count(prefix) {
+        if utf8Byte(text, offset) != utf8Byte(prefix, offset) { return false }
+    }
+    return true
+}
+
+function endsWithText(text: String, suffix: String) -> Bool {
+    let start = utf8Count(text) - utf8Count(suffix)
+    if start < 0 { return false }
+    for offset in 0..utf8Count(suffix) {
+        if utf8Byte(text, start + offset) != utf8Byte(suffix, offset) { return false }
+    }
+    return true
+}

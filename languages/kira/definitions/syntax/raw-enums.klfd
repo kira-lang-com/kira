@@ -1,0 +1,64 @@
+extend Parser {
+    // The whole integer each raw value spells, for an `@Open` enum whose
+    // cases are tagged by their raw values.
+    function rawTags(borrow mut self, values: [Int]) -> [Int] {
+        var tags: [Int] = []
+        for value in values {
+            match tree.expressions[value].kind.codeLiteral() {
+                Some(tag) -> tags.append(tag)
+                None -> {
+                    report(.ExpectedLiteralEquals, tree.expressions[value].span)
+                    tags.append(tags.count)
+                }
+            }
+        }
+        return tags
+    }
+
+    function rawEnumMethods(borrow mut self, name: Identifier, representation: TypeReference, cases: [CaseDeclaration], values: [Int]) -> [FunctionDeclaration] {
+        let span = name.span
+        let selfName = Identifier { text = "self", span = span }
+        let rawName = Identifier { text = "raw", span = span }
+        var toRaw: [MatchArm] = []
+        var fromRaw: [MatchArm] = []
+        for index in 0..cases.count {
+            let returned = tree.addStatement(.Return(.Some(values[index])), span)
+            toRaw.append(MatchArm {
+                variant = cases[index].name, binding = .None, pattern = .Variant,
+                alternatives = [], body = [returned]
+            })
+            var pattern: ArmPattern = .Integer(index)
+            match tree.expressions[values[index]].kind.codeLiteral() {
+                Some(value) -> pattern = .Integer(value)
+                None -> report(.ExpectedLiteralEquals, tree.expressions[values[index]].span)
+            }
+            let variant = tree.addExpression(.Variant(cases[index].name, .None), span)
+            fromRaw.append(MatchArm {
+                variant = cases[index].name, binding = .None, pattern = pattern,
+                alternatives = [], body = [tree.addStatement(.Return(.Some(variant)), span)]
+            })
+        }
+        let trap = tree.addExpression(.Call(Identifier { text = "runtimeTrap", span = span }, []), span)
+        fromRaw.append(MatchArm {
+            variant = Identifier { text = "else", span = span }, binding = .None,
+            pattern = .Otherwise, alternatives = [], body = [tree.addStatement(.Evaluation(trap), span)]
+        })
+        let owner = TypeReference { qualifier = .None, name = name, arguments = [], modes = [], instanceName = name.text }
+        let readSelf = tree.addExpression(.Name(selfName), span)
+        let readRaw = tree.addExpression(.Name(rawName), span)
+        return [
+            FunctionDeclaration {
+                name = Identifier { text = "rawValue", span = span }, annotations = [], receiver = .Borrowed,
+                parameters = [], result = .Some(representation),
+                body = [tree.addStatement(.Match(readSelf, toRaw), span)], span = span,
+                typeParameters = [], scope = GenericScope.none()
+            },
+            FunctionDeclaration {
+                name = Identifier { text = "fromRawValue", span = span }, annotations = [], receiver = .Static,
+                parameters = [Parameter { name = rawName, mode = .Owned, annotation = representation, copies = false, initial = .None }],
+                result = .Some(owner), body = [tree.addStatement(.Match(readRaw, fromRaw), span)], span = span,
+                typeParameters = [], scope = GenericScope.none()
+            }
+        ]
+    }
+}

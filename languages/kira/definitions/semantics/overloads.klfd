@@ -1,0 +1,313 @@
+// Choosing among the declarations that share a name. A call picks the one its
+// arguments fit:
+//
+// 1. Arity. A declaration is in the running when the call passes no more
+//    arguments than it takes and every slot left empty declares a default.
+// 2. Admissibility. Every argument reaches its parameter, by the rule a call
+//    to a name declared once is checked with.
+// 3. Specificity. An argument whose type is the parameter's beats one that
+//    converts or erases into it; the fewest conversions win.
+// 4. Directness. Between equal conversions, the fewest defaults filled win.
+//
+// 5. Scope. The file's own module beats an imported library, and an imported
+//    library beats Foundation, which every package sees.
+//
+// A tie after that is ambiguous and reported rather than broken by
+// declaration order, which would make a call's meaning depend on which file
+// was read first.
+//
+// A generic declaration of the name is chosen when none of the others fits
+// the call and it takes as many arguments as the call passes: what it binds
+// its type parameters to is only known once it is the one called.
+
+struct OverloadScore {
+    let conversions: Int
+    let narrowings: Int
+    let defaults: Int
+    let scope: Int
+
+    function before(borrow self, other: OverloadScore) -> Bool {
+        return conversions < other.conversions || (conversions == other.conversions && (narrowings < other.narrowings || (narrowings == other.narrowings && (defaults < other.defaults || (defaults == other.defaults && scope < other.scope)))))
+    }
+
+    function same(borrow self, other: OverloadScore) -> Bool {
+        return conversions == other.conversions && narrowings == other.narrowings && defaults == other.defaults && scope == other.scope
+    }
+}
+
+extend Checker {
+    // Whether a call with these written arguments goes to `template`, the
+    // generic declaration of a name whose other declarations are `candidates`.
+    function takesGeneric(borrow mut self, template: FunctionDeclaration, candidates: [Int], arguments: [Int]) -> Bool {
+        if candidates.count == 0 { return true }
+        if template.parameters.count != arguments.count { return false }
+        let actual = trialTypes(arguments)
+        for candidate in candidates {
+            if overloadScore(candidate, arguments, actual).isSome() { return false }
+        }
+        return true
+    }
+
+    function freeCallOverload(borrow mut self, name: String, arguments: [Int], expected: Optional<Type>, span: Span) -> Optional<Int> {
+        let candidates = visibleOverloads(.None, name)
+        if candidates.count == 0 { return .None }
+        match expected {
+            Some(result) -> {
+                var matching: [Int] = []
+                for candidate in candidates {
+                    if declarations.signatures[candidate].result.equals(result) { matching.append(candidate) }
+                }
+                if matching.count > 0 { return .Some(chooseOverload(matching, arguments, span)) }
+            }
+            None -> {}
+        }
+        return .Some(chooseOverload(candidates, arguments, span))
+    }
+    // The declaration of `name` a call with these written arguments means,
+    // among the free functions, or with an owner the methods, declared under
+    // it.
+    function overload(borrow mut self, owner: Optional<Type>, name: String, arguments: [Int], span: Span) -> Optional<Int> {
+        let candidates = visibleOverloads(owner, name)
+        if candidates.count == 0 { return .None }
+        return .Some(chooseOverload(candidates, arguments, span))
+    }
+
+    // A module's own free functions take precedence over imported names.
+    function visibleOverloads(borrow self, owner: Optional<Type>, name: String) -> [Int] {
+        let candidates = declarations.overloadsOf(owner, name)
+        if owner.isSome() { return candidates }
+        var own: [Int] = []
+        var imported: [Int] = []
+        for candidate in candidates {
+            let declaredFile = declarations.signatures[candidate].name.span.file
+            if declarations.sameModule(declaredFile, file()) {
+                own.append(candidate)
+            } else if declarations.visibleIn(file(), declaredFile) {
+                imported.append(candidate)
+            }
+        }
+        for candidate in imported { own.append(candidate) }
+        return own
+    }
+
+    // A name declared once answers without ranking, so its arity and type
+    // errors stay the ones its call reports. A call that fits nothing is
+    // checked against the first declaration, which reports the mismatch.
+    function chooseOverload(borrow mut self, candidates: [Int], arguments: [Int], span: Span) -> Int {
+        if candidates.count == 1 { return candidates[0] }
+        let actual = trialTypes(arguments)
+        var winners: [Int] = []
+        var best = OverloadScore { conversions = 0, defaults = 0, scope = 0 }
+        for candidate in candidates {
+            match overloadScore(candidate, arguments, actual) {
+                Some(score) -> {
+                    if winners.count == 0 || score.before(best) {
+                        best = score
+                        winners = [candidate]
+                    } else if score.same(best) {
+                        winners.append(candidate)
+                    }
+                }
+                None -> {}
+            }
+        }
+        if winners.count == 0 { return candidates[0] }
+        if winners.count > 1 {
+            var known = true
+            for argumentType in actual {
+                if argumentType.isInvalid() { known = false }
+            }
+            if known { report(.AmbiguousOverload, span) }
+        }
+        return winners[0]
+    }
+
+    // How closely arguments of these types fit `target`, or nothing when
+    // they do not fit at all. An argument whose type could not be told on
+    // its own fits any parameter without counting as a conversion: the
+    // other arguments decide, and the real check reports it.
+    function overloadScore(borrow self, target: Int, arguments: [Int], actual: [Type]) -> Optional<OverloadScore> {
+        let callee = declarations.signatures[target]
+        let first = callee.parameters.count - callee.declaration.parameters.count
+        var filled: [Optional<Int>] = []
+        match parameterArguments(target, first, arguments, actual.count) {
+            Some(slots) -> filled = slots
+            None -> return .None
+        }
+        var conversions = 0
+        var narrowings = 0
+        var defaults = 0
+        for slot in 0..filled.count {
+            var index = 0
+            match filled[slot] {
+                Some(argument) -> index = argument
+                None -> {
+                    if callee.declaration.parameters[slot].initial.isNone() { return .None }
+                    defaults += 1
+                    continue
+                }
+            }
+            let parameter = callee.parameters[first + slot]
+            let argumentType = actual[index]
+            if index < arguments.count && !variantFits(arguments[index], parameter.valueType) { return .None }
+            if argumentType.isInvalid() || argumentType.equals(parameter.valueType) { continue }
+            if parameter.mode == .MutablyBorrowed || !reaches(argumentType, parameter.valueType) { return .None }
+            conversions += 1
+            if (argumentType.isInteger() || argumentType.kind == .Decimal) && parameter.valueType.kind == .Floating {
+                conversions += 1
+                narrowings += 1
+            }
+        }
+        var scope = 1
+        if callee.owner.isSome() || declarations.sameModule(callee.name.span.file, file()) {
+            scope = 0
+        } else if declarations.inFoundation(callee.name.span.file) {
+            scope = 2
+        }
+        return .Some(OverloadScore { conversions = conversions, narrowings = narrowings, defaults = defaults, scope = scope })
+    }
+
+    // Whether `argument` can be passed where `target` is expected as far as
+    // a leading dot tells: `.Case` has no type of its own, so only an enum
+    // declaring the case takes it. Without this, `HStack(spacing: .Length(4))`
+    // would fit an init whose `spacing` is a `Number` as well as the header.
+    function variantFits(borrow self, argument: Int, target: Type) -> Bool {
+        var written = argument
+        match tree.expressions[argument].kind.argumentLabel() {
+            Some(labelled) -> written = labelled.value
+            None -> {}
+        }
+        match tree.expressions[written].kind.writtenVariant() {
+            Some(name) -> {
+                if target.isInvalid() { return true }
+                if target.kind != .Enumeration { return false }
+                return program.enums[target.declaration].variant(name.text).isSome()
+            }
+            None -> return true
+        }
+    }
+
+    // What an argument looks like when a declaration is being chosen for it.
+    // A literal written where nothing says what it is is the value it spells
+    // at this point: an integer literal is an `Int`, which every `Int`
+    // parameter takes with no conversion at all, and a literal with a
+    // fraction point is a `Float`, so `1.0` picks a `Float` declaration over
+    // a `U64` one. A `Number` parameter converts either, which leaves the same
+    // value. Which declaration the call means is settled here, and the one
+    // chosen then types the literal exactly, so the declaration a literal
+    // picks is the one it would have picked before a literal had a type of
+    // its own.
+    function trialType(borrow mut self, argument: Int) -> Type {
+        let found = typeOf(expression(argument, .None))
+        if found.kind != .Decimal { return found }
+        if tree.expressions[argument].kind.isIntegerLiteral() { return Type.int() }
+        if tree.expressions[argument].kind.isFractionLiteral() { return Type.floating(64) }
+        return found
+    }
+
+    // Whether a value of `actual` becomes a `target` when passed, by the
+    // crossings `coerce` makes.
+    function reaches(borrow self, actual: Type, target: Type) -> Bool {
+        if actual.kind == .Decimal && (target.isInteger() || target.kind == .Floating) { return true }
+        if actual.kind == .Decimal && target.kind == .Decimal { return actual.widensToNumber(target) }
+        if target.kind == .Decimal && actual.isInteger() { return actual.widensToNumber(target) }
+        // A `Float` reaches a `Number` too. Without this the `Number` overload
+        // of a name like `max` is not admissible for `max(someNumber, 0.5)`:
+        // the literal trials as a `Float`, and nothing admits it to a `Number`,
+        // so the `Float` overload is the only one standing and wins a call
+        // whose `Number` argument is exact. Admitting it costs the `Float`
+        // overload nothing -- scoring already charges twice for crossing a
+        // `Number` down into a `Float` -- so the exact argument picks its own
+        // overload and only a `Number` argument pulls the call onto the
+        // `Number` one.
+        if target.kind == .Decimal && actual.kind == .Floating { return target.isNumber() }
+        if actual.equals(target) || classIsSubtype(program, actual, target) { return true }
+        // A value reaches an optional of what it reaches, as `coerce`
+        // promotes it; an optional is never promoted into another.
+        match optionalPayload(program, target) {
+            Some(payload) -> {
+                if optionalPayload(program, actual).isNone() && reaches(actual, payload) { return true }
+            }
+            None -> {}
+        }
+        if nativeStateErasure(program, declarations, actual, target) { return true }
+        if isStringType(program, actual) && isCStringType(program, target) { return true }
+        if actual.kind == .Pointer && isForeignPointerValue(program, target) { return true }
+        if target.kind == .Pointer && isForeignPointerValue(program, actual) { return true }
+        if existentialCase(program, actual, target).isSome() || isAnyType(program, target) { return true }
+        if witnessBoxOf(actual, target).isSome() { return true }
+        if target.kind == .Floating { return actual.kind == .Floating || actual.isInteger() }
+        return actual.isInteger() && target.isInteger() && (actual.isInt() || target.isInt())
+    }
+
+    // The types the written arguments have on their own. Which declaration
+    // is called decides what each argument is checked against, and the
+    // arguments' types decide which declaration is called; this breaks the
+    // cycle by checking them once against no expectation and then dropping
+    // that check: the diagnostics it reported are held and discarded, and
+    // the locals it changed, moves included, are put back. The real check
+    // runs against the declaration chosen. A copied array shares its
+    // elements with the original, so the locals are saved element by
+    // element into an array of their own.
+    function trialTypes(borrow mut self, arguments: [Int]) -> [Type] {
+        var savedLocals: [Local] = []
+        for local in locals { savedLocals.append(local) }
+        let savedVisible = visible
+        let savedScopes = scopes
+        let savedLoopMoves = loopMoves
+        let savedHandlers = handlers
+        let savedPropagated = propagated
+        let savedTry = tryAllowed
+        let savedMainThread = mainThreadCall
+        diag_hold()
+        var types: [Type] = []
+        for argument in arguments { types.append(trialType(argument)) }
+        diag_release(0)
+        locals = savedLocals
+        visible = savedVisible
+        scopes = savedScopes
+        loopMoves = savedLoopMoves
+        handlers = savedHandlers
+        propagated = savedPropagated
+        tryAllowed = savedTry
+        mainThreadCall = savedMainThread
+        return types
+    }
+}
+
+extend ExpressionKind {
+    // Whether the expression is a literal written with a fraction point.
+    function isFractionLiteral(borrow self) -> Bool {
+        match self {
+            Name -> { return false }
+            IntegerLiteral -> { return false }
+            FloatLiteral -> { return true }
+            BooleanLiteral -> { return false }
+            StringLiteral -> { return false }
+            ArrayLiteral -> { return false }
+            Index -> { return false }
+            Transfer -> { return false }
+            Labelled -> { return false }
+            TypeQuery -> { return false }
+            Member -> { return false }
+            Call -> { return false }
+            GenericCall -> { return false }
+            MethodCall -> { return false }
+            IndirectCall -> { return false }
+            Lambda -> { return false }
+            KeyPath -> { return false }
+            Task -> { return false }
+            ExpandedMacro -> { return false }
+            Quote -> { return false }
+            MacroCall -> { return false }
+            Try -> { return false }
+            Variant -> { return false }
+            StructLiteral -> { return false }
+            Unary -> { return false }
+            Binary -> { return false }
+            Conditional -> { return false }
+            MatchValue -> { return false }
+            Content -> { return false }
+        }
+    }
+}

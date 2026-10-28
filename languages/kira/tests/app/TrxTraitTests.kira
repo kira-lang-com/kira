@@ -1,0 +1,547 @@
+import Foundation
+
+// Traits: declaration, conformance, defaults, and retroactive implementation.
+// Prefix: trx / Trx.
+//
+// A trait names a set of members a type may promise to present. A bodyless
+// member is a requirement; one with a body is a default a conforming type
+// inherits unless it writes its own. Conformance is spelled with `:` on the
+// declaration, or retroactively with `extend T: Trait { … }`. Dispatch is
+// static: `value.member()` resolves to the implementation at type-check time,
+// so every case here is an ordinary direct call on both engines.
+//
+// Exercises: a requirement implemented in the type's own body; a default
+// inherited; a default overridden; a marker trait with no members; a
+// retroactive impl on a struct declared elsewhere in the package; conformance
+// on a class, including a subclass inheriting the implementation; conformance
+// on a construct-backed declaration; the compiler-known `Copyable` claim; a
+// default that calls a requirement and so runs the conforming type's body; a
+// receiver written `borrow self`; a `borrow mut self` receiver that writes
+// through to the caller's storage; and a supertrait clause, whose default calls
+// across to the required trait's members.
+
+trait TrxScored {
+    function score(borrow self) -> Int
+    function doubled(borrow self) -> Int {
+        return self.score() * 2
+    }
+    function label(borrow self) -> String {
+        return "scored"
+    }
+}
+
+trait TrxTagged {}
+
+type TrxCount = U16
+
+enum TrxBox<Value> {
+    Value(Value)
+}
+
+struct TrxLeaf: TrxScored, TrxTagged {
+    let n: Int
+    function score(borrow self) -> Int {
+        return n + 1
+    }
+}
+
+// Traits are not limited to struct-shaped values. Enums may claim a marker in
+// their declaration and receive behavioral members through an impl block; the
+// scalar and array impls below exercise the same existential representation.
+enum TrxColor: TrxTagged {
+    Red
+    Blue
+}
+
+extend TrxColor: TrxScored {
+    function score(borrow self) -> Int {
+        return 21
+    }
+}
+
+extend Int: TrxScored {
+    function score(borrow self) -> Int {
+        return 22
+    }
+}
+
+extend Float: TrxScored {
+    function score(borrow self) -> Int {
+        return 23
+    }
+}
+
+extend Bool: TrxScored {
+    function score(borrow self) -> Int {
+        return 24
+    }
+}
+
+extend String: TrxScored {
+    function score(borrow self) -> Int {
+        return 25
+    }
+}
+
+extend[Int]: TrxScored {
+    function score(borrow self) -> Int {
+        return 26
+    }
+}
+
+extend I32: TrxScored {
+    function score(borrow self) -> Int {
+        return 27
+    }
+}
+
+extend TrxCount: TrxScored {
+    function score(borrow self) -> Int {
+        return 28
+    }
+}
+
+extend TrxBox<Int>: TrxScored {
+    function score(borrow self) -> Int {
+        return 29
+    }
+}
+
+// Overrides the `doubled` default and inherits `label`.
+struct TrxTriple: TrxScored {
+    let n: Int
+    function score(borrow self) -> Int {
+        return n
+    }
+    function doubled(borrow self) -> Int {
+        return n * 3
+    }
+}
+
+// Declared with no conformance clause; the trait is claimed retroactively.
+struct TrxLate {
+    let base: Int
+}
+
+extend TrxLate: TrxScored {
+    function score(borrow self) -> Int {
+        return base * 10
+    }
+}
+
+// A struct whose members are all scalars really is copyable, so the claim
+// holds. An ineligible claim is a compile error rather than a runtime one, so
+// it belongs to the diagnostic tests instead of here.
+struct TrxPoint: Copyable {
+    let x: Int
+    let y: Int
+}
+
+class TrxBase: TrxScored {
+    let seed: Int = 4
+    function score(borrow self) -> Int {
+        return seed
+    }
+}
+
+// A subclass takes its parent's implementation, so it keeps the promise too.
+class TrxDerived: TrxScored extends TrxBase {
+    override function score(borrow self) -> Int {
+        return seed * 100
+    }
+}
+
+// A family may claim a trait: every declaration backed by it must keep the
+// promise, and one that writes the claim itself keeps its own conformance.
+construct TrxShape: TrxScored {
+    @Required function sides() -> Int
+}
+
+construct TrxSquare(edge: Int): TrxScored extends TrxShape {
+    function sides() -> Int {
+        return 4
+    }
+    function score(borrow self) -> Int {
+        return edge * 4
+    }
+}
+
+// A `borrow mut self` receiver: the method writes through the value it was
+// called on, and the write lands in the caller's storage.
+struct TrxCounter {
+    var ticks: Int
+    function bump(borrow mut self, by: Int) {
+        self.ticks = self.ticks + by
+    }
+}
+
+trait TrxMutable {
+    function bump(borrow mut self, by: Int)
+    function value(borrow self) -> Int
+}
+
+struct TrxTraitCounter: TrxMutable {
+    var ticks: Int
+    function bump(borrow mut self, by: Int) {
+        self.ticks = self.ticks + by
+    }
+    function value(borrow self) -> Int {
+        return self.ticks
+    }
+}
+
+function trxSum(value: borrow TrxLeaf) -> Int {
+    return value.score() + value.doubled()
+}
+
+@Test
+function trxARequirementIsCalledDirectly() {
+    let leaf = TrxLeaf(n: 6)
+    expect!(leaf.score() == 7)
+}
+
+@Test
+function trxAEnumConformerEntersTheExistential() {
+    let color = TrxColor.Red
+    let erased: TrxScored = color
+    expect!(erased.score() == 21)
+}
+
+@Test
+function trxAIntConformerEntersTheExistential() {
+    let erased: TrxScored = Int(1)
+    expect!(erased.score() == 22)
+}
+
+@Test
+function trxAFloatConformerEntersTheExistential() {
+    let erased: TrxScored = Float(1.0)
+    expect!(erased.score() == 23)
+}
+
+@Test
+function trxABoolConformerEntersTheExistential() {
+    let erased: TrxScored = true
+    expect!(erased.score() == 24)
+}
+
+@Test
+function trxAStringConformerEntersTheExistential() {
+    let erased: TrxScored = "value"
+    expect!(erased.score() == 25)
+}
+
+@Test
+function trxAArrayConformerEntersTheExistential() {
+    var values: [Int] = []
+    values.append(1)
+    let erased: TrxScored = move values
+    expect!(erased.score() == 26)
+}
+
+@Test
+function trxAFixedWidthConformerKeepsItsSpelling() {
+    let value: I32 = 1
+    let erased: TrxScored = value
+    expect!(erased.score() == 27)
+}
+
+@Test
+function trxAAliasConformerUsesTheResolvedIdentity() {
+    let value: U16 = 1
+    let erased: TrxScored = value
+    expect!(erased.score() == 28)
+}
+
+@Test
+function trxAGenericEnumInstantiationConforms() {
+    let value: TrxBox<Int> = .Value(1)
+    let erased: TrxScored = value
+    expect!(erased.score() == 29)
+}
+
+@Test
+function trxADefaultIsInheritedAndCallsTheRequirement() {
+    let leaf = TrxLeaf(n: 6)
+    expect!(leaf.doubled() == 14)
+}
+
+@Test
+function trxADefaultTheTypeWroteWins() {
+    let triple = TrxTriple(n: 5)
+    expect!(triple.doubled() == 15)
+}
+
+@Test
+function trxADefaultReturningTextIsInherited() {
+    let triple = TrxTriple(n: 5)
+    expect!(triple.label() == "scored")
+}
+
+@Test
+function trxARetroactiveImplementationIsAnOrdinaryMethod() {
+    let late = TrxLate(base: 3)
+    expect!(late.score() + late.doubled() == 90)
+}
+
+@Test
+function trxAMarkerTraitAddsNoMembers() {
+    let leaf = TrxLeaf(n: 1)
+    expect!(leaf.score() == 2)
+}
+
+@Test
+function trxAClassKeepsThePromise() {
+    let base = TrxBase()
+    expect!(base.score() + base.doubled() == 12)
+}
+
+@Test
+function trxASubclassOverrideWinsThroughTheDefault() {
+    let derived = TrxDerived()
+    expect!(derived.doubled() == 800)
+}
+
+@Test
+function trxAConstructBackedDeclarationKeepsThePromise() {
+    let square = TrxSquare(edge: 3)
+    expect!(square.doubled() + square.sides() == 28)
+}
+
+@Test
+function trxACopyableClaimLeavesTheTypeCopying() {
+    let a = TrxPoint(x: 2, y: 3)
+    let b = a
+    expect!(a.x + b.y == 5)
+}
+
+@Test
+function trxABorrowedReceiverLeavesTheValueUsable() {
+    let leaf = TrxLeaf(n: 2)
+    expect!(trxSum(leaf) + leaf.score() == 12)
+}
+
+@Test
+function trxAMutableReceiverWritesBackToTheCaller() {
+    var counter = TrxCounter(ticks: 1)
+    counter.bump(by: 5)
+    counter.bump(by: 2)
+    expect!(counter.ticks == 8)
+}
+
+@Test
+function trxAMutableTraitExistentialWritesBackToTheCaller() {
+    var counter: TrxMutable = TrxTraitCounter(ticks: 3)
+    counter.bump(by: 4)
+    counter.bump(by: 2)
+    expect!(counter.value() == 9)
+}
+
+// Churn: a heap-owning conforming type built and released in a loop, so a
+// per-iteration leak in the inherited-default path would scale.
+struct TrxNamed: TrxScored {
+    let name: String
+    function score(borrow self) -> Int {
+        return name.count
+    }
+}
+
+@Test
+function trxAnInheritedDefaultOnAHeapOwningTypeChurnsClean() {
+    var total = 0
+    for i in 0..500 {
+        let named = TrxNamed(name: "ab" + "cd")
+        total = total + named.doubled()
+    }
+    expect!(total == 4000)
+}
+
+// Supertraits: `trait Ord: Eq { … }` states that conforming to `TrxOrdered`
+// obliges a type to conform to `TrxEquated` too. It is a requirement rather
+// than an inheritance — the members come from the supertrait's own conformance
+// — so a default declared here may call across to them on `self`, and the call
+// resolves statically on the concrete type exactly as any other does.
+
+trait TrxEquated {
+    function equals(borrow self, other: Int) -> Bool
+}
+
+trait TrxOrdered: TrxEquated {
+    function less(borrow self, other: Int) -> Bool
+    function atMost(borrow self, other: Int) -> Bool {
+        return self.less(other) || self.equals(other)
+    }
+    function rank(borrow self, other: Int) -> Int {
+        if self.less(other) {
+            return 0
+        }
+        if self.equals(other) {
+            return 1
+        }
+        return 2
+    }
+}
+
+struct TrxMark: TrxEquated, TrxOrdered {
+    let n: Int
+    function equals(borrow self, other: Int) -> Bool {
+        return n == other
+    }
+    function less(borrow self, other: Int) -> Bool {
+        return n < other
+    }
+}
+
+// The supertrait is kept retroactively; the declaration claims only the
+// requiring trait.
+struct TrxLateMark: TrxOrdered {
+    let n: Int
+    function less(borrow self, other: Int) -> Bool {
+        return n * 2 < other
+    }
+}
+
+extend TrxLateMark: TrxEquated {
+    function equals(borrow self, other: Int) -> Bool {
+        return n * 2 == other
+    }
+}
+
+@Test
+function trxADefaultCallsAcrossToASupertraitMember() {
+    let mark = TrxMark(n: 4)
+    let ok = mark.atMost(4) && mark.atMost(5) && !mark.atMost(3)
+    expect!(ok)
+}
+
+@Test
+function trxASupertraitDefaultRanksAcrossBothMembers() {
+    let mark = TrxMark(n: 4)
+    expect!(mark.rank(9) * 100 + mark.rank(4) * 10 + mark.rank(1) == 12)
+}
+
+@Test
+function trxARetroactiveSupertraitConformanceIsEnough() {
+    let mark = TrxLateMark(n: 3)
+    expect!(mark.rank(7) * 10 + mark.rank(6) == 1)
+}
+
+// `Send` and `Sync` are compiler-known markers derived from a type's members,
+// the way `Copyable` is. A claim is a checked assertion and adds no member and
+// no representation, so a claiming type behaves exactly as it did without one —
+// which is what these cases show on both engines. Owning heap storage does not
+// stop a value crossing a thread boundary: one owner moves, and the receiving
+// side is then the only holder.
+
+struct TrxParcel: Send, Sync {
+    let label: String
+    let weights: [Int]
+    function total(borrow self) -> Int {
+        var sum = 0
+        for i in 0..weights.count {
+            sum = sum + weights[i]
+        }
+        return sum + label.count
+    }
+}
+
+// A declared trait may require a marker; the obligation is discharged by the
+// derived fact rather than by writing the marker out a second time.
+trait TrxPortable: Send {
+    function ferry(borrow self) -> Int
+}
+
+struct TrxCrate: TrxPortable {
+    let id: Int
+    function ferry(borrow self) -> Int {
+        return id * 3
+    }
+}
+
+@Test
+function trxAMarkerClaimLeavesAHeapOwningTypeAlone() {
+    let parcel = TrxParcel(label: "ab", weights: [3, 4, 5])
+    expect!(parcel.total() == 14)
+}
+
+@Test
+function trxATraitRequiringSendIsKeptByTheDerivedFact() {
+    let box = TrxCrate(id: 7)
+    expect!(box.ferry() == 21)
+}
+
+// A declaration that never writes the trait in its own head still keeps it,
+// because the family it is backed by claimed it.
+construct TrxHex(edge: Int) extends TrxShape {
+    function sides() -> Int {
+        return 6
+    }
+    function score(borrow self) -> Int {
+        return edge * 6
+    }
+}
+
+// A family may also *answer* a trait it claims, once, for every declaration
+// backed by it: an `extend Family: Trait` block carries the member on the
+// family value, so no declaration owes it.
+trait TrxTitled {
+    function title(borrow self) -> String
+    function shout(borrow self) -> String {
+        return self.title() + "!"
+    }
+}
+
+construct TrxPane {
+    @Required function depth() -> Int
+}
+
+extend TrxPane: TrxTitled {
+    function title(borrow self) -> String {
+        return "pane"
+    }
+}
+
+construct TrxSidebar(width: Int) extends TrxPane {
+    function depth() -> Int {
+        return width
+    }
+}
+
+@Test
+function trxAFamilyClaimBindsEveryDeclarationBackedByIt() {
+    let hex = TrxHex(edge: 2)
+    expect!(hex.doubled() + hex.sides() == 30)
+}
+
+@Test
+function trxADeclarationMayAlsoWriteTheClaimItsFamilyMade() {
+    let square = TrxSquare(edge: 2)
+    expect!(square.doubled() == 16)
+}
+
+@Test
+function trxAFamilyMayAnswerTheTraitForEveryDeclaration() {
+    let bar = TrxSidebar(width: 3)
+    expect!(bar.shout() == "pane!")
+}
+
+function trxSection() -> Int {
+    var checksum = 0
+    checksum = checksum + TrxLeaf(n: 6).doubled()
+    checksum = wrappingAdd(wrappingMul(checksum, 31), TrxTriple(n: 5).doubled())
+    checksum = wrappingAdd(wrappingMul(checksum, 31), TrxLate(base: 3).doubled())
+    checksum = wrappingAdd(wrappingMul(checksum, 31), TrxDerived().doubled())
+    checksum = wrappingAdd(wrappingMul(checksum, 31), TrxSquare(edge: 3).doubled())
+    checksum = wrappingAdd(wrappingMul(checksum, 31), TrxNamed(name: "abcd").doubled())
+    checksum = wrappingAdd(wrappingMul(checksum, 31), TrxMark(n: 4).rank(9))
+    checksum = wrappingAdd(wrappingMul(checksum, 31), TrxMark(n: 4).rank(4))
+    checksum = wrappingAdd(wrappingMul(checksum, 31), TrxLateMark(n: 3).rank(6))
+    checksum = wrappingAdd(
+        wrappingMul(checksum, 31),
+        TrxParcel(label: "ab", weights: [3, 4, 5]).total()
+    )
+    checksum = wrappingAdd(wrappingMul(checksum, 31), TrxCrate(id: 7).ferry())
+    checksum = wrappingAdd(wrappingMul(checksum, 31), TrxHex(edge: 2).doubled())
+    checksum = wrappingAdd(wrappingMul(checksum, 31), TrxSidebar(width: 3).shout().count)
+    return checksum
+}

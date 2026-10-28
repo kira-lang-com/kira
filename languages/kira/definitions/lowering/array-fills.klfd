@@ -1,0 +1,94 @@
+struct ZeroArrayLoop {
+    let array: Int
+    let limit: Int
+}
+
+extend FunctionLowering {
+    function zeroArrayLoop(borrow self) -> Optional<ZeroArrayLoop> {
+        if checked.body.count != 4 || checked.entry || checked.lambda { return .None }
+        var array = -1
+        match emptyArrayDeclaration(program.statements[checked.body[0]]) {
+            Some(local) -> array = local
+            None -> return .None
+        }
+        if !checked.result.equals(checked.locals[array].valueType) || !isArrayType(program, checked.result) { return .None }
+        if checked.locals[array].cell || checked.locals[array].byReference { return .None }
+        var counter = -1
+        match zeroCounterDeclaration(program.statements[checked.body[1]]) {
+            Some(local) -> counter = local
+            None -> return .None
+        }
+        if !checked.locals[counter].valueType.equals(Type.int()) || checked.locals[counter].cell { return .None }
+        var limit = -1
+        match arrayFillLoop(program.statements[checked.body[2]], array, counter) {
+            Some(found) -> limit = found
+            None -> return .None
+        }
+        if !returnsArray(program.statements[checked.body[3]], array) { return .None }
+        return .Some(ZeroArrayLoop { array = array, limit = limit })
+    }
+
+    function lowerZeroArrayBody(borrow mut self) -> Bool {
+        var shape = ZeroArrayLoop { array = -1, limit = -1 }
+        match zeroArrayLoop() {
+            Some(found) -> shape = found
+            None -> return false
+        }
+        var destination = storage[shape.array]
+        match result {
+            Some(address) -> destination = address
+            None -> return false
+        }
+        let element = program.structs[checked.result.declaration].typeArguments[0]
+        let length = nonnegativeArrayCount(value(shape.limit))
+        let data = allocateBuilderArray(destination, length)
+        let width = kir.integer(types.integer64, types.byteSize(element))
+        let usedBytes = kir.binary(kirOperator(.Multiply, true), true, true, length, width)
+        kir.setBytes(data, kir.integer(types.integer8, 0), usedBytes)
+        cleanupValues()
+        kir.returnVoid()
+        open = false
+        return true
+    }
+
+    function nonnegativeArrayCount(borrow mut self, requested: KirValue) -> KirValue {
+        let zero = kir.integer(types.integer64, 0)
+        let positive = kir.compare(kirPredicate(.Greater, true), requested, zero)
+        let lengthSlot = temporary(Type.int())
+        kir.store(zero, lengthSlot)
+        let nonempty = kir.block()
+        let sized = kir.block()
+        kir.branchIf(positive, nonempty, sized)
+        enter(nonempty)
+        kir.store(requested, lengthSlot)
+        flowInto(sized)
+        enter(sized)
+        return kir.load(lengthSlot)
+    }
+
+    function allocateBuilderArray(borrow mut self, destination: KirAddress, length: KirValue) -> KirValue {
+        let zero = kir.integer(types.integer64, 0)
+        let element = program.structs[checked.result.declaration].typeArguments[0]
+        let capacity = temporary(Type.int())
+        kir.store(zero, capacity)
+        let test = kir.block()
+        let grow = kir.block()
+        let ready = kir.block()
+        flowInto(test)
+        enter(test)
+        let available = kir.load(capacity)
+        kir.branchIf(kir.compare(kirPredicate(.Less, true), available, length), grow, ready)
+        enter(grow)
+        let doubled = kir.binary(kirOperator(.Multiply, true), true, true, available, kir.integer(types.integer64, 2))
+        let next = kir.binary(kirOperator(.Add, true), true, true, doubled, kir.integer(types.integer64, 4))
+        kir.store(next, capacity)
+        flowInto(test)
+        enter(ready)
+        let width = kir.integer(types.integer64, types.byteSize(element))
+        let bytes = kir.binary(kirOperator(.Multiply, true), true, true, kir.load(capacity), width)
+        let data = arrayRuntimePointer(0, [bytes])
+        initializeBufferHeader(destination, data, length)
+        kir.store(kir.load(capacity), kir.field(destination, 2, types.integer64))
+        return data
+    }
+}

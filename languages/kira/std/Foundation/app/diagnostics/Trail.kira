@@ -1,0 +1,857 @@
+// The trail: what `log` statements and failures record. The parser writes
+// each `log`, each `try … otherwise`, `handle` arm and `absorb`, and each
+// `return .Error(…)` as calls to the functions below.
+//
+// A site describes itself the first time it is reached. Recorded events go to
+// a ring of the most recent ones, and those at or above the site's category
+// threshold are also written to standard output as they happen. A fault, and a
+// program that traps or fails, first writes out the recorded events nobody
+// saw, oldest first, so the history that led there survives it.
+//
+// Standard output, and not standard error, because a `log` is a program's own
+// account of what it did and belongs beside what it printed. `print` writes to
+// the same place for the same reason.
+//
+// A `log` belongs to a category. The implicit category is the module's; a
+// category named in the statement, `log(category: Tls.Handshake, …)`, is a
+// case of a `LogCategory` enum, and it has a declared threshold of its own. The
+// threshold an event prints at is, lowest precedence first: the declared one,
+// then a bare `KIRA_LOG` threshold, then the longest matching rule, which is
+// `KIRA_LOG` or a `Log` call. Rules name a path (`Shop.net`, `Network.Tls.Handshake`)
+// or a family (`Network.Tls.*`, which matches the same paths as `Network.Tls`
+// followed by a dot).
+//
+// Events down to `debug` are recorded whatever their threshold, so a crash shows
+// its history.
+//
+// Thread safety: every change to the trail's state, and every write, happens
+// under one reentrant lock. The lock is held for one step at a time: a
+// field's expression is evaluated outside it, so a field that logs does not
+// deadlock. An event's fields are kept on the open-event stack of the thread
+// that began it, so two threads' events never mix.
+//
+// The functions the parser calls take the integers it writes: a level's code,
+// a kind's code, a library flag as 0 or 1. Each one turns them into the types
+// below on entry, and nothing past that sees a number standing for something.
+
+@Service("klfsvc_io_write")
+function kernelWrite(data: RawPtr, count: Int) -> Int
+
+@Service("klfsvc_time_monotonic")
+function kernelMonotonicNanos() -> Int
+
+// How loud an event is, coded as the parser codes it: louder is lower.
+enum TrailLevel: Int {
+    Fault = 0
+    Warn = 1
+    Info = 2
+    Debug = 3
+    Trace = 4
+
+    // Whether a threshold of this level lets `level` through.
+    function admits(borrow self, level: borrow TrailLevel) -> Bool {
+        return code(level) <= code(self)
+    }
+
+    // The louder-admitting of the two: whichever lets more through.
+    function widest(borrow self, other: borrow TrailLevel) -> TrailLevel {
+        return code(other) > code(self) ? other : self
+    }
+
+    function name(borrow self) -> String {
+        match self {
+            Fault -> return "fault"
+            Warn -> return "warn"
+            Info -> return "info"
+            Debug -> return "debug"
+            Trace -> return "trace"
+        }
+    }
+}
+
+// What wrote an event, coded as the parser codes it.
+enum TrailKind: Int {
+    // A `log`.
+    Log = 0
+    // A failure a `try … otherwise` absorbed.
+    Absorbed = 1
+    // A failure a `handle` arm took.
+    Handled = 2
+    // A failure `return .Error(…)` made.
+    Origin = 3
+}
+
+// How much of a trail is printed: nothing, or everything up to a level.
+enum TrailThreshold {
+    Off
+    UpTo(TrailLevel)
+
+    function admits(borrow self, level: borrow TrailLevel) -> Bool {
+        match self {
+            Off -> return false
+            UpTo(threshold) -> return threshold.admits(level)
+        }
+    }
+}
+
+// A word of `KIRA_LOG` as a threshold.
+function trailThreshold(word: borrow String) -> TrailThreshold? {
+    match word {
+        "off" -> return .Some(.Off)
+        "fault" -> return .Some(.UpTo(.Fault))
+        "warn" -> return .Some(.UpTo(.Warn))
+        "info" -> return .Some(.UpTo(.Info))
+        "debug" -> return .Some(.UpTo(.Debug))
+        "trace" -> return .Some(.UpTo(.Trace))
+        else -> return .None
+    }
+}
+
+// An enum of log categories. Each case's `threshold` is its declared default:
+// the quietest level it prints until a rule, `KIRA_LOG` or `Log` says otherwise.
+trait LogCategory {
+    function threshold(borrow self) -> TrailThreshold
+}
+
+namespace TrailLimit {
+    // How many recent events the ring keeps.
+    let ring: Int = 256
+    // The most causes a report follows back.
+    let chain: Int = 8
+    // How many times a site prints in full before only its powers of two do.
+    let repeats: Int = 4
+}
+
+namespace TrailDefault {
+    // The quietest level every program records, printed or not.
+    let recorded: TrailLevel = .Debug
+    // Unset, what a program prints of its own trails and of its libraries'.
+    // A library's events print as the program's do: a warning a library
+    // logs is one the person running the program needs to see.
+    let program: TrailLevel = .Info
+    let library: TrailLevel = .Info
+}
+
+// The words of the trail's shared block, each one an `Int` read and written
+// atomically: the lock, its owner and depth (read under the lock), the loudest
+// level in use, the configuration's generation and whether it is read yet.
+namespace TrailWord {
+    let lock: Int = 0
+    let owner: Int = 1
+    let depth: Int = 2
+    let loudest: Int = 3
+    let generation: Int = 4
+    let configured: Int = 5
+    let count: Int = 6
+}
+
+struct TrailSite {
+    let level: TrailLevel
+    let kind: TrailKind
+    let trail: String
+    let path: String
+    let library: Bool
+    let line: Int
+    let column: Int
+    let message: String
+    let names: [String]
+    // The line the site is written on, and how many bytes of it it spans
+    // from its column.
+    let snippet: String
+    let width: Int
+    // The category's path, `Network.Tls.Handshake`; the module's name for the
+    // implicit category.
+    let category: String
+    // The category's declared threshold.
+    let declared: TrailThreshold
+    // The threshold the site prints at, as of configuration `printedGeneration`.
+    var printed: TrailThreshold = .Off
+    var printedGeneration: Int = -1
+    var printedCount: Int = 0
+}
+
+struct TrailEvent {
+    let site: Int
+    let serial: Int
+    let time: Int
+    // Each field's `traceText`, in the site's order.
+    let values: [String]
+    // The serial of the event this one follows from.
+    let cause: Int?
+    var shown: Bool = false
+}
+
+// An event between its `trailBegin` and `trailEnd`, on the thread that began it.
+struct OpenEvent {
+    let thread: Int
+    let site: Int
+    var values: [String] = []
+    var madeWhileHandling: Bool = false
+}
+
+struct TrailRule {
+    let prefix: String
+    let threshold: TrailThreshold
+}
+
+// How a program ended, coded as `@AtExit` reports it.
+@Open
+enum ProgramEnd: Int {
+    Returned = 0
+    Trapped = 1
+    Failed = 2
+// Anything else is a fault of the machine running it.
+}
+
+// Everything the trail knows. Its words live in a block of memory the atomic
+// operations use, so the block is allocated when the state is made.
+struct TrailState {
+    var block: RawPtr = trailAllocateBlock()
+    // What `KIRA_LOG` and `Log` set. A later rule for the same path replaces an
+    // earlier one.
+    var rules: [TrailRule] = []
+    // What `KIRA_LOG` sets for every category, when it sets that.
+    var threshold: TrailThreshold? = .None
+    // The loudest declared threshold of any site described so far.
+    var declaredLoudest: TrailLevel = TrailDefault.recorded
+    // By the number the loader gave each site.
+    var sites: Map<Int, TrailSite> = Map()
+    var ring: [TrailEvent] = []
+    var ringNext: Int = 0
+    var open: [OpenEvent] = []
+    var values: [String] = []
+    var serial: Int = 0
+    // The last failure made and not yet taken, and its text.
+    var failure: Int? = .None
+    var failureText: String = ""
+    // The last failure absorbed or handled.
+    var handling: Int? = .None
+}
+
+// A category's path and its thresholds, for `Log.categories`.
+struct LogCategoryInfo {
+    let path: String
+    // What the category prints at now.
+    let threshold: TrailThreshold
+    // Its declared default.
+    let declared: TrailThreshold
+}
+
+enum LogConfigFailure {
+    // The path is not `Name`, `Name.Name` or a family `Name.Name.*`, with
+    // segments that are not empty.
+    MalformedPath(String)
+}
+
+// The `Log` control: enable, disable and inspect categories at runtime. Paths
+// are the names `KIRA_LOG` uses, `Network.Tls.Handshake`, `Network.Tls.*`.
+struct LogControl {
+    // Prints the path's events at `level` and quieter.
+    function enable(borrow self, path: String, level: TrailLevel) -> Result<Void, LogConfigFailure> {
+        return trailSetRule(move path, .UpTo(move level))
+    }
+
+    // Prints none of the path's events.
+    function disable(borrow self, path: String) -> Result<Void, LogConfigFailure> {
+        return trailSetRule(move path, .Off)
+    }
+
+    // Sets the path's threshold, whatever the declared default is.
+    function set(borrow self, path: String, threshold: TrailThreshold) -> Result<Void, LogConfigFailure> {
+        return trailSetRule(move path, move threshold)
+    }
+
+    // Removes the rule for the path, back to `KIRA_LOG` or the declared default.
+    function reset(borrow self, path: String) -> Result<Void, LogConfigFailure> {
+        return trailResetRule(move path)
+    }
+
+    // Every category that has described itself, with what it prints at now and
+    // its declared default. A category that has not run yet is not listed.
+    function categories(borrow self) -> [LogCategoryInfo] {
+        return trailCategories()
+    }
+}
+
+let Log: LogControl = LogControl {}
+
+// The site the loader numbered `index`. It describes every site before
+// beginning an event there, so one missing is the parser's mistake.
+function describedSite(index: Int) -> TrailSite {
+    match runtimeContext.trail.sites.value(index) {
+        Some(site) -> return site
+        None -> {
+            printError("trail site " + String(index) + " was never described")
+            runtimeTrap()
+        }
+    }
+}
+
+// The block the trail's words live in, zeroed, with the loudest level set to
+// the quietest recorded one.
+function trailAllocateBlock() -> RawPtr {
+    let block = heapAllocateRaw(TrailWord.count * 8, 8)
+    let zero: Int = 0
+    for word in 0..TrailWord.count {
+        heapStore<Int>(heapOffset(block, word * 8), zero)
+    }
+    heapStore<Int>(heapOffset(block, TrailWord.loudest * 8), code(TrailDefault.recorded))
+    return block
+}
+
+function trailWord(index: Int) -> RawPtr {
+    return heapOffset(runtimeContext.trail.block, index * 8)
+}
+
+function trailLoad(index: Int) -> Int {
+    return atomicLoad<Int>(trailWord(index), .Acquire)
+}
+
+function trailStore(index: Int, value: Int) {
+    atomicStore(trailWord(index), value, .Release)
+}
+
+// The number of the calling thread, as the lock's owner word records it.
+function trailThreadNumber() -> Int {
+    return Int(kernelThreadCurrent())
+}
+
+// Takes the trail's lock. It is reentrant: a thread that holds it may take it
+// again, which happens when a field's expression logs.
+function trailLock() {
+    let me = trailThreadNumber()
+    if trailLoad(TrailWord.owner) == me && heapLoad<Int>(trailWord(TrailWord.depth)) > 0 {
+        heapStore<Int>(trailWord(TrailWord.depth), heapLoad<Int>(trailWord(TrailWord.depth)) + 1)
+        return
+    }
+    let free: Int = 0
+    let taken: Int = 1
+    while atomicCompareExchange(trailWord(TrailWord.lock), free, taken, .Acquire, .Relaxed) != free {
+        kernelThreadYield()
+    }
+    trailStore(TrailWord.owner, me)
+    heapStore<Int>(trailWord(TrailWord.depth), taken)
+}
+
+function trailUnlock() {
+    let depth = heapLoad<Int>(trailWord(TrailWord.depth)) - 1
+    heapStore<Int>(trailWord(TrailWord.depth), depth)
+    if depth > 0 { return }
+    let free: Int = 0
+    trailStore(TrailWord.owner, free)
+    atomicStore(trailWord(TrailWord.lock), free, .Release)
+}
+
+// Reads `KIRA_LOG` once, the first time the trail is used.
+function trailEnsureConfigured() {
+    if trailLoad(TrailWord.configured) == 1 { return }
+    trailLock()
+    if trailLoad(TrailWord.configured) == 0 {
+        trailConfigure()
+        trailStore(TrailWord.configured, 1)
+    }
+    trailUnlock()
+}
+
+// Whether an event at `level` may be recorded or printed by some site: the
+// loudest threshold in use, which an undescribed site is always let through so
+// that its description runs.
+function trailOpen(level: Int, site: Int) -> Bool {
+    trailEnsureConfigured()
+    if level <= trailLoad(TrailWord.loudest) { return true }
+    return trailUnknown(site)
+}
+
+function trailUnknown(site: Int) -> Bool {
+    trailLock()
+    let unknown = !runtimeContext.trail.sites.contains(site)
+    trailUnlock()
+    return unknown
+}
+
+// The site of a `log` in the implicit category: the module's name.
+function trailSite(
+    site: Int,
+    level: Int,
+    kind: Int,
+    trail: String,
+    path: String,
+    library: Int,
+    line: Int,
+    column: Int,
+    message: String,
+    names: [String],
+    snippet: String,
+    width: Int
+) -> Bool {
+    let declared: TrailThreshold = .UpTo(library == 1 ? TrailDefault.library : TrailDefault.program)
+    let category = copy trail
+    return trailDescribe(
+        site, level, kind, move trail, move path, library, line, column, move message, move names,
+        move snippet, width, move category, move declared
+    )
+}
+
+// The site of a `log` in a category: `category` is the enum case, and its
+// path is the module's name and the category's name.
+function trailCategorySite(
+    site: Int,
+    level: Int,
+    kind: Int,
+    trail: String,
+    path: String,
+    library: Int,
+    line: Int,
+    column: Int,
+    message: String,
+    names: [String],
+    snippet: String,
+    width: Int,
+    categoryPath: String,
+    declared: TrailThreshold
+) -> Bool {
+    return trailDescribe(
+        site, level, kind, move trail, move path, library, line, column, move message, move names,
+        move snippet, width, move categoryPath, move declared
+    )
+}
+
+function trailDescribe(
+    site: Int,
+    level: Int,
+    kind: Int,
+    trail: String,
+    path: String,
+    library: Int,
+    line: Int,
+    column: Int,
+    message: String,
+    names: [String],
+    snippet: String,
+    width: Int,
+    category: String,
+    declared: TrailThreshold
+) -> Bool {
+    trailEnsureConfigured()
+    trailLock()
+    trailWidenFor(declared)
+    runtimeContext.trail.sites.set(
+        site,
+        TrailSite {
+            level = fromCode<TrailLevel>(level),
+            kind = fromCode<TrailKind>(kind),
+            trail = move trail,
+            path = move path,
+            library = library == 1,
+            line = line,
+            column = column,
+            message = move message,
+            names = move names,
+            snippet = move snippet,
+            width = width,
+            category = move category,
+            declared = declared
+        }
+    )
+    trailUnlock()
+    return true
+}
+
+// Raises the loudest level in use to `declared`'s, when it is louder.
+function trailWidenFor(declared: borrow TrailThreshold) {
+    match declared {
+        UpTo(threshold) -> trailWidenLoudest(threshold)
+        Off -> {}
+    }
+}
+
+// Raises the loudest level in use to `level`, when it is louder, and records it
+// as a declared level so a later configuration keeps it.
+function trailWidenLoudest(level: TrailLevel) {
+    runtimeContext.trail.declaredLoudest = runtimeContext.trail.declaredLoudest.widest(level)
+    let loudest = fromCode<TrailLevel>(trailLoad(TrailWord.loudest))
+    trailStore(TrailWord.loudest, code(loudest.widest(level)))
+}
+
+// Begins an event at `site` on this thread, if it records or prints; its fields
+// follow with `trailField` and it ends with `trailEnd`.
+function trailBegin(site: Int) -> Bool {
+    trailLock()
+    var described = describedSite(site)
+    let generation = trailLoad(TrailWord.generation)
+    if described.printedGeneration != generation {
+        described.printed = trailThresholdFor(described.category, described.declared)
+        described.printedGeneration = generation
+        runtimeContext.trail.sites.set(site, copy described)
+    }
+    let recording = TrailDefault.recorded.admits(described.level) || described.printed.admits(described.level)
+    if recording {
+        runtimeContext.trail.open.append(OpenEvent { thread = trailThreadNumber(), site = site })
+    }
+    trailUnlock()
+    return recording
+}
+
+// The index of this thread's innermost open event.
+function trailOpenIndex() -> Int {
+    let me = trailThreadNumber()
+    var index = runtimeContext.trail.open.count - 1
+    while index >= 0 {
+        if runtimeContext.trail.open[index].thread == me { return index }
+        index--
+    }
+    printError("trail field with no open event")
+    runtimeTrap()
+    return 0
+}
+
+function trailField(value: String) {
+    trailLock()
+    let index = trailOpenIndex()
+    runtimeContext.trail.open[index].values.append(move value)
+    trailUnlock()
+}
+
+// Records that the open event on this thread was made while another failure
+// was being handled.
+function trailMarkMade(madeWhileHandling: Bool) {
+    trailLock()
+    let index = trailOpenIndex()
+    runtimeContext.trail.open[index].madeWhileHandling = madeWhileHandling
+    trailUnlock()
+}
+
+// The event's serial: the number a later event names it by.
+function trailEnd() -> Int {
+    trailLock()
+    let index = trailOpenIndex()
+    let open = runtimeContext.trail.open[index]
+    trailRemoveOpen(index)
+    var site = describedSite(open.site)
+    runtimeContext.trail.serial++
+    let serial = runtimeContext.trail.serial
+    var event = TrailEvent {
+        site = open.site,
+        serial = serial,
+        time = kernelMonotonicNanos(),
+        values = open.values,
+        cause = trailCause(site.kind, open.values, open.madeWhileHandling)
+    }
+    if site.level == .Fault { trailSpill("before this fault") }
+    let printed = site.printed.admits(site.level)
+    if printed {
+        site.printedCount++
+        runtimeContext.trail.sites.set(open.site, copy site)
+        let count = site.printedCount
+        if count <= TrailLimit.repeats || (count & (count - 1)) == 0 {
+            trailWrite(trailRendered(event, false, count))
+        }
+        event.shown = true
+    }
+    if TrailDefault.recorded.admits(site.level) || printed { trailRemember(move event) }
+    trailUnlock()
+    return serial
+}
+
+// Drops the open event at `index`, keeping the others in order.
+function trailRemoveOpen(index: Int) {
+    var kept: [OpenEvent] = []
+    for position in 0..runtimeContext.trail.open.count {
+        if position != index { kept.append(runtimeContext.trail.open[position]) }
+    }
+    runtimeContext.trail.open = kept
+}
+
+// What the event about to be numbered `serial` follows from, and the
+// failures in flight after it.
+function trailCause(kind: borrow TrailKind, values: borrow [String], madeWhileHandling: Bool) -> Int? {
+    let serial = runtimeContext.trail.serial
+    match kind {
+        Absorbed, Handled -> {
+            var cause: Int? = .None
+            if values.count > 0 && values[0] == runtimeContext.trail.failureText {
+                cause = runtimeContext.trail.failure
+            }
+            runtimeContext.trail.failure = .None
+            runtimeContext.trail.handling = .Some(serial)
+            return cause
+        }
+        Origin -> {
+            var cause: Int? = .None
+            if madeWhileHandling {
+                cause = laterOf(runtimeContext.trail.handling, runtimeContext.trail.failure)
+            }
+            runtimeContext.trail.failure = .Some(serial)
+            if values.count > 0 { runtimeContext.trail.failureText = values[0] }
+            return cause
+        }
+        Log -> return .None
+    }
+}
+
+// The later of two serials, either of which may be missing.
+function laterOf(first: Int?, second: Int?) -> Int? {
+    match first {
+        Some(one) -> {
+            match second {
+                Some(other) -> return .Some(other > one ? other : one)
+                None -> return first
+            }
+        }
+        None -> return second
+    }
+}
+
+// `return .Error(…)`: the failure recorded where it is made, and passed on
+// as it was. `context` is 1 when it is made inside a `handle` arm.
+function trailReturned<Returned>(
+    value: Returned,
+    site: Int,
+    context: Int,
+    described: Bool
+) -> Returned {
+    if trailOpen(code(TrailLevel.Debug), site) && trailBegin(site) {
+        trailField(trailPayloadText(traceText(value)))
+        trailMarkMade(context == 1)
+        trailEnd()
+    }
+    return move value
+}
+
+// `Error(x)` as `x`, the text the event that takes the failure traces.
+function trailPayloadText(text: String) -> String {
+    if text.startsWith("Error(") && text.endsWith(")") { return text.substring(6, text.count - 1) }
+    return text
+}
+
+// The ring keeps the most recent events: once full, each one replaces the
+// oldest. The lock is held.
+function trailRemember(event: TrailEvent) {
+    if runtimeContext.trail.ring.count < TrailLimit.ring {
+        runtimeContext.trail.ring.append(move event)
+        return
+    }
+    runtimeContext.trail.ring[runtimeContext.trail.ringNext] = move event
+    runtimeContext.trail.ringNext = (runtimeContext.trail.ringNext + 1) % TrailLimit.ring
+}
+
+// The ring's slot holding its `index`th oldest event.
+function trailRingSlot(index: Int) -> Int {
+    if runtimeContext.trail.ring.count < TrailLimit.ring { return index }
+    return (runtimeContext.trail.ringNext + index) % TrailLimit.ring
+}
+
+// The slot of the event numbered `serial`, or nothing once the ring has let
+// it go.
+function trailRingFind(serial: Int) -> Int? {
+    for index in 0..runtimeContext.trail.ring.count {
+        if runtimeContext.trail.ring[index].serial == serial { return .Some(index) }
+    }
+    return .None
+}
+
+// Writes the recorded events nobody saw, oldest first. An event a later one
+// follows from is shown in that one's report, so not again on its own.
+function trailSpill(occasion: String) {
+    for index in 0..runtimeContext.trail.ring.count {
+        if runtimeContext.trail.ring[index].shown { continue }
+        match runtimeContext.trail.ring[index].cause {
+            Some(cause) -> {
+                match trailRingFind(cause) {
+                    Some(slot) -> runtimeContext.trail.ring[slot].shown = true
+                    // Already let go: nothing left to hide.
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+    }
+    var pending: Int = 0
+    for event in runtimeContext.trail.ring {
+        if !event.shown { pending++ }
+    }
+    if pending == 0 { return }
+    let heading = pending == 1
+    ? "note: the trail event recorded " + occasion + "\n"
+    : "note: the " + String(pending) + " trail events recorded " + occasion + "\n"
+    trailWrite(heading)
+    for index in 0..runtimeContext.trail.ring.count {
+        let slot = trailRingSlot(index)
+        if runtimeContext.trail.ring[slot].shown { continue }
+        trailWrite(trailRendered(runtimeContext.trail.ring[slot], true, 0))
+        runtimeContext.trail.ring[slot].shown = true
+    }
+}
+
+// Runs as the program ends. A program that returned has released its
+// globals, and printed whatever it was asked to.
+@AtExit
+function trailEnded(reason: Int, detail: Int) {
+    trailLock()
+    match fromCode<ProgramEnd>(reason) {
+        Returned -> {}
+        Trapped -> trailSpill("before the trap KLF-RT-" + zeroPadded(detail, 4))
+        Failed -> trailSpill("before the failure " + String(detail))
+        else -> trailSpill("before the fault KLF-VM-" + zeroPadded(detail, 4))
+    }
+    trailUnlock()
+}
+
+// Writes text to standard output. The lock is held, so two events never share
+// a line.
+function trailWrite(text: borrow String) {
+    kernelWrite(text.data, text.count)
+}
+
+// Reads `KIRA_LOG` once: comma-separated words, each a threshold for every
+// category or `prefix=threshold` for one. A word naming no threshold is ignored,
+// as an unknown variable setting is everywhere else. The lock is held.
+function trailConfigure() {
+    let setting = environmentValue("KIRA_LOG")
+    if !setting.isEmpty() {
+        for part in setting.split(",") {
+            trailConfigureItem(part.trim())
+        }
+    }
+    trailRecomputeLoudest()
+}
+
+// One `KIRA_LOG` item, read as `prefix=threshold` or as a bare threshold.
+function trailConfigureItem(item: String) {
+    match item.indexOf("=") {
+        Some(equals) -> {
+            let prefix = item.substring(0, equals).trim()
+            match trailThreshold(item.substring(equals + 1, item.count).trim()) {
+                Some(threshold) -> {
+                    if prefix.isEmpty() { return }
+                    runtimeContext.trail.rules.append(TrailRule { prefix = prefix, threshold = threshold })
+                }
+                None -> {}
+            }
+        }
+        None -> {
+            match trailThreshold(item) {
+                Some(threshold) -> runtimeContext.trail.threshold = .Some(threshold)
+                None -> {}
+            }
+        }
+    }
+}
+
+// Sets the loudest level in use to the loudest of everything that can print,
+// and moves to a new generation so each site rereads its threshold. Called
+// whenever configuration changes; the lock is held.
+function trailRecomputeLoudest() {
+    var loudest = TrailDefault.recorded
+    match runtimeContext.trail.threshold {
+        Some(threshold) -> loudest = widestOf(loudest, threshold)
+        None -> {}
+    }
+    for rule in runtimeContext.trail.rules {
+        loudest = widestOf(loudest, rule.threshold)
+    }
+    loudest = loudest.widest(runtimeContext.trail.declaredLoudest)
+    trailStore(TrailWord.loudest, code(loudest))
+    trailStore(TrailWord.generation, trailLoad(TrailWord.generation) + 1)
+}
+
+// `level`, widened to whatever `threshold` prints.
+function widestOf(level: borrow TrailLevel, threshold: borrow TrailThreshold) -> TrailLevel {
+    match threshold {
+        UpTo(other) -> return level.widest(other)
+        Off -> return level
+    }
+}
+
+// The threshold a category at `path` prints at: the longest rule naming it or a
+// path it is inside; otherwise the bare `KIRA_LOG` threshold; otherwise the
+// declared one. The lock is held.
+//
+// A `log` is the programmer saying they want this recorded, so the declared
+// default of an implicit category is `info`, and of a library's, `info` too: a
+// library that logs is saying what the person running the program needs to
+// know. `KIRA_LOG=Name=fault` quiets one.
+function trailThresholdFor(path: borrow String, declared: borrow TrailThreshold) -> TrailThreshold {
+    var threshold: TrailThreshold = declared
+    match runtimeContext.trail.threshold {
+        Some(general) -> threshold = general
+        None -> {}
+    }
+    var longest: Int = 0
+    for rule in runtimeContext.trail.rules {
+        let inside = path == rule.prefix || path.startsWith(rule.prefix + ".")
+        if inside && rule.prefix.count > longest {
+            longest = rule.prefix.count
+            threshold = rule.threshold
+        }
+    }
+    return threshold
+}
+
+// The rule prefix a `Log` path names, or nothing when the path is malformed. A
+// family `Name.Name.*` names the prefix `Name.Name`.
+function trailRulePrefix(path: borrow String) -> String? {
+    var name = path
+    if name.endsWith(".*") { name = name.substring(0, name.count - 2) }
+    if name.isEmpty() { return .None }
+    for part in name.split(".") {
+        if part.isEmpty() || part == "*" { return .None }
+    }
+    return .Some(name)
+}
+
+// Sets the rule for `path` to `threshold`, replacing one for the same prefix.
+function trailSetRule(path: String, threshold: TrailThreshold) -> Result<Void, LogConfigFailure> {
+    match trailRulePrefix(path) {
+        Some(prefix) -> {
+            trailLock()
+            var kept: [TrailRule] = []
+            for rule in runtimeContext.trail.rules {
+                if rule.prefix != prefix { kept.append(rule) }
+            }
+            kept.append(TrailRule { prefix = prefix, threshold = threshold })
+            runtimeContext.trail.rules = kept
+            trailRecomputeLoudest()
+            trailUnlock()
+            return .Ok
+        }
+        None -> return .Error(.MalformedPath(path))
+    }
+}
+
+// Removes the rule for `path`.
+function trailResetRule(path: String) -> Result<Void, LogConfigFailure> {
+    match trailRulePrefix(path) {
+        Some(prefix) -> {
+            trailLock()
+            var kept: [TrailRule] = []
+            for rule in runtimeContext.trail.rules {
+                if rule.prefix != prefix { kept.append(rule) }
+            }
+            runtimeContext.trail.rules = kept
+            trailRecomputeLoudest()
+            trailUnlock()
+            return .Ok
+        }
+        None -> return .Error(.MalformedPath(path))
+    }
+}
+
+// Every category that has described itself, once each, with its thresholds.
+function trailCategories() -> [LogCategoryInfo] {
+    trailEnsureConfigured()
+    trailLock()
+    var found: [LogCategoryInfo] = []
+    var seen: [String] = []
+    for site in runtimeContext.trail.sites.values() {
+        if seen.contains(site.category) { continue }
+        seen.append(site.category)
+        found.append(LogCategoryInfo {
+            path = site.category,
+            threshold = trailThresholdFor(site.category, site.declared),
+            declared = site.declared
+        })
+    }
+    trailUnlock()
+    return found
+}

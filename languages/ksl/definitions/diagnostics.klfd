@@ -1,0 +1,92 @@
+// Every code ksl reports.
+//
+// KSL spells a code by family and number: `KSLP001` for the parser,
+// `KSLS001` for semantics. The kernel's diagnostic channel carries one
+// integer, so each family is a thousands band and the low digits are KSL's
+// own number: KSLP is 1000 and KSLS 2000. The titles and explanations are the
+// `DiagnosticSpec` list in language.klfd; docs/diagnostics.md maps both.
+
+enum Diagnostic {
+    Unexpected
+    NotADeclaration
+    BadResource
+    BadAccess
+    BadAnnotation
+    BadStageItem
+    BadThreads
+    LiteralRange
+
+    UnknownType
+    UnknownName
+    Duplicate
+    TypeMismatch
+    ArgumentCount
+    NoSuchMember
+    BadBuiltin
+    NotAssignable
+    BadStage
+    BadOption
+    UnresolvedImport
+    BadResourceType
+    ShaderCount
+    BadOperator
+    MissingReturn
+    BadConstant
+    BadBinding
+    Recursion
+    StageDerivative
+
+    function code(borrow self) -> Int {
+        match self {
+            Unexpected -> return 1001
+            NotADeclaration -> return 1002
+            BadResource -> return 1003
+            BadAccess -> return 1004
+            BadAnnotation -> return 1005
+            BadStageItem -> return 1006
+            BadThreads -> return 1007
+            LiteralRange -> return 1008
+
+            UnknownType -> return 2001
+            UnknownName -> return 2002
+            Duplicate -> return 2003
+            TypeMismatch -> return 2004
+            ArgumentCount -> return 2005
+            NoSuchMember -> return 2006
+            BadBuiltin -> return 2007
+            NotAssignable -> return 2008
+            BadStage -> return 2009
+            BadOption -> return 2010
+            UnresolvedImport -> return 2011
+            BadResourceType -> return 2012
+            ShaderCount -> return 2013
+            BadOperator -> return 2014
+            MissingReturn -> return 2015
+            BadConstant -> return 2017
+            BadBinding -> return 2018
+            Recursion -> return 2022
+            StageDerivative -> return 2023
+        }
+    }
+}
+
+// A byte range of one source file.
+struct Span {
+    let file: Int
+    let start: Int
+    let end: Int
+}
+
+// What stops parsing: the diagnostic and where it points.
+struct Failure {
+    let diagnostic: Diagnostic
+    let span: Span
+
+    function report(borrow self) {
+        report(diagnostic, span)
+    }
+}
+
+function report(diagnostic: Diagnostic, span: Span) {
+    diag_error_in(span.file as SourceFile, diagnostic.code(), span.start, span.end)
+}

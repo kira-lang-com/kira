@@ -1,0 +1,245 @@
+import Foundation
+
+// Valgrind for a target, which knvm provisions beside the toolchains: the
+// pinned upstream release, built with the selected `klf` toolchain's clang
+// against the target's C library, and landed whole at
+// `<home>/tools/valgrind/<version>/<target>/`.
+//
+// The tree it lands is a root to lay over a target's own. Valgrind finds its
+// tools under the prefix it was configured with, so the prefix is where the
+// tree puts them, `usr/lib/valgrind`, and a system carrying the tree at its
+// root runs it as built.
+//
+// Valgrind runs only where it was ported: Linux on the architectures below,
+// against glibc.
+
+public let valgrindName: String = "valgrind"
+public let valgrindVersion: String = "3.25.1"
+public let valgrindSha256: String = "61deb8d0727b45c268efdc1b3b6c9e679cd97cbf5ee4b28d1dead7c8b7a271af"
+public let valgrindMirror: String = "https://sourceware.org/pub/valgrind"
+public let valgrindPrefix: String = "/usr/lib/valgrind"
+
+// The targets a build is offered for, as the target's C library names them.
+public function valgrindTargets() -> [String] {
+    return ["aarch64-linux-gnu", "x86_64-linux-gnu"]
+}
+
+// `valgrind install --target <triple> --sysroot <directory>`.
+public struct ValgrindRequest {
+    var target: String = ""
+    // The target's C library and headers, which Valgrind links its launcher
+    // and its preloads against.
+    var sysroot: String = ""
+}
+
+// Why Valgrind could not be installed.
+public enum ValgrindFailure {
+    UnknownTarget(String)
+    MissingSysroot(String)
+    // No `klf` toolchain is selected, or the selected one carries no clang.
+    NoCompiler
+    // GNU make, which Valgrind's makefiles are written for.
+    NoMake(String)
+    Staging(String)
+    Download(String)
+    // The archive's SHA-256, which is not the pinned one.
+    ChecksumMismatch(String)
+    StepFailed(FailedStep)
+}
+
+// A build step and the status it ended with.
+public struct FailedStep {
+    let label: String
+    let status: Number
+}
+
+// A landed tree, and whether it was there before this install.
+public struct ValgrindTree {
+    let root: String
+    let already: Bool
+}
+
+public enum ValgrindOutcome {
+    Installed(ValgrindTree)
+    Failed(ValgrindFailure)
+}
+
+// `<home>/tools`: what knvm provisions that is not a toolchain.
+public function toolsRoot() -> String {
+    let home = klfHome()
+    if home.isEmpty() { return "" }
+    return joinPath(home, "tools")
+}
+
+// `<home>/tools/valgrind/<version>/<target>`.
+public function valgrindRoot(version: borrow String, target: borrow String) -> String {
+    return joinPath(joinPath(joinPath(toolsRoot(), valgrindName), version), target)
+}
+
+// The launcher in a landed tree, which is what makes the tree Valgrind.
+public function valgrindLauncher(root: borrow String) -> String {
+    return joinPath(root, "usr/lib/valgrind/bin/valgrind")
+}
+
+// Builds and lands Valgrind for `request.target`, or answers the tree already
+// landed for it.
+public function installValgrind(request: borrow ValgrindRequest) -> ValgrindOutcome {
+    if !valgrindTargets().contains(request.target) {
+        return .Failed(.UnknownTarget(copy request.target))
+    }
+    if !isDirectory(request.sysroot) { return .Failed(.MissingSysroot(copy request.sysroot)) }
+    let destination = valgrindRoot(valgrindVersion, request.target)
+    if fileExists(valgrindLauncher(destination)) {
+        return .Installed(ValgrindTree { root: destination, already: true })
+    }
+    let binaries = match selectedClang() {
+        Some(directory) -> directory
+        None -> return .Failed(.NoCompiler)
+    }
+    let staging = joinPath(stagingRoot(), valgrindName + "-" + processTag())
+    if !makeDirectoryTree(staging) { return .Failed(.Staging(staging)) }
+    let outcome = buildValgrind(request, binaries, staging, destination)
+    removeTree(staging)
+    return outcome
+}
+
+// The `bin` directory of the selected `klf` toolchain, when it carries the
+// clang, `llvm-ar` and `llvm-strip` a C build for another target needs.
+public function selectedClang() -> Optional<String> {
+    let klf = klfCompiler()
+    match readSelection(klf) {
+        Selected(selection) -> {
+            let root = toolchainRoot(klf, selection.channel, selection.version)
+            let binaries = joinPath(root, binaryDirectoryName)
+            for tool in ["clang", "llvm-ar", "llvm-strip", "ld.lld"] {
+                if !fileExists(joinPath(binaries, tool)) { return .None }
+            }
+            return .Some(binaries)
+        }
+        NothingSelected -> return .None
+        Unusable -> return .None
+    }
+}
+
+// Fetches, checks, configures, builds and installs the release in `staging`,
+// then moves the installed tree to `destination`.
+public function buildValgrind(
+    request: borrow ValgrindRequest,
+    binaries: borrow String,
+    staging: borrow String,
+    destination: borrow String
+) -> ValgrindOutcome {
+    let release = valgrindName + "-" + valgrindVersion
+    let archive = joinPath(staging, release + ".tar.bz2")
+    let url = valgrindMirror + "/" + release + ".tar.bz2"
+    if download(url, archive) != 0 { return .Failed(.Download(url)) }
+    match digestOfFile(archive) {
+        Some(found) -> {
+            let hex = digestHex(found)
+            if hex != valgrindSha256 { return .Failed(.ChecksumMismatch(hex)) }
+        }
+        None -> return .Failed(.Download(archive))
+    }
+    let none: [EnvironmentEntry] = []
+    let unpacked = runToolIn("tar", ["-xjf", archive, "-C", staging], staging, none)
+    if unpacked != 0 {
+        return .Failed(.StepFailed(FailedStep { label: "unpack " + archive, status: unpacked }))
+    }
+
+    let make = match gnuMake() {
+        Some(tool) -> tool
+        None -> return .Failed(.NoMake(makeHint()))
+    }
+    let source = joinPath(staging, release)
+    let build = joinPath(staging, "build")
+    let payload = joinPath(staging, "root")
+    if !makeDirectoryTree(build) { return .Failed(.Staging(build)) }
+    let environment = valgrindEnvironment(request, binaries)
+    let steps: [(String, String, [String])] = [
+        (
+            "configure",
+            joinPath(source, "configure"),
+            [
+                "--host=" + request.target,
+                "--prefix=" + valgrindPrefix,
+                "--enable-only64bit"
+            ]
+        ),
+        ("make", copy make, ["-j" + String(Number(processorCount()))]),
+        ("make install", copy make, ["install", "DESTDIR=" + payload])
+    ]
+    for (label, tool, arguments) in steps {
+        let status = runToolIn(tool, arguments, build, environment)
+        if status != 0 { return .Failed(.StepFailed(FailedStep { label: label, status: status })) }
+    }
+    if !fileExists(valgrindLauncher(payload)) {
+        return .Failed(.StepFailed(FailedStep { label: "make install", status: 0 }))
+    }
+    match landTree(payload, destination, joinPath(staging, "retired")) {
+        Replaced -> return .Installed(ValgrindTree { root: copy destination, already: false })
+        Failed(failure) -> return .Failed(.Staging(copy destination))
+    }
+}
+
+// The C toolchain configure records: clang aimed at the target and its C
+// library, linking with lld, and LLVM's archiver writing the GNU format the
+// target's linker reads. Each is a full command, so configure takes it as it
+// is rather than looking for `<target>-gcc` and its binutils.
+public function valgrindEnvironment(
+    request: borrow ValgrindRequest,
+    binaries: borrow String
+) -> [EnvironmentEntry] {
+    let archiver = joinPath(binaries, "llvm-ar") + " --format=gnu"
+    return [
+        EnvironmentEntry {
+            name: "CC",
+            value: joinPath(
+                binaries,
+                "clang"
+            ) + " --target=" + request.target + " --sysroot=" + request.sysroot + " -fuse-ld=lld -Wno-unused-command-line-argument"
+        },
+        EnvironmentEntry { name: "AR", value: copy archiver },
+        EnvironmentEntry { name: "RANLIB", value: archiver + " s" },
+        EnvironmentEntry { name: "STRIP", value: joinPath(binaries, "llvm-strip") }
+    ]
+}
+
+// GNU make: `gmake` where the system's own `make` is another, as on macOS,
+// whose 3.81 Valgrind's makefiles do not build with.
+public function gnuMake() -> Optional<String> {
+    for tool in ["gmake", "make"] {
+        let probe = captureTool(tool, ["--version"])
+        if probe.succeeded() && probe.output.startsWith("GNU Make 4") { return .Some(tool) }
+    }
+    return .None
+}
+
+public function makeHint() -> String {
+    if currentHostKey().endsWith("macos") { return "install it with `brew install make`" }
+    return "install GNU make 4 or newer"
+}
+
+// Why Valgrind could not be installed, in one line.
+public function valgrindFailureText(failure: borrow ValgrindFailure) -> String {
+    match failure {
+        UnknownTarget(target) -> {
+            return "Valgrind is not built for `" + target + "`; targets: "
+                + joinedWith(valgrindTargets(), ", ")
+        }
+        MissingSysroot(path) -> { return "no sysroot at `" + path + "`" }
+        NoCompiler -> {
+            return "no `klf` toolchain with clang is selected; run `" + toolName + " setup`"
+        }
+        NoMake(hint) -> { return "Valgrind builds with GNU make 4; " + hint }
+        Staging(path) -> { return "could not prepare `" + path + "`" }
+        Download(url) -> { return "could not download `" + url + "`" }
+        ChecksumMismatch(found) -> {
+            return "the Valgrind " + valgrindVersion + " archive has the SHA-256 " + found
+                + ", not " + valgrindSha256
+        }
+        StepFailed(step) -> {
+            return "Valgrind's " + step.label + " failed with status " + String(step.status)
+        }
+    }
+    return ""
+}

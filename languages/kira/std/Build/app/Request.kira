@@ -1,0 +1,116 @@
+import Foundation
+
+// The command line a build program was started with (DESIGN.md section 7):
+//
+//     [step...] [-option value...] [-jobs n] [-keep-going] [-dry-run]
+//     [-explain] [-graph] [-verbose] [-clean] [argument...]
+//
+// Every flag takes one dash. The library's own flags are read here; what is
+// left stays in order in `arguments`, where the graph's options take their
+// `-name value` or `-name=value`, the leading words that name steps are the
+// steps, and the rest goes to them.
+
+/// The command line a build program was started with: the steps it names, its options, and the library's own flags. Every flag takes one dash.
+public struct BuildRequest {
+    /// The command line without the library's own flags.
+    let arguments: [String] = []
+    /// How many commands run at once; 0 is one per processor.
+    let jobs: UNumber = 0
+    /// Whether the build keeps going past a failed command.
+    let keepGoing: Bool = false
+    /// Whether the build only says what it would run.
+    let dryRun: Bool = false
+    /// Whether the build says why each command runs.
+    let explain: Bool = false
+    /// Whether the build prints the graph instead of running it.
+    let graph: Bool = false
+    /// Whether the build reports more.
+    let verbose: Bool = false
+    /// Whether the build removes what it made.
+    let clean: Bool = false
+    /// What the command line gave wrongly, each as one line.
+    let problems: [String] = []
+}
+
+function parseRequest(arguments: borrow [String]) -> BuildRequest {
+    var kept: [String] = []
+    var jobs: UNumber = 0
+    var keepGoing = false
+    var dryRun = false
+    var explain = false
+    var graph = false
+    var verbose = false
+    var clean = false
+    var problems: [String] = []
+    // Whether the next argument is the count `-jobs` or `-j` waits for.
+    var waiting = false
+    for argument in arguments {
+        if waiting {
+            jobs = jobCount(argument, problems)
+            waiting = false
+            continue
+        }
+        match argument {
+            "-keep-going" -> keepGoing = true
+            "-dry-run" -> dryRun = true
+            "-explain" -> explain = true
+            "-graph" -> graph = true
+            "-verbose" -> verbose = true
+            "-clean" -> clean = true
+            "-jobs", "-j" -> waiting = true
+            else -> {
+                let jobsGiven = "-jobs="
+                if argument.startsWith("--") {
+                    problems.append(
+                        "a flag takes one dash: \(argument.substring(1, argument.count))"
+                    )
+                } else if argument.startsWith(jobsGiven) {
+                    jobs = jobCount(argument.substring(jobsGiven.count, argument.count), problems)
+                } else if jobsShorthand(argument) {
+                    jobs = jobCount(argument.substring(2, argument.count), problems)
+                } else {
+                    kept.append(copy argument)
+                }
+            }
+        }
+    }
+    if waiting { problems.append("-jobs needs a value") }
+    return BuildRequest {
+        arguments: kept,
+        jobs: jobs,
+        keepGoing: keepGoing,
+        dryRun: dryRun,
+        explain: explain,
+        graph: graph,
+        verbose: verbose,
+        clean: clean,
+        problems: problems
+    }
+}
+
+// Whether `argument` is `-jN`.
+function jobsShorthand(argument: borrow String) -> Bool {
+    return argument.startsWith("-j") && argument.count > 2 && countDigits(
+        argument
+    ) == argument.count - 2
+}
+
+// `text` as a count of jobs, at least 1.
+function jobCount(text: borrow String, problems: borrow mut [String]) -> UNumber {
+    let digits = text.count > 0 && text.count == countDigits(text)
+    if digits {
+        let count = Number(text)
+        if count >= 1 { return count }
+    }
+    problems.append("-jobs takes a whole number from 1, not \(text)")
+    return 0
+}
+
+function countDigits(text: borrow String) -> Number {
+    var count = 0
+    for index in 0..text.count {
+        let byte = UN8(text.byteAt(index))
+        if byte >= UN8(48) && byte <= UN8(57) { count += 1 }
+    }
+    return count
+}

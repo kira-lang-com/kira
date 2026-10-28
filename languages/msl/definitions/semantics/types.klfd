@@ -1,0 +1,261 @@
+// MSL's types, interned in one arena so a type is an index and two types
+// are equal when their indices are.
+//
+// An entry is a shape and the fields that shape reads: a scalar's kind; a
+// vector's kind and width; a matrix's kind, columns (`width`) and rows; an
+// array's element and length (-1 for the runtime array a `device T*` is);
+// a struct's index; an image's texel kind, dimension, arrayness, sample
+// count, depth and access; an atomic's kind. `short` and `ushort` are not
+// kinds: they appear only as vertex attributes, which are widened.
+
+enum Scalar {
+    Bool
+    Int
+    UInt
+    Half
+    Float
+
+    function ksir(borrow self) -> String {
+        match self {
+            Bool -> return "bool"
+            Int -> return "i32"
+            UInt -> return "u32"
+            Half -> return "f16"
+            Float -> return "f32"
+        }
+    }
+
+    function isFloat(borrow self) -> Bool {
+        return self == .Half || self == .Float
+    }
+
+    function isInteger(borrow self) -> Bool {
+        return self == .Int || self == .UInt
+    }
+
+    // The order of C++'s usual arithmetic conversions: the wider wins.
+    function rank(borrow self) -> Int {
+        match self {
+            Bool -> return 0
+            Int -> return 1
+            UInt -> return 2
+            Half -> return 3
+            Float -> return 4
+        }
+    }
+}
+
+enum Shape {
+    Void
+    ScalarShape
+    Vector
+    Matrix
+    Struct
+    Array
+    Image
+    Sampler
+    Atomic
+}
+
+enum Dimension {
+    Line
+    Plane
+    Volume
+    Cube
+
+    function ksir(borrow self) -> String {
+        match self {
+            Line -> return "1d"
+            Plane -> return "2d"
+            Volume -> return "3d"
+            Cube -> return "cube"
+        }
+    }
+
+    // Lanes of a coordinate: a cube is sampled with a direction.
+    function lanes(borrow self) -> Int {
+        match self {
+            Line -> return 1
+            Plane -> return 2
+            Volume -> return 3
+            Cube -> return 3
+        }
+    }
+}
+
+enum Access {
+    Sample
+    Read
+    Write
+    ReadWrite
+}
+
+struct TypeEntry {
+    let shape: Shape
+    let scalar: Scalar
+    let width: Int
+    let rows: Int
+    let element: Int
+    let length: Int
+    let structure: Int
+    let dimension: Dimension
+    let arrayed: Bool
+    let multisampled: Bool
+    let depth: Bool
+    let access: Access
+
+    function same(borrow self, other: TypeEntry) -> Bool {
+        return shape == other.shape && scalar == other.scalar && width == other.width && rows == other.rows
+            && element == other.element && length == other.length && structure == other.structure
+            && dimension == other.dimension && arrayed == other.arrayed && multisampled == other.multisampled
+            && depth == other.depth && access == other.access
+    }
+}
+
+function entry(shape: Shape, scalar: Scalar, width: Int, rows: Int) -> TypeEntry {
+    return TypeEntry {
+        shape = shape, scalar = scalar, width = width, rows = rows, element = -1, length = 0, structure = -1,
+        dimension = .Plane, arrayed = false, multisampled = false, depth = false, access = .Sample
+    }
+}
+
+// The scalar a library spelling names, without `short` and `ushort`.
+function scalarNamed(word: String) -> Optional<Scalar> {
+    match word {
+        "bool" -> return .Some(.Bool)
+        "int" -> return .Some(.Int)
+        "uint" -> return .Some(.UInt)
+        "half" -> return .Some(.Half)
+        "float" -> return .Some(.Float)
+        else -> {
+            let none: Optional<Scalar> = .None
+            return none
+        }
+    }
+}
+
+extend Checker {
+    function intern(borrow mut self, wanted: TypeEntry) -> Int {
+        for index in 0..program.types.count {
+            if program.types[index].same(wanted) { return index }
+        }
+        program.types.append(wanted)
+        return program.types.count - 1
+    }
+
+    function typeAt(borrow self, index: Int) -> TypeEntry {
+        return program.types[index]
+    }
+
+    function voidType(borrow mut self) -> Int {
+        return intern(entry(.Void, .Bool, 0, 0))
+    }
+
+    function scalarType(borrow mut self, scalar: Scalar) -> Int {
+        return intern(entry(.ScalarShape, scalar, 1, 1))
+    }
+
+    function vectorType(borrow mut self, scalar: Scalar, width: Int) -> Int {
+        if width == 1 { return scalarType(scalar) }
+        return intern(entry(.Vector, scalar, width, 1))
+    }
+
+    function matrixType(borrow mut self, scalar: Scalar, columns: Int, rows: Int) -> Int {
+        return intern(entry(.Matrix, scalar, columns, rows))
+    }
+
+    function arrayType(borrow mut self, element: Int, length: Int) -> Int {
+        let base = entry(.Array, .Bool, 0, 0)
+        return intern(TypeEntry {
+            shape = base.shape, scalar = base.scalar, width = 0, rows = 0, element = element, length = length,
+            structure = -1, dimension = .Plane, arrayed = false, multisampled = false, depth = false,
+            access = .Sample
+        })
+    }
+
+    function structType(borrow mut self, structure: Int) -> Int {
+        let base = entry(.Struct, .Bool, 0, 0)
+        return intern(TypeEntry {
+            shape = base.shape, scalar = base.scalar, width = 0, rows = 0, element = -1, length = 0,
+            structure = structure, dimension = .Plane, arrayed = false, multisampled = false, depth = false,
+            access = .Sample
+        })
+    }
+
+    function samplerType(borrow mut self) -> Int {
+        return intern(entry(.Sampler, .Bool, 0, 0))
+    }
+
+    function atomicType(borrow mut self, scalar: Scalar) -> Int {
+        return intern(entry(.Atomic, scalar, 1, 1))
+    }
+
+    function imageType(borrow mut self, image: TypeEntry) -> Int {
+        return intern(image)
+    }
+
+    // The scalar or vector of `scalar` with the lanes of `like`.
+    function withScalar(borrow mut self, like: Int, scalar: Scalar) -> Int {
+        let shaped = typeAt(like)
+        if shaped.shape == .Vector { return vectorType(scalar, shaped.width) }
+        if shaped.shape == .Matrix { return matrixType(scalar, shaped.width, shaped.rows) }
+        return scalarType(scalar)
+    }
+
+    function isVoid(borrow self, index: Int) -> Bool {
+        return typeAt(index).shape == .Void
+    }
+
+    function isScalar(borrow self, index: Int) -> Bool {
+        return typeAt(index).shape == .ScalarShape
+    }
+
+    function isVector(borrow self, index: Int) -> Bool {
+        return typeAt(index).shape == .Vector
+    }
+
+    // A scalar or vector: what arithmetic applies to lane by lane.
+    function isLaned(borrow self, index: Int) -> Bool {
+        let shape = typeAt(index).shape
+        return shape == .ScalarShape || shape == .Vector
+    }
+
+    function isNumeric(borrow self, index: Int) -> Bool {
+        return isLaned(index) && typeAt(index).scalar != .Bool
+    }
+
+    function isFloating(borrow self, index: Int) -> Bool {
+        return isLaned(index) && typeAt(index).scalar.isFloat()
+    }
+
+    function isIntegral(borrow self, index: Int) -> Bool {
+        return isLaned(index) && typeAt(index).scalar.isInteger()
+    }
+
+    function isHandle(borrow self, index: Int) -> Bool {
+        let shape = typeAt(index).shape
+        return shape == .Image || shape == .Sampler
+    }
+
+    // Whether a value of the type can be built, copied and stored.
+    function isConstructible(borrow self, index: Int) -> Bool {
+        let found = typeAt(index)
+        match found.shape {
+            Void -> return false
+            ScalarShape -> return true
+            Vector -> return true
+            Matrix -> return true
+            Struct -> return true
+            Array -> return found.length >= 0 && isConstructible(found.element)
+            Image -> return false
+            Sampler -> return false
+            Atomic -> return false
+        }
+    }
+
+    function lanes(borrow self, index: Int) -> Int {
+        let found = typeAt(index)
+        if found.shape == .Vector { return found.width }
+        return 1
+    }
+}

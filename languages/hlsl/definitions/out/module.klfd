@@ -1,0 +1,188 @@
+// The module: structs, constants and globals, the helpers the bodies call,
+// then each function and each entry point with its wrapper.
+
+extend TextOut {
+    function writeHlslModule(borrow mut self) {
+        prepareNames(hlslReserved(), false)
+        dialect.debug = flag("unit", -1, 0, "debug")
+        prepareSlots()
+        prepareHelpers()
+        writeStructs()
+        writeConstants()
+        writeGlobals()
+        for at in 0..dialect.helperTexts.count {
+            write(joinText([dialect.helperTexts[at], "\n"]))
+        }
+        let functions = count("functions", -1)
+        for which in 0..functions {
+            if !isEntry(which) { writeFunction(which, functionNames[which]) }
+        }
+        for which in 0..functions {
+            if isEntry(which) { writeEntry(which) }
+        }
+    }
+
+    function writeStructs(borrow self) {
+        let types = count("types", -1)
+        for typeIndex in 0..types {
+            if typeKind(typeIndex) == "struct" { writeStruct(typeIndex) }
+        }
+    }
+
+    function writeStruct(borrow self, typeIndex: Int) {
+        let members = count("members", typeIndex)
+        var slots: [Int] = []
+        if dialect.padded[typeIndex] {
+            slots = dialect.slots[typeIndex]
+        } else {
+            for member in 0..members {
+                slots.append(member)
+            }
+        }
+        var pieces: [String] = [joinText(["struct ", structName(typeIndex), " {\n"])]
+        var pad = 0
+        for slot in slots {
+            if slot < 0 {
+                for scalar in 0..(0 - slot) {
+                    pieces.append(joinText(["    uint _pad", decimalText(pad), ";\n"]))
+                    pad += 1
+                }
+            } else {
+                let declared = declare(field("members", typeIndex, slot, "type"), memberName(typeIndex, slot))
+                pieces.append(joinText(["    ", declared, ";\n"]))
+            }
+        }
+        pieces.append("};\n\n")
+        write(joinText(pieces))
+    }
+
+    // The value a constant or private global starts with, or a refusal at
+    // the record of `table` when it is not constant.
+    function constantValue(borrow self, table: String, index: Int) -> String {
+        let value = field(table, -1, index, "value")
+        if value < 0 {
+            refuseAt("an initializer that is not constant", table, -1, index)
+            return ""
+        }
+        return constText(value)
+    }
+
+    function writeConstants(borrow self) {
+        let constants = count("constants", -1)
+        for constant in 0..constants {
+            let value = constantValue("constants", constant)
+            let declared = declare(field("constants", -1, constant, "type"), constantNames[constant])
+            write(joinText(["static const ", declared, " = ", value, ";\n"]))
+        }
+        if count("overrides", -1) > 0 { refuse("a kept override") }
+    }
+
+    function writeGlobals(borrow self) {
+        let globals = count("globals", -1)
+        for global in 0..globals {
+            let declaration = globalDeclaration(global)
+            if utf8Count(declaration) > 0 { write(joinText([declaration, "\n"])) }
+        }
+        write("\n")
+    }
+
+    // A global's declaration, or empty when it has none.
+    function globalDeclaration(borrow self, global: Int) -> String {
+        let name = globalNames[global]
+        let globalType = field("globals", -1, global, "type")
+        let space = text("globals", -1, global, "space")
+        let registered = utf8Count(text("globals", -1, global, "resource")) > 0
+        var register = ""
+        if registered {
+            register = joinText([" : register(", text("globals", -1, global, "slot_class"),
+                decimalText(field("globals", -1, global, "slot")), ")"])
+        }
+        if space == "uniform" && registered {
+            let declared = declare(globalType, name)
+            return joinText(["cbuffer ", name, "_buffer", register, " {\n    ", declared, ";\n};"])
+        }
+        if space == "storage" && registered {
+            var element = globalType
+            if typeKind(globalType) == "array" {
+                element = typeField(globalType, "base")
+            } else if runtimeTail(globalType) {
+                refuseAt("a buffer struct that ends in a runtime-sized array", "globals", -1, global)
+                return ""
+            }
+            let elementText = typeName(element)
+            var major = ""
+            if typeKind(element) == "matrix" { major = "row_major " }
+            let access = text("globals", -1, global, "access")
+            var buffer = "StructuredBuffer"
+            if containsWord(access, "store") || containsWord(access, "atomic") { buffer = "RWStructuredBuffer" }
+            return joinText([buffer, "<", major, elementText, "> ", name, register, ";"])
+        }
+        if space == "handle" && registered {
+            let written = typeName(globalType)
+            return joinText([written, " ", name, register, ";"])
+        }
+        if space == "private" {
+            let declared = declare(globalType, name)
+            var value = ""
+            if field("globals", -1, global, "init") >= 0 {
+                value = constantValue("globals", global)
+            } else {
+                let zero = zeroText(globalType)
+                if failedText(zero) {
+                    refuseAt(failureText(zero), "globals", -1, global)
+                } else {
+                    value = zero
+                }
+            }
+            return joinText(["static ", declared, " = ", value, ";"])
+        }
+        if space == "workgroup" {
+            let declared = declare(globalType, name)
+            return joinText(["groupshared ", declared, ";"])
+        }
+        refuseAt(joinText(["global `", text("globals", -1, global, "name"), "` has no HLSL form"]), "globals", -1,
+            global)
+        return ""
+    }
+
+    function writeFunction(borrow mut self, which: Int, name: String) {
+        prepareBody(which)
+        var parameters: [String] = []
+        let arguments = count("arguments", which)
+        for argument in 0..arguments {
+            let argumentType = field("arguments", which, argument, "type")
+            if typeKind(argumentType) == "pointer" {
+                parameters.append(joinText(["inout ", declare(typeField(argumentType, "base"),
+                    argumentNames[argument])]))
+            } else {
+                parameters.append(declare(argumentType, argumentNames[argument]))
+            }
+        }
+        var result = "void"
+        let resultIndex = field("functions", -1, which, "result")
+        if resultIndex >= 0 { result = typeName(resultIndex) }
+        write(joinText([result, " ", name, "(", joinWith(parameters, ", "), ") {\n"]))
+        let locals = count("locals", which)
+        for local in 0..locals {
+            let localType = field("locals", which, local, "type")
+            let init = field("locals", which, local, "init")
+            var value = ""
+            if init >= 0 && !flag("expressions", which, init, "emits") {
+                value = operand(init)
+            } else if init >= 0 {
+                refuseAt("a local initialized by a runtime expression", "locals", which, local)
+            } else {
+                let zero = zeroText(localType)
+                if failedText(zero) {
+                    refuseAt(failureText(zero), "locals", which, local)
+                } else {
+                    value = zero
+                }
+            }
+            let declared = declare(localType, localNames[local])
+            write(joinText(["    ", declared, " = ", value, ";\n"]))
+        }
+        writeBlock(field("functions", -1, which, "body"), 1)
+        write("}\n\n")
+    }
+}

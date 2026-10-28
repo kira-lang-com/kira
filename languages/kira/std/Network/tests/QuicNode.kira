@@ -1,0 +1,127 @@
+import Foundation
+
+// Foundation's QUIC node end to end: a listener and a dialer in one node,
+// talking through real UDP sockets on loopback, told as notes in the order
+// things happened.
+
+// Notes of one exchange: the client opens a stream and sends "ping", the
+// server answers "pong" and finishes, the client finishes, then a second
+// stream the server resets, then the client closes.
+function nodeExchange() -> String {
+    var node = match openQuicNode(QuicNodeOptions { protocol: "kira-test" }) {
+        Ok(value) -> value
+        Error(failure) -> return traceText(failure)
+    }
+    let listener = match node.listen("127.0.0.1:0", quicTestIdentity()) {
+        Ok(value) -> value
+        Error(failure) -> return traceText(failure)
+    }
+    let address = match node.listenerAddress(listener) {
+        Ok(value) -> value
+        Error(failure) -> return traceText(failure)
+    }
+    let dialed = match node.connect(
+        QuicDial { address: address, serverName: "localhost", anchors: quicTestAnchors() }
+    ) {
+        Ok(value) -> value
+        Error(failure) -> return traceText(failure)
+    }
+    var notes: [String] = []
+    var client: QuicStreamId? = .None
+    var streams = 0
+    var done = false
+    let deadline = node.now().plus(DriverTest.patience)
+    while !done && node.now().raw < deadline.raw {
+        for event in node.wait(.Some(deadline)) {
+            match event {
+                Opened(opened) -> {
+                    let side = opened.listener == .Some(listener) ? "server" : "client"
+                    notes.append("opened \(side)")
+                    if opened.connection == dialed {
+                        let stream = try node.openStream(dialed) otherwise return "open"
+                        absorb node.write(stream, "ping".utf8())
+                        client = .Some(stream)
+                    }
+                }
+                StreamOpened(stream) -> {
+                    streams += 1
+                    notes.append("stream \(streams)")
+                }
+                StreamData(data) -> {
+                    let text = bodyText(data.bytes)
+                    notes.append("data \(text)")
+                    if text == "ping" {
+                        absorb node.write(data.stream, "pong".utf8())
+                        absorb node.finish(data.stream)
+                    }
+                    if text == "again" { absorb node.reset(data.stream, 7) }
+                }
+                StreamEnded(end) -> {
+                    notes.append("ended \(traceText(end.ending))")
+                    if end.stream.connection != dialed { continue }
+                    match end.ending {
+                        Finished -> {
+                            match client {
+                                Some(stream) -> absorb node.finish(stream)
+                                None -> {}
+                            }
+                            let again = try node.openStream(dialed) otherwise return "again"
+                            absorb node.write(again, "again".utf8())
+                        }
+                        Reset(_) -> absorb node.close(dialed, 3, "bye")
+                        Stopped(_) -> {}
+                    }
+                }
+                Closed(closed) -> {
+                    notes.append("closed \(closed.code) \(closed.reason) \(closed.byPeer)")
+                    if closed.byPeer { done = true }
+                }
+            }
+        }
+    }
+    node.shutdown()
+    return joined(notes, ", ")
+}
+
+@Test
+function exchange() {
+    expect!(nodeExchange() == "opened client, opened server, stream 1, data ping, data pong, ended QuicStreamEnding.Finished, ended QuicStreamEnding.Finished, stream 2, data again, ended QuicStreamEnding.Reset(7), closed 3 bye false, closed 3 bye true")
+}
+
+
+// A dial the server's certificate does not satisfy closes without opening.
+function quicNodeRefusesNameOutcome() -> String {
+    var node = try openQuicNode(
+        QuicNodeOptions { protocol: "kira-test" }
+    ) otherwise return "node"
+    let listener = try node.listen("127.0.0.1:0", quicTestIdentity()) otherwise return "listen"
+    let address = try node.listenerAddress(listener) otherwise return "address"
+    let dialed = try node.connect(
+        QuicDial { address: address, serverName: "elsewhere.test", anchors: quicTestAnchors() }
+    ) otherwise return "connect"
+    let deadline = node.now().plus(DriverTest.patience)
+    var outcome = "timed out"
+    while outcome == "timed out" && node.now().raw < deadline.raw {
+        for event in node.wait(.Some(deadline)) {
+            match event {
+                Opened(opened) -> {
+                    if opened.connection == dialed { outcome = "opened" }
+                }
+                Closed(closed) -> {
+                    if closed.connection == dialed { outcome = "closed \(closed.application)" }
+                }
+                else -> {}
+            }
+        }
+    }
+    node.shutdown()
+    return outcome
+}
+
+@Test
+function quicNodeRefusesName() {
+    let expected: String = "closed false"
+    expect!(quicNodeRefusesNameOutcome() == expected)
+}
+
+

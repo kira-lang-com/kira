@@ -1,0 +1,109 @@
+import Foundation
+
+// Hex text as bytes, for the RFC vectors; the vectors are well formed.
+function hexBytes(text: borrow String) -> [UN8] {
+    let digits = text.utf8()
+    var bytes: [UN8] = []
+    var at = 0
+    while at + 1 < digits.count {
+        bytes.append(UN8(hexDigit(digits[at]) * 16 + hexDigit(digits[at + 1])))
+        at += 2
+    }
+    return bytes
+}
+
+function hexDigit(digit: UN8) -> Number {
+    let value = Number(digit)
+    return value < 97 ? value - 48 : value - 87
+}
+
+function hexText(bytes: borrow [UN8]) -> String {
+    let digits = "0123456789abcdef"
+    var text = ""
+    for byte in bytes {
+        let value = Number(byte)
+        text += digits.substring(trunc(value / 16), trunc(value / 16) + 1) + digits.substring(
+            value % 16,
+            value % 16 + 1
+        )
+    }
+    return text
+}
+
+// A test's text, or the failure that kept it from being made.
+function textOrFailure(made: borrow Result<String, CryptoFailure>) -> String {
+    return match made {
+        Ok(text) -> copy text
+        Error(failure) -> traceText(failure)
+    }
+}
+
+function sha256Suite() -> TlsSuiteParameters {
+    return tlsSuiteParameters(.Aes128GcmSha256).or(
+        TlsSuiteParameters { suite: .Aes128GcmSha256, hash: .Sha256, hashBytes: 0, keyBytes: 0 }
+    )
+}
+
+// RFC 9001 appendix A.1: the Initial client secret, server secret, key, iv and
+// header key of connection ID 0x8394c8f03e515708, as hex, in that order.
+function initialKeyParts() -> Result<[String], CryptoFailure> {
+    let suite = sha256Suite()
+    let salt = hexBytes("38762cf7f55934b34d179ae6a4c80cadccbb7f0a")
+    let initial = try hkdfExtract(.Sha256, salt, hexBytes("8394c8f03e515708"))
+    let empty: [UN8] = []
+    let client = try tlsExpandLabel(.Sha256, initial, "client in", empty, 32)
+    let server = try tlsExpandLabel(.Sha256, initial, "server in", empty, 32)
+    let keys = try tlsTrafficKeys(suite, client, .Quic)
+    return .Ok([hexText(client), hexText(server), hexText(keys.key.key), hexText(keys.iv), hexText(keys.header)])
+}
+
+// Each Initial secret and key matches its RFC 9001 appendix A.1 value.
+@Test
+function quicInitialKeysMatchRfc9001() {
+    let parts = match initialKeyParts() {
+        Ok(found) -> found
+        Error(failure) -> {
+            expect!(traceText(failure) == "")
+            return
+        }
+    }
+    expect!((parts[0]) == "c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea")
+    expect!((parts[1]) == "3c199828fd139efd216c155ad844cc81fb82fa8d7446fa7d78be803acdda951b")
+    expect!((parts[2]) == "1f369613dd76d5467730efcbe3b1a22d")
+    expect!((parts[3]) == "fa044b2f42a3fd3b46fb255c")
+    expect!((parts[4]) == "9f50449e04a0e810283a1e9933adedd2")
+}
+
+// RFC 8448 section 3: the early secret with no PSK, and the handshake secret
+// from its (EC)DHE shared secret.
+function stageSecretParts() -> Result<[String], CryptoFailure> {
+    let suite = sha256Suite()
+    let early = try tlsEarlySecret(suite)
+    let shared = hexBytes("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d")
+    let handshake = try tlsHandshakeSecret(suite, shared)
+    return .Ok([hexText(early), hexText(handshake)])
+}
+
+// The early and handshake secrets match RFC 8448 section 3.
+@Test
+function stageSecretsMatchRfc8448() {
+    let parts = match stageSecretParts() {
+        Ok(found) -> found
+        Error(failure) -> {
+            expect!(traceText(failure) == "")
+            return
+        }
+    }
+    expect!((parts[0]) == "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a")
+    expect!((parts[1]) == "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac")
+}
+
+// The sequence number is XORed into the low bytes of the IV, so a sequence
+// that differs only in its high byte changes a different byte.
+@Test
+function noncesXorTheSequenceIntoTheIv() {
+    let iv = hexBytes("fa044b2f42a3fd3b46fb255c")
+    expect!(hexText(tlsSequenceNonce(iv, 2)) == "fa044b2f42a3fd3b46fb255e")
+    expect!(hexText(tlsSequenceNonce(iv, 258)) == "fa044b2f42a3fd3b46fb245e")
+    expect!(hexText(tlsSequenceNonce(iv, 0)) == "fa044b2f42a3fd3b46fb255c")
+}

@@ -1,0 +1,96 @@
+// A sized number is stored as the integer of its width (KLF-RIDL sections
+// 21.1 and 27.5), but while checking it is still a number type. Every
+// crossing between one and a `Number` is made explicit here, as a conversion
+// that lowering carries out once the type has become that integer.
+
+extend Checker {
+    // The `Number` a sized value is: a literal's own decimal, or the integer
+    // widened through the number service.
+    function numberFromSized(borrow mut self, value: Int, span: Span) -> Int {
+        match wholeLiteralWord(value) {
+            Some(word) -> return wholeLiteral(word, span)
+            None -> {}
+        }
+        return numberCall(2, [add(.Convert(value), Type.int(), span)], Type.number(), span)
+    }
+
+    // `value` as a `Number`, whichever number type it has.
+    function asNumber(borrow mut self, value: Int) -> Int {
+        if !typeOf(value).isSizedNumber() { return value }
+        return numberFromSized(value, program.expressions[value].span)
+    }
+
+    // A whole literal at a sized type: the integer it writes, still known
+    // for the literal it is.
+    function sizedWord(borrow mut self, word: Int, target: Type, span: Span) -> Int {
+        let typed = add(.Integer(word), target, span)
+        wholeLiterals.append(WholeLiteral { expression = typed, word = word })
+        return typed
+    }
+
+    // A sized value at a number type that holds all its values.
+    function widenSized(borrow mut self, value: Int, target: Type, span: Span) -> Int {
+        if target.isNumber() { return numberFromSized(value, span) }
+        return add(.Convert(value), target, span)
+    }
+
+    // `UN32(n)` of a `Number`: truncated toward zero and trapping outside the
+    // range, as `U32(n)` is.
+    function sizedFromNumber(borrow mut self, value: Int, target: Type, span: Span) -> Int {
+        match wholeLiteralWord(value) {
+            Some(word) -> {
+                if target.holdsLiteral(word, false) { return sizedWord(word, target, span) }
+                report(.LiteralOutOfRange, span)
+                return add(.Integer(word), Type.invalid(), span)
+            }
+            None -> {}
+        }
+        return add(.Convert(fromNumber(value, target.storage(), span)), target, span)
+    }
+
+    // `UN8(x)`: an integer or sized value converts at its width, a `Number`
+    // through `sizedFromNumber`, a float by truncation and a string through
+    // the `Number` it spells.
+    function sizedConversion(borrow mut self, target: Type, argument: Int, span: Span) -> Int {
+        var value = expression(argument, .Some(target))
+        var source = typeOf(value)
+        if isDistinctType(program, source) {
+            source = program.structs[source.declaration].fields[0].valueType
+            value = add(.Member(value, 0), source, span)
+        }
+        if source.isInvalid() || source.equals(target) { return value }
+        if source.isInteger() || source.isSizedNumber() { return add(.Convert(value), target, span) }
+        if source.isNumber() { return sizedFromNumber(value, target, span) }
+        if source.kind == .Floating { return add(.Convert(add(.Convert(value), target.storage(), span)), target, span) }
+        if isStringType(program, source) { return sizedFromNumber(numberCall(6, [value], Type.number(), span), target, span) }
+        report(.ConversionArguments, span)
+        return add(.Integer(0), Type.invalid(), span)
+    }
+
+    // Arithmetic on two values of one sized type acts at the width and traps
+    // outside the range, except division, whose quotient need not be whole.
+    function sizedArithmetic(borrow mut self, arithmetic: ArithmeticOperator, operands: Operands, span: Span) -> Int {
+        if arithmetic == .Divide {
+            let widened = Operands { left = numberFromSized(operands.left, span), right = numberFromSized(operands.right, span) }
+            return numberArithmetic(.Divide, widened, span)
+        }
+        return add(.Arithmetic(arithmetic, operands.left, operands.right), typeOf(operands.left), span)
+    }
+
+    // `-n` keeps a signed width; an unsigned one has no negative values, so
+    // its negation is a `Number`. `~n` acts on the whole number's bits.
+    function sizedUnary(borrow mut self, operator: UnaryOperator, operand: Int, span: Span) -> Int {
+        let operandType = typeOf(operand)
+        match operator {
+            Negate -> {
+                if operandType.signed { return add(.Unary(.Negate, operand), operandType, span) }
+                return numberNegation(numberFromSized(operand, span), span)
+            }
+            Complement -> return numberComplement(numberFromSized(operand, span), span)
+            Not -> {
+                report(.OperatorOperand, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+}

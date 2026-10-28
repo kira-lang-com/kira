@@ -1,0 +1,23 @@
+extend Checker {
+    function requirePublicRuntimeFunction(borrow self, target: Int, span: Span) {
+        let declared = declarations.signatures[target]
+        if !declarations.inFoundation(declared.name.span.file) || declarations.inFoundation(file()) { return }
+        let name = declared.name.text
+        if hasAttribute(declared.declaration.annotations, .Service)
+            || isFileServiceHelper(name)
+            || startsWithText(name, "kernel")
+            || startsWithText(name, "numberTo")
+            || startsWithText(name, "numberFrom") {
+            report(.NotImported, span)
+        }
+    }
+}
+
+// The file-service helpers `FileSystem.kira` is written over. A program reaches
+// files through `FileSystem`'s `Result`s instead.
+function isFileServiceHelper(name: String) -> Bool {
+    match name {
+        "fileBytes", "fileText", "directoryEntries", "regularFileExists", "sizeOfFile", "writeChunks", "FileService" -> return true
+        else -> return false
+    }
+}

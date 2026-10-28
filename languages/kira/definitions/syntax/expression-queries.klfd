@@ -1,0 +1,253 @@
+enum LiteralShape {
+    Integer
+    Decimal
+    Operand(Int)
+    Other
+}
+
+extend ExpressionKind {
+    function triedOperand(borrow self) -> Optional<Int> {
+        match self {
+            ExpandedMacro -> return .None
+            Quote -> return .None
+            MacroCall -> return .None
+            Try(operand) -> return .Some(operand)
+            GenericCall -> return .None
+            Call -> return .None
+            Name -> return .None
+            MethodCall -> return .None
+            IndirectCall -> return .None
+            Lambda -> return .None
+            KeyPath -> return .None
+            Task -> return .None
+            TypeQuery -> return .None
+            Labelled -> return .None
+            IntegerLiteral -> return .None
+            FloatLiteral -> return .None
+            BooleanLiteral -> return .None
+            StringLiteral -> return .None
+            ArrayLiteral -> return .None
+            Index -> return .None
+            Transfer -> return .None
+            Member -> return .None
+            Variant -> return .None
+            StructLiteral -> return .None
+            Unary -> return .None
+            Binary -> return .None
+            Conditional -> return .None
+            MatchValue -> return .None
+            Content -> return .None
+        }
+    }
+
+    function constructedType(borrow self) -> Optional<TypeReference> {
+        match self {
+            GenericCall(name, arguments, values) -> return .Some(TypeReference {
+                qualifier = .None, name = name, arguments = arguments, modes = [],
+                instanceName = genericInstanceName(name.text, arguments)
+            })
+            Call -> return .None
+            Name -> return .None
+            MethodCall -> return .None
+            IndirectCall -> return .None
+            Lambda -> return .None
+            KeyPath -> return .None
+            Task -> return .None
+            ExpandedMacro -> return .None
+            Quote -> return .None
+            MacroCall -> return .None
+            Try -> return .None
+            TypeQuery -> return .None
+            Labelled -> return .None
+            IntegerLiteral -> return .None
+            FloatLiteral -> return .None
+            BooleanLiteral -> return .None
+            StringLiteral -> return .None
+            ArrayLiteral -> return .None
+            Index -> return .None
+            Transfer -> return .None
+            Member -> return .None
+            Variant -> return .None
+            StructLiteral -> return .None
+            Unary -> return .None
+            Binary -> return .None
+            Conditional -> return .None
+            MatchValue -> return .None
+            Content -> return .None
+        }
+    }
+
+    function taskCall(borrow self) -> Optional<TaskCallSyntax> {
+        match self {
+            Call(name, arguments) -> return .Some(TaskCallSyntax { receiver = .None, name = name, arguments = arguments })
+            GenericCall -> return .None
+            Name -> return .None
+            MethodCall(receiver, method, arguments) -> return .Some(TaskCallSyntax { receiver = .Some(receiver), name = method, arguments = arguments })
+            IndirectCall -> return .None
+            Lambda -> return .None
+            KeyPath -> return .None
+            Task -> return .None
+            ExpandedMacro -> return .None
+            Quote -> return .None
+            MacroCall -> return .None
+            Try -> return .None
+            TypeQuery -> return .None
+            Labelled -> return .None
+            IntegerLiteral -> return .None
+            FloatLiteral -> return .None
+            BooleanLiteral -> return .None
+            StringLiteral -> return .None
+            ArrayLiteral -> return .None
+            Index -> return .None
+            Transfer -> return .None
+            Member -> return .None
+            Variant -> return .None
+            StructLiteral -> return .None
+            Unary -> return .None
+            Binary -> return .None
+            Conditional -> return .None
+            MatchValue -> return .None
+            Content -> return .None
+        }
+    }
+
+    function queriedType(borrow self) -> Optional<Int> {
+        match self {
+            TypeQuery(mode, operand, target) -> return .Some(target)
+            Labelled -> return .None
+            IntegerLiteral -> return .None
+            FloatLiteral -> return .None
+            BooleanLiteral -> return .None
+            StringLiteral -> return .None
+            ArrayLiteral -> return .None
+            Index -> return .None
+            Transfer -> return .None
+            Name -> return .None
+            Member -> return .None
+            Call -> return .None
+            GenericCall -> return .None
+            MethodCall -> return .None
+            IndirectCall -> return .None
+            Lambda -> return .None
+            KeyPath -> return .None
+            Task -> return .None
+            ExpandedMacro -> return .None
+            Quote -> return .None
+            MacroCall -> return .None
+            Try -> return .None
+            Variant -> return .None
+            StructLiteral -> return .None
+            Unary -> return .None
+            Binary -> return .None
+            Conditional -> return .None
+            MatchValue -> return .None
+            Content -> return .None
+        }
+    }
+
+    function argumentLabel(borrow self) -> Optional<FieldValue> {
+        match self {
+            Labelled(name, value) -> return .Some(FieldValue { name = name, value = value })
+            TypeQuery -> return .None
+            IntegerLiteral -> return .None
+            FloatLiteral -> return .None
+            BooleanLiteral -> return .None
+            StringLiteral -> return .None
+            ArrayLiteral -> return .None
+            Index -> return .None
+            Transfer -> return .None
+            Name -> return .None
+            Member -> return .None
+            Call -> return .None
+            GenericCall -> return .None
+            MethodCall -> return .None
+            IndirectCall -> return .None
+            Lambda -> return .None
+            KeyPath -> return .None
+            Task -> return .None
+            ExpandedMacro -> return .None
+            Quote -> return .None
+            MacroCall -> return .None
+            Try -> return .None
+            Variant -> return .None
+            StructLiteral -> return .None
+            Unary -> return .None
+            Binary -> return .None
+            Conditional -> return .None
+            MatchValue -> return .None
+            Content -> return .None
+        }
+    }
+
+    // The case an argument written `.Case` or `.Case(payload)` names, which
+    // only an enum declaring it can take.
+    function writtenVariant(borrow self) -> Optional<Identifier> {
+        match self {
+            Labelled -> return .None
+            TypeQuery -> return .None
+            IntegerLiteral -> return .None
+            FloatLiteral -> return .None
+            BooleanLiteral -> return .None
+            StringLiteral -> return .None
+            ArrayLiteral -> return .None
+            Index -> return .None
+            Transfer -> return .None
+            Name -> return .None
+            Member -> return .None
+            Call -> return .None
+            GenericCall -> return .None
+            MethodCall -> return .None
+            IndirectCall -> return .None
+            Lambda -> return .None
+            KeyPath -> return .None
+            Task -> return .None
+            ExpandedMacro -> return .None
+            Quote -> return .None
+            MacroCall -> return .None
+            Try -> return .None
+            Variant(name, payload) -> return .Some(name)
+            StructLiteral -> return .None
+            Unary -> return .None
+            Binary -> return .None
+            Conditional -> return .None
+            MatchValue -> return .None
+            Content -> return .None
+        }
+    }
+
+    // What a literal is when nothing says what type it has: a whole number, a
+    // decimal one, or a sign over another expression.
+    function literalShape(borrow self) -> LiteralShape {
+        match self {
+            ExpandedMacro -> return .Other
+            Quote -> return .Other
+            MacroCall -> return .Other
+            Try -> return .Other
+            GenericCall -> return .Other
+            Call -> return .Other
+            Name -> return .Other
+            MethodCall -> return .Other
+            IndirectCall -> return .Other
+            Lambda -> return .Other
+            KeyPath -> return .Other
+            Task -> return .Other
+            TypeQuery -> return .Other
+            Labelled -> return .Other
+            IntegerLiteral -> return .Integer
+            FloatLiteral -> return .Decimal
+            BooleanLiteral -> return .Other
+            StringLiteral -> return .Other
+            ArrayLiteral -> return .Other
+            Index -> return .Other
+            Transfer -> return .Other
+            Member -> return .Other
+            Variant -> return .Other
+            StructLiteral -> return .Other
+            Unary(operator, operand) -> return .Operand(operand)
+            Binary -> return .Other
+            Conditional -> return .Other
+            MatchValue -> return .Other
+            Content -> return .Other
+        }
+    }
+}

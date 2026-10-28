@@ -1,0 +1,377 @@
+function macroSourceUnit(tree: SyntaxTree, file: Int) -> Optional<SourceUnit> {
+    for source in tree.sources { if source.file == file { return .Some(source) } }
+    return .None
+}
+
+function macroLibraryFile(tree: SyntaxTree, file: Int) -> Bool {
+    match macroSourceUnit(tree, file) {
+        Some(source) -> return tree.modules[source.module].library
+        None -> return false
+    }
+}
+
+// Whether the program a macro runs in holds `candidate`: what the libraries
+// declare, and the functions marked to run at compile time.
+function macroEvaluatedFunction(tree: SyntaxTree, candidate: FunctionDeclaration) -> Bool {
+    return macroLibraryFile(tree, candidate.name.span.file) || hasAttribute(candidate.annotations, .Comptime)
+}
+
+// Libraries imported by compile-time source files, plus the macro ABI.
+// Runtime imports in other files of the same package do not participate.
+function macroEvaluationLibraries(tree: SyntaxTree, expansions: [FunctionDeclaration]) -> [Int] {
+    let places = macroSourcePlaces(tree)
+    var modules: [Int] = []
+    for index in 0..tree.modules.count {
+        if tree.modules[index].name == "Foundation" { macroImportLibrary(tree, index, modules) }
+    }
+    for expansion in expansions { macroImportFile(tree, places, expansion.name.span.file, modules) }
+    for candidate in tree.functions {
+        if hasAttribute(candidate.annotations, .Comptime) { macroImportFile(tree, places, candidate.name.span.file, modules) }
+    }
+    return modules
+}
+
+// Where the source unit of each file sits among the tree's sources, by
+// file: -1 for a file that is no source of the tree.
+function macroSourcePlaces(tree: SyntaxTree) -> [Int] {
+    var last = 0
+    for source in tree.sources { if source.file >= last { last = source.file + 1 } }
+    var places: [Int] = []
+    for _ in 0..last { places.append(-1) }
+    for index in 0..tree.sources.count {
+        let file = tree.sources[index].file
+        if file >= 0 && places[file] < 0 { places[file] = index }
+    }
+    return places
+}
+
+function macroImportFile(tree: SyntaxTree, places: [Int], file: Int, modules: borrow mut [Int]) {
+    if file < 0 || file >= places.count || places[file] < 0 { return }
+    macroImportSource(tree, tree.sources[places[file]], modules)
+}
+
+function macroImportSource(tree: SyntaxTree, source: SourceUnit, modules: borrow mut [Int]) {
+    for imported in source.imports {
+        match imported.module {
+            Some(module) -> macroImportLibrary(tree, module, modules)
+            None -> {}
+        }
+    }
+}
+
+function macroImportLibrary(tree: SyntaxTree, module: Int, modules: borrow mut [Int]) {
+    if contains(modules, module) { return }
+    modules.append(module)
+    for source in tree.sources {
+        if source.module == module { macroImportSource(tree, source, modules) }
+    }
+}
+
+// Which files the program macros run in holds the types and globals of, by
+// file: only a library's. A macro's own file contributes its `expand` and
+// compile-time functions, never the runtime declarations beside them, which
+// may build on parts of the package the macro program leaves out.
+function macroEvaluationFiles(tree: SyntaxTree, libraries: [Int]) -> [Bool] {
+    let places = macroSourcePlaces(tree)
+    var files: [Bool] = []
+    for place in places { files.append(place >= 0 && contains(libraries, tree.sources[place].module)) }
+    return files
+}
+
+function macroEvaluationFile(files: [Bool], file: Int) -> Bool {
+    return file >= 0 && file < files.count && files[file]
+}
+
+function macroEvaluationFunction(files: [Bool], candidate: FunctionDeclaration) -> Bool {
+    return hasAttribute(candidate.annotations, .Comptime) || macroEvaluationFile(files, candidate.name.span.file)
+}
+
+// The program macro bodies run in: the libraries, the compile-time functions
+// and the `expand` functions of the macros evaluated.
+function macroEvaluationTree(tree: SyntaxTree, expansions: [FunctionDeclaration]) -> SyntaxTree {
+    let libraries = macroEvaluationLibraries(tree, expansions)
+    let files = macroEvaluationFiles(tree, libraries)
+    var evaluator = tree
+    evaluator.limitedReferences = true
+    evaluator.functions = []
+    evaluator.genericFunctions = []
+    evaluator.traits = []
+    evaluator.bounds = []
+    evaluator.foreignTypes = []
+    evaluator.fieldBits = []
+    evaluator.structs = []
+    evaluator.genericStructs = []
+    evaluator.enums = []
+    evaluator.genericEnums = []
+    evaluator.aliases = []
+    evaluator.globals = []
+    evaluator.constructs = []
+    evaluator.classes = []
+    evaluator.distincts = []
+    evaluator.sourceInvocations = []
+    evaluator.annotated = []
+    evaluator.copyAssertions = []
+    evaluator.conformances = []
+    evaluator.extensions = []
+    for candidate in tree.functions { if macroEvaluationFunction(files, candidate) && !hasAttribute(candidate.annotations, .Foreign) { evaluator.functions.append(candidate) } }
+    for expansion in expansions { evaluator.functions.append(expansion) }
+    for candidate in tree.genericFunctions { if macroEvaluationFunction(files, candidate) { evaluator.genericFunctions.append(candidate) } }
+    for declared in tree.traits { if macroEvaluationFile(files, declared.name.span.file) { evaluator.traits.append(declared) } }
+    for bound in tree.bounds { if macroEvaluationFile(files, bound.traitName.name.span.file) { evaluator.bounds.append(bound) } }
+    for marked in tree.foreignTypes { if macroEvaluationFile(files, marked.name.span.file) { evaluator.foreignTypes.append(marked) } }
+    for bits in tree.fieldBits { if macroEvaluationFile(files, bits.field.file) { evaluator.fieldBits.append(bits) } }
+    for structure in tree.structs { if macroEvaluationFile(files, structure.name.span.file) { evaluator.structs.append(structure) } }
+    for structure in tree.genericStructs { if macroEvaluationFile(files, structure.name.span.file) { evaluator.genericStructs.append(structure) } }
+    for enumeration in tree.enums { if macroEvaluationFile(files, enumeration.name.span.file) { evaluator.enums.append(enumeration) } }
+    for enumeration in tree.genericEnums { if macroEvaluationFile(files, enumeration.name.span.file) { evaluator.genericEnums.append(enumeration) } }
+    for alias in tree.aliases { if macroEvaluationFile(files, alias.name.span.file) { evaluator.aliases.append(alias) } }
+    for global in tree.globals { if macroEvaluationFile(files, global.binding.name.span.file) { evaluator.globals.append(global) } }
+    for declared in tree.classes { if macroEvaluationFile(files, declared.name.span.file) { evaluator.classes.append(declared) } }
+    for declared in tree.distincts { if macroEvaluationFile(files, declared.name.span.file) { evaluator.distincts.append(declared) } }
+    for declared in tree.constructs { if macroEvaluationFile(files, declared.name.span.file) { evaluator.constructs.append(declared) } }
+    for declared in tree.extensions { if macroEvaluationFile(files, declared.owner.name.span.file) { evaluator.extensions.append(declared) } }
+    for declared in tree.conformances { if macroEvaluationFile(files, declared.owner.name.span.file) { evaluator.conformances.append(declared) } }
+    evaluator.modules = []
+    for index in 0..tree.modules.count {
+        let module = tree.modules[index]
+        evaluator.modules.append(Module {
+            name = module.name, root = module.root, manifest = module.manifest, package = module.package,
+            library = index == 0 || module.library, loading = false, libraries = module.libraries,
+            framework = module.framework
+        })
+    }
+    return evaluator
+}
+
+// What `macroEvaluationTree` takes from the tree for `expansions`, as the
+// libraries it reads and the place of each declaration it keeps: two trees
+// with the same key give those macros the same program to run in. What a
+// module outside those libraries declares stays out of the program, so it
+// leaves the key alone.
+function macroEvaluatorKey(tree: SyntaxTree, expansions: [FunctionDeclaration]) -> [Int] {
+    let libraries = macroEvaluationLibraries(tree, expansions)
+    let files = macroEvaluationFiles(tree, libraries)
+    var key: [Int] = [tree.modules.count, libraries.count]
+    for library in libraries { key.append(library) }
+    for candidate in tree.functions { if macroEvaluationFunction(files, candidate) && !hasAttribute(candidate.annotations, .Foreign) { appendSpanKey(key, candidate.name.span) } }
+    for candidate in tree.genericFunctions { if macroEvaluationFunction(files, candidate) { appendSpanKey(key, candidate.name.span) } }
+    for declared in tree.traits { if macroEvaluationFile(files, declared.name.span.file) { appendSpanKey(key, declared.name.span) } }
+    for bound in tree.bounds { if macroEvaluationFile(files, bound.traitName.name.span.file) { appendSpanKey(key, bound.traitName.name.span) } }
+    for marked in tree.foreignTypes { if macroEvaluationFile(files, marked.name.span.file) { appendSpanKey(key, marked.name.span) } }
+    for bits in tree.fieldBits { if macroEvaluationFile(files, bits.field.file) { appendSpanKey(key, bits.field) } }
+    for structure in tree.structs { if macroEvaluationFile(files, structure.name.span.file) { appendSpanKey(key, structure.name.span) } }
+    for structure in tree.genericStructs { if macroEvaluationFile(files, structure.name.span.file) { appendSpanKey(key, structure.name.span) } }
+    for enumeration in tree.enums { if macroEvaluationFile(files, enumeration.name.span.file) { appendSpanKey(key, enumeration.name.span) } }
+    for enumeration in tree.genericEnums { if macroEvaluationFile(files, enumeration.name.span.file) { appendSpanKey(key, enumeration.name.span) } }
+    for alias in tree.aliases { if macroEvaluationFile(files, alias.name.span.file) { appendSpanKey(key, alias.name.span) } }
+    for global in tree.globals { if macroEvaluationFile(files, global.binding.name.span.file) { appendSpanKey(key, global.binding.name.span) } }
+    for declared in tree.classes { if macroEvaluationFile(files, declared.name.span.file) { appendSpanKey(key, declared.name.span) } }
+    for declared in tree.distincts { if macroEvaluationFile(files, declared.name.span.file) { appendSpanKey(key, declared.name.span) } }
+    for declared in tree.constructs { if macroEvaluationFile(files, declared.name.span.file) { appendSpanKey(key, declared.name.span) } }
+    for declared in tree.extensions { if macroEvaluationFile(files, declared.owner.name.span.file) { appendSpanKey(key, declared.owner.name.span) } }
+    for declared in tree.conformances { if macroEvaluationFile(files, declared.owner.name.span.file) { appendSpanKey(key, declared.owner.name.span) } }
+    return key
+}
+
+// What the answers of macros running in the program for `expansions`
+// depend on besides their entries (KLF-RIDL section 9.2): the modules it
+// sees and the text of every file it is built from, the libraries' and
+// those of its `expand` and compile-time functions. A later build asking a
+// macro the same finds the answer it kept (`macroAnswerKey`).
+function macroProgramKey(session: Session, tree: SyntaxTree, expansions: [FunctionDeclaration]) -> String {
+    var files = macroEvaluationFiles(tree, macroEvaluationLibraries(tree, expansions))
+    for expansion in expansions { markFile(files, expansion.name.span.file) }
+    for candidate in tree.functions { if hasAttribute(candidate.annotations, .Comptime) { markFile(files, candidate.name.span.file) } }
+    for candidate in tree.genericFunctions { if hasAttribute(candidate.annotations, .Comptime) { markFile(files, candidate.name.span.file) } }
+    // What `Build` answers a macro body: a check and a test build of the
+    // same sources expand differently.
+    var parts: [String] = [tree.buildTarget]
+    if tree.testing { parts.append(" testing") }
+    if tree.release { parts.append(" release") }
+    parts.append("\n")
+    for module in tree.modules {
+        parts.append(module.name)
+        if module.library { parts.append(" library") }
+        if module.framework { parts.append(" framework") }
+        for library in module.libraries { parts.append(" ") parts.append(decimalText(library)) }
+        parts.append("\n")
+    }
+    // In the order the tree holds its sources, which the files' numbers in
+    // the session need not follow from one build to the next.
+    for source in tree.sources {
+        if !macroEvaluationFile(files, source.file) { continue }
+        for word in 0..4 { parts.append(decimalText(source_digest(session, source.file as SourceFile, word))) parts.append(" ") }
+        parts.append("\n")
+    }
+    return joinText(parts)
+}
+
+function markFile(files: borrow mut [Bool], file: Int) {
+    if file >= 0 && file < files.count { files[file] = true }
+}
+
+// The key of what the macro answers for `arguments` in the program
+// `program` keys: the entry calling it, in the module of its file.
+function macroAnswerKey(program: String, tree: SyntaxTree, declared: ProceduralMacroDeclaration, arguments: [String]) -> String {
+    var module = -1
+    match macroSourceUnit(tree, declared.name.span.file) { Some(context) -> module = context.module None -> {} }
+    return joinText([program, decimalText(module), "\n", macroEntrySource("entry", declared, arguments)])
+}
+
+function appendSpanKey(key: borrow mut [Int], span: Span) {
+    key.append(span.file)
+    key.append(span.start)
+}
+
+// `text` as a string literal, each run of bytes that needs no escape
+// written as it is.
+function escapedSourceString(text: String) -> String {
+    var parts: [String] = ["\""]
+    var run = 0
+    for index in 0..utf8Count(text) {
+        let byte = utf8Byte(text, index)
+        if byte != 34 && byte != 92 && byte != 10 && byte != 13 && byte != 9 && byte != 0 { continue }
+        parts.append(utf8Slice(text, run, index))
+        parts.append(sourceEscape(byte))
+        run = index + 1
+    }
+    parts.append(utf8Slice(text, run, utf8Count(text)))
+    parts.append("\"")
+    return joinText(parts)
+}
+
+// How a string literal writes `byte`, one `escapedSourceString` escapes.
+function sourceEscape(byte: Int) -> String {
+    if byte == 34 { return "\\\"" }
+    if byte == 92 { return "\\\\" }
+    if byte == 10 { return "\\n" }
+    if byte == 13 { return "\\r" }
+    if byte == 9 { return "\\t" }
+    return "\\0"
+}
+
+function evaluateSourceMacro(session: Session, unit: Unit, tree: SyntaxTree, batch: MacroBatch, declared: ProceduralMacroDeclaration, input: String, origin: Span) -> Result<Int, Failure> {
+    return evaluateMacro(session, unit, tree, batch, declared, [macroSyntaxArgument(input)], origin)
+}
+
+function macroSyntaxArgument(input: String) -> String {
+    return joinText(["Syntax { text = ", escapedSourceString(input), " }"])
+}
+
+// The function that calls the macro's `expand` over `arguments` and hands
+// back what it produced through `macroOutcome`.
+function macroEntrySource(entry: String, declared: ProceduralMacroDeclaration, arguments: [String]) -> String {
+    var call: [String] = []
+    for index in 0..arguments.count {
+        if index > 0 { call.append(", ") }
+        call.append(arguments[index])
+    }
+    return joinText([
+        "function ", entry, "() -> String { let syntax = ", declared.expansion.name.text,
+        "(", joinText(call), ") return macroOutcome(syntax) }"
+    ])
+}
+
+// The tree with the entry `source` parsed into it, in the module and with
+// the imports of the file declaring the macro.
+function withMacroEntry(move evaluator: SyntaxTree, tree: SyntaxTree, declared: ProceduralMacroDeclaration, source: String, file: Int) -> Result<SyntaxTree, Failure> {
+    var module = 0
+    var imports: [Import] = []
+    match macroSourceUnit(tree, declared.name.span.file) { Some(context) -> { module = context.module imports = context.imports } None -> {} }
+    // Entry wrappers call the macro ABI even when the user's file imports
+    // no library (for example, a platform query).
+    for index in 0..tree.modules.count {
+        if tree.modules[index].name != "Foundation" { continue }
+        var imported = false
+        for existing in imports {
+            match existing.module {
+                Some(found) -> { if found == index { imported = true } }
+                None -> {}
+            }
+        }
+        if !imported {
+            let name = Identifier { text = "Foundation", span = declared.name.span }
+            imports.append(Import { name = name, alias = name, module = .Some(index) })
+        }
+    }
+    var parsed = try parseFile(move evaluator, source, file, module)
+    parsed.sources[parsed.sources.count - 1].imports = imports
+    return .Ok(parsed)
+}
+
+// The macro's result as the batch evaluated it, or evaluated now. Either
+// way the editor learns which text the use at `origin` produced
+// (KLF-EDITOR.md section 13.6).
+function evaluateMacro(session: Session, unit: Unit, tree: SyntaxTree, batch: MacroBatch, declared: ProceduralMacroDeclaration, arguments: [String], origin: Span) -> Result<Int, Failure> {
+    var file = -1
+    match batchedMacro(batch, tree, declared, arguments, origin) {
+        Some(batched) -> file = batched
+        None -> file = try evaluateSourceMacroArguments(session, unit, tree, declared, arguments, origin)
+    }
+    source_expansion(session, file as SourceFile, origin.file as SourceFile, origin.start, origin.end, declared.name.text)
+    return .Ok(file)
+}
+
+// Runs the macro's `expand` over arguments written as Kira source and
+// returns the file holding the syntax it produced. The body runs as a
+// program of its own on the VM; `macroOutcome` hands back the syntax, or the
+// codes of what the body reported, behind a leading 0x01 byte.
+function evaluateSourceMacroArguments(session: Session, unit: Unit, tree: SyntaxTree, declared: ProceduralMacroDeclaration, arguments: [String], origin: Span) -> Result<Int, Failure> {
+    if declared.expansion.parameters.count != arguments.count {
+        return .Error(Failure { diagnostic = .MacroExpandSignature, span = declared.expansion.name.span })
+    }
+    let key = macroAnswerKey(macroProgramKey(session, tree, [declared.expansion]), tree, declared, arguments)
+    let recalled = subquery_recall(session, origin.file as SourceFile, key)
+    if recalled >= 0 { return .Ok(recalled) }
+    if !tree.compileTimeBodies { return .Error(Failure { diagnostic = .MacroProgramUnread, span = origin }) }
+    let entry = "__source_macro_entry"
+    let wrapper = macroEntrySource(entry, declared, arguments)
+    let file = addSource(session, declared.name.span.file as SourceFile, wrapper)
+    if file < 0 { return .Error(Failure { diagnostic = .MacroResultUnreadable, span = origin }) }
+    let evaluator = try withMacroEntry(macroEvaluationTree(tree, [declared.expansion]), tree, declared, wrapper, file)
+    let program = check(evaluator, .Some([entry]))
+    var target = -1
+    for index in 0..program.functions.count {
+        if program.functions[index].symbol == entry { target = index }
+    }
+    if target < 0 { return .Error(Failure { diagnostic = .MacroEntryMissing, span = origin }) }
+    let builder = kir_module_detached(session, unit)
+    var roots: [Int] = [target]
+    match program.globalInitializer {
+        Some(initializer) -> roots.append(initializer)
+        None -> {}
+    }
+    let functions = lowerCheckedProgram(builder, program, roots, false)
+    let evaluated = kir_module_evaluate_buffer(builder, functions[target], 0, 1, macroStepBudget, macroMemoryBudget)
+    if kir_evaluation_status(evaluated) != 1 {
+        return .Error(Failure { diagnostic = .MacroEvaluationTrapped, span = origin })
+    }
+    let result = kir_evaluation_source(session, origin.file as SourceFile, evaluated)
+    if result < 0 { return .Error(Failure { diagnostic = .MacroResultUnreadable, span = origin }) }
+    let text = fileText(session, result as SourceFile)
+    if macroReported(text) {
+        return .Error(Failure { diagnostic = macroReportedDiagnostic(text), span = origin })
+    }
+    subquery_keep(session, key, result as SourceFile)
+    return .Ok(result)
+}
+
+let macroStepBudget = 500000000
+let macroMemoryBudget = 1073741824
+
+function macroReported(text: String) -> Bool {
+    return utf8Count(text) > 0 && utf8Byte(text, 0) == 1
+}
+
+// The first code a macro body reported, from the decimal codes after the
+// 0x01 marker.
+function macroReportedDiagnostic(text: String) -> Diagnostic {
+    var code = 0
+    for index in 1..utf8Count(text) {
+        let byte = utf8Byte(text, index)
+        if byte < 48 || byte > 57 { break }
+        code = code * 10 + byte - 48
+    }
+    if code == 25 { return .MacroNoSuchField }
+    return .MacroReported
+}

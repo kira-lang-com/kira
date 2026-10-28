@@ -1,0 +1,37 @@
+import Foundation
+
+// Source scopes: a path is relative to its scope only inside it, and a
+// portable source keeps its identity when the tree moves while a fixed one
+// does not.
+
+@Test
+function scopesKeepTheirBoundaries() {
+    expect!((relativeSourcePath("/train/tessera/date", "/train").or("outside")) == "tessera/date")
+    expect!((relativeSourcePath("/train/kira/../kira/ui", "/train").or("outside")) == "kira/ui")
+    expect!((relativeSourcePath("/train-other/date", "/train").or("outside")) == "outside")
+    expect!((relativeSourcePath("/train", "/train").or("outside")) == ".")
+    expect!((relativeSourcePath("/train/date", "").or("outside")) == "outside")
+}
+
+// A portable source has the same identity in two trees; a fixed one does
+// not; a toolchain path is the same in both.
+@Test
+function portableSourcesKeepTheirIdentityAcrossTrees() {
+    let first = Graph { project: "Tessera", root: "/development/tessera", request: BuildRequest {} }
+    let second = Graph { project: "Tessera", root: "/worktree/tessera", request: BuildRequest {} }
+    let portable = CommandAction { label: "compile", tool: "true", sourceRoot: ".." }
+    let fixed = CommandAction { label: "compile", tool: "true" }
+    let a = first.root + "/../date/app/Main.kira"
+    let b = second.root + "/../date/app/Main.kira"
+    expect!((testSourceIdentity(first, portable, a) == testSourceIdentity(second, portable, b)) == (true))
+    expect!((testSourceIdentity(first, fixed, a) != testSourceIdentity(second, fixed, b)) == (true))
+    expect!((testSourceIdentity(second, portable, "/toolchains/kira")) == "/toolchains/kira")
+    expect!((testSourceIdentity(first, portable, a)) == "source:date/app/Main.kira")
+}
+
+function testSourceIdentity(graph: borrow Graph, command: borrow CommandAction, path: borrow String) -> String {
+    return match commandSourcePath(graph, command, path) {
+        Ok(identity) -> identity
+        Error(failure) -> failureText(failure)
+    }
+}

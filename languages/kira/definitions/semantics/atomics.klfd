@@ -1,0 +1,249 @@
+// Atomic memory operations on an integer at an address (KLF section 12.14).
+//
+//     atomicLoad<Int>(pointer, .Acquire)
+//     atomicStore(pointer, value, .Release)
+//     atomicAdd(pointer, 1, .Relaxed)               -- the value before
+//     atomicCompareExchange(pointer, expected, replacement, .AcquireRelease, .Acquire)
+//     atomicFence(.SequentiallyConsistent)
+//
+// Each is one KIR atomic instruction. The ordering is a `MemoryOrder` case
+// written at the call, since KIR fixes it in the instruction. The operand is
+// an integer the hardware moves whole; the read-modify-writes answer the
+// value they replaced, and `atomicMax`/`atomicMin` compare as the integer
+// type is signed. `atomicCompareExchange` answers the value it read, which
+// is `expected` exactly when it exchanged; `atomicCompareExchangeWeak` may
+// fail spuriously and so answers only whether it exchanged.
+
+enum AtomicStep {
+    // pointer, ordering
+    Load(Int, Int)
+    // pointer, value, ordering
+    Store(Int, Int, Int)
+    // KIR's read-modify-write operator, pointer, value, ordering
+    Modify(Int, Int, Int, Int)
+    // pointer, expected, replacement, success and failure orderings, weak
+    Exchange(Int, Int, Int, Int, Int, Bool)
+    // ordering
+    Fence(Int)
+
+    function operands(borrow self) -> [Int] {
+        match self {
+            Load(pointer, order) -> return [pointer]
+            Store(pointer, value, order) -> return [pointer, value]
+            Modify(operator, pointer, value, order) -> return [pointer, value]
+            Exchange(pointer, expected, replacement, success, failure, weak) -> return [pointer, expected, replacement]
+            Fence -> return []
+        }
+    }
+}
+
+// Which orderings an operation can have. A load does not release, a store
+// does not acquire, a fence orders something, and a compare-exchange's
+// failure (a load) is no stronger than its success ordering.
+enum AtomicOrderRule {
+    Load
+    Store
+    Modify
+    Fence
+    Failure(Int)
+
+    function allows(borrow self, order: Int) -> Bool {
+        match self {
+            Load -> return order != atomicRelease && order != atomicAcquireRelease
+            Store -> return order != atomicAcquire && order != atomicAcquireRelease
+            Modify -> return true
+            Fence -> return order != atomicRelaxed
+            Failure(success) -> {
+                if order == atomicRelease || order == atomicAcquireRelease { return false }
+                if success == atomicRelease { return order == atomicRelaxed }
+                if success == atomicAcquireRelease { return order <= atomicAcquire }
+                return order <= success
+            }
+        }
+    }
+}
+
+// C11's memory_order numbering, which KIR takes.
+let atomicRelaxed = 0
+let atomicAcquire = 2
+let atomicRelease = 3
+let atomicAcquireRelease = 4
+let atomicSequentiallyConsistent = 5
+
+enum AtomicBuiltin {
+    Load
+    Store
+    Exchange
+    Add
+    Subtract
+    And
+    Or
+    Xor
+    Max
+    Min
+    CompareExchange
+    CompareExchangeWeak
+    Fence
+}
+
+function atomicBuiltin(name: String) -> Optional<AtomicBuiltin> {
+    match name {
+        "atomicLoad" -> return .Some(.Load)
+        "atomicStore" -> return .Some(.Store)
+        "atomicExchange" -> return .Some(.Exchange)
+        "atomicAdd" -> return .Some(.Add)
+        "atomicSubtract" -> return .Some(.Subtract)
+        "atomicAnd" -> return .Some(.And)
+        "atomicOr" -> return .Some(.Or)
+        "atomicXor" -> return .Some(.Xor)
+        "atomicMax" -> return .Some(.Max)
+        "atomicMin" -> return .Some(.Min)
+        "atomicCompareExchange" -> return .Some(.CompareExchange)
+        "atomicCompareExchangeWeak" -> return .Some(.CompareExchangeWeak)
+        "atomicFence" -> return .Some(.Fence)
+        else -> return .None
+    }
+}
+
+extend Checker {
+    // A call of one of the builtins above, unless the program declares a
+    // function of that name itself. `given` is the `<T>` written, if any.
+    function atomicCall(borrow mut self, builtin: AtomicBuiltin, given: Optional<Type>, arguments: [Int], expected: Optional<Type>, span: Span) -> Int {
+        match builtin {
+            Load -> {
+                if arguments.count != 2 { return atomicArity(span) }
+                var loaded = given
+                if loaded.isNone() { loaded = valueExpected(expected) }
+                match loaded {
+                    Some(valueType) -> {
+                        if !atomicOperand(valueType, false, span) { return add(.Integer(0), Type.invalid(), span) }
+                        let pointer = heapPointerArgument(arguments[0])
+                        let order = atomicOrder(arguments[1], .Load)
+                        return add(.Atomic(.Load(pointer, order)), valueType, span)
+                    }
+                    None -> {
+                        report(.TypedMemoryUntyped, span)
+                        return add(.Integer(0), Type.invalid(), span)
+                    }
+                }
+            }
+            Store -> {
+                if arguments.count != 3 { return atomicArity(span) }
+                let pointer = heapPointerArgument(arguments[0])
+                let value = storedValue(given, arguments[1])
+                if !atomicOperand(typeOf(value), false, span) { return add(.Integer(0), Type.invalid(), span) }
+                let order = atomicOrder(arguments[2], .Store)
+                return add(.Atomic(.Store(pointer, value, order)), Type.void(), span)
+            }
+            CompareExchange -> return atomicExchangeCall(given, arguments, false, span)
+            CompareExchangeWeak -> return atomicExchangeCall(given, arguments, true, span)
+            Fence -> {
+                if arguments.count != 1 { return atomicArity(span) }
+                let order = atomicOrder(arguments[0], .Fence)
+                return add(.Atomic(.Fence(order)), Type.void(), span)
+            }
+            Exchange -> return atomicModifyCall(builtin, given, arguments, span)
+            Add -> return atomicModifyCall(builtin, given, arguments, span)
+            Subtract -> return atomicModifyCall(builtin, given, arguments, span)
+            And -> return atomicModifyCall(builtin, given, arguments, span)
+            Or -> return atomicModifyCall(builtin, given, arguments, span)
+            Xor -> return atomicModifyCall(builtin, given, arguments, span)
+            Max -> return atomicModifyCall(builtin, given, arguments, span)
+            Min -> return atomicModifyCall(builtin, given, arguments, span)
+        }
+    }
+
+    // A read-modify-write: the value at the pointer before it changed.
+    function atomicModifyCall(borrow mut self, builtin: AtomicBuiltin, given: Optional<Type>, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 3 { return atomicArity(span) }
+        let pointer = heapPointerArgument(arguments[0])
+        let value = storedValue(given, arguments[1])
+        let valueType = typeOf(value)
+        let operator = atomicOperator(builtin, valueType)
+        if !atomicOperand(valueType, operator != 0, span) { return add(.Integer(0), Type.invalid(), span) }
+        let order = atomicOrder(arguments[2], .Modify)
+        return add(.Atomic(.Modify(operator, pointer, value, order)), valueType, span)
+    }
+
+    function atomicExchangeCall(borrow mut self, given: Optional<Type>, arguments: [Int], weak: Bool, span: Span) -> Int {
+        if arguments.count != 5 { return atomicArity(span) }
+        let pointer = heapPointerArgument(arguments[0])
+        let expectedValue = storedValue(given, arguments[1])
+        let valueType = typeOf(expectedValue)
+        if !atomicOperand(valueType, false, span) { return add(.Integer(0), Type.invalid(), span) }
+        let replacement = coerce(expression(arguments[2], .Some(valueType)), valueType, .ArgumentTypeMismatch)
+        let success = atomicOrder(arguments[3], .Modify)
+        let failure = atomicOrder(arguments[4], .Failure(success))
+        var result = valueType
+        if weak { result = Type.boolean() }
+        return add(.Atomic(.Exchange(pointer, expectedValue, replacement, success, failure, weak)), result, span)
+    }
+
+    function atomicArity(borrow mut self, span: Span) -> Int {
+        report(.ArgumentCount, span)
+        return add(.Integer(0), Type.invalid(), span)
+    }
+
+    // An integer, a sized number (as the integer it is stored as) or, for
+    // the loads, stores and exchanges, a pointer: a value one word holds.
+    function atomicOperand(borrow mut self, valueType: Type, arithmetic: Bool, span: Span) -> Bool {
+        if valueType.isInvalid() { return false }
+        if valueType.isInteger() || valueType.isSizedNumber() { return true }
+        if valueType.kind == .Pointer && !arithmetic { return true }
+        report(.AtomicOperand, span)
+        return false
+    }
+
+    // The ordering a `MemoryOrder` case written at the call names, refused
+    // where `rule` does not allow it.
+    function atomicOrder(borrow mut self, argument: Int, rule: AtomicOrderRule) -> Int {
+        let declared = declarations.typeNamed("MemoryOrder")
+        var wanted: Optional<Type> = .None
+        if declared.isSome() && declared.unwrap().kind == .Enumeration { wanted = declared }
+        let checked = expression(argument, wanted)
+        let span = program.expressions[checked].span
+        var order = -1
+        match program.expressions[checked].operation.taggedVariant() {
+            Some(variant) -> {
+                let orderType = typeOf(checked)
+                if wanted.isSome() && orderType.equals(wanted.unwrap()) {
+                    match program.enums[orderType.declaration].variants[variant].name.text {
+                        "Relaxed" -> order = atomicRelaxed
+                        "Acquire" -> order = atomicAcquire
+                        "Release" -> order = atomicRelease
+                        "AcquireRelease" -> order = atomicAcquireRelease
+                        "SequentiallyConsistent" -> order = atomicSequentiallyConsistent
+                        else -> {}
+                    }
+                }
+            }
+            None -> {}
+        }
+        if order < 0 {
+            report(.AtomicOrdering, span)
+            return atomicSequentiallyConsistent
+        }
+        if !rule.allows(order) { report(.AtomicOrdering, span) }
+        return order
+    }
+}
+
+// KIR's read-modify-write operator: 0 xchg 1 add 2 sub 3 and 4 or 5 xor
+// 7 max 8 min 9 umax 10 umin.
+function atomicOperator(builtin: AtomicBuiltin, valueType: Type) -> Int {
+    match builtin {
+        Exchange -> return 0
+        Add -> return 1
+        Subtract -> return 2
+        And -> return 3
+        Or -> return 4
+        Xor -> return 5
+        Max -> { if valueType.signed { return 7 } return 9 }
+        Min -> { if valueType.signed { return 8 } return 10 }
+        Load -> return 0
+        Store -> return 0
+        CompareExchange -> return 0
+        CompareExchangeWeak -> return 0
+        Fence -> return 0
+    }
+}

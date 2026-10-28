@@ -1,0 +1,37 @@
+import Foundation
+
+// Base64 as RFC 4648 section 10 gives it, read back; a stray character is
+// refused; a key's PEM body is base64 between its armour lines.
+
+// The RFC's vectors, each one a text that encodes and decodes to itself.
+@Test
+function base64EncodesTheRfcVectors() {
+    expect!((base64Text("".utf8())) == "")
+    expect!((base64Text("f".utf8())) == "Zg==")
+    expect!((base64Text("fo".utf8())) == "Zm8=")
+    expect!((base64Text("foo".utf8())) == "Zm9v")
+    expect!((base64Text("foob".utf8())) == "Zm9vYg==")
+    expect!((base64Text("fooba".utf8())) == "Zm9vYmE=")
+    expect!((base64Text("foobar".utf8())) == "Zm9vYmFy")
+}
+
+@Test
+function base64DecodesWhatItEncodes() {
+    for text in ["", "f", "fo", "foo", "foob", "fooba", "foobar"] {
+        let outcome = match base64Decoded(base64Text(text.utf8())) {
+            Some(bytes) -> textFromBytes(bytes).or("?")
+            None -> "?"
+        }
+        expect!((outcome) == text)
+    }
+}
+
+@Test
+function base64RefusesAStrayCharacter() {
+    expect!((base64Decoded("a$b").isNone()) == (true))
+}
+
+@Test
+function pemBodyIsItsBase64Line() {
+    expect!((pemText("PRIVATE KEY", "abc".utf8()).trim().split("\n")[1]) == "YWJj")
+}

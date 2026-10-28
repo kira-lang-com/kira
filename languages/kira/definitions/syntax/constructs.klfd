@@ -1,0 +1,282 @@
+extend Parser {
+    function constructDeclaration(borrow mut self) -> Result<Span, Failure> {
+        let start = try expect(.Construct)
+        let name = try identifier(.ExpectedConstructName)
+        let typeParameters = try genericParameters(name)
+        var parameters: Optional<[FieldDeclaration]> = .None
+        if eat(.LeftParen) {
+            var inputs: [FieldDeclaration] = []
+            while !at(.RightParen) {
+                inputs.append(try constructParameter())
+                if !eat(.Comma) { break }
+            }
+            try expect(.RightParen)
+            parameters = .Some(inputs)
+        }
+        try conformances(namedReference(name))
+        var parents: [TypeReference] = []
+        if eat(.Extends) {
+            parents.append(try typeReference())
+            while eat(.Comma) { parents.append(try typeReference()) }
+        }
+        // `extends Family<Arguments>`: the family is the bare name; the
+        // arguments are kept for inference (tree.klfd, `FamilyArguments`).
+        for index in 0..parents.count {
+            let parent = parents[index]
+            if parent.arguments.count > 0 && parent.qualifier.isNone() {
+                tree.familyArguments.append(FamilyArguments { owner = name.text, ownerSpan = name.span, family = parent.name.text, span = parent.name.span, arguments = parent.arguments })
+                parents[index] = namedReference(parent.name)
+            }
+        }
+        if parameters.isSome() && parents.count == 0 {
+            return .Error(Failure { diagnostic = .ConstructParametersWithoutFamily, span = name.span })
+        }
+        if parameters.isSome() && parents.count > 1 {
+            return .Error(Failure { diagnostic = .ConstructWithTwoFamilies, span = parents[1].name.span })
+        }
+        if parameters.isNone() && typeParameters.count > 0 {
+            return .Error(Failure { diagnostic = .GenericFamily, span = typeParameters[0].span })
+        }
+        return constructBody(name, typeParameters, parameters, parents, start.span)
+    }
+
+    // `Family Name { ... }`: the bare spelling of `construct Name() extends
+    // Family { ... }`, with the family named where `construct` would be.
+    function bareConstructHead(borrow mut self) -> Result<Span, Failure> {
+        let start = current().span
+        let family = try identifier(.ExpectedConstructName)
+        let name = try identifier(.ExpectedConstructName)
+        let inputs: [FieldDeclaration] = []
+        return constructBody(name, [], .Some(inputs), [namedReference(family)], start)
+    }
+
+    function constructBody(borrow mut self, name: Identifier, typeParameters: [Identifier], parameters: Optional<[FieldDeclaration]>, parents: [TypeReference], start: Span) -> Result<Span, Failure> {
+        try expect(.LeftBrace)
+        var members = ConstructMembers { fields = [], requirements = [], computed = [], methods = [], overrides = [], inits = [] }
+        while !at(.RightBrace) { try constructMember(members, name.text) }
+        try expect(.RightBrace)
+        // A family is never constructed itself, so it has no init.
+        if parameters.isNone() && members.inits.count > 0 {
+            return .Error(Failure { diagnostic = .ExpectedMember, span = members.inits[0].name.span })
+        }
+        var inits: [FunctionDeclaration] = []
+        for init in members.inits {
+            inits.append(FunctionDeclaration {
+                name = init.name, annotations = init.annotations, receiver = .Static,
+                parameters = init.parameters, result = .Some(templateReference(name, typeParameters)), body = init.body,
+                span = init.span, typeParameters = init.typeParameters, scope = init.scope
+            })
+        }
+        tree.constructs.append(ConstructDeclaration {
+            name = name, parameters = parameters, parents = parents, fields = members.fields,
+            requirements = members.requirements, computed = members.computed,
+            methods = members.methods, overrides = members.overrides, inits = inits, typeParameters = typeParameters
+        })
+        return .Ok(spanFrom(start))
+    }
+
+    // `name: T` or `name: T = default`, an input of a construct declaration.
+    function constructParameter(borrow mut self) -> Result<FieldDeclaration, Failure> {
+        let name = try identifier(.ExpectedParameterName)
+        try expect(.Colon)
+        let annotation = try typeReference()
+        var initial: Optional<Int> = .None
+        if eat(.Equals) {
+            let value = try expression()
+            spellStrings(value)
+            initial = .Some(value)
+        }
+        return .Ok(FieldDeclaration {
+            name = name, mutable = false, annotation = annotation, initial = initial, annotations = [],
+            inferred = false, span = spanFrom(name.span)
+        })
+    }
+
+    // One member of the construct or family `owner`. Its doc comments, claimed
+    // before its first token, are recorded once the member's name is known.
+    function constructMember(borrow mut self, members: borrow mut ConstructMembers, owner: String) -> Result<Bool, Failure> {
+        let memberDocs = try claimDocs()
+        if atWord("requires") && peek(1).kind == .LeftBrace {
+            // A block of requirements has no doc comment of its own: each
+            // requirement inside it takes the comments written before it.
+            if memberDocs.count > 0 {
+                return .Error(Failure { diagnostic = .DocWithoutDeclaration, span = memberDocs[0].span })
+            }
+            advance()
+            advance()
+            while !at(.RightBrace) {
+                let requiredDocs = try claimDocs()
+                var annotations = try annotations()
+                annotations.append(implicitAnnotation(.Required, current().span))
+                let required = try memberFunction(annotations)
+                recordDocs(requiredDocs, "method", required.name.text, owner)
+                members.methods.append(required)
+            }
+            advance()
+            return .Ok(true)
+        }
+        let memberStart = current().span
+        let prefix = try memberPrefix()
+        let annotations = prefix.annotations
+        if at(.Function) {
+            let method = try memberFunction(annotations)
+            keepPrivate(prefix, method.name)
+            recordDocs(memberDocs, "method", method.name.text, owner)
+            members.methods.append(method)
+            return .Ok(true)
+        }
+        if at(.Let) || at(.Var) {
+            let start = current().span
+            let mutable = advance().kind == .Var
+            let name = try identifier(.ExpectedMemberName)
+            keepPrivate(prefix, name)
+            recordDocs(memberDocs, "field", name.text, owner)
+            if !at(.Colon) && !mutable && at(.LeftBrace) {
+                // `let name { ... }` reads as the value its block ends with,
+                // and has that value's type (`inferComputedResult`).
+                members.computed.append(FunctionDeclaration {
+                    name = name, annotations = [implicitAnnotation(.Computed, name.span)],
+                    receiver = .Free, parameters = [], result = .Some(inferredReference(name.span)),
+                    body = try block(), span = spanFrom(start), typeParameters = [], scope = GenericScope.none()
+                })
+                return .Ok(true)
+            }
+            if !at(.Colon) {
+                // A member a property wrapper takes up may leave its type
+                // to the wrapper, as `@Environment(\.scenePhase) var
+                // scenePhase` does: the wrapper's expansion gives it one.
+                var initial: Optional<Int> = .None
+                if eat(.Equals) {
+                    let value = try expression()
+                    spellStrings(value)
+                    initial = .Some(value)
+                } else if !wrapped(annotations) {
+                    return .Error(Failure { diagnostic = .ComputedMemberType, span = name.span })
+                }
+                let field = FieldDeclaration {
+                    name = name, mutable = mutable, annotation = inferredReference(name.span),
+                    initial = initial, annotations = annotations, inferred = true,
+                    span = spanFrom(memberStart)
+                }
+                if hasAttribute(annotations, .Required) {
+                    members.requirements.append(field)
+                } else {
+                    members.fields.append(field)
+                }
+                return .Ok(true)
+            }
+            advance()
+            var annotation = try typeReference()
+            if hasAttribute(annotations, .Content) { annotation = contentSpelling(annotation) }
+            if at(.LeftBrace) && peek(1).kind == .Identifier && text(peek(1).span) == "get" && peek(2).kind == .LeftBrace {
+                return computedAccessors(members, name, mutable, annotation, memberStart)
+            }
+            if at(.LeftBrace) {
+                members.computed.append(FunctionDeclaration {
+                    name = name, annotations = [implicitAnnotation(.Computed, name.span)],
+                    receiver = .Free, parameters = [], result = .Some(annotation),
+                    body = try block(), span = spanFrom(start), typeParameters = [], scope = GenericScope.none()
+                })
+                return .Ok(true)
+            }
+            var initial: Optional<Int> = .None
+            if eat(.Equals) {
+                let value = try expression()
+                spellStrings(value)
+                initial = .Some(value)
+            }
+            let field = FieldDeclaration {
+                name = name, mutable = mutable, annotation = annotation, initial = initial, annotations = annotations,
+                inferred = false, span = spanFrom(memberStart)
+            }
+            if hasAttribute(annotations, .Required) {
+                members.requirements.append(field)
+            } else {
+                members.fields.append(field)
+            }
+            return .Ok(true)
+        }
+        if prefix.hidden { return .Error(failure(.ExpectedMember)) }
+        // `init(...)`, or `init<Value>(...)` with type parameters of its own.
+        if atWord("init") && (peek(1).kind == .LeftParen || peek(1).kind == .Less) && annotations.count == 0 {
+            let start = current().span
+            let name = try identifier(.ExpectedMemberName)
+            recordDocs(memberDocs, "init", name.text, owner)
+            members.inits.append(try functionDefinition(name, [], start))
+            return .Ok(true)
+        }
+        if at(.Identifier) && annotations.count == 0 {
+            let member = try identifier(.ExpectedMemberName)
+            recordDocs(memberDocs, "method", member.text, owner)
+            let body = try block()
+            members.overrides.append(ConstructOverride { name = member, body = body, span = spanFrom(member.span) })
+            return .Ok(true)
+        }
+        return .Error(failure(.ExpectedMember))
+    }
+
+    // `{ get { ... } set(value) { ... } }`: a computed member read through its
+    // getter and, when it has a setter, assigned through it. The getter is the
+    // zero-parameter method a computed member always is; the setter is a
+    // method of the member's name taking the value assigned.
+    function computedAccessors(borrow mut self, members: borrow mut ConstructMembers, name: Identifier, mutable: Bool, annotation: TypeReference, start: Span) -> Result<Bool, Failure> {
+        try expect(.LeftBrace)
+        advance()
+        members.computed.append(FunctionDeclaration {
+            name = name, annotations = [implicitAnnotation(.Computed, name.span)],
+            receiver = .Free, parameters = [], result = .Some(annotation),
+            body = try block(), span = spanFrom(start), typeParameters = [], scope = GenericScope.none()
+        })
+        if atWord("set") {
+            if !mutable { return .Error(failure(.ComputedSetterOnLet)) }
+            advance()
+            try expect(.LeftParen)
+            let value = try identifier(.ExpectedParameterName)
+            try expect(.RightParen)
+            members.methods.append(FunctionDeclaration {
+                name = name, annotations = [implicitAnnotation(.ComputedSetter, name.span)],
+                receiver = .Free,
+                parameters = [Parameter { name = value, mode = .Owned, annotation = annotation, copies = false, initial = .None }],
+                result = .None, body = try block(), span = spanFrom(start), typeParameters = [], scope = GenericScope.none()
+            })
+        }
+        try expect(.RightBrace)
+        return .Ok(true)
+    }
+}
+
+// A member's annotations, and whether it is written `private`.
+struct MemberPrefix {
+    let annotations: [Annotation]
+    let hidden: Bool
+}
+
+struct ConstructMembers {
+    var fields: [FieldDeclaration]
+    var requirements: [FieldDeclaration]
+    var computed: [FunctionDeclaration]
+    var methods: [FunctionDeclaration]
+    var overrides: [ConstructOverride]
+    var inits: [FunctionDeclaration]
+}
+
+// The type a member written without one stands in with until checking
+// gives it its initializer's. No written type has an empty name.
+function inferredReference(span: Span) -> TypeReference {
+    return TypeReference {
+        qualifier = .None, name = Identifier { text = "", span = span }, arguments = [], modes = [], instanceName = ""
+    }
+}
+
+function isInferredReference(reference: TypeReference) -> Bool {
+    return utf8Count(reference.name.text) == 0
+}
+
+// Whether a member's annotations name a macro or a property wrapper, which
+// is no built-in attribute.
+function wrapped(annotations: [Annotation]) -> Bool {
+    for annotation in annotations {
+        if annotation.attribute.isNone() { return true }
+    }
+    return false
+}

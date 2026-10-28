@@ -1,0 +1,53 @@
+import Foundation
+
+// A library declares its categories the same way; this program declares its
+// own. Each case's threshold is its declared default.
+enum Tls: LogCategory {
+    Handshake
+    Records
+    Alerts
+
+    function threshold(borrow self) -> TrailThreshold {
+        match self {
+            Handshake -> return .UpTo(.Info)
+            Records -> return .Off
+            Alerts -> return .UpTo(.Warn)
+        }
+    }
+}
+
+struct Tally {
+    var evaluated: Number = 0
+
+    function counted(borrow mut self, value: Number) -> Number {
+        self.evaluated = self.evaluated + 1
+        return value
+    }
+}
+
+// The paths this program names are well formed, so a configuration call
+// cannot fail here.
+function configured(result: Result<Void, LogConfigFailure>) {
+    match result {
+        Ok -> {}
+        // A well-formed path cannot fail, so there is nothing to report.
+        Error(failure) -> absorb failure
+    }
+}
+
+@Main
+function main() -> Number {
+    var tally = Tally { evaluated: 0 }
+    log(category: Tls.Handshake, "peer accepted", peer: 7)
+    // Off by default: the field is not evaluated.
+    log trace(category: Tls.Records, "record", length: tally.counted(12))
+    log warn(category: Tls.Alerts, "alert", code: tally.counted(40))
+    // Enabled at runtime by path: the record now prints at trace.
+    configured(Log.enable("Categories.Tls.Records", .Trace))
+    log trace(category: Tls.Records, "record", length: tally.counted(13))
+    // Disabled at runtime: the handshake event no longer prints.
+    configured(Log.disable("Categories.Tls.Handshake"))
+    log(category: Tls.Handshake, "quiet now", peer: 8)
+    print(tally.evaluated)
+    return tally.evaluated
+}

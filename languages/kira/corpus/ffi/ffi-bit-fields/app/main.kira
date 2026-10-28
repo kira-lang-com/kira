@@ -1,0 +1,45 @@
+// `@Bits(n)` members of an `@FFI.Struct`, placed where C places them: by
+// value both ways and behind a pointer.
+
+@FFI.Struct { layout: c }
+struct Flags {
+    let tag: U8
+    let mode: U32 @Bits(3)
+    let delta: I32 @Bits(5)
+    let wide: U32 @Bits(20)
+    let after: U8
+    let big: U64 @Bits(40)
+    let tail: I16 @Bits(7)
+}
+
+@FFI.Pointer { target: Flags }
+struct FlagsPtr {}
+
+@FFI.Extern { library: klfseam, symbol: seam_flags_size, abi: c }
+function flagsSize(): I32
+
+@FFI.Extern { library: klfseam, symbol: seam_flags_sum, abi: c }
+function flagsSum(flags: Flags): Int
+
+@FFI.Extern { library: klfseam, symbol: seam_flags_make, abi: c }
+function flagsMake(seed: I32): Flags
+
+@FFI.Extern { library: klfseam, symbol: seam_flags_at, abi: c }
+function flagsAt(flags: FlagsPtr): Int
+
+@Main
+function main() {
+    print(flagsSize())
+    let given = Flags { tag: 9, mode: 6, delta: -16, wide: 1048575, after: 255, big: 1234567890, tail: 63 }
+    print(flagsSum(given))
+    print(flagsAt(given))
+    let made = flagsMake(12)
+    print(Int(made.tag))
+    print(Int(made.mode))
+    print(Int(made.delta))
+    print(Int(made.wide))
+    print(Int(made.after))
+    print(Int(made.big))
+    print(Int(made.tail))
+    print(flagsSum(made))
+}

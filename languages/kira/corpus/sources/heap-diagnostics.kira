@@ -1,0 +1,33 @@
+// What typed memory refuses: a load with no type to read, a type with no C
+// memory shape, and copies of values whose drop would then run twice: one
+// itself, one through a case payload.
+struct Owned: Drop {
+    let start: RawPtr
+
+    function drop(borrow mut self) {
+        heapFreeRaw(self.start)
+        return
+    }
+}
+
+enum Shape {
+    Dot
+    Line(Int)
+}
+
+enum Held {
+    Empty
+    Full(Owned)
+}
+
+@Main
+function main() -> Int {
+    let start = heapAllocateRaw(16, 8)
+    heapLoad(start)
+    let text = heapLoad<Shape>(start)
+    let first = Owned { start = start }
+    let second = first
+    let held: Held = .Full(move second)
+    let again = held
+    return 0
+}

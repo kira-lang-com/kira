@@ -1,0 +1,99 @@
+// Struct padding and constant values.
+//
+// A target that places struct members itself realizes a recorded layout
+// (section 19.1 rule 4) with padding scalars of four bytes where its own
+// placement falls short of a member's recorded offset.
+//
+// A constant is written as the value the validator evaluated it to. The
+// out defines `dialectLiteral(table, owner, index)`, which spells the
+// literal fields of a record of `expressions` or `values`, and
+// `dialectCompose(typeIndex, parts)`, which spells a composite.
+
+// A struct's members with padding. A slot of zero or more is the index of a
+// member; a negative one is that many padding scalars. `problem` says why
+// the target cannot reach the layout, when it cannot.
+struct Padding {
+    let slots: [Int]
+    let problem: String
+}
+
+extend TextOut {
+    // The slots of struct `typeIndex` reaching `size` bytes, given each
+    // member's size and alignment on the target.
+    function paddedSlots(borrow self, typeIndex: Int, size: Int, sizes: [Int], aligns: [Int]) -> Padding {
+        var slots: [Int] = []
+        var end = 0
+        var widest = 4
+        let members = count("members", typeIndex)
+        for index in 0..members {
+            var align = aligns[index]
+            if align > widest { widest = align }
+            if align < 1 { align = 1 }
+            let offset = field("members", typeIndex, index, "offset")
+            let placed = alignUp(end, align)
+            let name = text("members", typeIndex, index, "name")
+            if placed > offset {
+                return Padding {
+                    slots = [],
+                    problem = joinText(["member `", name, "` cannot be placed at offset ", decimalText(offset)])
+                }
+            }
+            if placed < offset {
+                let gap = offset - end
+                if gap % 4 != 0 || offset % align != 0 {
+                    return Padding {
+                        slots = [],
+                        problem = joinText(["member `", name, "` at offset ", decimalText(offset),
+                            " cannot be reached with padding"])
+                    }
+                }
+                slots.append(0 - gap / 4)
+            }
+            slots.append(index)
+            end = offset + sizes[index]
+        }
+        let naturalSize = alignUp(end, widest)
+        if naturalSize < size && end < size {
+            let gap = size - end
+            if gap % 4 == 0 { slots.append(0 - gap / 4) }
+        }
+        return Padding { slots = slots, problem = "" }
+    }
+
+    // The text of value record `value`.
+    function constText(borrow self, value: Int) -> String {
+        if kind("values", -1, value) == "scalar" { return dialectLiteral("values", -1, value) }
+        var parts: [String] = []
+        let items = fieldCount("values", -1, value, "items")
+        for at in 0..items {
+            parts.append(constText(fieldItem("values", -1, value, "items", at)))
+        }
+        return dialectCompose(field("values", -1, value, "type"), parts)
+    }
+}
+
+// A float literal's text that every C-like target reads back exactly: the
+// shortest text of its value, with `.0` when that has no point or exponent.
+function cFloatText(shortest: String) -> String {
+    if containsByte(shortest, 46) || containsByte(shortest, 101) || containsByte(shortest, 69) { return shortest }
+    return joinText([shortest, ".0"])
+}
+
+// `text` in parentheses when it starts with a minus, so that a unary minus
+// before it never reads as `--`.
+function signedText(text: String) -> String {
+    if utf8Count(text) > 0 && utf8Byte(text, 0) == 45 { return joinText(["(", text, ")"]) }
+    return text
+}
+
+extend TextOut {
+    // A float literal of a record of `expressions` or `values`, written as
+    // `cFloatText` does, and as a division when it is not finite.
+    function floatOf(borrow self, table: String, owner: Int, index: Int) -> String {
+        let shortest = text(table, owner, index, "float")
+        if flag(table, owner, index, "finite") { return cFloatText(shortest) }
+        if shortest == "NaN" { return "(0.0 / 0.0)" }
+        if startsWithText(shortest, "-") { return "(-1.0 / 0.0)" }
+        return "(1.0 / 0.0)"
+    }
+}

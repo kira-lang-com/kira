@@ -1,0 +1,97 @@
+import Heap
+
+// The arguments the program was started with, its own path excluded, on the
+// kernel's `klf.process` services. A backend that hosts the program, as the
+// VM runner does, hands it the same arguments a native build reads from its
+// command line.
+
+@Service("klfsvc_process_argument_count")
+function kernelArgumentCount() -> Int
+
+@Service("klfsvc_process_argument")
+function kernelArgument(index: Int, destination: RawPtr, capacity: Int) -> Int
+
+function processArgumentCount() -> Number {
+    return Number(kernelArgumentCount())
+}
+
+namespace ProcessArgument {
+    // Room for most arguments; a longer one is read again into its size.
+    let capacity: Int = 64
+}
+
+// The argument at `index`, or nothing past the last one.
+function processArgument(index: Number) -> String? {
+    let empty: String = ""
+    var capacity = ProcessArgument.capacity
+    var data = makeArrayData(capacity)
+    var count = kernelArgument(Int(index), data, capacity)
+    if count < 0 { return .None }
+    if count > capacity {
+        capacity = count
+        data = resizeArrayData(data, capacity)
+        count = kernelArgument(Int(index), data, capacity)
+    }
+    return .Some(String { data = data, count = count, capacity = capacity, ops = empty.ops })
+}
+
+@Service("klfsvc_time_sleep")
+function kernelSleep(nanoseconds: Int)
+
+@Service("klfsvc_time_wall")
+function kernelWallNanos() -> Int
+
+@Service("klfsvc_process_exit")
+function kernelExit(status: Int)
+
+// Pause the process for `milliseconds` of wall-clock time. Unlike
+// `taskSleep`, this is not the task scheduler's logical clock.
+function processSleep(milliseconds: Number) {
+    if milliseconds > 0 { kernelSleep(Int(milliseconds * WallTime.nanosecondsPerMillisecond)) }
+}
+
+// End the process now with `status`, as C's `exit` does: for a program that
+// has answered what its command line asked, `--help` or a usage error, before
+// the work it would otherwise have started.
+function processExit(status: Number) {
+    kernelExit(Int(status))
+}
+
+namespace WallTime {
+    let nanosecondsPerMillisecond: Number = 1000000
+}
+
+// The time now, in milliseconds since the Unix epoch.
+function unixMillis() -> Number {
+    return Number(kernelWallNanos()) / WallTime.nanosecondsPerMillisecond
+}
+
+// Standard error, declared here because this is the one place Foundation uses
+// it. A trap is not a program's account of what it did, it is the end of it, and
+// `print` and `log` are both on standard output where the output a program
+// produced can be read in the order it produced it.
+@Service("klfsvc_io_write_error")
+function kernelWriteError(data: RawPtr, count: Int) -> Int
+
+// `text` on standard error as one line, ended with a newline as `print` ends
+// its output.
+function printError(text: borrow String) {
+    let line = text + "\n"
+    kernelWriteError(line.data, line.count)
+}
+
+// `abort(message)`: the message on standard error, as Kira's runtime words
+// a trap, and the process ends with status 1.
+function abort(message: borrow String) {
+    let line = "kira: runtime trap: aborted: " + message + "\n"
+    kernelWriteError(line.data, line.count)
+    kernelExit(1)
+}
+
+function assert(condition: Bool) {
+    if !condition { abort("assertion failed") }
+}
+
+function assertEqual(got: Any, want: Any) {
+    if got != want { abort("assertion failed: values are not equal") }
+}

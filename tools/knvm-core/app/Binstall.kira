@@ -1,0 +1,528 @@
+import Foundation
+
+// Building this checkout into an installed dev toolchain: `knvm <compiler>
+// binstall`.
+//
+// This is the developer route. It compiles the compiler out of the checkout it
+// is run inside, shapes the result into the same tree a release archive unpacks
+// to (`bin/<binary>` with the sources it was built from beside it), and lands it
+// on the `dev` channel through the same staging, validate and rename pipeline a
+// release install uses. Installing selects it, so the launcher dispatches to the
+// fresh build immediately.
+//
+// Running it again replaces the installed tree. A dev toolchain names a moving
+// target, so "already installed" would mean "silently stale", which is the one
+// thing a rebuild command must never be.
+
+// The tools this checkout ships: the version manager and the launcher.
+public let toolDirectoryName: String = "tools"
+
+// Why a checkout could not be built into an installed toolchain.
+public enum BinstallFailure {
+    NotACheckout(String)
+    VersionUnreadable(String)
+    BuildToolUnavailable(String)
+    BuildFailed(String)
+    MissingBuildArtifact(String)
+    // This command's own scratch space, before a toolchain exists to install.
+    Staging(String)
+    // The toolchain pipeline's own refusal, kept whole rather than restated: it
+    // already names the path and the reason, and wrapping a rendered sentence in
+    // another one is how a diagnostic ends up quoted inside itself.
+    Install(InstallFailure)
+    // No directory above the one `binstall` ran in holds a `toolchain.klfd`.
+    NoManifest(String)
+    // The manifest is there and cannot be read or does not parse.
+    ManifestUnreadable(String)
+    // The manifest at this path does not list the language asked for.
+    NotListed(String)
+    // The toolchain landed and its language could not be recorded.
+    Unregistered(String)
+    // The compiler comes from its releases, and nothing here builds it.
+    Published(String)
+}
+
+public enum BinstallOutcome {
+    Binstalled(Installed)
+    Failed(BinstallFailure)
+}
+
+// Builds the enclosing checkout of `compiler` and installs it as the selected
+// dev toolchain.
+//
+// `start` is where the search begins: the working directory, for the binary.
+// A language is found through the `toolchain.klfd` that lists it. The build's output is
+// left on this process's own streams, so a compile error lands in front of the
+// user rather than in a captured buffer.
+public function binstallToolchain(
+    compiler: borrow Compiler,
+    start: borrow String
+) -> BinstallOutcome {
+    return match compiler.route {
+        Published -> .Failed(.Published(compiler.name))
+        Definition(language) -> binstallListed(compiler.name, start)
+        Registered -> binstallListed(compiler.name, start)
+    }
+}
+
+
+// The language `name`, as the manifest enclosing `start` lists it, built and
+// registered.
+public function binstallListed(name: borrow String, start: borrow String) -> BinstallOutcome {
+    match enclosingManifest(start) {
+        Missing -> { return .Failed(.NoManifest(start)) }
+        Failed(detail) -> { return .Failed(.ManifestUnreadable(detail)) }
+        Found(manifest) -> {
+            for language in manifest.languages {
+                if language.name == name { return binstallLanguage(manifest.root, language) }
+            }
+            return .Failed(.NotListed(joinPath(manifest.root, manifestFileName)))
+        }
+    }
+    return .Failed(.NoManifest(start))
+}
+
+// One language of the repository at `root`: built, landed on the dev channel,
+// selected, and registered so every later invocation and launcher knows it.
+//
+// Registered after it lands rather than before, so a build that fails leaves
+// no language behind that has nothing installed.
+public function binstallLanguage(
+    root: borrow String,
+    language: borrow ToolchainLanguage
+) -> BinstallOutcome {
+    let compiler = languageCompiler(language)
+    match checkoutVersion(compiler, root) {
+        None -> { return .Failed(.VersionUnreadable(joinPath(root, compiler.versionFile))) }
+        Some(version) -> {
+            match buildDevToolchain(compiler, root, version) {
+                Failed(failure) -> { return .Failed(failure) }
+                Binstalled(installed) -> {
+                    if !register(compiler) { return .Failed(.Unregistered(compilerRoot(compiler))) }
+                    return .Binstalled(installed)
+                }
+            }
+        }
+    }
+    return .Failed(.NotACheckout(root))
+}
+
+// The nearest directory above `start` holding everything a checkout of
+// `compiler` is.
+//
+// Every marker, not one: a directory holding some of a checkout's parts is a
+// subtree of it, and building from there would stage a toolchain missing the
+// rest.
+public function enclosingCheckout(compiler: borrow Compiler, start: borrow String) -> Optional<String> {
+    var current = start
+    if current.isEmpty() { return .None }
+    while true {
+        if holdsEveryMarker(compiler, current) { return .Some(current) }
+        let parent = directoryOfPath(current)
+        if parent.isEmpty() || parent == current { return .None }
+        current = parent
+    }
+}
+
+// Whether `directory` holds every marker of `compiler`'s checkout.
+public function holdsEveryMarker(compiler: borrow Compiler, directory: borrow String) -> Bool {
+    for index in 0..compiler.markers.count {
+        if !pathExists(joinPath(directory, compiler.markers[index])) { return false }
+    }
+    return true
+}
+
+// The version the checkout states.
+//
+// `definitions/language.klfd` declares `let version: String = "0.1.0"` and the
+// framework declares `version = "0.1.0"` in its manifest; either is the one place
+// a checkout says what it is. A dev toolchain is named after it, so two
+// checkouts of different versions do not overwrite one another on the `dev`
+// channel.
+public function checkoutVersion(compiler: borrow Compiler, root: borrow String) -> Optional<String> {
+    match textOf(joinPath(root, compiler.versionFile)) {
+        Some(text) -> return versionFromManifest(text)
+        None -> return .None
+    }
+}
+
+// The text between the first two quotes in `line`.
+public function quoted(line: borrow String) -> String? {
+    match line.indexOf("\"") {
+        Some(opening) -> {
+            match line.indexOf("\"", opening + 1) {
+                Some(closing) -> return .Some(line.substring(opening + 1, closing))
+                None -> return .None
+            }
+        }
+        None -> return .None
+    }
+}
+
+// The first `version` a manifest declares, in either of the two spellings a
+// checkout writes it in.
+public function versionFromManifest(text: borrow String) -> String? {
+    let lines = text.split("\n")
+    for index in 0..lines.count {
+        let line = withoutPrefix(lines[index].trim(), "let ")
+        if !line.startsWith("version") { continue }
+        match quoted(line) {
+            Some(named) -> {
+                if !named.isEmpty() { return .Some(named) }
+            }
+            None -> {}
+        }
+    }
+    return .None
+}
+
+// `text` without `prefix`, when it starts with it.
+public function withoutPrefix(text: borrow String, prefix: borrow String) -> String {
+    if !text.startsWith(prefix) { return text }
+    return text.substring(prefix.count, text.count)
+}
+
+public function buildDevToolchain(
+    compiler: borrow Compiler,
+    root: borrow String,
+    version: borrow String
+) -> BinstallOutcome {
+    if !isSingleComponent(version) { return .Failed(.VersionUnreadable(version)) }
+
+    let staging = joinPath(stagingRoot(), processTag())
+    if !makeDirectoryTree(staging) { return .Failed(.Staging(staging)) }
+
+    let built = runRoute(compiler, root, staging)
+    if built != 0 {
+        removeTree(staging)
+        if built == toolNotRunnable { return .Failed(.BuildToolUnavailable(buildToolOf(compiler))) }
+        return .Failed(.BuildFailed(joinPath(root, compiler.name)))
+    }
+    if !copyLanguageFiles(compiler, root, staging) {
+        removeTree(staging)
+        return .Failed(.Staging(root))
+    }
+    return landBuiltToolchain(compiler, staging, version)
+}
+
+// The tool this compiler's build route runs, named by the refusal that says it
+// was missing: `klf` builds a definition package.
+public function buildToolOf(compiler: borrow Compiler) -> String {
+    return match compiler.route {
+        Published -> klfBinary
+        Definition(language) -> klfBinary
+        Registered -> klfBinary
+    }
+}
+
+// Builds `root` into `staging`, answering the build tool's exit status.
+public function runRoute(
+    compiler: borrow Compiler,
+    root: borrow String,
+    staging: borrow String
+) -> Number {
+    match compiler.route {
+        Definition(language) -> {
+            return buildDefinitionPackage(
+                compiler,
+                language,
+                joinPath(root, language.path),
+                staging,
+                root
+            )
+        }
+        Registered -> { return toolNotRunnable }
+        Published -> { return toolNotRunnable }
+    }
+    return toolNotRunnable
+}
+
+// `klf build <package> -o <staging>/bin/<binary>`.
+//
+// The `klf` that runs it is the selected managed one where there is one, so a
+// machine that installed the framework's compiler needs no second copy on PATH to
+// build a driver with it.
+public function buildDefinitionPackage(
+    compiler: borrow Compiler,
+    language: borrow ToolchainLanguage,
+    package: borrow String,
+    staging: borrow String,
+    root: borrow String
+) -> Number {
+    let binary = binaryPath(staging, compiler)
+    if !makeDirectoryTree(directoryOfPath(binary)) { return 1 }
+    var arguments: [String] = []
+    arguments.append("build")
+    arguments.append(package)
+    for out in shaderOutPathsOf(language, root) {
+        arguments.append("--language")
+        arguments.append(out)
+    }
+    arguments.append("-o")
+    arguments.append(binary)
+    return runTool(compilerForBuild(klfCompilerName), arguments)
+}
+
+// The packages of the outs `language` names, beside `root`.
+//
+// A surface language reaches its outs by linking them: one `emit` per target,
+// one driver, and nothing compiled for a target nobody asked for. A name that
+// resolves to no language here is a manifest that does not parse, which
+// `parseToolchainManifest` refuses, so an empty path cannot reach `klf`.
+public function shaderOutPathsOf(language: borrow ToolchainLanguage, root: borrow String) -> [String] {
+    var paths: [String] = []
+    if language.shaderOuts.count == 0 { return paths }
+    match enclosingManifest(root) {
+        Missing -> { return paths }
+        Failed(detail) -> { return paths }
+        Found(manifest) -> {
+            for name in language.shaderOuts {
+                let path = pathOfLanguage(manifest.languages, name)
+                if path.count == 0 { continue }
+                paths.append(joinPath(manifest.root, path))
+            }
+        }
+    }
+    return paths
+}
+
+
+
+
+
+
+// Copies what the manifest lists beside a language's binary: each `from`,
+// relative to the language package, to its `to` under the toolchain root.
+public function copyLanguageFiles(
+    compiler: borrow Compiler,
+    root: borrow String,
+    staging: borrow String
+) -> Bool {
+    match compiler.route {
+        Definition(language) -> {
+            let package = joinPath(root, language.path)
+            for file in language.files {
+                if !copyTree(joinPath(package, file.from), joinPath(staging, file.to)) {
+                    return false
+                }
+            }
+            return true
+        }
+        Registered -> return true
+        Published -> return true
+    }
+}
+
+// The built tree validated, landed on the dev channel, and selected.
+public function landBuiltToolchain(
+    compiler: borrow Compiler,
+    staging: borrow String,
+    version: borrow String
+) -> BinstallOutcome {
+    let usable = validateToolchain(compiler, staging)
+    match usable {
+        Some(detail) -> {
+            removeTree(staging)
+            return .Failed(.MissingBuildArtifact(detail))
+        }
+        None -> {
+            let channel: Channel = .Dev
+            let destination = toolchainRoot(compiler, channel, version)
+            let retired = joinPath(stagingRoot(), "retired-" + processTag())
+            let landed = landTree(staging, destination, retired)
+            match landed {
+                Failed(failure) -> {
+                    removeTree(retired)
+                    removeTree(staging)
+                    return .Failed(.Install(failure))
+                }
+                Replaced -> {
+                    carryPlatforms(retired, destination)
+                    removeTree(retired)
+                    let installed = Installed {
+                        compiler: compiler.name,
+                        channel: channel,
+                        version: version,
+                        root: destination,
+                        alreadyInstalled: false,
+                        digest: ""
+                    }
+                    let selected = selectInstalled(compiler, installed)
+                    match selected {
+                        Failed(failure) -> { return .Failed(.Install(failure)) }
+                        Installed(landed) -> { return .Binstalled(landed) }
+                    }
+                }
+            }
+        }
+    }
+    return .Failed(.Staging(staging))
+}
+
+// The platforms the replaced build had and this one did not build, moved
+// into it.
+//
+// A build lays out the runtimes for the targets it was asked for, the host's
+// when none were named, so a host-only rebuild would otherwise drop every
+// cross target's runtime — a Tessera one built by hand among them — and each
+// compile for that target would then build its runtime in the workspace
+// again. Moved rather than copied, so the runner keeps its executable bit.
+public function carryPlatforms(retired: borrow String, destination: borrow String) {
+    let previous = joinPath(retired, "platforms")
+    if !isDirectory(previous) { return }
+    let current = joinPath(destination, "platforms")
+    if !makeDirectoryTree(current) { return }
+    for name in entriesOf(previous) {
+        let kept = joinPath(current, name)
+        if !pathExists(kept) { succeeded(renamePath(joinPath(previous, name), kept)) }
+    }
+}
+
+// Why an install failed, in one line.
+public function installFailureText(failure: borrow InstallFailure) -> String {
+    match failure {
+        SourceFailed(problem) -> { return sourceFailureText(problem) }
+        TarUnavailable -> {
+            return "`tar` was not found on PATH; knvm unpacks release archives with it"
+        }
+        ChecksumMismatch(detail) -> { return detail }
+        ExtractFailed(detail) -> { return detail }
+        UnrecognizedArchiveLayout(archive) -> {
+            return "`" + archive + "` does not contain a toolchain: expected one directory holding `"
+                + binaryDirectoryName + "/<compiler>` and the sources it was built from"
+        }
+        MissingPart(detail) -> { return detail }
+        InvalidVersion(version) -> {
+            return "`" + version + "` is not a version name: a version is a single directory component"
+        }
+        IncompleteInstall(detail) -> { return detail }
+        Staging(path) -> { return "could not finish the install in `" + path + "`" }
+    }
+    return ""
+}
+
+// The compiler that builds with `name`: the selected managed toolchain's binary
+// where one is installed, and the bare name otherwise.
+//
+// The managed one comes first so that a machine which installed the framework's
+// compiler needs no second `klf` on PATH to build a driver with it, and so that
+// a checkout builds with the `klf` its author selected rather than whichever
+// one the shell happened to find.
+public function compilerForBuild(name: borrow String) -> String {
+    let found = compilerForBinary(allCompilers(), name)
+    match found {
+        None -> { return name }
+        Some(compiler) -> {
+            match readSelection(compiler) {
+                Selected(selection) -> {
+                    let binary = binaryPath(
+                        toolchainRoot(compiler, selection.channel, selection.version),
+                        compiler
+                    )
+                    if fileExists(binary) { return binary }
+                }
+                Unusable(failure) -> { return name }
+                NothingSelected -> { return name }
+            }
+        }
+    }
+    return name
+}
+
+// Why a checkout could not be built into an installed toolchain, in one line.
+public function binstallFailureText(compiler: borrow Compiler, failure: borrow BinstallFailure) -> String {
+    match failure {
+        NotACheckout(start) -> {
+            return "`" + start + "` is not inside a " + compiler.name + " checkout: no enclosing directory holds "
+                + markersOf(compiler)
+        }
+        VersionUnreadable(manifest) -> {
+            return "`" + manifest + "` does not state a version, so the " + compiler.name
+                + " toolchain cannot be named"
+        }
+        BuildToolUnavailable(tool) -> {
+            return "`" + tool + "` was not found on PATH; a " + compiler.name + " checkout is built with it"
+        }
+        BuildFailed(target) -> {
+            return "building " + target + " failed; the build's own output names the error"
+        }
+        MissingBuildArtifact(expected) -> {
+            return "the build left no usable toolchain: " + expected
+        }
+        Staging(path) -> { return "could not finish the install in `" + path + "`" }
+        Install(failure) -> { return installFailureText(failure) }
+        NoManifest(start) -> {
+            return "`" + start + "` is not inside a repository of languages: no enclosing directory holds `"
+                + manifestFileName + "`"
+        }
+        ManifestUnreadable(detail) -> { return detail }
+        NotListed(manifest) -> {
+            return "`" + manifest + "` does not list " + compiler.name + "; `" + toolName
+                + " binstall` builds every language it does list"
+        }
+        Unregistered(directory) -> {
+            return "the toolchain was installed and " + compiler.name + " could not be recorded in `"
+                + directory + "`"
+        }
+        Published(name) -> {
+            return name + " comes from its releases: `" + toolName + " " + name + " install latest`"
+        }
+    }
+    return ""
+}
+
+// Why a self-install failed, in one line.
+public function sinstallFailureText(failure: borrow SinstallFailure) -> String {
+    match failure {
+        NotACheckout(start) -> {
+            return "`" + start + "` is not inside a Kira checkout: no enclosing directory holds `"
+                + joinPath(toolDirectoryName, managerToolName) + "`"
+        }
+        NoCompiler(detail) -> { return detail }
+        BuildFailed(package) -> {
+            return "`kira " + package + "` failed; its output names the error"
+        }
+        MissingBuildArtifact(expected) -> { return "the build left no tool at `" + expected + "`" }
+        Staging(path) -> { return "could not finish the install in `" + path + "`" }
+    }
+    return ""
+}
+
+// Why a release could not be listed or fetched, in one line.
+public function sourceFailureText(failure: borrow SourceFailure) -> String {
+    match failure {
+        ChannelEmpty(channel) -> { return "no versions published on the `" + channel + "` channel" }
+        VersionNotFound(version) -> { return "version `" + version + "` was not found" }
+        MissingHostArtifact(artifact) -> {
+            return "no artifact for this host (expected `" + artifact + "`)"
+        }
+        UnsupportedHost -> {
+            return "unsupported host `" + currentHostKey() + "`: no releases are published for it"
+        }
+        TransportFailed(detail) -> { return "could not reach the release source: " + detail }
+        ToolUnavailable(tool) -> {
+            return "`" + tool + "` was not found on PATH; knvm runs it to fetch releases"
+        }
+        MalformedFeed(detail) -> { return "the release feed could not be understood: " + detail }
+        NoFeed(variable) -> {
+            return "no repository publishes these releases, and no local feed was named: set `"
+                + variable + "` to a directory laid out like a published one"
+        }
+    }
+    return ""
+}
+
+// What a checkout of `compiler` is, as one phrase: the markers that make one.
+public function markersOf(compiler: borrow Compiler) -> String {
+    var text = ""
+    for index in 0..compiler.markers.count {
+        if index > 0 { text = text + " beside " }
+        text = text + "`" + compiler.markers[index] + "`"
+    }
+    return text
+}
+
+// The directory a checkout keeps its own tools in.
+public function toolDirectory(root: borrow String) -> String {
+    return joinPath(root, toolDirectoryName)
+}

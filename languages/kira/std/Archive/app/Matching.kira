@@ -1,0 +1,161 @@
+import Foundation
+
+// What the compressors share: the bits they write and how they find earlier
+// copies of the bytes ahead.
+
+// Bits written from the lowest up: DEFLATE reads them so, and Zstandard
+// reads them back from the end.
+struct LowBitWriter {
+    var bytes: [UN8] = []
+    var held: Number = 0
+    var heldCount: Number = 0
+
+    // The low `count` bits of `value`; `count` is at most 56.
+    function add(borrow mut self, value: Number, count: Number) {
+        held = held | ((value & ((1 << count) - 1)) << heldCount)
+        heldCount += count
+        while heldCount >= 8 {
+            bytes.append(UN8(held & 255))
+            held = held >> 8
+            heldCount -= 8
+        }
+    }
+
+    // The stream with its end mark: a 1 bit above the last, then zeros up to
+    // a whole byte.
+    function close(borrow mut self) -> [UN8] {
+        add(1, 1)
+        if heldCount > 0 { bytes.append(UN8(held & 255)) }
+        return copy bytes
+    }
+}
+
+// The hash chains: the last position of each hash, and before each position
+// the last one with its hash. A slot holds a position plus one, 0 for none,
+// in 4 bytes, so the tables stay small enough for the cache: the finder
+// takes data shorter than 4 GiB.
+struct MatchFinder {
+    var heads: [UN32]
+    var chain: [UN32]
+    let depth: Number
+    // The chain's and the hash's masks, and the farthest a match may be.
+    let chainBits: Number
+    let hashBits: Number
+    let farthest: Number
+    // The shortest match it takes, 3 or 4 bytes, which is what it hashes.
+    let shortest: Number
+    // The length at which a match is long enough to stop looking.
+    var nice: Number
+    // The farthest a match of `shortest` bytes may be: a far one costs more
+    // to write than its bytes as literals.
+    var farthestShortest: Number
+    // Whether a long run without matches is crossed in longer steps, and a
+    // match's inside sampled rather than added whole.
+    let skips: Bool
+
+    // Adds the position `at`, which has `shortest` bytes after it.
+    function insert(borrow mut self, data: borrow [UN8], at: Number) {
+        let hash = matchHash(data, at, hashBits, shortest)
+        chain[at & chainBits] = heads[hash]
+        heads[hash] = UN32(at + 1)
+    }
+
+    // Adds the positions after `at` inside the match from `at` to `next`:
+    // every one, or when skipping, the second and the last two, which is
+    // where the next copy of the same bytes most often starts.
+    function insertMatched(borrow mut self, data: borrow [UN8], at: Number, next: Number) {
+        let last = min(next, data.count - shortest + 1)
+        match skips {
+            true -> {
+                if at + 2 < last { insert(data, at + 2) }
+                let tail = max(next - 2, at + 3)
+                for inside in tail..last { insert(data, inside) }
+            }
+            false -> {
+                for inside in (at + 1)..last { insert(data, inside) }
+            }
+        }
+    }
+
+    // The longest earlier match of the bytes at `at`, ending by `end`, as its
+    // length and distance; a length of 0 when there is none worth taking.
+    // Adds `at` to the chains.
+    function find(borrow mut self, data: borrow [UN8], at: Number, end: Number) -> (
+        Number,
+        Number
+    ) {
+        let hash = matchHash(data, at, hashBits, shortest)
+        let head = heads[hash]
+        chain[at & chainBits] = head
+        heads[hash] = UN32(at + 1)
+        var candidate = Number(head) - 1
+        var bestLength: Number = 0
+        var bestDistance: Number = 0
+        var tries: Number = 0
+        while candidate >= 0 && at - candidate < farthest && tries < depth {
+            if at + bestLength < end && data[candidate + bestLength] == data[at + bestLength] {
+                var length: Number = 0
+                while at + length < end && data[candidate + length] == data[at + length] {
+                    length += 1
+                }
+                if length > bestLength {
+                    bestLength = length
+                    bestDistance = at - candidate
+                    if at + length == end || length >= nice { break }
+                }
+            }
+            let earlier = Number(chain[candidate & chainBits]) - 1
+            if earlier >= candidate { break }
+            candidate = earlier
+            tries += 1
+        }
+        if bestLength < shortest || (bestLength == shortest && bestDistance > farthestShortest) {
+            return (0, 0)
+        }
+        return (bestLength, bestDistance)
+    }
+}
+
+// A finder trying `depth` candidates at most, with `1 << chainLog` chain
+// slots and `1 << hashLog` heads, for matches of `shortest` bytes or more,
+// 3 or 4, less than `window` back. `skips` crosses long runs without matches
+// in longer steps.
+function matchFinder(
+    shortest: Number,
+    depth: Number,
+    chainLog: Number,
+    hashLog: Number,
+    window: Number,
+    skips: Bool
+) -> MatchFinder {
+    var heads: [UN32] = []
+    for slot in 0..(1 << hashLog) { heads.append(0) }
+    var chain: [UN32] = []
+    for slot in 0..(1 << chainLog) { chain.append(0) }
+    return MatchFinder {
+        heads: heads,
+        chain: chain,
+        depth: depth,
+        chainBits: (1 << chainLog) - 1,
+        hashBits: (1 << hashLog) - 1,
+        farthest: window,
+        shortest: shortest,
+        nice: window,
+        farthestShortest: window,
+        skips: skips
+    }
+}
+
+// The hash of the `width` bytes at `at`, 3 or 4, under the mask `bits`. The
+// product of a 32-bit word and the multiplier is below 2^64, so it is exact
+// as a Number, and its low bits are those a 64-bit wrapping multiply gives.
+function matchHash(data: borrow [UN8], at: Number, bits: Number, width: Number) -> Number {
+    var word: Number = Number(data[at]) | (Number(data[at + 1]) << 8) | (Number(data[at + 2]) << 16)
+    if width == 4 { word = word | (Number(data[at + 3]) << 24) }
+    return ((word * 2654435761) >> 15) & bits
+}
+
+// Appends the low `count` bytes of `value`, lowest first.
+function appendLittle(bytes: borrow mut [UN8], value: Number, count: Number) {
+    for index in 0..count { bytes.append(UN8((value >> (index * 8)) & 255)) }
+}

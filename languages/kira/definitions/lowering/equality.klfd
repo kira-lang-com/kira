@@ -1,0 +1,65 @@
+extend FunctionLowering {
+    function equalArrayBody(borrow mut self, left: KirAddress, right: KirAddress, arrayType: Type) -> KirValue {
+        let result = temporary(Type.boolean())
+        kir.store(kir.integer(types.boolean, 0), result)
+        let length = kir.load(kir.field(left, 1, types.integer64))
+        let otherLength = kir.load(kir.field(right, 1, types.integer64))
+        let start = kir.block()
+        let done = kir.block()
+        kir.branchIf(kir.compare(kirPredicate(.Equal, false), length, otherLength), start, done)
+        enter(start)
+        kir.store(kir.integer(types.boolean, 1), result)
+        let counter = temporary(Type.int())
+        kir.store(kir.integer(types.integer64, 0), counter)
+        let test = kir.block()
+        let body = kir.block()
+        flowInto(test)
+        enter(test)
+        let index = kir.load(counter)
+        let more = kir.compare(kirPredicate(.Less, false), index, length)
+        let continuing = kir.binary(kirOperator(.BitAnd, false), false, false, more, kir.load(result))
+        kir.branchIf(continuing, body, done)
+        enter(body)
+        let elementType = program.structs[arrayType.declaration].typeArguments[0]
+        let first = arrayElement(left, arrayType, index)
+        let second = arrayElement(right, arrayType, index)
+        kir.store(equalValues(first, second, elementType), result)
+        kir.store(kir.binary(kirOperator(.Add, true), false, true, index, kir.integer(types.integer64, 1)), counter)
+        flowInto(test)
+        enter(done)
+        return kir.load(result)
+    }
+
+    function equalEnumBody(borrow mut self, left: KirAddress, right: KirAddress, valueType: Type) -> KirValue {
+        let result = temporary(Type.boolean())
+        kir.store(kir.integer(types.boolean, 0), result)
+        let sameTag = kir.compare(kirPredicate(.Equal, false), kir.tag(left), kir.tag(right))
+        if program.enums[valueType.declaration].open && !carriesPayload(program, valueType) { return sameTag }
+        let dispatch = kir.block()
+        let done = kir.block()
+        kir.branchIf(sameTag, dispatch, done)
+        enter(dispatch)
+        let variants = program.enums[valueType.declaration].variants
+        var blocks: [KirBlockBuilder] = []
+        for index in 0..variants.count {
+            let block = kir.block()
+            blocks.append(block)
+            kir.switchCase(index, block)
+        }
+        kir.switchEnum(left)
+        for index in 0..variants.count {
+            enter(blocks[index])
+            match variants[index].payload {
+                Some(payload) -> {
+                    let first = payloadPlace(left, valueType, index)
+                    let second = payloadPlace(right, valueType, index)
+                    kir.store(equalValues(first, second, payload), result)
+                }
+                None -> kir.store(kir.integer(types.boolean, 1), result)
+            }
+            flowInto(done)
+        }
+        enter(done)
+        return kir.load(result)
+    }
+}

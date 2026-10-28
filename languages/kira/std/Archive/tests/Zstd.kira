@@ -1,0 +1,126 @@
+import Foundation
+
+// Zstandard: the encoder's frames for small inputs, a frame made by the
+// reference `zstd`, large inputs and concatenated frames read back, and
+// damaged frames refused.
+
+// Magic, descriptor, window, size, then a raw or an RLE block and the
+// checksum's low bytes, as `zstd -d` reads them.
+@Test
+function zstdFramesSmallInputsAreFixed() {
+    let empty: [UN8] = []
+    let inputs = [empty, "a".utf8(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".utf8()]
+    var frames: [String] = []
+    for input in inputs {
+        frames.append(decimalText(zstdCompress(input, 3)))
+    }
+    expect!((frames[0]) == "40,181,47,253,196,88,0,0,0,0,0,0,0,0,1,0,0,153,233,216,81")
+    expect!((frames[1]) == "40,181,47,253,196,88,1,0,0,0,0,0,0,0,11,0,0,97,91,110,140,169")
+    expect!((frames[2]) == "40,181,47,253,196,88,40,0,0,0,0,0,0,0,67,1,0,97,3,239,17,49")
+}
+
+// Each small frame decodes back to the bytes it came from.
+@Test
+function zstdSmallFramesDecodeToTheirInput() {
+    let empty: [UN8] = []
+    let inputs = [empty, "a".utf8(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".utf8()]
+    for input in inputs {
+        let outcome = match decompressZstd(zstdCompress(input, 3)) {
+            Ok(bytes) -> decimalText(bytes)
+            Error(failure) -> archiveFailureText(failure)
+        }
+        expect!((outcome) == decimalText(input))
+    }
+}
+
+// A 892-byte text, made by `zstd -19`: Huffman-coded literals in four
+// streams, sequences with tables of their own, and a checksum.
+@Test
+function zstdReadsWhatZstdWrote() {
+    let frame: [UN8] = [
+        40, 181, 47, 253, 100, 124, 2, 69, 8, 0, 194, 5, 18, 17, 160, 111, 96, 131, 77, 200, 35,
+        159, 230, 216, 252, 255, 255, 242, 91, 197, 3, 160, 62, 169, 223, 204, 167, 195, 174,
+        79, 94, 59, 243, 219, 175, 184, 58, 134, 114, 18, 207, 231, 51, 31, 255, 212, 170, 232,
+        71, 186, 46, 63, 220, 68, 102, 244, 95, 224, 161, 158, 97, 191, 224, 151, 97, 91, 18,
+        49, 116, 193, 156, 176, 189, 173, 2, 110, 168, 113, 79, 146, 164, 253, 51, 32, 68, 96,
+        148, 131, 235, 1, 16, 16, 78, 140, 36, 42, 12, 7, 226, 52, 145, 177, 149, 122, 146, 253,
+        149, 240, 185, 192, 113, 25, 31, 139, 109, 39, 71, 195, 13, 73, 189, 239, 6, 189, 202,
+        53, 95, 24, 36, 175, 34, 43, 136, 97, 246, 168, 82, 211, 245, 179, 91, 3, 173, 61, 33,
+        108, 135, 73, 81, 228, 181, 0, 99, 155, 18, 247, 160, 219, 160, 226, 133, 139, 145, 178,
+        10, 218, 8, 82, 207, 75, 0, 161, 167, 234, 16, 46, 58, 196, 87, 151, 38, 183, 249, 221,
+        21, 202, 58, 241, 100, 56, 241, 18, 117, 140, 10, 138, 124, 54, 210, 128, 90, 215, 36,
+        252, 78, 222, 237, 12, 43, 21, 193, 35, 217, 233, 204, 112, 108, 145, 213, 24, 184, 157,
+        235, 215, 9, 124, 163, 21, 31, 231, 137, 214, 237, 135, 81, 2, 57, 238, 112, 2, 85, 9,
+        148, 218, 222, 53, 72, 109, 215, 179, 36, 8, 169, 185, 162, 100, 231, 9, 105, 61, 57,
+        22, 175, 2, 234, 56, 19, 21
+    ]
+    let outcome = match decompressZstd(move frame) {
+        Ok(bytes) -> {
+            let text = textFromBytes(bytes).or("?")
+            "\(bytes.count) \(text.substring(0, 24))...\(text.substring(text.count - 8, text.count))"
+        }
+        Error(failure) -> archiveFailureText(failure)
+    }
+    expect!((outcome) == "892 lazy fences jumps zebras...fox fox\n")
+}
+
+// Inputs past one block, at the fastest and the hardest level, read back
+// exactly; two frames in a row read back as one run of both.
+@Test
+function zstdRoundTripsLargeInputsAtTwoLevels() {
+    var input: [UN8] = []
+    var seed: Number = 7
+    for index in 0..300000 {
+        seed = (seed * 1103515245 + 12345) & 2147483647
+        input.append(UN8(index % 7 == 0 ? (seed >> 16) & 255 : 97 + (seed >> 16) % 6))
+    }
+    var frames: [UN8] = zstdCompress(input, 1)
+    frames.appendAll(zstdCompress(input, 19))
+    let outcome = match decompressZstd(move frames) {
+        Ok(bytes) -> {
+            let same = bytes.count == 2 * input.count
+                && byteRun(bytes, 0, input.count) == input
+                && byteRun(bytes, input.count, bytes.count) == input
+            same ? "same" : "different"
+        }
+        Error(failure) -> archiveFailureText(failure)
+    }
+    expect!((outcome) == "same")
+}
+
+// A skippable frame ahead of a real one is passed over.
+@Test
+function zstdSkipsSkippableFrames() {
+    var frames: [UN8] = [80, 42, 77, 24, 2, 0, 0, 0, 1, 2]
+    frames.appendAll(zstdCompress("skip me".utf8(), 3))
+    let outcome = match decompressZstd(move frames) {
+        Ok(bytes) -> textFromBytes(bytes).or("?")
+        Error(failure) -> archiveFailureText(failure)
+    }
+    expect!((outcome) == "skip me")
+}
+
+// One flipped bit in the trailing checksum is refused, and the message says
+// which check failed.
+@Test
+function zstdRefusesAWrongChecksum() {
+    var frame = zstdCompress("checksum".utf8(), 3)
+    frame[frame.count - 1] = frame[frame.count - 1] ^ 1
+    let outcome = match decompressZstd(move frame) {
+        Ok(bytes) -> "read \(bytes.count)"
+        Error(failure) -> archiveFailureText(failure)
+    }
+    expect!((outcome) == "malformed: a Zstandard frame's checksum is wrong")
+}
+
+// A frame cut before its end is refused rather than read short.
+@Test
+function zstdRefusesATruncatedFrame() {
+    let frame = zstdCompress("truncated input".utf8(), 3)
+    let cut = byteRun(frame, 0, frame.count - 4)
+    let outcome = match decompressZstd(move cut) {
+        Ok(bytes) -> "read \(bytes.count)"
+        Error(failure) -> archiveFailureText(failure)
+    }
+    expect!((outcome) == "malformed: a Zstandard frame's checksum is cut off")
+}

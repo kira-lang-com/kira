@@ -1,0 +1,59 @@
+// Foundation's `@Derive(CaseIterable)`: every case of an enum, in the order it
+// declares them, as Swift's `CaseIterable` gives `allCases`.
+//
+//   @Derive(CaseIterable)
+//   enum Direction {
+//       North
+//       East
+//       South
+//       West
+//   }
+//
+// generates
+//
+//   function allCases_Direction() -> [Direction]
+//
+// The generated name is glued to the enum's exact name, the same fixed
+// contract the other Foundation derives keep.
+//
+// # Why this exists
+//
+// A list of an enum's cases written by hand is a second list of them: a case
+// added to the enum and not to the list is missing from every menu, picker
+// and search built from it, and no compiler says so. Generating the list from
+// the declaration leaves one list, and it is the enum.
+//
+// # Payload-carrying variants are refused
+//
+// A variant with a payload is not one case but as many as its payload has
+// values, and there is no value to list it with. Foundation refuses rather
+// than guesses, as Swift does for an enum with associated values.
+
+comptime macro CaseIterable {
+    kind { derive }
+    appliesTo { enum }
+    expand(target: Declaration) -> Syntax {
+        var appends: [Syntax] = []
+        for variant in target.fields {
+            // A payload-less variant reflects with an empty written type.
+            if variant.type != "" {
+                deriveUnsupported(
+                    "Derive(CaseIterable): a variant carrying a payload is as many cases as its payload has values, so there is no one value to list it with; list the cases you mean by hand",
+                    at: variant.syntax
+                )
+            }
+            appends.append(
+                quote {
+                    cases.append(.#{variant.name})
+                }
+            )
+        }
+        return quote {
+            function allCases_#{target.name}() -> [#{target.name}] {
+                var cases: [#{target.name}] = []
+                #{appends}
+                return cases
+            }
+        }
+    }
+}

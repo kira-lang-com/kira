@@ -1,0 +1,33 @@
+import Foundation
+
+// `sourceDigest!()` and `sourceDigest!("package")`: each is 64 hexadecimal
+// digits, the same wherever it is written in one package, and the two differ
+// here, since this package imports Foundation and the first covers it.
+
+function isHexDigest(text: borrow String) -> Bool {
+    if text.count != 64 { return false }
+    for index in 0..text.count {
+        let byte = text.byteAt(index)
+        let digit = byte >= 48 && byte <= 57
+        let letter = byte >= 97 && byte <= 102
+        if !digit && !letter { return false }
+    }
+    return true
+}
+
+@Test
+function sourceDigestIsHex() {
+    expect!(isHexDigest(sourceDigest!()))
+    expect!(isHexDigest(sourceDigest!("package")))
+}
+
+@Test
+function sourceDigestIsStable() {
+    expect!(sourceDigest!() == sourceDigest!())
+    expect!(sourceDigest!("package") == sourceDigest!("package"))
+}
+
+@Test
+function packageDigestLeavesImportsOut() {
+    expect!(sourceDigest!("package") != sourceDigest!())
+}

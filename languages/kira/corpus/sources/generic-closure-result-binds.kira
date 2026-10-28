@@ -1,0 +1,18 @@
+// A closure passed where a type parameter is its result decides that
+// parameter: its own parameters take what the arguments before it bound, and
+// its result is the value its body gives back.
+
+import Foundation
+
+function mapped<Source, Item>(from: [Source], read: (borrow Source) -> Item) -> [Item] {
+    var items: [Item] = []
+    for source in from { items.append(read(source)) }
+    return items
+}
+
+@Main
+function main() -> Int {
+    let counts = mapped(from: ["a", "bb", "ccc"], read: { text in return text.count })
+    let doubled = mapped(counts, { count in count * 2 })
+    return doubled[2] + counts[1]
+}

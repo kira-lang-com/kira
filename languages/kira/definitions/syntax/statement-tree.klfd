@@ -1,0 +1,159 @@
+// The statements of a body, as the parser writes them.
+
+struct BindingStatement {
+    let mutable: Bool
+    let name: Identifier
+    let annotation: Optional<Int>
+    // A `borrow`, `borrow mut` or `copy` written before the annotation; a
+    // `move` there is read as `move` before the value.
+    let prefix: Optional<BindingPrefix>
+    let value: Int
+}
+
+enum BindingMode {
+    Borrowed
+    MutablyBorrowed
+    Copied
+}
+
+struct BindingPrefix {
+    let mode: BindingMode
+    let span: Span
+}
+
+struct GlobalDeclaration {
+    let binding: BindingStatement
+    let span: Span
+    // `@ThreadLocal`, the one attribute a global takes.
+    var annotations: [Annotation] = []
+}
+
+// An arm of a `match`. A variant arm names the variant in `variant`; any
+// other has `variant` empty, spanning the pattern. `A, B -> ...` keeps its
+// first pattern here and the rest in `alternatives`.
+struct MatchArm {
+    let variant: Identifier
+    let binding: Optional<Identifier>
+    let pattern: ArmPattern
+    let alternatives: [ArmAlternative]
+    let body: [Int]
+}
+
+// A pattern after the first in an arm, spelled like the first.
+struct ArmAlternative {
+    let variant: Identifier
+    let pattern: ArmPattern
+}
+
+enum ArmPattern {
+    Variant
+    Integer(Int)
+    Boolean(Bool)
+    // `low..high`: an integer from `low` up to but not including `high`.
+    Range(Int, Int)
+    // A decimal literal and `low..high` over decimals, written as written:
+    // the text is the number, exactly, and is read where it is checked.
+    Decimal(String)
+    DecimalRange(String, String)
+    // A string literal, the expression it parsed to.
+    TextLiteral(Int)
+    // `else`: every value no other arm takes.
+    Otherwise
+    // The two sides of `try X otherwise Y`, which name the variants they
+    // take only once `X`'s type is known: what `X` gave, a result's `Ok` or
+    // an optional value's `Some`, and what it fell back from, `Error` or
+    // `None`.
+    Kept
+    Fallen
+
+    function isVariant(borrow self) -> Bool {
+        match self {
+            Variant -> return true
+            Kept -> return true
+            Fallen -> return true
+            Integer -> return false
+            Boolean -> return false
+            Range -> return false
+            Decimal -> return false
+            DecimalRange -> return false
+            TextLiteral -> return false
+            Otherwise -> return false
+        }
+    }
+
+    function isFallen(borrow self) -> Bool {
+        match self {
+            Fallen -> return true
+            Variant -> return false
+            Kept -> return false
+            Integer -> return false
+            Boolean -> return false
+            Range -> return false
+            Decimal -> return false
+            DecimalRange -> return false
+            TextLiteral -> return false
+            Otherwise -> return false
+        }
+    }
+}
+
+enum StatementKind {
+    Binding(BindingStatement)
+    Assignment(Int, Int)
+    // `place op= value`.
+    CompoundAssignment(BinaryOperator, Int, Int)
+    Evaluation(Int)
+    If(Int, [Int], [Int])
+    While(Int, [Int])
+    For(Identifier, Int, Int, [Int])
+    ForEach(Identifier, Int, [Int])
+    Match(Int, [MatchArm])
+    Attempt([Int], [MatchArm])
+    Return(Optional<Int>)
+    Break
+    Continue
+}
+
+struct Statement {
+    let kind: StatementKind
+    let span: Span
+}
+
+extend StatementKind {
+    function evaluatedExpression(borrow self) -> Optional<Int> {
+        match self {
+            Evaluation(value) -> return .Some(value)
+            Binding -> return .None
+            Assignment -> return .None
+            CompoundAssignment -> return .None
+            If -> return .None
+            While -> return .None
+            For -> return .None
+            ForEach -> return .None
+            Match -> return .None
+            Attempt -> return .None
+            Return -> return .None
+            Break -> return .None
+            Continue -> return .None
+        }
+    }
+
+    // The value a `return value` statement gives back.
+    function returnedExpression(borrow self) -> Optional<Int> {
+        match self {
+            Evaluation -> return .None
+            Binding -> return .None
+            Assignment -> return .None
+            CompoundAssignment -> return .None
+            If -> return .None
+            While -> return .None
+            For -> return .None
+            ForEach -> return .None
+            Match -> return .None
+            Attempt -> return .None
+            Return(value) -> return value
+            Break -> return .None
+            Continue -> return .None
+        }
+    }
+}

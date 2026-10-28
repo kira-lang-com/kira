@@ -1,0 +1,79 @@
+import Foundation
+
+// Language-wide `type Name = Target` aliases, exercised through scalar folds so
+// the harness catches canonicalization regressions across the executable backends.
+
+type Byte = U8
+type ByteBuffer = [Byte]
+type ByteMatrix = [ByteBuffer]
+type ByteWord = Byte
+
+struct AliasPacket {
+    var payload: ByteBuffer
+}
+
+function aliasBufferSum(buffer: borrow ByteBuffer) -> Number {
+    var total: Number = 0
+    for value in buffer {
+        total = total + Number(value)
+    }
+    return total
+}
+
+function aliasBuildPacket(start: Number, count: Number) -> AliasPacket {
+    var payload: ByteBuffer = []
+    for i in 0..count {
+        payload.append(U8(start + i))
+    }
+    return AliasPacket { payload: move payload }
+}
+
+function aliasMatrixScore(matrix: borrow ByteMatrix) -> Number {
+    var score: Number = 0
+    for row in matrix {
+        score = score + aliasBufferSum(row) + row.count * 10
+    }
+    return score
+}
+
+@Test
+function byteAliasAssignsAnIntegerLiteral() {
+    let value: Byte = 7
+    expect!((Number(value)) == (7))
+}
+
+@Test
+function byteBufferAliasSumsItsElements() {
+    var payload: ByteBuffer = []
+    payload.append(2)
+    payload.append(4)
+    payload.append(6)
+    expect!((aliasBufferSum(payload)) == (12))
+}
+
+@Test
+function aliasPacketCarriesAnAliasedField() {
+    let packet = aliasBuildPacket(3, 3)
+    expect!((aliasBufferSum(packet.payload)) == (12))
+    expect!(packet.payload.count == 3)
+}
+
+@Test
+function nestedByteMatrixAliasScoresEachRow() {
+    var left: ByteBuffer = []
+    left.append(1)
+    left.append(2)
+    var right: ByteBuffer = []
+    right.append(3)
+    right.append(4)
+    var matrix: ByteMatrix = []
+    matrix.append(move left)
+    matrix.append(move right)
+    expect!((aliasMatrixScore(matrix)) == (50))
+}
+
+@Test
+function byteWordAliasIsAByte() {
+    let word: ByteWord = 9
+    expect!((Number(word)) == (9))
+}

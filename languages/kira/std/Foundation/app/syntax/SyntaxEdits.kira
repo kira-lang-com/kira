@@ -1,0 +1,478 @@
+import Heap
+
+// The edits a macro body makes to the syntax it is handed:
+// `Syntax.replaceIdentifier`, and `Declaration.replaceField` and
+// `Declaration.dropField`. `replaceIdentifier` reads the text once, word by
+// word, so a name inside a string or a comment is never touched and `counter`
+// is never found inside `counters`; the field edits splice the bytes the
+// compiler recorded for the field, reading none of the rest. Each copies the
+// text once, so the source it leaves alone survives byte for byte, comments
+// included.
+//
+// An edit that cannot be made reports through `runtimeContext.macroReports`, the codes a
+// macro body raised while it ran, and leaves the syntax as it was.
+
+function macroReportError(message: String, at: Syntax) {
+    runtimeContext.macroReports.append(21)
+}
+
+namespace MacroOutcome {
+    // The byte that opens a body's reports, which no syntax starts with.
+    let reported: Int = 0x01
+}
+
+// What the expander reads back from a macro body: the syntax it returned, or,
+// when the body reported anything, a 0x01 byte and the codes it reported.
+function macroOutcome(syntax: borrow Syntax) -> String {
+    if runtimeContext.macroReports.count == 0 { return syntax.text }
+    var text = encodedScalar(MacroOutcome.reported)
+    for code in runtimeContext.macroReports {
+        text = text + stringFromInteger(code) + " "
+    }
+    return text
+}
+
+// One edit: the bytes from `start` to `end` become `text`.
+struct SyntaxEdit {
+    let start: Int
+    let end: Int
+    let text: String
+}
+
+// A `$` starts a name only, `$name` being the value a property wrapper
+// projects for `name`, so it is read as part of the word it starts.
+function syntaxWordByte(byte: Int, first: Bool) -> Bool {
+    let letter = (byte >= 65 && byte <= 90) || (
+        byte >= 97 && byte <= 122
+    ) || byte == 95 || byte == 36
+    if first { return letter }
+    return letter || (byte >= 48 && byte <= 57)
+}
+
+// Whether the bytes of `text` from `start` to `end` spell `word`.
+function syntaxSpells(text: borrow String, start: Int, end: Int, word: borrow String) -> Bool {
+    if end - start != word.count { return false }
+    for offset in 0..word.count {
+        if text.charAt(start + offset) != word.charAt(offset) { return false }
+    }
+    return true
+}
+
+// Every identifier spelled `from`, wherever it appears outside a string or
+// a comment, spelled `to`.
+function replacedIdentifier(text: borrow String, from: borrow String, to: borrow String) -> Syntax {
+    var edits: [SyntaxEdit] = []
+    var index: Int = 0
+    while index < text.count {
+        let byte = text.charAt(index)
+        var next: Int = 0
+        if index + 1 < text.count { next = text.charAt(index + 1) }
+        if byte == 47 && next == 47 {
+            while index < text.count && text.charAt(index) != 10 { index = index + 1 }
+        } else if byte == 47 && next == 42 {
+            index = index + 2
+            while index + 1 < text.count && !(
+                text.charAt(index) == 42 && text.charAt(index + 1) == 47
+            ) { index = index + 1 }
+            index = index + 2
+        } else if byte == 34 {
+            index = index + 1
+            while index < text.count && text.charAt(index) != 34 {
+                index = index + (text.charAt(index) == 92 ? 2 : 1)
+            }
+            index = index + 1
+        } else if syntaxWordByte(byte, false) {
+            let start = index
+            while index < text.count && syntaxWordByte(text.charAt(index), false) {
+                index = index + 1
+            }
+            if syntaxWordByte(byte, true) && syntaxSpells(text, start, index, from) {
+                edits.append(SyntaxEdit { start = start, end = index, text = to })
+            }
+        } else {
+            index = index + 1
+        }
+    }
+    return Syntax { text = splicedText(text, edits) }
+}
+
+// The declaration with the bytes of its field `name` replaced by
+// `replacement`. Every other field keeps its bytes, moved by what the
+// replacement adds or takes away before them.
+function replacedField(
+    declaration: borrow Declaration,
+    name: borrow String,
+    replacement: borrow String
+) -> Declaration {
+    for field in declaration.fields {
+        if field.name.text == name && field.end > field.start {
+            let edits = [SyntaxEdit { start = field.start, end = field.end, text = replacement }]
+            var fields: [DeclarationField] = []
+            for kept in declaration.fields {
+                fields.append(
+                    DeclarationField {
+                        name = kept.name,
+                        type = kept.type,
+                        syntax = kept.syntax,
+                        initializer = kept.initializer,
+                        annotations = kept.annotations,
+                        start = movedOffset(kept.start, edits),
+                        end = movedOffset(kept.end, edits)
+                    }
+                )
+            }
+            return Declaration {
+                name = declaration.name,
+                kind = declaration.kind,
+                syntax = Syntax { text = splicedText(declaration.syntax.text, edits) },
+                fields = fields,
+                family = declaration.family,
+                typeParameters = declaration.typeParameters
+            }
+        }
+    }
+    runtimeContext.macroReports.append(25)
+    return Declaration {
+        name = declaration.name,
+        kind = declaration.kind,
+        syntax = declaration.syntax,
+        fields = declaration.fields,
+        family = declaration.family,
+        typeParameters = declaration.typeParameters
+    }
+}
+
+// The text without the line that declares the field `name`.
+//
+// `Declaration.dropField` removes the bytes the compiler recorded for a field.
+// A macro holding only the text has to find the line itself: a field is
+// written `var name: Type`, `let name: Type`, or with a visibility in front,
+// and a declaration ends with its line.
+function droppedField(text: borrow String, name: borrow String) -> Syntax {
+    var lineStart: Int = 0
+    for index in 0..text.count + 1 {
+        if index == text.count || text.charAt(index) == 10 {
+            if lineDeclaresField(text, lineStart, index, name) {
+                var end = index
+                if end < text.count { end = index + 1 }
+                let edits = [SyntaxEdit { start = lineStart, end = end, text = "" }]
+                return Syntax { text = splicedText(text, edits) }
+            }
+            lineStart = index + 1
+        }
+    }
+    runtimeContext.macroReports.append(25)
+    return Syntax { text = text }
+}
+
+// Whether the line from `start` to `end` declares the field `name`: a `var` or
+// a `let`, then a name of its own, then a `:`.
+function lineDeclaresField(
+    text: borrow String,
+    start: borrow Int,
+    end: borrow Int,
+    name: borrow String
+) -> Bool {
+    var keyword = false
+    var index = start
+    while index < end {
+        let byte = text.charAt(index)
+        if !syntaxWordByte(byte, false) {
+            index = index + 1
+            continue
+        }
+        let wordStart = index
+        while index < end && syntaxWordByte(text.charAt(index), false) { index = index + 1 }
+        let word = syntaxTextSlice(text, wordStart, index)
+        if word == "var" || word == "let" {
+            keyword = true
+            continue
+        }
+        if keyword && word == name {
+            var after = index
+            while after < end && syntaxSpace(text.charAt(after)) { after = after + 1 }
+            if after < end && text.charAt(after) == 58 { return true }
+        }
+    }
+    return false
+}
+
+// One use of a property.
+struct PropertyUse {
+    // Just past the name the property is spelled under, `self` included when
+    // the use went through it.
+    let after: Int
+    let writes: Bool
+    // Just past the `=` of a write and the spaces after it; where a read
+    // stands, this is `after`.
+    let valueStart: Int
+}
+
+// Every use of the property `name` in `text`, rewritten: a read becomes
+// `getter`, and a write `name = value` or `self.name = value` becomes
+// `setter(value)`.
+//
+// A struct's field is read by its bare name inside a method, so a macro that
+// drops the field has to rewrite the bare name too, not only `self.name`.
+//
+// Two things are left alone, both because the text cannot tell them from the
+// thing it rewrites:
+//
+// - A named argument. `f(name = value)` writes the argument `name`, and the
+//   `name =` is the callee's parameter, not this property. A bare `name`
+//   followed by `=` and preceded by `(` or `,` is inside an argument list and
+//   is a label; its `value` is read and rewritten on its own turn.
+//
+// - A binding. A `var name`, a `let name` or a `name:` parameter in the same
+//   text shadows the field for every method that declares one, and rewriting a
+//   shadowed name would be a wrong answer rather than a refused one. `self.name`
+//   is never shadowed, so it is always rewritten.
+//
+// The scan is the one `replacedIdentifier` uses, so a name inside a string or a
+// comment is never touched. A write is read to the end of the statement it
+// belongs to, counting the brackets that could nest inside it, so
+// `self.x = a[i] + f(b)` keeps all of its value.
+function rewrittenProperty(
+    text: borrow String,
+    name: borrow String,
+    getter: borrow String,
+    setter: borrow String
+) -> Syntax {
+    var edits: [SyntaxEdit] = []
+    let bare = !textBindsName(text, name)
+    var index: Int = 0
+    while index < text.count {
+        let byte = text.charAt(index)
+        var next: Int = 0
+        if index + 1 < text.count { next = text.charAt(index + 1) }
+        if byte == 47 && next == 47 {
+            while index < text.count && text.charAt(index) != 10 { index = index + 1 }
+        } else if byte == 47 && next == 42 {
+            index = index + 2
+            while index + 1 < text.count && !(
+                text.charAt(index) == 42 && text.charAt(index + 1) == 47
+            ) { index = index + 1 }
+            index = index + 2
+        } else if byte == 34 {
+            index = index + 1
+            while index < text.count && text.charAt(index) != 34 {
+                index = index + (text.charAt(index) == 92 ? 2 : 1)
+            }
+            index = index + 1
+        } else if syntaxWordByte(byte, false) {
+            let start = index
+            while index < text.count && syntaxWordByte(text.charAt(index), false) {
+                index = index + 1
+            }
+            let self_ = syntaxWordByte(byte, true) && syntaxSpells(text, start, index, "self")
+            if self_ {
+                match selfPropertyAt(text, index, name) {
+                    Some(use) -> {
+                        for edit in propertyEdits(text, start, use, getter, setter) {
+                            edits.append(edit)
+                        }
+                        index = use.after
+                    }
+                    None -> {}
+                }
+            } else if bare && syntaxWordByte(byte, true) && syntaxSpells(text, start, index, name) {
+                match barePropertyAt(text, start, index, name) {
+                    Some(use) -> {
+                        for edit in propertyEdits(text, start, use, getter, setter) {
+                            edits.append(edit)
+                        }
+                        index = use.after
+                    }
+                    None -> {}
+                }
+            }
+        } else {
+            index = index + 1
+        }
+    }
+    return Syntax { text = splicedText(text, edits) }
+}
+
+// The edits that turn one use of the property into its accessor call.
+//
+// A read is one edit, the name becoming the getter. A write is two: the head
+// runs from the name to where its value starts and becomes `setter(`, and an
+// empty edit where the value ends closes the call, so
+// `self.x = a + f(b)` becomes `setter(a + f(b))` with the whole value kept.
+function propertyEdits(
+    text: borrow String,
+    start: borrow Int,
+    use: borrow PropertyUse,
+    getter: borrow String,
+    setter: borrow String
+) -> [SyntaxEdit] {
+    if !use.writes { return [SyntaxEdit { start = start, end = use.after, text = getter }] }
+    let valueEnd = statementEnd(text, use.valueStart)
+    return [SyntaxEdit { start = start, end = use.valueStart, text = setter + "(" }, SyntaxEdit {
+        start = valueEnd,
+        end = valueEnd,
+        text: ")"
+    }]
+}
+
+// The use of the property `name` a `self` ending at `from` stands for, or none
+// when what follows `self` is not that property.
+function selfPropertyAt(
+    text: borrow String,
+    from: borrow Int,
+    name: borrow String
+) -> Optional<PropertyUse> {
+    var index = from
+    while index < text.count && syntaxSpace(text.charAt(index)) { index = index + 1 }
+    if index >= text.count || text.charAt(index) != 46 { return .None }
+    index = index + 1
+    if index >= text.count || !syntaxWordByte(text.charAt(index), true) { return .None }
+    let start = index
+    while index < text.count && syntaxWordByte(text.charAt(index), false) { index = index + 1 }
+    if !syntaxSpells(text, start, index, name) { return .None }
+    return bareUse(text, index, name)
+}
+
+// The use a bare name ending at `end` stands for: a write unless the `=` is a
+// named argument's label.
+function barePropertyAt(
+    text: borrow String,
+    start: borrow Int,
+    end: borrow Int,
+    name: borrow String
+) -> Optional<PropertyUse> {
+    var index = end
+    while index < text.count && syntaxSpace(text.charAt(index)) { index = index + 1 }
+    // `=` that is not the first half of `==`, so a comparison reads.
+    if index < text.count && text.charAt(index) == 61
+        && !(index + 1 < text.count && text.charAt(index + 1) == 61) {
+        if afterArgumentMark(text, start) { return .None }
+        index = index + 1
+        while index < text.count && syntaxSpace(text.charAt(index)) { index = index + 1 }
+        return .Some(PropertyUse { after = end, writes = true, valueStart = index })
+    }
+    return .Some(PropertyUse { after = end, writes = false, valueStart: end })
+}
+
+// The shared tail of both forms: whether the `=` at `index` writes, and where
+// the value after it starts.
+function bareUse(
+    text: borrow String,
+    after: borrow Int,
+    name: borrow String
+) -> Optional<PropertyUse> {
+    var index = after
+    while index < text.count && syntaxSpace(text.charAt(index)) { index = index + 1 }
+    if index < text.count && text.charAt(index) == 61
+        && !(index + 1 < text.count && text.charAt(index + 1) == 61)
+        && !afterArgumentMark(text, after) {
+        index = index + 1 while index < text.count && syntaxSpace(text.charAt(index)) {
+            index = index + 1
+
+        }
+        return .Some(PropertyUse { after = after, writes = true, valueStart = index })
+    }
+    return .Some(PropertyUse { after = after, writes = false, valueStart = after })
+}
+
+// Whether the word ending at `from` opens a named argument, so the `=` after it
+// is a label and not a write.
+function afterArgumentMark(text: borrow String, from: borrow Int) -> Bool {
+    var index = from - 1
+    while index >= 0 && syntaxSpace(text.charAt(index)) { index = index - 1 }
+    if index < 0 { return false }
+    return text.charAt(index) == 40 || text.charAt(index) == 44
+}
+
+// Whether `text` binds `name` anywhere, so that a bare `name` in it is a local
+// or a parameter rather than the field.
+function textBindsName(text: borrow String, name: borrow String) -> Bool {
+    var index: Int = 0
+    var keyword = false
+    while index < text.count {
+        let byte = text.charAt(index)
+        if !syntaxWordByte(byte, false) {
+            if byte == 34 {
+                index = index + 1
+                while index < text.count && text.charAt(index) != 34 {
+                    index = index + (text.charAt(index) == 92 ? 2 : 1)
+                }
+            }
+            index = index + 1
+            continue
+        }
+        let start = index
+        while index < text.count && syntaxWordByte(text.charAt(index), false) { index = index + 1 }
+        let word = syntaxTextSlice(text, start, index)
+        if word == "var" || word == "let" {
+            keyword = true
+            continue
+        }
+        if (keyword && word == name) || (!keyword && word == name) {
+            if keyword { return true }
+            var after = index
+            while after < text.count && syntaxSpace(text.charAt(after)) { after = after + 1 }
+            if after < text.count && text.charAt(after) == 58 { return true }
+        }
+        keyword = false
+    }
+    return false
+}
+
+// Where the statement whose value starts at `from` ends: the `;` or the line's
+// end that closes it, after any bracket opened inside it is closed again.
+function statementEnd(text: borrow String, from: borrow Int) -> Int {
+    var index = from
+    var depth: Int = 0
+    while index < text.count {
+        let byte = text.charAt(index)
+        if byte == 34 {
+            index = index + 1
+            while index < text.count && text.charAt(index) != 34 {
+                index = index + (text.charAt(index) == 92 ? 2 : 1)
+            }
+            index = index + 1
+            continue
+        }
+        if byte == 40 || byte == 91 || byte == 123 { depth = depth + 1 }
+        if byte == 41 || byte == 93 || byte == 125 { depth = depth - 1 }
+        if depth <= 0 && (byte == 59 || byte == 10) { return index }
+        index = index + 1
+    }
+    return text.count
+}
+
+function syntaxSpace(byte: Int) -> Bool {
+    return byte == 32 || byte == 9 || byte == 13
+}
+
+// `text` with each edit's bytes replaced by its text, copied once into a
+// string of the length it comes to. Edits are in order of where they start
+// and never overlap.
+function splicedText(text: borrow String, edits: borrow [SyntaxEdit]) -> String {
+    let empty: String = ""
+    var count = text.count
+    for edit in edits { count = count - (edit.end - edit.start) + edit.text.count }
+    let data = makeArrayData(count)
+    var offset: Int = 0
+    var cursor: Int = 0
+    for edit in edits {
+        heapCopyBytes(heapOffset(data, offset), heapOffset(text.data, cursor), edit.start - cursor)
+        offset = offset + edit.start - cursor
+        heapCopyBytes(heapOffset(data, offset), edit.text.data, edit.text.count)
+        offset = offset + edit.text.count
+        cursor = edit.end
+    }
+    heapCopyBytes(heapOffset(data, offset), heapOffset(text.data, cursor), text.count - cursor)
+    return String { data = data, count = count, capacity = count, ops = empty.ops }
+}
+
+// Where the byte at `offset` lands once `edits` are made: an edit before it
+// moves it by what it adds or takes away.
+function movedOffset(offset: Int, edits: borrow [SyntaxEdit]) -> Int {
+    var moved = offset
+    for edit in edits {
+        if edit.end <= offset { moved = moved + edit.text.count - (edit.end - edit.start) }
+    }
+    return moved
+}

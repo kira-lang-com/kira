@@ -1,0 +1,474 @@
+import Foundation
+
+// CfxScalarExtraTests.kira
+// Deep scalar test suite: arithmetic identities, operator precedence, integer
+// div/mod edge cases, comparison matrices, boolean truth tables, ternary chains,
+// float checksums, and Gauss/triangular/square-number cross-checks.
+// All top-level names use prefix cfxs / CfxS.
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function cfxsSumTo(n: Int) -> Int {
+    var s = 0
+    for i in 1..(n + 1) {
+        s = s + i
+    }
+    return s
+}
+
+function cfxsSquareSum(n: Int) -> Int {
+    var s = 0
+    for i in 1..(n + 1) {
+        s = s + i * i
+    }
+    return s
+}
+
+function cfxsPow(base: Int, exp: Int) -> Int {
+    var r = 1
+    for i in 0..exp {
+        r = r * base
+    }
+    return r
+}
+
+function cfxsAbs(n: Int) -> Int {
+    return n >= 0 ? n : (0 - n)
+}
+
+function cfxsGcd(a: Int, b: Int) -> Int {
+    var x = a
+    var y = b
+    while y != 0 {
+        let t = x % y
+        x = y
+        y = t
+    }
+    return x
+}
+
+function cfxsMin(a: Int, b: Int) -> Int {
+    return a < b ? a : b
+}
+
+function cfxsMax(a: Int, b: Int) -> Int {
+    return a > b ? a : b
+}
+
+// A compound assignment folds the current value in before storing: `x += y`
+// stores `x + y`. One fold walks every operator — arithmetic, bitwise, and the
+// two shifts — through an integer local and an array element, so a backend that
+// evaluated the place or the fold differently answers a different number.
+function cfxsCompoundAssign() -> Int {
+    var i = 0
+    i += 5
+    i -= 2
+    i *= 4
+    i /= 2
+    i %= 5
+    var mask = 6
+    mask &= 3
+    mask |= 8
+    mask ^= 1
+    mask <<= 2
+    mask >>= 1
+    var xs: [Int] = [1, 2, 3]
+    xs[1] += 10
+    xs[2] *= 3
+    return i * 1000000 + mask * 1000 + xs[1] * 10 + xs[2]
+}
+
+// A generalized `match`: an enum with an alternation and an `else`, an `Int`
+// with literals, an alternation, a half-open range, and an `else`, and a `Bool`
+// covered by both sides. Folded so a backend that lowered any arm differently
+// answers a different number.
+enum CfxHue {
+    Red
+    Green
+    Blue
+    Cyan
+}
+
+function cfxsHueScore(h: borrow CfxHue) -> Int {
+    match h {
+        Red -> return 1
+        Green, Blue -> return 2
+        Cyan -> return 9
+    }
+}
+
+function cfxsGrade(n: Int) -> Int {
+    match n {
+        0 -> return 100
+        1, 2, 3 -> return 200
+        4..10 -> return 300
+        else -> return 0
+    }
+}
+
+function cfxsMatchGeneralized() -> Int {
+    var score = 0
+    score = score + cfxsHueScore(.Red)
+    score = score + cfxsHueScore(.Blue) * 10
+    score = score + cfxsHueScore(.Cyan) * 100
+    score = score + cfxsGrade(0)
+    score = score + cfxsGrade(2) * 2
+    score = score + cfxsGrade(7)
+    score = score + cfxsGrade(50) + 5
+    let b = true
+    match b {
+        true -> score = score + 1000
+        false -> score = score + 2000
+    }
+    return score
+}
+
+// ---------------------------------------------------------------------------
+// Arithmetic identities
+// ---------------------------------------------------------------------------
+
+@Test
+function cfxSCompoundAssignment() {
+    expect!(cfxsCompoundAssign() == 1022129)
+}
+
+@Test
+function cfxSMatchGeneralized() {
+    expect!(cfxsMatchGeneralized() == 2726)
+}
+
+@Test
+function cfxSArithIdentityAddZero() {
+    expect!(12345 + 0 == 12345)
+}
+
+@Test
+function cfxSArithIdentityMulOne() {
+    expect!(9876 * 1 == 9876)
+}
+
+@Test
+function cfxSArithIdentitySubSelf() {
+    let x = 54321
+    expect!(x - x == 0)
+}
+
+@Test
+function cfxSArithIdentityMulZero() {
+    expect!(99999 * 0 == 0)
+}
+
+@Test
+function cfxSArithIdentityDivSelf() {
+    let x = 777
+    expect!(x / x == 1)
+}
+
+@Test
+function cfxSArithIdentityModSelf() {
+    let x = 888
+    expect!(x % x == 0)
+}
+
+@Test
+function cfxSArithIdentityCommutesAdd() {
+    expect!((17 + 25) == (25 + 17))
+}
+
+@Test
+function cfxSArithIdentityCommutesMul() {
+    expect!((13 * 7) == (7 * 13))
+}
+
+@Test
+function cfxSArithIdentityAssociatesAdd() {
+    expect!(((3 + 4) + 5) == (3 + (4 + 5)))
+}
+
+@Test
+function cfxSArithIdentityDistributes() {
+    expect!((3 * (4 + 5)) == (3 * 4 + 3 * 5))
+}
+
+@Test
+function cfxSArithNegNeg() {
+    let n = 42
+    let neg = 0 - n
+    let negneg = 0 - neg
+    expect!(negneg == 42)
+}
+
+@Test
+function cfxSArithNegSum() {
+    expect!((0 - 15) + (0 - 27) == 0 - 42)
+}
+
+// ---------------------------------------------------------------------------
+// Operator precedence
+// ---------------------------------------------------------------------------
+
+@Test
+function cfxSPrecMulBeforeAdd() {
+    expect!(2 + 3 * 4 == 14)
+}
+
+@Test
+function cfxSPrecAddBeforeEq() {
+    expect!(1 + 2 == 3)
+}
+
+@Test
+function cfxSPrecParensOverrideMul() {
+    expect!((2 + 3) * 4 == 20)
+}
+
+// left-assoc: (120/6)/4 = 20/4 = 5
+@Test
+function cfxSPrecChainedMulDiv() {
+    expect!(120 / 6 / 4 == 5)
+}
+
+// left-assoc: ((100-30)-20)-10 = 40
+@Test
+function cfxSPrecChainedSubtract() {
+    expect!(100 - 30 - 20 - 10 == 40)
+}
+
+// 1 + 6 - 2 + 2 = 7
+@Test
+function cfxSPrecMixedAll() {
+    expect!(1 + 2 * 3 - 4 / 2 + 5 % 3 == 7)
+}
+
+// -(3*9) = -27
+@Test
+function cfxSPrecNegatedMul() {
+    expect!(0 - (3 * (4 + 5)) == 0 - 27)
+}
+
+// true&&false=false, false||false=false
+@Test
+function cfxSPrecAndBeforeOr() {
+    expect!(!(false || true && false))
+}
+
+@Test
+function cfxSPrecNotHighest() {
+    expect!(!false && !false)
+}
+
+@Test
+function cfxSPrecCmpChain() {
+    let x = 5
+    expect!(x > 3 && x < 10)
+}
+
+// ---------------------------------------------------------------------------
+// Integer div/mod edge cases
+// ---------------------------------------------------------------------------
+
+@Test
+function cfxSDivIdentitySmall() {
+    expect!(1 / 1 == 1)
+}
+
+// truncates to 0
+@Test
+function cfxSDivByLarger() {
+    let value: Int = 3 / 10
+    expect!(value == 0)
+}
+
+// truncates toward zero: -3
+@Test
+function cfxSDivNegNumerator() {
+    let value: Int = (0 - 7) / 2
+    expect!(value == 0 - 3)
+}
+
+// truncates toward zero: -3
+@Test
+function cfxSDivNegDenominator() {
+    let value: Int = 7 / (0 - 2)
+    expect!(value == 0 - 3)
+}
+
+// (-7)/(-2) = 3
+@Test
+function cfxSDivBothNeg() {
+    let value: Int = (0 - 7) / (0 - 2)
+    expect!(value == 3)
+}
+
+@Test
+function cfxSDivModIdentity() {
+    let a: Int = 12345
+    let b: Int = 71
+    expect!((a / b) * b + (a % b) == 12345)
+}
+
+@Test
+function cfxSDivModIdentityNeg() {
+    let a: Int = 0 - 17
+    let b: Int = 5
+    expect!((a / b) * b + (a % b) == 0 - 17)
+}
+
+@Test
+function cfxSModPositive() {
+    expect!(17 % 5 == 2)
+}
+
+@Test
+function cfxSModExact() {
+    expect!(15 % 5 == 0)
+}
+
+@Test
+function cfxSModNegNum() {
+    expect!((0 - 17) % 5 == 0 - 2)
+}
+
+@Test
+function cfxSModLargeBase() {
+    expect!(3 % 1000 == 3)
+}
+
+// 4 full cycles of 0+1+2+3+4+5+6=21 => 84
+@Test
+function cfxSModCycleSum() {
+    var acc = 0
+    for i in 0..28 {
+        acc = acc + (i % 7)
+    }
+    expect!(acc == 84)
+}
+
+// 50*10 = 500 checks, all should pass
+@Test
+function cfxSDivModLoopIdentity() {
+    var ok = 0
+    for i in 1..51 {
+        for j in 1..11 {
+            let check = trunc(i / j) * j + (i % j)
+            if check == i {
+                ok = ok + 1
+            }
+        }
+    }
+    expect!(ok == 500)
+}
+
+// 999999000000
+@Test
+function cfxSLargeArith() {
+    let a = 1000000
+    let b = 999999
+    expect!(a * b == 999999000000)
+}
+
+// 1000000000 / 333333 = 3000 (exact: 333333*3000=999999000, r=1000)
+@Test
+function cfxSLargeDiv() {
+    let a: Int = 1000000000
+    let b: Int = 333333
+    expect!(a / b == 3000)
+}
+
+// 1000000000 - 3000*333333 = 1000000000 - 999999000 = 1000
+@Test
+function cfxSLargeMod() {
+    let a = 1000000000
+    let b = 333333
+    expect!(a % b == 1000)
+}
+
+// ---------------------------------------------------------------------------
+// Comparison matrix folded to counts
+// ---------------------------------------------------------------------------
+
+// diagonal: 10
+@Test
+function cfxSCmpEqualCount() {
+    var count = 0
+    let xs: [Int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    for a in xs {
+        for b in xs {
+            if a == b {
+                count = count + 1
+            }
+        }
+    }
+    expect!(count == 10)
+}
+
+// upper triangle: 5*4/2 = 10
+@Test
+function cfxSCmpLessCount() {
+    var count = 0
+    let xs: [Int] = [1, 2, 3, 4, 5]
+    for a in xs {
+        for b in xs {
+            if a < b {
+                count = count + 1
+            }
+        }
+    }
+    expect!(count == 10)
+}
+
+@Test
+function cfxSCmpSymmetry() {
+    var lt_count = 0
+    var gt_count = 0
+    let xs: [Int] = [1, 2, 3, 4, 5, 6]
+    for a in xs {
+        for b in xs {
+            if a < b {
+                lt_count = lt_count + 1
+            }
+            if a > b {
+                gt_count = gt_count + 1
+            }
+        }
+    }
+    expect!(lt_count == gt_count)
+}
+
+// all transitivity checks pass; count = C(5,3)=10
+@Test
+function cfxSCmpTransitive() {
+    var ok = 0
+    let xs: [Int] = [1, 3, 5, 7, 9]
+    for a in xs {
+        for b in xs {
+            for c in xs {
+                if a < b && b < c {
+                    if a < c {
+                        ok = ok + 1
+                    }
+                }
+            }
+        }
+    }
+    expect!(ok == 10)
+}
+
+// i<=10: 0..10 => 11 times (+11)
+// i>=10: 10..19 => 10 times (+100)
+// total = 111
+@Test
+function cfxSCmpLeGeRelation() {
+    var count = 0
+    for i in 0..20 {
+        if i <= 10 {
+            count = count + 1
+        }
+        if i >= 10 {
+            count = count + 10
+        }
+    }
+    expect!(count == 111)
+}

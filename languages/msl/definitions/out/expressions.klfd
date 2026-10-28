@@ -1,0 +1,333 @@
+// MSL expressions: texture member functions, `fmod` for the float
+// remainder, and atomic loads through the explicit functions.
+
+function mslBinary(op: String, scalarKindText: String) -> String {
+    if scalarKindText == "bool" && op == "and" { return "&&" }
+    if scalarKindText == "bool" && op == "inclusive_or" { return "||" }
+    if scalarKindText == "bool" && op == "exclusive_or" { return "!=" }
+    match op {
+        "add" -> return "+"
+        "subtract" -> return "-"
+        "multiply" -> return "*"
+        "divide" -> return "/"
+        "modulo" -> return "%"
+        "equal" -> return "=="
+        "not_equal" -> return "!="
+        "less" -> return "<"
+        "less_equal" -> return "<="
+        "greater" -> return ">"
+        "greater_equal" -> return ">="
+        "and" -> return "&"
+        "inclusive_or" -> return "|"
+        "exclusive_or" -> return "^"
+        "logical_and" -> return "&&"
+        "logical_or" -> return "||"
+        "shift_left" -> return "<<"
+        "shift_right" -> return ">>"
+        else -> return op
+    }
+}
+
+extend TextOut {
+    function dialectLiteral(borrow self, table: String, owner: Int, index: Int) -> String {
+        let value = text(table, owner, index, "literal")
+        let scalar = text(table, owner, index, "scalar")
+        if scalar == "bool" { return value }
+        if scalar == "i32" {
+            if value == "-2147483648" { return "(-2147483647 - 1)" }
+            return signedText(value)
+        }
+        if scalar == "u32" { return joinText([value, "u"]) }
+        if scalar == "i64" { return signedText(joinText([value, "L"])) }
+        if scalar == "u64" { return joinText([value, "uL"]) }
+        if scalar == "f32" {
+            if !flag(table, owner, index, "finite") {
+                return joinText(["as_type<float>(", decimalText(field(table, owner, index, "bits")), "u)"])
+            }
+            return signedText(floatOf(table, owner, index))
+        }
+        if scalar == "f16" { return signedText(joinText([floatOf(table, owner, index), "h"])) }
+        return "/* MSL has no double */"
+    }
+
+    function dialectCompose(borrow self, typeIndex: Int, parts: [String]) -> String {
+        if typeIndex < 0 { return joinText(["(", joinWith(parts, ", "), ")"]) }
+        var written = mslType(typeIndex)
+        if failedText(written) { written = "" }
+        let shape = typeKind(typeIndex)
+        if shape == "struct" { return structValue(typeIndex, parts) }
+        if shape == "array" { return joinText([written, " { ", joinWith(parts, ", "), " }"]) }
+        return joinText([written, "(", joinWith(parts, ", "), ")"])
+    }
+
+    function pointeeIsAtomic(borrow self, pointer: Int) -> Bool {
+        let pointee = pointeeOf(pointer)
+        return pointee >= 0 && typeKind(pointee) == "atomic"
+    }
+
+    // The coordinate arguments of a texture access: the coordinate, then
+    // the array layer, as Metal's member functions take them.
+    function coordinateArguments(borrow self, expression: Int, integer: Bool) -> [String] {
+        let coordinate = operandOf(expression, "coordinate")
+        var first = operand(coordinate)
+        if integer {
+            let coordinateType = typeOf(coordinate)
+            if typeKind(coordinateType) == "vector" {
+                first = joinText(["uint", decimalText(typeField(coordinateType, "lanes")), "(", first, ")"])
+            } else {
+                first = joinText(["uint(", first, ")"])
+            }
+        }
+        var parts: [String] = [first]
+        let arrayIndex = operandOf(expression, "array_index")
+        if arrayIndex >= 0 { parts.append(joinText(["uint(", operand(arrayIndex), ")"])) }
+        return parts
+    }
+
+    function mslImageDimension(borrow self, image: Int) -> String {
+        return typeText(typeOf(image), "dimension")
+    }
+
+    function mslSample(borrow self, expression: Int) -> String {
+        let image = operandOf(expression, "image")
+        let dimension = mslImageDimension(image)
+        let texture = operand(image)
+        var arguments: [String] = [operand(operandOf(expression, "sampler"))]
+        for part in coordinateArguments(expression, false) {
+            arguments.append(part)
+        }
+        let reference = operandOf(expression, "depth_ref")
+        if reference >= 0 { arguments.append(operand(reference)) }
+        let gather = operandOf(expression, "gather")
+        var method = "sample"
+        if gather >= 0 && reference >= 0 {
+            method = "gather_compare"
+        } else if gather >= 0 {
+            method = "gather"
+        } else if reference >= 0 {
+            method = "sample_compare"
+        }
+        if gather < 0 {
+            var gradient = "gradient2d"
+            if dimension == "cube" {
+                gradient = "gradientcube"
+            } else if dimension == "3d" {
+                gradient = "gradient3d"
+            }
+            let level = text("expressions", current, expression, "level")
+            if level == "zero" {
+                arguments.append("level(0.0)")
+            } else if level == "exact" {
+                arguments.append(joinText(["level(", operand(operandOf(expression, "level_value")), ")"]))
+            } else if level == "bias" {
+                arguments.append(joinText(["bias(", operand(operandOf(expression, "level_value")), ")"]))
+            } else if level == "gradient" {
+                arguments.append(joinText([gradient, "(", operand(operandOf(expression, "gradient_x")), ", ",
+                    operand(operandOf(expression, "gradient_y")), ")"]))
+            }
+        }
+        let offset = operandOf(expression, "offset")
+        if offset >= 0 {
+            arguments.append(operand(offset))
+        } else if gather >= 0 && reference < 0 {
+            arguments.append("int2(0)")
+        }
+        if gather >= 0 && reference < 0 { arguments.append(joinText(["component::", laneText(gather)])) }
+        return joinText([texture, ".", method, "(", joinWith(arguments, ", "), ")"])
+    }
+
+    function mslLoad(borrow self, expression: Int) -> String {
+        let image = operandOf(expression, "image")
+        let texture = operand(image)
+        var arguments = coordinateArguments(expression, true)
+        let storage = typeText(typeOf(image), "class") == "storage"
+        var value = operandOf(expression, "sample")
+        if value < 0 { value = operandOf(expression, "level_value") }
+        if value >= 0 {
+            arguments.append(joinText(["uint(", operand(value), ")"]))
+        } else if !storage {
+            arguments.append("0u")
+        }
+        return joinText([texture, ".read(", joinWith(arguments, ", "), ")"])
+    }
+
+    function mslQuery(borrow self, expression: Int) -> String {
+        let image = operandOf(expression, "image")
+        let texture = operand(image)
+        let dimension = mslImageDimension(image)
+        let query = text("expressions", current, expression, "query")
+        if query == "levels" { return joinText([texture, ".get_num_mip_levels()"]) }
+        if query == "layers" { return joinText([texture, ".get_array_size()"]) }
+        if query == "samples" { return joinText([texture, ".get_num_samples()"]) }
+        var level = ""
+        let levelValue = operandOf(expression, "level_value")
+        if levelValue >= 0 { level = joinText(["uint(", operand(levelValue), ")"]) }
+        var parts: [String] = []
+        if dimension == "1d" {
+            parts.append(joinText([texture, ".get_width()"]))
+        } else {
+            parts.append(joinText([texture, ".get_width(", level, ")"]))
+            parts.append(joinText([texture, ".get_height(", level, ")"]))
+            if dimension == "3d" { parts.append(joinText([texture, ".get_depth(", level, ")"])) }
+        }
+        return joinText([resultType(expression), "(", joinWith(parts, ", "), ")"])
+    }
+
+    function accessIndex(borrow self, expression: Int) -> String {
+        let base = operandOf(expression, "base")
+        let index = operandOf(expression, "index")
+        let baseText = operand(base)
+        var baseType = typeOf(base)
+        if typeKind(baseType) == "pointer" { baseType = typeField(baseType, "base") }
+        let shape = typeKind(baseType)
+        if shape == "struct" { return joinText([baseText, ".", memberName(baseType, index)]) }
+        if shape == "vector" { return joinText([baseText, ".", laneText(index)]) }
+        return joinText([baseText, "[", decimalText(index), "]"])
+    }
+
+    // `array_length` reads the count parameter of the buffer.
+    function arrayLength(borrow self, pointer: Int) -> String {
+        var at = pointer
+        while true {
+            let which = expressionKind(at)
+            if which == "global" { return joinText([globalNames[operandOf(at, "global")], "_count"]) }
+            if which != "access_index" {
+                refuse("the length of an array that is not in a buffer")
+                return ""
+            }
+            at = operandOf(at, "base")
+        }
+        return ""
+    }
+
+    function dialectExpression(borrow self, expression: Int) -> String {
+        let which = expressionKind(expression)
+        match which {
+            "literal" -> {
+                if text("expressions", current, expression, "scalar") == "f64" { refuse("MSL has no 64-bit float") }
+                return dialectLiteral("expressions", current, expression)
+            }
+            "constant" -> return constantNames[operandOf(expression, "constant")]
+            "override" -> return overrideNames[operandOf(expression, "override")]
+            "zero" -> return joinText([resultType(expression), " {}"])
+            "compose" -> {
+                var parts: [String] = []
+                let items = fieldCount("expressions", current, expression, "items")
+                for at in 0..items {
+                    parts.append(operand(fieldItem("expressions", current, expression, "items", at)))
+                }
+                let shape = typeKindOf(expression)
+                if shape == "struct" { return structValue(typeOf(expression), parts) }
+                if shape == "array" { return joinText([resultType(expression), " { ", joinWith(parts, ", "), " }"]) }
+                return joinText([resultType(expression), "(", joinWith(parts, ", "), ")"])
+            }
+            "access" -> return joinText([operand(operandOf(expression, "base")), "[",
+                operand(operandOf(expression, "index")), "]"])
+            "access_index" -> return accessIndex(expression)
+            "splat" -> return joinText([resultType(expression), "(", operand(operandOf(expression, "value")), ")"])
+            "swizzle" -> return joinText([operand(operandOf(expression, "vector")), ".",
+                text("expressions", current, expression, "pattern")])
+            "arg" -> return argumentNames[operandOf(expression, "argument")]
+            "global" -> return globalNames[operandOf(expression, "global")]
+            "local" -> return localNames[operandOf(expression, "local")]
+            "load" -> {
+                let pointer = operandOf(expression, "pointer")
+                if pointeeIsAtomic(pointer) {
+                    return joinText(["atomic_load_explicit(&", operand(pointer), ", memory_order_relaxed)"])
+                }
+                return operand(pointer)
+            }
+            "image_sample" -> return mslSample(expression)
+            "image_load" -> return mslLoad(expression)
+            "image_query" -> return mslQuery(expression)
+            "unary" -> {
+                let value = operand(operandOf(expression, "expr"))
+                let op = text("expressions", current, expression, "op")
+                if op == "negate" { return joinText(["(-", value, ")"]) }
+                if op == "not" { return joinText(["(!", value, ")"]) }
+                return joinText(["(~", value, ")"])
+            }
+            "binary" -> {
+                let left = operandOf(expression, "left")
+                let a = operand(left)
+                let b = operand(operandOf(expression, "right"))
+                let op = text("expressions", current, expression, "op")
+                let leftKind = scalarKind(scalarOf(left))
+                if op == "modulo" && leftKind == "float" { return joinText(["fmod(", a, ", ", b, ")"]) }
+                return joinText(["(", a, " ", mslBinary(op, leftKind), " ", b, ")"])
+            }
+            "select" -> {
+                let condition = operandOf(expression, "condition")
+                let c = operand(condition)
+                let a = operand(operandOf(expression, "accept"))
+                let r = operand(operandOf(expression, "reject"))
+                if typeKindOf(condition) == "vector" { return joinText(["select(", r, ", ", a, ", ", c, ")"]) }
+                return joinText(["(", c, " ? ", a, " : ", r, ")"])
+            }
+            "derivative" -> {
+                let axis = text("expressions", current, expression, "axis")
+                var name = "fwidth"
+                if axis == "x" {
+                    name = "dfdx"
+                } else if axis == "y" {
+                    name = "dfdy"
+                }
+                return joinText([name, "(", operand(operandOf(expression, "expr")), ")"])
+            }
+            "relational" -> {
+                let argument = operandOf(expression, "argument")
+                let value = operand(argument)
+                let fun = text("expressions", current, expression, "fun")
+                let vector = typeKindOf(argument) == "vector"
+                if fun == "all" && vector { return joinText(["all(", value, ")"]) }
+                if fun == "any" && vector { return joinText(["any(", value, ")"]) }
+                if fun == "all" || fun == "any" { return value }
+                if fun == "is_nan" { return joinText(["isnan(", value, ")"]) }
+                return joinText(["isinf(", value, ")"])
+            }
+            "math" -> return mslMath(expression)
+            "convert" -> return joinText(["static_cast<", resultType(expression), ">(",
+                operand(operandOf(expression, "expr")), ")"])
+            "bitcast" -> return joinText(["as_type<", resultType(expression), ">(",
+                operand(operandOf(expression, "expr")), ")"])
+            "array_length" -> return arrayLength(operandOf(expression, "pointer"))
+            else -> return joinText(["_ksir_unset", decimalText(expression)])
+        }
+    }
+
+    function dialectTemporary(borrow self, name: String, expression: Int, value: String) -> String {
+        return joinText([resultType(expression), " ", name, " = ", value, ";"])
+    }
+
+    function dialectNativeLoop(borrow self) -> Bool {
+        return false
+    }
+
+    function dialectCaseBreak(borrow self) -> Bool {
+        return true
+    }
+
+    function dialectCaseLabel(borrow self, value: String) -> String {
+        return cLabel(value)
+    }
+
+    function dialectKeepsArgument(borrow self, expression: Int) -> Bool {
+        return true
+    }
+
+    function dialectArgument(borrow self, expression: Int) -> String {
+        return operand(expression)
+    }
+
+    function dialectCallArguments(borrow self, callee: Int) -> [String] {
+        return hiddenArguments(dialect.hidden[callee])
+    }
+
+    function dialectBakeAlways(borrow self, expression: Int) -> Bool {
+        return false
+    }
+
+    function dialectLineDirective(borrow self, file: Int, lineNumber: Int) -> String {
+        return ""
+    }
+}

@@ -1,0 +1,322 @@
+// The lexer: MSL source text to tokens ending in `End`.
+//
+// Whitespace, `//` and `/* */` comments, and a backslash before a newline
+// are trivia. A number is lexed as C's preprocessing number, every letter,
+// digit, `.` and exponent sign that follows, and classified when it is
+// read. A byte the lexer cannot classify becomes one `Unknown` token, which
+// the parser reports.
+
+let asciiTab = 9
+let asciiNewline = 10
+let asciiFormFeed = 12
+let asciiReturn = 13
+let asciiSpace = 32
+let asciiBang = 33
+let asciiQuote = 34
+let asciiHash = 35
+let asciiPercent = 37
+let asciiAmpersand = 38
+let asciiApostrophe = 39
+let asciiLeftParen = 40
+let asciiRightParen = 41
+let asciiStar = 42
+let asciiPlus = 43
+let asciiComma = 44
+let asciiMinus = 45
+let asciiDot = 46
+let asciiSlash = 47
+let asciiZero = 48
+let asciiSeven = 55
+let asciiNine = 57
+let asciiColon = 58
+let asciiSemicolon = 59
+let asciiLess = 60
+let asciiEquals = 61
+let asciiGreater = 62
+let asciiQuestion = 63
+let asciiUpperA = 65
+let asciiUpperE = 69
+let asciiUpperF = 70
+let asciiUpperP = 80
+let asciiUpperX = 88
+let asciiUpperZ = 90
+let asciiLeftBracket = 91
+let asciiBackslash = 92
+let asciiRightBracket = 93
+let asciiCaret = 94
+let asciiUnderscore = 95
+let asciiLowerA = 97
+let asciiLowerE = 101
+let asciiLowerF = 102
+let asciiLowerP = 112
+let asciiLowerX = 120
+let asciiLowerZ = 122
+let asciiLeftBrace = 123
+let asciiPipe = 124
+let asciiRightBrace = 125
+let asciiTilde = 126
+
+let endOfInput = -1
+
+function isDigit(byte: Int) -> Bool {
+    return byte >= asciiZero && byte <= asciiNine
+}
+
+function isLetter(byte: Int) -> Bool {
+    return (byte >= asciiLowerA && byte <= asciiLowerZ) || (byte >= asciiUpperA && byte <= asciiUpperZ)
+}
+
+function isNameStart(byte: Int) -> Bool {
+    return byte == asciiUnderscore || isLetter(byte)
+}
+
+function isNameContinue(byte: Int) -> Bool {
+    return isNameStart(byte) || isDigit(byte)
+}
+
+function isHorizontalSpace(byte: Int) -> Bool {
+    return byte == asciiSpace || byte == asciiTab || byte == asciiReturn || byte == asciiFormFeed
+}
+
+function lex(source: String, file: Int) -> Result<[Token], Failure> {
+    var lexer = Lexer { source = source, file = file, position = 0, lineStart = true }
+    var tokens: [Token] = []
+    while true {
+        let token = try lexer.next()
+        tokens.append(token)
+        if token.kind == .End { return .Ok(tokens) }
+    }
+    return .Ok(tokens)
+}
+
+struct Lexer {
+    let source: String
+    let file: Int
+    var position: Int
+    var lineStart: Bool
+
+    function byte(borrow self, ahead: Int) -> Int {
+        let at = position + ahead
+        if at >= utf8Count(source) { return endOfInput }
+        return utf8Byte(source, at)
+    }
+
+    function span(borrow self, start: Int) -> Span {
+        return Span { file = file, start = start, end = position }
+    }
+
+    function token(borrow mut self, kind: TokenKind, start: Int) -> Token {
+        let made = Token {
+            kind = kind, text = utf8Slice(source, start, position), span = span(start), lineStart = lineStart
+        }
+        lineStart = false
+        return made
+    }
+
+    function next(borrow mut self) -> Result<Token, Failure> {
+        try skipTrivia()
+        let start = position
+        let first = byte(0)
+        if first == endOfInput { return .Ok(token(.End, start)) }
+        if isNameStart(first) {
+            while isNameContinue(byte(0)) {
+                position += 1
+            }
+            return .Ok(token(.Word, start))
+        }
+        if isDigit(first) || (first == asciiDot && isDigit(byte(1))) { return .Ok(number()) }
+        if first == asciiQuote || first == asciiApostrophe { return quoted(first) }
+        return .Ok(symbol())
+    }
+
+    function skipTrivia(borrow mut self) -> Result<Bool, Failure> {
+        while true {
+            let current = byte(0)
+            if current == asciiNewline {
+                position += 1
+                lineStart = true
+            } else if isHorizontalSpace(current) {
+                position += 1
+            } else if current == asciiBackslash && byte(1) == asciiNewline {
+                position += 2
+            } else if current == asciiBackslash && byte(1) == asciiReturn && byte(2) == asciiNewline {
+                position += 3
+            } else if current == asciiSlash && byte(1) == asciiSlash {
+                while byte(0) != asciiNewline && byte(0) != endOfInput {
+                    position += 1
+                }
+            } else if current == asciiSlash && byte(1) == asciiStar {
+                let start = position
+                position += 2
+                while !(byte(0) == asciiStar && byte(1) == asciiSlash) {
+                    if byte(0) == endOfInput {
+                        return .Error(Failure { diagnostic = .Unterminated, span = span(start) })
+                    }
+                    if byte(0) == asciiNewline { lineStart = true }
+                    position += 1
+                }
+                position += 2
+            } else {
+                return .Ok(true)
+            }
+        }
+        return .Ok(true)
+    }
+
+    // A preprocessing number: digits, letters, `.`, and a sign after an
+    // exponent letter.
+    function number(borrow mut self) -> Token {
+        let start = position
+        var float = false
+        while true {
+            let current = byte(0)
+            let exponent = current == asciiLowerE || current == asciiUpperE
+                || current == asciiLowerP || current == asciiUpperP
+            if exponent && (byte(1) == asciiPlus || byte(1) == asciiMinus) {
+                float = true
+                position += 2
+            } else if current == asciiDot {
+                float = true
+                position += 1
+            } else if isNameContinue(current) {
+                position += 1
+            } else {
+                break
+            }
+        }
+        let text = utf8Slice(source, start, position)
+        if !float && !isHexText(text) {
+            for index in 0..utf8Count(text) {
+                let letter = utf8Byte(text, index)
+                if letter == asciiLowerE || letter == asciiUpperE { float = true }
+            }
+        }
+        if float { return token(.FloatLiteral, start) }
+        return token(.IntegerLiteral, start)
+    }
+
+    function quoted(borrow mut self, quote: Int) -> Result<Token, Failure> {
+        let start = position
+        position += 1
+        while byte(0) != quote {
+            if byte(0) == endOfInput || byte(0) == asciiNewline {
+                return .Error(Failure { diagnostic = .Unterminated, span = span(start) })
+            }
+            if byte(0) == asciiBackslash { position += 1 }
+            position += 1
+        }
+        position += 1
+        if quote == asciiQuote { return .Ok(token(.StringLiteral, start)) }
+        return .Ok(token(.CharLiteral, start))
+    }
+
+    function symbol(borrow mut self) -> Token {
+        let start = position
+        match symbolOf(byte(0), byte(1), byte(2)) {
+            Some(found) -> {
+                position += found.width
+                return token(found.kind, start)
+            }
+            None -> {}
+        }
+        position += utf8Width(byte(0))
+        return token(.Unknown, start)
+    }
+}
+
+function isHexText(text: String) -> Bool {
+    if utf8Count(text) < 2 || utf8Byte(text, 0) != asciiZero { return false }
+    let second = utf8Byte(text, 1)
+    return second == asciiLowerX || second == asciiUpperX
+}
+
+struct Symbol {
+    let kind: TokenKind
+    let width: Int
+}
+
+function symbolOf(first: Int, second: Int, third: Int) -> Optional<Symbol> {
+    if third == asciiEquals {
+        if first == asciiLess && second == asciiLess { return .Some(Symbol { kind = .LessLessEquals, width = 3 }) }
+        if first == asciiGreater && second == asciiGreater {
+            return .Some(Symbol { kind = .GreaterGreaterEquals, width = 3 })
+        }
+    }
+    match pairOf(first, second) {
+        Some(kind) -> return .Some(Symbol { kind = kind, width = 2 })
+        None -> {}
+    }
+    match singleOf(first) {
+        Some(kind) -> return .Some(Symbol { kind = kind, width = 1 })
+        None -> {
+            let none: Optional<Symbol> = .None
+            return none
+        }
+    }
+}
+
+function pairOf(first: Int, second: Int) -> Optional<TokenKind> {
+    let none: Optional<TokenKind> = .None
+    if second == asciiEquals {
+        if first == asciiPlus { return .Some(.PlusEquals) }
+        if first == asciiMinus { return .Some(.MinusEquals) }
+        if first == asciiStar { return .Some(.StarEquals) }
+        if first == asciiSlash { return .Some(.SlashEquals) }
+        if first == asciiPercent { return .Some(.PercentEquals) }
+        if first == asciiAmpersand { return .Some(.AmpersandEquals) }
+        if first == asciiPipe { return .Some(.PipeEquals) }
+        if first == asciiCaret { return .Some(.CaretEquals) }
+        if first == asciiEquals { return .Some(.EqualEqual) }
+        if first == asciiBang { return .Some(.BangEqual) }
+        if first == asciiLess { return .Some(.LessEqual) }
+        if first == asciiGreater { return .Some(.GreaterEqual) }
+        return none
+    }
+    if first == asciiColon && second == asciiColon { return .Some(.ColonColon) }
+    if first == asciiPlus && second == asciiPlus { return .Some(.PlusPlus) }
+    if first == asciiMinus && second == asciiMinus { return .Some(.MinusMinus) }
+    if first == asciiMinus && second == asciiGreater { return .Some(.Arrow) }
+    if first == asciiAmpersand && second == asciiAmpersand { return .Some(.AmpersandAmpersand) }
+    if first == asciiPipe && second == asciiPipe { return .Some(.PipePipe) }
+    if first == asciiLess && second == asciiLess { return .Some(.LessLess) }
+    if first == asciiGreater && second == asciiGreater { return .Some(.GreaterGreater) }
+    return none
+}
+
+function singleOf(byte: Int) -> Optional<TokenKind> {
+    if byte == asciiHash { return .Some(.Hash) }
+    if byte == asciiLeftParen { return .Some(.LeftParen) }
+    if byte == asciiRightParen { return .Some(.RightParen) }
+    if byte == asciiLeftBrace { return .Some(.LeftBrace) }
+    if byte == asciiRightBrace { return .Some(.RightBrace) }
+    if byte == asciiLeftBracket { return .Some(.LeftBracket) }
+    if byte == asciiRightBracket { return .Some(.RightBracket) }
+    if byte == asciiSemicolon { return .Some(.Semicolon) }
+    if byte == asciiComma { return .Some(.Comma) }
+    if byte == asciiDot { return .Some(.Dot) }
+    if byte == asciiColon { return .Some(.Colon) }
+    if byte == asciiQuestion { return .Some(.Question) }
+    if byte == asciiTilde { return .Some(.Tilde) }
+    if byte == asciiBang { return .Some(.Bang) }
+    if byte == asciiPlus { return .Some(.Plus) }
+    if byte == asciiMinus { return .Some(.Minus) }
+    if byte == asciiStar { return .Some(.Star) }
+    if byte == asciiSlash { return .Some(.Slash) }
+    if byte == asciiPercent { return .Some(.Percent) }
+    if byte == asciiCaret { return .Some(.Caret) }
+    if byte == asciiAmpersand { return .Some(.Ampersand) }
+    if byte == asciiPipe { return .Some(.Pipe) }
+    if byte == asciiEquals { return .Some(.Equals) }
+    if byte == asciiLess { return .Some(.Less) }
+    if byte == asciiGreater { return .Some(.Greater) }
+    let none: Optional<TokenKind> = .None
+    return none
+}
+
+// The bytes of the character a UTF-8 leading byte opens.
+function utf8Width(byte: Int) -> Int {
+    if byte < 128 { return 1 }
+    if byte >= 192 && byte < 224 { return 2 }
+    if byte >= 224 && byte < 240 { return 3 }
+    return 4
+}

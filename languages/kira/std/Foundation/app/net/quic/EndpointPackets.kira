@@ -1,0 +1,126 @@
+// What an endpoint sends on its own, outside any connection: version
+// negotiation, stateless resets and Retry packets, and the tokens behind
+// the last two.
+
+namespace QuicEndpointLabel {
+    // Labels keep the keys taken from the one secret apart.
+    let token: String = "quic retry token"
+    let reset: String = "quic stateless reset"
+}
+
+extend QuicEndpoint {
+    function derived(
+        borrow self,
+        label: borrow String,
+        data: borrow [UN8]
+    ) -> Result<[UN8], CryptoFailure> {
+        let input = joinedBytes(label.utf8(), data)
+        let mac = try hmac(.Sha256, secret, input)
+        return .Ok(mac)
+    }
+
+    function tokenKey(borrow self) -> Result<AeadKey, CryptoFailure> {
+        let empty: [UN8] = []
+        let key = try derived(QuicEndpointLabel.token, empty)
+        return .Ok(AeadKey { suite: .Aes256GcmSha384, key: key })
+    }
+
+    // The token a server announces for `id`: the same every time, so a
+    // server that lost the connection can still send it.
+    function resetTokenFor(borrow self, id: borrow [UN8]) -> Result<[UN8], CryptoFailure> {
+        let mac = try derived(QuicEndpointLabel.reset, id)
+        return .Ok(byteRun(mac, 0, Quic.statelessResetTokenBytes))
+    }
+
+    // A Retry token: when it was made and the ID the client first sent to,
+    // sealed to the client's address so it is no use from another.
+    function sealToken(
+        borrow self,
+        original: borrow [UN8],
+        peer: borrow String,
+        now: QuicInstant
+    ) -> Result<[UN8], CryptoFailure> {
+        let key = try tokenKey()
+        let nonce = try randomBytes(UNumber(QuicEndpointLimit.tokenNonceBytes))
+        var plain = WireWriter {}
+        plain.writeVarint(now.raw)
+        plain.writeBytes(original)
+        let sealed = try sealAead(key, nonce, peer.utf8(), plain.bytes)
+        return .Ok(joinedBytes(nonce, sealed))
+    }
+
+    // The ID a token names, when this endpoint made it for `peer` in the
+    // last few seconds.
+    function openToken(
+        borrow self,
+        token: borrow [UN8],
+        peer: borrow String,
+        now: QuicInstant
+    ) -> [UN8]? {
+        if token.count <= QuicEndpointLimit.tokenNonceBytes { return .None }
+        let key = try tokenKey() otherwise return .None
+        let nonce = byteRun(token, 0, QuicEndpointLimit.tokenNonceBytes)
+        let sealed = byteRun(token, QuicEndpointLimit.tokenNonceBytes, token.count)
+        let plain = try openAead(key, nonce, peer.utf8(), sealed) otherwise return .None
+        var reader = WireReader { bytes: plain }
+        let issued = try reader.readVarint() otherwise return .None
+        let age = now.raw - issued
+        if age < 0 || age > QuicEndpointLimit.tokenLifetime { return .None }
+        return .Some(reader.readRest())
+    }
+
+    function sendRetry(
+        borrow mut self,
+        datagram: borrow Datagram,
+        raw: borrow QuicRawHeader,
+        now: QuicInstant
+    ) {
+        let source = try quicFreshConnectionId() otherwise return
+        let token = try sealToken(raw.destination, datagram.peer, now) otherwise return
+        let request = QuicRetryRequest {
+            clientSource: copy raw.source,
+            original: copy raw.destination,
+            source: source,
+            token: token
+        }
+        let packet = try quicRetryPacket(request) otherwise return
+        outgoing.append(Datagram { peer: copy datagram.peer, bytes: packet })
+    }
+
+    // A short packet for a connection this endpoint does not have: a
+    // stateless reset, smaller than the packet, so the peer stops (RFC
+    // 9000 section 10.3).
+    function sendReset(borrow mut self, datagram: borrow Datagram, raw: borrow QuicRawHeader) {
+        let size = min(datagram.bytes.count - 1, QuicEndpointLimit.largestReset)
+        if size < Quic.smallestReset { return }
+        let token = try resetTokenFor(raw.destination) otherwise return
+        let filler = try randomBytes(UNumber(size - token.count)) otherwise return
+        var packet = joinedBytes(filler, token)
+        // It looks like a short header packet: fixed bit set, long bit clear.
+        packet[0] = UN8((Number(packet[0]) & Quic.shortProtectedBits) | Quic.fixedBit)
+        outgoing.append(Datagram { peer: copy datagram.peer, bytes: packet })
+    }
+
+    // A long packet of a version this endpoint does not speak, in a
+    // datagram large enough to be a client's first: the versions it does
+    // (RFC 9000 section 6.1).
+    function negotiate(borrow mut self, datagram: borrow Datagram) {
+        if datagram.bytes.count < Quic.minimumDatagram { return }
+        var reader = WireReader { bytes: copy datagram.bytes }
+        let first = try reader.readByte() otherwise return
+        if (first & Quic.longHeader) == 0 { return }
+        let version = try reader.readInteger(QuicPacketLimit.versionBytes) otherwise return
+        // A version negotiation packet is never answered with another.
+        if version == QuicEndpointLimit.negotiationVersion { return }
+        let destination = try reader.readVector(Tls.shortVector) otherwise return
+        let source = try reader.readVector(Tls.shortVector) otherwise return
+        let unused = try randomBytes(1) otherwise return
+        var writer = WireWriter {}
+        writer.writeByte(Quic.longHeader | (Number(unused[0]) & Quic.unusedNegotiationBits))
+        writer.writeInteger(QuicEndpointLimit.negotiationVersion, QuicPacketLimit.versionBytes)
+        writer.writeVector(source, Tls.shortVector)
+        writer.writeVector(destination, Tls.shortVector)
+        writer.writeInteger(Quic.version1, QuicPacketLimit.versionBytes)
+        outgoing.append(Datagram { peer: copy datagram.peer, bytes: writer.bytes })
+    }
+}

@@ -1,0 +1,32 @@
+import Foundation
+
+// Helpers shared by the Archive tests. Scratch files go under the workspace's
+// karc-work directory, named per test so parallel test runs do not share them.
+
+// Bytes as two lower-case hex digits each.
+function hexText(bytes: borrow [UN8]) -> String {
+    let digits = "0123456789abcdef"
+    var text = ""
+    for byte in bytes {
+        let value = Number(byte)
+        let high = trunc(value / 16)
+        let low = value % 16
+        text += digits.substring(high, high + 1) + digits.substring(low, low + 1)
+    }
+    return text
+}
+
+// Bytes as decimal numbers separated by commas.
+function decimalText(bytes: borrow [UN8]) -> String {
+    var parts: [String] = []
+    for byte in bytes { parts.append(String(Number(byte))) }
+    return joined(parts, ",")
+}
+
+// A path under karc-work's Archive scratch directory that only this test
+// name uses. The directory is created on first use.
+function scratchPath(name: borrow String) -> String {
+    let base = "/Users/priamc/Code/kira-projects/karc-work/archive-test-scratch"
+    absorb makeDirectory(base)
+    return base + "/" + name
+}

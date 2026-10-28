@@ -1,0 +1,84 @@
+// What a string literal means. The lexer accepted only the escapes Kira has,
+// `\n`, `\t`, `\r`, `\e`, `\0`, `\"` and `\\`, and the line continuation a
+// backslash before a line break writes. A continuation contributes nothing:
+// neither the line break nor the whitespace lining the next line up is text.
+
+// The text `raw`, a whole literal token, names; nothing when it holds no
+// backslash, so the source between its quotes already is that text.
+function stringLiteralText(raw: String) -> Optional<String> {
+    let end = utf8Count(raw) - 1
+    var escaped = false
+    for index in 1..end {
+        if utf8Byte(raw, index) == asciiBackslash { escaped = true }
+    }
+    if !escaped { return .None }
+    var parts: [String] = []
+    var run = 1
+    var index = 1
+    while index < end {
+        if utf8Byte(raw, index) != asciiBackslash {
+            index += 1
+            continue
+        }
+        parts.append(utf8Slice(raw, run, index))
+        let escape = utf8Byte(raw, index + 1)
+        index += 2
+        if isLineBreak(escape) {
+            index = continuationEnd(raw, index, end)
+        } else {
+            parts.append(escapeText(escape))
+        }
+        run = index
+    }
+    parts.append(utf8Slice(raw, run, end))
+    return .Some(joinText(parts))
+}
+
+function escapeText(escape: Int) -> String {
+    if escape == asciiLowerN { return "\n" }
+    if escape == asciiLowerT { return "\t" }
+    if escape == asciiLowerR { return "\r" }
+    if escape == asciiLowerE { return "\u{1b}" }
+    if escape == asciiZero { return "\0" }
+    if escape == asciiQuote { return "\"" }
+    return "\\"
+}
+
+// Where the text resumes after a continuation: at the first character from
+// `start` that is not Unicode whitespace, so a blank line is layout too.
+function continuationEnd(raw: String, start: Int, end: Int) -> Int {
+    var index = start
+    while index < end {
+        let width = whitespaceWidth(raw, index)
+        if width == 0 { return index }
+        index += width
+    }
+    return end
+}
+
+// The bytes of the whitespace character at `index`, or 0 when it is not one.
+function whitespaceWidth(raw: String, index: Int) -> Int {
+    let first = utf8Byte(raw, index)
+    if first == asciiSpace || (first >= asciiTab && first <= asciiReturn) { return 1 }
+    if first == 194 {
+        let second = utf8Byte(raw, index + 1)
+        if second == 133 || second == 160 { return 2 }
+        return 0
+    }
+    if first == 225 {
+        if utf8Byte(raw, index + 1) == 154 && utf8Byte(raw, index + 2) == 128 { return 3 }
+        return 0
+    }
+    if first == 226 {
+        let second = utf8Byte(raw, index + 1)
+        let third = utf8Byte(raw, index + 2)
+        if second == 128 && (third <= 138 || third == 168 || third == 169 || third == 175) { return 3 }
+        if second == 129 && third == 159 { return 3 }
+        return 0
+    }
+    if first == 227 {
+        if utf8Byte(raw, index + 1) == 128 && utf8Byte(raw, index + 2) == 128 { return 3 }
+        return 0
+    }
+    return 0
+}

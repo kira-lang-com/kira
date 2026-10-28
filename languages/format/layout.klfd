@@ -1,0 +1,644 @@
+// The layout the shader languages' `format` hooks share (KLF-FORMAT.md
+// section 4). It works on the token stream of a C-like language: line
+// breaks between statements are the source's, while indentation, the
+// breaks around braces and `;`, and the spacing around commas, operators
+// and brackets are normalized. Lists in parentheses and initializer braces
+// are groups, so they wrap at the line width. Where the tokens alone cannot
+// tell a spacing apart, such as `<` opening a template or comparing, the
+// source's spacing stays.
+
+struct LayoutRules {
+    // Words written with a space before `(`, such as `if` and `while`.
+    let spacedCalls: [String]
+    // Words after which `-`, `*` or `&` starts an operand: `return -x`.
+    let keywords: [String]
+    // Operators whose spacing the source decides.
+    let ambiguous: [String]
+    // Whether `->` is written with spaces, as KSL's return arrow is.
+    let spacedArrow: Bool
+    // Words that open a label ending in `:`, such as `case`.
+    let labels: [String]
+    // Whether `;` ends a statement and `#` at a line start opens a directive.
+    let semicolons: Bool
+    // Whether `{` opens a struct literal when the braces are empty or start
+    // with `name =` or `name:` and close on their line or hold a comma,
+    // outside a header. Such braces are spaced inside. Otherwise `{` after `=`, `,` or `return`, or inside
+    // parentheses, opens an initializer.
+    let literals: Bool
+    // Words starting a header that a block ends, such as `if` and `struct`.
+    // Braces in a header, outside its parentheses, are never a literal.
+    let headers: [String]
+    // Whether a block the source writes on one line stays on one when it fits.
+    let inlineBlocks: Bool
+}
+
+// What each open frame is.
+let layoutBlock = 1
+let layoutLabel = 2
+let layoutContinuation = 3
+let layoutParen = 4
+let layoutInitializer = 5
+let layoutBracket = 6
+let layoutInline = 7
+// Brackets the source breaks after `[`: one item per source line, indented.
+let layoutListed = 8
+
+// The separators before a token.
+let layoutNone = 0
+let layoutFixed = 1
+let layoutKeep = 2
+let layoutHard = 3
+let layoutBreakable = 4
+let layoutSoft = 5
+
+struct Layout {
+    let source: String
+    let starts: [Int]
+    let ends: [Int]
+    let rules: LayoutRules
+    var frames: [Int]
+    var top: Int
+    // Open parentheses, brackets and initializer braces.
+    var nesting: Int
+    var ternary: Int
+    // Open template argument lists: `<` right after a name, as the source
+    // wrote it. Their commas never break.
+    var angles: Int
+    var labelPending: Bool
+    var previousUnary: Bool
+    // How the previous token, if an operator the source decides, was spaced.
+    var previousStyle: Int
+    // Whether the previous token was the `:` of a label.
+    var afterLabel: Bool
+    var previousDirective: Bool
+    // The nesting outside each open block: a block's statements break
+    // lines even inside parentheses.
+    var outer: [Int]
+    var blocks: Int
+    // The nesting of the open header's own tokens, or -1 outside a header.
+    var header: Int
+}
+
+function layoutTokens(source: String, starts: [Int], ends: [Int], rules: LayoutRules) -> Bool {
+    var layout = Layout {
+        source = source, starts = starts, ends = ends, rules = rules, frames = [], top = 0,
+        nesting = 0, ternary = 0, angles = 0, labelPending = false, previousUnary = false, previousStyle = 0,
+        afterLabel = false, previousDirective = false, outer = [], blocks = 0, header = -1
+    }
+    return layout.run()
+}
+
+extend Layout {
+    function text(borrow self, index: Int) -> String {
+        return utf8Slice(source, starts[index], ends[index])
+    }
+
+    function push(borrow mut self, frame: Int) {
+        if top == frames.count {
+            frames.append(frame)
+        } else {
+            frames[top] = frame
+        }
+        top += 1
+    }
+
+    function innermost(borrow self) -> Int {
+        if top == 0 { return 0 }
+        return frames[top - 1]
+    }
+
+    // Closes the innermost frame if it is `frame`.
+    function close(borrow mut self, frame: Int) {
+        if innermost() == frame {
+            format_end()
+            if frame == layoutParen || frame == layoutInitializer { format_end() }
+            top -= 1
+            if frame == layoutBlock { leaveBlock() }
+        }
+    }
+
+    function enterBlock(borrow mut self, frame: Int) {
+        push(frame)
+        if blocks == outer.count {
+            outer.append(nesting)
+        } else {
+            outer[blocks] = nesting
+        }
+        blocks += 1
+        nesting = 0
+    }
+
+    function leaveBlock(borrow mut self) {
+        blocks -= 1
+        nesting = outer[blocks]
+    }
+
+    function run(borrow mut self) -> Bool {
+        let count = starts.count
+        var index = 0
+        while index < count {
+            let current = text(index)
+            if rules.semicolons && current == "#" && layoutAtLineStart(source, starts[index]) {
+                close(layoutContinuation)
+                if index > 0 { format_line(2) }
+                let end = layoutDirectiveEnd(source, starts[index])
+                format_verbatim(starts[index], end)
+                index += 1
+                while index < count && starts[index] < end { index += 1 }
+                previousDirective = true
+                previousUnary = false
+                continue
+            }
+            // Whether the token closes an initializer is settled before
+            // `separate` closes the frames that end at it: a block's `}` closes
+            // the block there, and must not then read as its enclosing
+            // initializer's close.
+            let closing = current == ")" || closesInitializer(current)
+            if index > 0 { separate(index, current) }
+            write(index, current, closing)
+            previousDirective = false
+            index += 1
+        }
+        while top > 0 {
+            let frame = frames[top - 1]
+            if frame != layoutBracket { format_end() }
+            if frame == layoutParen || frame == layoutInitializer || frame == layoutInline { format_end() }
+            top -= 1
+        }
+        return true
+    }
+
+    // The line break or space before the token at `index`, with the frames
+    // that close before it.
+    function separate(borrow mut self, index: Int, current: String) {
+        let previous = text(index - 1)
+        if current == ")" || closesInitializer(current) {
+            return
+        }
+        if current == "]" {
+            if innermost() == layoutListed {
+                format_end()
+                if previous != "[" { format_line(2) }
+            }
+            return
+        }
+        if current == "}" {
+            close(layoutContinuation)
+            close(layoutLabel)
+            if innermost() == layoutInline {
+                format_end()
+                if previous != "{" { format_line(1) }
+                format_end()
+                top -= 1
+                leaveBlock()
+                return
+            }
+            close(layoutBlock)
+            if previous != "{" { format_line(2) }
+            return
+        }
+        if previous == "(" {
+            format_line(0)
+            return
+        }
+        if previous == "{" && innermost() == layoutInitializer && current != "}" {
+            if rules.literals { format_line(1) } else { format_line(0) }
+            return
+        }
+        if previous == "{" && innermost() == layoutInline {
+            format_line(1)
+            return
+        }
+        let newline = layoutNewlineBetween(source, ends[index - 1], starts[index])
+        var hard = previousDirective || (afterLabel && current != "{")
+        afterLabel = false
+        if innermost() == layoutBlock && previous == "{" { hard = true }
+        if previous == "}" && nesting == 0 && newline { hard = true }
+        if rules.semicolons && previous == ";" && nesting == 0 { hard = true }
+        if newline && nesting == 0 { hard = true }
+        // A closure's parameters stay on its `{` line, however the source
+        // broke them.
+        if previous == "{" && closureHead(index) { hard = false }
+        if hard {
+            let continues = nesting == 0 && current != "{" && !previousDirective
+                && (continuing(previous) || previous == "," || continuing(current))
+            // A header ends with the line it is written on, unless the line
+            // continues it: the `{` of a bodyless declaration comes after a
+            // later line, and must not be read as that declaration's block,
+            // while a condition wrapped after `&&` still opens its block.
+            if nesting == header && current != "{" && !continues { header = -1 }
+            if continues {
+                if innermost() != layoutContinuation {
+                    format_indent()
+                    push(layoutContinuation)
+                }
+            } else {
+                close(layoutContinuation)
+                if layoutHas(rules.labels, current) { close(layoutLabel) }
+            }
+            format_line(2)
+            return
+        }
+        // Items of an initializer the source separates by line breaks rather
+        // than commas keep them: the break is their separator.
+        if newline && innermost() == layoutInitializer && previous != "," && !continuing(previous)
+            && !continuing(current) {
+            format_line(2)
+            return
+        }
+        // Brackets never break on their own (section 7, rule 3), so the
+        // source's breaks are the only ones a long list has, and rule 2
+        // keeps them.
+        if newline && innermost() == layoutListed {
+            format_line(2)
+            return
+        }
+        let listed = innermost() == layoutParen || innermost() == layoutInitializer
+        if previous == "," && listed && angles == 0 {
+            format_line(1)
+            return
+        }
+        let spacing = space(index, previous, current)
+        if spacing == layoutFixed {
+            format_line(3)
+        } else if spacing == layoutKeep && starts[index] > ends[index - 1] {
+            format_line(3)
+        }
+    }
+
+    // Whether the token at `index`, the first after a block's `{`, starts a
+    // closure's parameters: names and commas on one line up to an `in` that
+    // ends it, as in Kira's `{ graphics in`. They go on the `{` line.
+    function closureHead(borrow self, index: Int) -> Bool {
+        var at = index
+        while at < starts.count {
+            let token = text(at)
+            if token == "in" {
+                return at + 1 == starts.count || layoutNewlineBetween(source, ends[at], starts[at + 1])
+            }
+            if token != "," && !layoutWordish(token) { return false }
+            if at > index && layoutNewlineBetween(source, ends[at - 1], starts[at]) { return false }
+            at += 1
+        }
+        return false
+    }
+
+    function closesInitializer(borrow self, current: String) -> Bool {
+        return current == "}" && innermost() == layoutInitializer
+    }
+
+    // The token at `index`, with the frames it opens or closes. `closing`
+    // says whether it closes a parenthesis or an initializer.
+    function write(borrow mut self, index: Int, current: String, closing: Bool) {
+        var previous = ""
+        if index > 0 { previous = text(index - 1) }
+        let unary = layoutPrefix(current) && (index == 0 || !valueEnd(previous))
+        if current == "(" || (current == "{" && opensInitializer(index, previous)) {
+            format_token(starts[index], ends[index])
+            format_group()
+            format_indent()
+            if current == "(" { push(layoutParen) } else { push(layoutInitializer) }
+            nesting += 1
+        } else if closing {
+            let frame = innermost()
+            if frame == layoutParen || frame == layoutInitializer {
+                format_end()
+                if previous != "(" && previous != "{" {
+                    if current == "}" && rules.literals { format_line(1) } else { format_line(0) }
+                }
+                format_end()
+                top -= 1
+            }
+            format_token(starts[index], ends[index])
+            nesting -= 1
+        } else if current == "{" {
+            close(layoutContinuation)
+            format_token(starts[index], ends[index])
+            if nesting == header { header = -1 }
+            if rules.inlineBlocks && onOneLine(index) {
+                format_group()
+                format_indent()
+                enterBlock(layoutInline)
+            } else {
+                format_indent()
+                enterBlock(layoutBlock)
+            }
+        } else if current == "[" {
+            format_token(starts[index], ends[index])
+            if index + 1 < starts.count && layoutNewlineBetween(source, ends[index], starts[index + 1]) {
+                format_indent()
+                push(layoutListed)
+            } else {
+                push(layoutBracket)
+            }
+            nesting += 1
+        } else if current == "]" {
+            format_token(starts[index], ends[index])
+            if innermost() == layoutBracket || innermost() == layoutListed { top -= 1 }
+            nesting -= 1
+        } else if current == ":" && labelPending && ternary == 0 && nesting == 0 {
+            format_token(starts[index], ends[index])
+            format_indent()
+            push(layoutLabel)
+            labelPending = false
+            afterLabel = true
+        } else {
+            format_token(starts[index], ends[index])
+        }
+        if layoutHas(rules.labels, current) && nesting == 0 { labelPending = true }
+        if layoutHas(rules.headers, current) && header < 0 { header = nesting }
+        if current == "<" && layoutHas(rules.ambiguous, "<") && templateOpens(index) { angles += 1 }
+        if layoutHas(rules.ambiguous, current) { previousStyle = style(index, previous, current) }
+        if angles > 0 && current == ">" { angles -= 1 }
+        if angles > 0 && current == ">>" { angles -= 2 }
+        if angles < 0 || current == ";" || current == "{" { angles = 0 }
+        if current == "?" && !optionalMark(index) { ternary += 1 }
+        if current == ":" && ternary > 0 && labelPending == false { ternary -= 1 }
+        if current == ";" && nesting == 0 { ternary = 0 }
+        previousUnary = unary
+    }
+
+    // The spacing of an operator whose meaning depends on its neighbours:
+    // `<` and `>` around template arguments, `*` and `&` in declarations.
+    function style(borrow self, index: Int, previous: String, current: String) -> Int {
+        if current == "<" {
+            if previous == "template" { return layoutFixed }
+            if templateOpens(index) { return layoutNone }
+            return layoutFixed
+        }
+        if current == ">" || current == ">>" {
+            if angles > 0 { return layoutNone }
+            return layoutFixed
+        }
+        if previous == ")" || previous == "]" || layoutNumber(previous) { return layoutFixed }
+        return layoutKeep
+    }
+
+    // Whether the `<` at `index` opens template arguments: it follows a name
+    // and a matching `>` comes before anything that cannot be an argument.
+    function templateOpens(borrow self, index: Int) -> Bool {
+        if index == 0 { return false }
+        let previous = text(index - 1)
+        if !layoutWordish(previous) || layoutNumber(previous) || layoutHas(rules.keywords, previous) {
+            return false
+        }
+        var depth = 1
+        // Parentheses the arguments open, as a tuple type does in
+        // `Result<(A, B), Failure>`; an unmatched `)` ends the search.
+        var parens = 0
+        var at = index + 1
+        while at < starts.count && at < index + 64 {
+            let token = text(at)
+            if token == "<" { depth += 1 }
+            if token == ">" { depth -= 1 }
+            if token == ">>" { depth -= 2 }
+            if depth <= 0 { return parens == 0 }
+            if token == "?" && optionalMark(at) {
+                at += 1
+                continue
+            }
+            if token == "(" { parens += 1 }
+            if token == ")" {
+                if parens == 0 { return false }
+                parens -= 1
+            }
+            if layoutHas([";", "{", "}", "&&", "||", "?", "=", "==", "!="], token) {
+                return false
+            }
+            at += 1
+        }
+        return false
+    }
+
+    // Whether a line ending or starting with `token` continues a statement.
+    // The operators the source decides the spacing of may end a declaration
+    // instead, as `>` ends `template <typename T>`.
+    function continuing(borrow self, token: String) -> Bool {
+        return layoutOperator(token) && !layoutHas(rules.ambiguous, token)
+    }
+
+    function opensInitializer(borrow self, index: Int, previous: String) -> Bool {
+        if rules.literals { return nesting != header && literalAhead(index) }
+        if nesting > 0 { return true }
+        return previous == "=" || previous == "," || previous == "return"
+    }
+
+    // Whether the `{` at `index` starts a struct literal's fields: empty, or
+    // `name =` or `name:` first, and closing on its own line or holding a
+    // comma at its level.
+    function literalAhead(borrow self, index: Int) -> Bool {
+        if index + 2 >= starts.count { return false }
+        let next = text(index + 1)
+        if next == "}" { return true }
+        if !layoutWordish(next) || layoutHas(rules.keywords, next) { return false }
+        let after = text(index + 2)
+        if after != "=" && after != ":" { return false }
+        if onOneLine(index) { return true }
+        var depth = 0
+        for at in index..starts.count {
+            let token = text(at)
+            if token == "{" || token == "(" || token == "[" { depth += 1 }
+            if token == "}" || token == ")" || token == "]" {
+                depth -= 1
+                // The `}` of a literal the source writes over several lines
+                // starts its own line; a block's statements are indented.
+                if depth == 0 {
+                    return token == "}" && layoutNewlineBetween(source, ends[at - 1], starts[at])
+                }
+            }
+            if depth == 1 && token == "," { return true }
+        }
+        return false
+    }
+
+    // Whether the block opened at `index` closes on the same source line.
+    function onOneLine(borrow self, index: Int) -> Bool {
+        var depth = 0
+        var at = index
+        while at < starts.count {
+            if at > index && layoutNewlineBetween(source, ends[at - 1], starts[at]) { return false }
+            let token = text(at)
+            if token == "{" { depth += 1 }
+            if token == "}" {
+                depth -= 1
+                if depth == 0 { return true }
+            }
+            at += 1
+        }
+        return false
+    }
+
+    // Whether the `?` at `index` closes an optional type, as Kira's
+    // `Number?`, rather than opening a conditional: what follows it cannot
+    // start an operand, or it ends the line.
+    function optionalMark(borrow self, index: Int) -> Bool {
+        if index + 1 >= starts.count { return true }
+        if layoutNewlineBetween(source, ends[index], starts[index + 1]) { return true }
+        return layoutHas([")", "]", ",", "=", ">", ">>", "{", "}", ";"], text(index + 1))
+    }
+
+    // Whether `token` ends an operand, so an operator after it is binary.
+    function valueEnd(borrow self, token: String) -> Bool {
+        if token == ")" || token == "]" || token == "++" || token == "--" { return true }
+        // A longer token ending in `}` is one piece, such as a quote's hole.
+        let length = utf8Count(token)
+        if length > 1 && utf8Byte(token, length - 1) == 125 { return true }
+        return layoutWordish(token) && !layoutHas(rules.keywords, token)
+    }
+
+    function space(borrow self, index: Int, previous: String, current: String) -> Int {
+        if current == "," || current == ";" || current == ")" || current == "]" { return layoutNone }
+        if previous == "." || current == "::" || previous == "::" { return layoutNone }
+        if current == "." {
+            if valueEnd(previous) || previousUnary || layoutHas(["(", "[", "{", "}", "!", "~", "@", "\\"], previous) {
+                return layoutNone
+            }
+            // A keyword the source writes against the `.` is a name there, as
+            // Kira's `copy` is in `copy.count`; `return .Ok` keeps its space.
+            if layoutHas(rules.keywords, previous) && starts[index] == ends[index - 1] { return layoutNone }
+            return layoutFixed
+        }
+        // A key path, `\Root.member`, is written against its `\`.
+        if previous == "(" || previous == "[" || previous == "@" || previous == "\\" { return layoutNone }
+        if previous == "!" || previous == "~" { return layoutNone }
+        if previousUnary { return layoutNone }
+        if current == "->" || previous == "->" {
+            if rules.spacedArrow { return layoutFixed }
+            return layoutNone
+        }
+        if current == "(" {
+            if layoutWordish(previous) {
+                if layoutHas(rules.spacedCalls, previous) || layoutHas(rules.keywords, previous) {
+                    return layoutFixed
+                }
+                return layoutNone
+            }
+            if valueEnd(previous) { return layoutNone }
+            if layoutHas(rules.ambiguous, previous) { return layoutKeep }
+            // A range is written against its bounds, `0..(count + 1)` as
+            // `0..count`.
+            if layoutHas(["..", "...", "..<"], previous) { return layoutKeep }
+            return layoutFixed
+        }
+        if current == "[" {
+            if index + 1 < starts.count && text(index + 1) == "[" && starts[index + 1] == ends[index] {
+                return layoutFixed
+            }
+            // A template argument that is itself a bracketed type, as in
+            // `Result<[U8], Failure>`, opens against its `<`.
+            if previous == "<" && angles > 0 { return layoutNone }
+            // After a keyword `[` opens an operand or a type, as in
+            // `borrow [Int]`, unless the source writes it against the word.
+            if layoutHas(rules.keywords, previous) && starts[index] != ends[index - 1] { return layoutFixed }
+            if layoutWordish(previous) || previous == ")" || previous == "]" { return layoutNone }
+            return layoutFixed
+        }
+        if current == ":" {
+            if ternary > 0 && labelPending == false { return layoutFixed }
+            return layoutNone
+        }
+        if previous == ":" || previous == "," || previous == ";" { return layoutFixed }
+        if previous == "}" && layoutWordish(current) { return layoutFixed }
+        if current == "{" { return layoutFixed }
+        if current == "?" {
+            if optionalMark(index) { return layoutNone }
+            return layoutFixed
+        }
+        if previous == "?" && !optionalMark(index - 1) { return layoutFixed }
+        if current == "++" || current == "--" {
+            if valueEnd(previous) { return layoutNone }
+        }
+        if layoutHas(rules.ambiguous, current) { return style(index, previous, current) }
+        if layoutHas(rules.ambiguous, previous) {
+            if previous == "<" && angles > 0 { return layoutNone }
+            if (previous == ">" || previous == ">>") && previousStyle == layoutNone {
+                if layoutWordish(current) || layoutOperator(current) { return layoutFixed }
+                return layoutNone
+            }
+            return previousStyle
+        }
+        if layoutOperator(current) || layoutOperator(previous) { return layoutFixed }
+        if layoutWordish(previous) && layoutWordish(current) { return layoutFixed }
+        return layoutKeep
+    }
+}
+
+function layoutHas(words: [String], word: String) -> Bool {
+    for known in words {
+        if known == word { return true }
+    }
+    return false
+}
+
+function layoutNumber(token: String) -> Bool {
+    if utf8Count(token) == 0 { return false }
+    let first = utf8Byte(token, 0)
+    return first >= 48 && first <= 57
+}
+
+function layoutWordish(token: String) -> Bool {
+    if utf8Count(token) == 0 { return false }
+    let first = utf8Byte(token, 0)
+    return first == 95 || first == 34 || first == 39 || first >= 128
+        || (first >= 48 && first <= 57) || (first >= 65 && first <= 90) || (first >= 97 && first <= 122)
+}
+
+// The operators written with a space on each side when binary.
+function layoutOperator(token: String) -> Bool {
+    return layoutHas([
+        "=", "+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=", "&&", "||", "&", "|", "^",
+        "<<", ">>", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="
+    ], token)
+}
+
+// The operators that may also be prefixes.
+function layoutPrefix(token: String) -> Bool {
+    return layoutHas(["-", "+", "!", "~", "*", "&", "++", "--"], token)
+}
+
+function layoutNewlineBetween(source: String, start: Int, end: Int) -> Bool {
+    var at = start
+    while at < end {
+        if utf8Byte(source, at) == 10 { return true }
+        at += 1
+    }
+    return false
+}
+
+function layoutAtLineStart(source: String, start: Int) -> Bool {
+    var at = start - 1
+    while at >= 0 {
+        let byte = utf8Byte(source, at)
+        if byte == 10 { return true }
+        if byte != 32 && byte != 9 { return false }
+        at -= 1
+    }
+    return true
+}
+
+// The end of the directive starting at `start`: the end of its line, or of
+// the last line a trailing `\` continues it onto, without trailing spaces.
+function layoutDirectiveEnd(source: String, start: Int) -> Int {
+    let length = utf8Count(source)
+    var at = start
+    while at < length {
+        let byte = utf8Byte(source, at)
+        if byte == 10 {
+            var before = at - 1
+            if before >= 0 && utf8Byte(source, before) == 13 { before -= 1 }
+            if before >= 0 && utf8Byte(source, before) == 92 {
+                at += 1
+                continue
+            }
+            break
+        }
+        at += 1
+    }
+    var end = at
+    while end > start {
+        let last = utf8Byte(source, end - 1)
+        if last != 32 && last != 9 && last != 13 { return end }
+        end -= 1
+    }
+    return end
+}

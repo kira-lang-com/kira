@@ -1,0 +1,394 @@
+import Foundation
+
+// Deep `kira test` suite for the primitives the compiler answers directly:
+// the floating-point maths, the two Unicode-scalar string operations, and the
+// two that read a number out of text.
+//
+// These are worth a suite of their own because each replaced something a
+// program used to write for itself, and the thing it replaced was *nearly*
+// right. `sqrtApprox` was eight Newton iterations and agreed to about six
+// digits; `substring(0, count - 1)` is a backspace that works until the last
+// character is not one byte. A test that only checks the easy case would pass
+// against either.
+//
+// All top-level names use the `prm`/`Primitive` prefix so they never collide in
+// the harness's single flat package namespace.
+
+// --- helpers ---------------------------------------------------------------
+
+// Folds a float to an Int the runner can compare, keeping `digits` of it.
+//
+// The Test runner compares scalars, and comparing floats directly would make
+// these tests assert a decimal rendering rather than a value.
+function prmScaled(value: Float, digits: Int) -> Int {
+    var scale = 1
+    for index in 0..digits {
+        scale = scale * 10
+    }
+    return Int(value * Float(scale))
+}
+
+// --- floating point --------------------------------------------------------
+
+@Test
+function primitiveSqrtIsExactOnASquare() {
+    expect!(Int(sqrt(144.0)) == 12)
+}
+
+// The case the Newton approximation could not answer: ten digits of a root
+// that is not one.
+@Test
+function primitiveSqrtHoldsTenDigits() {
+    expect!(prmScaled(sqrt(2.0), 10) == 14142135623)
+}
+
+@Test
+function primitiveSqrtOfZero() {
+    expect!(Int(sqrt(0.0)) == 0)
+}
+
+@Test
+function primitiveCbrtPreservesTheRealSign() {
+    expect!(Int(cbrt(27.0)) * 10 + Int(cbrt(-8.0)) == 28)
+}
+
+@Test
+function primitiveSinAndCosAtZero() {
+    expect!(Int(sin(0.0)) * 10 + Int(cos(0.0)) == 1)
+}
+
+// A quarter turn: sine is one and cosine is zero, which a series expansion
+// only reaches approximately.
+@Test
+function primitiveSinAtAQuarterTurn() {
+    expect!(prmScaled(sin(1.5707963267948966), 9) == 1000000000)
+}
+
+// An eighth turn's tangent is 1 in mathematics and 0.9999999999999999 in
+// IEEE-754, because pi/4 is not exactly representable. The assertion is the
+// value the hardware gives — rounding it up to 1 here would be a test that
+// passes against an implementation which is wrong by more.
+@Test
+function primitiveTanAtAnEighthTurn() {
+    expect!(prmScaled(tan(0.7853981633974483), 9) == 999999999)
+}
+
+// Rounding away from zero is where floor and ceil differ, and where a naive
+// truncation gets both wrong.
+@Test
+function primitiveFloorAndCeilOnANegative() {
+    expect!(Int(floor(0.0 - 1.5)) * 10 + Int(ceil(0.0 - 1.5)) == 0 - 21)
+}
+
+@Test
+function primitiveAbsDropsTheSign() {
+    expect!(prmScaled(abs(0.0 - 1.5), 1) + prmScaled(abs(1.5), 1) == 30)
+}
+
+@Test
+function primitiveInfinityIsAFloatLiteral() {
+    var score = 0
+    if infinity > 1.0 { score = score + 1 }
+    if -infinity < -1.0 { score = score + 10 }
+    if infinity == infinity { score = score + 100 }
+    expect!(score == 111)
+}
+
+// --- the exponential and the logarithm -------------------------------------
+
+// The pair a program used to reach for a series expansion to get. Ten digits
+// of `e` is past where a Taylor sum written in Kira stopped agreeing.
+@Test
+function primitiveExpAtOneIsE() {
+    expect!(prmScaled(exp(1.0), 9) == 2718281828)
+}
+
+@Test
+function primitiveLogOfOneIsZero() {
+    expect!(Int(log(1.0)) == 0)
+}
+
+// Each undoes the other, which a pair of independent approximations would only
+// nearly do.
+// Each undoes the other to within a last-bit rounding. Where the round trip
+// lands is the host libm's last-bit choice — one library answers exactly 37,
+// another one ulp below — and both engines on one host share that library, so
+// the parity fact is the band, not a single value. The band is one scaled
+// unit wide: anything outside it is an implementation wrong by more than a
+// last bit, which is what this test exists to catch.
+@Test
+function primitiveExpAndLogInvertEachOther() {
+    let scaled = prmScaled(exp(log(37.0)), 6)
+    expect!(scaled >= 36999999 && scaled <= 37000000)
+}
+
+@Test
+function primitiveLog2AndExp2OnAPowerOfTwo() {
+    expect!(Int(log2(1024.0)) * 10000 + Int(exp2(10.0)) == 101024)
+}
+
+@Test
+function primitiveLog10OnAPowerOfTen() {
+    expect!(prmScaled(log10(1000.0), 6) == 3000000)
+}
+
+// --- rounding --------------------------------------------------------------
+
+// Halves go away from zero, and the fraction is dropped toward it. A cast to
+// `Int` gives the second answer for both, which is why `round` is here.
+@Test
+function primitiveRoundAndTruncDisagreeOnAHalf() {
+    expect!(Int(round(0.0 - 1.5)) * 10 + Int(trunc(0.0 - 1.5)) == 0 - 21)
+}
+
+@Test
+function primitiveRoundGoesAwayFromZero() {
+    expect!(Int(round(1.5)) * 10 + Int(round(2.5)) == 23)
+}
+
+// --- inverse and hyperbolic trigonometry -----------------------------------
+
+@Test
+function primitiveAsinAndAcosAtOne() {
+    expect!(prmScaled(asin(1.0), 9) + Int(acos(1.0)) == 1570796326)
+}
+
+@Test
+function primitiveAtanAtOneIsAnEighthTurn() {
+    expect!(prmScaled(atan(1.0), 9) == 785398163)
+}
+
+@Test
+function primitiveHyperbolicsAtZero() {
+    expect!(Int(sinh(0.0)) * 100 + Int(cosh(0.0)) * 10 + Int(tanh(0.0)) == 10)
+}
+
+@Test
+function primitiveTanhSaturatesBelowOne() {
+    expect!(prmScaled(tanh(1.0), 9) == 761594155)
+}
+
+// --- the two-operand operations --------------------------------------------
+
+// Two operands travel on one instruction, and the second is not ignored: an
+// arity taken from the operation is what makes `pow` reachable at all.
+@Test
+function primitivePowRaisesTheFirstToTheSecond() {
+    expect!(Int(pow(2.0, 10.0)) == 1024)
+}
+
+// The operands are not interchangeable, and a lowering that popped them in the
+// wrong order would answer 100 here.
+@Test
+function primitivePowKeepsItsOperandsInOrder() {
+    expect!(Int(pow(10.0, 2.0)) == 100)
+}
+
+// A scroll view's deceleration: the rate is per millisecond, so where a fling
+// comes to rest is the rate raised to a count of them.
+@Test
+function primitivePowDeceleratesAFling() {
+    expect!(prmScaled(pow(0.998, 500.0), 6) == 367511)
+}
+
+@Test
+function primitiveMinAndMaxPickAnOperand() {
+    expect!(Int(min(1.0, 2.0)) * 10 + Int(max(1.0, 2.0)) == 12)
+}
+
+@Test
+function primitiveMinAndMaxOnNegatives() {
+    expect!(Int(min(0.0 - 1.0, 0.0 - 2.0)) * 10 + Int(max(0.0 - 1.0, 0.0 - 2.0)) == 0 - 21)
+}
+
+@Test
+function primitiveHypotIsTheThreeFourFiveTriangle() {
+    expect!(Int(hypot(3.0, 4.0)) == 5)
+}
+
+// The sign comes from the second operand and the magnitude from the first, so
+// the two directions answer -15 and 15.
+@Test
+function primitiveCopysignTakesTheSecondSign() {
+    expect!(
+        prmScaled(copysign(1.5, 0.0 - 2.0), 1) * 100 + prmScaled(
+            copysign(0.0 - 1.5, 2.0),
+            1
+        ) == 0 - 1485
+    )
+}
+
+// Negative zero is the case `copysign` exists for: `0.0 - 0.0` is POSITIVE
+// zero, so the sign has to be carried rather than derived, and a `< 0.0` test
+// on the second operand would answer with the wrong sign here.
+@Test
+function primitiveCopysignReadsANegativeZerosSign() {
+    let zero: Float = 0.0
+    let one: Float = 1.0
+    let half: Float = 1.5
+    let negativeZero = copysign(zero, zero - one)
+    expect!(
+        prmScaled(copysign(half, negativeZero), 1) * 100 + prmScaled(
+            copysign(half, zero - zero),
+            1
+        ) == 0 - 1485
+    )
+}
+
+// Truncated toward zero, so the remainder keeps the dividend's sign.
+@Test
+function primitiveFmodKeepsTheDividendsSign() {
+    expect!(Int(fmod(7.0, 4.0)) * 10 + Int(fmod(0.0 - 7.0, 4.0)) == 27)
+}
+
+// `atan2` reads both signs to place the angle in its quadrant, which is the
+// whole reason it exists beside `atan`.
+@Test
+function primitiveAtan2TakesItsQuadrantFromBothSigns() {
+    expect!(prmScaled(atan2(1.0, 0.0 - 1.0), 9) == 2356194490)
+}
+
+// A two-operand primitive nested in another: the inner call must leave exactly
+// one value behind or the outer one pops the wrong operand.
+@Test
+function primitiveTwoOperandCallsNest() {
+    expect!(Int(pow(min(2.0, 3.0), max(3.0, 2.0))) == 8)
+}
+
+// The operands are `Float`, and a count held as an `Int` is converted at the
+// call rather than silently: `pow(2, 8)` is KSEM063, exactly as `sqrt(2)` is.
+@Test
+function primitiveTwoOperandCallsTakeConvertedInts() {
+    let base = 2
+    let exponent = 8
+    expect!(Int(pow(Float(base), Float(exponent))) == 256)
+}
+
+// A program may still name a function `min`; a two-operand primitive is
+// shadowed by a user's declaration exactly as `sqrt` is.
+function prmMin(a: Int, b: Int) -> Int {
+    return a * 100 + b
+}
+
+@Test
+function primitiveAProgramsOwnTwoOperandNameWins() {
+    expect!(prmMin(4, 2) == 402)
+}
+
+// A program may still name a function `sqrt`; the primitive answers only when
+// nothing else does.
+function prmSqrt(value: Int) -> Int {
+    return value + 1
+}
+
+@Test
+function primitiveAProgramsOwnNameWins() {
+    expect!(prmSqrt(41) == 42)
+}
+
+// --- Unicode scalars -------------------------------------------------------
+
+// The text of a code point, or `?` for one that is not a scalar.
+function prmScalar(codepoint: Number) -> String {
+    match scalarText(codepoint) {
+        Some(text) -> return text
+        None -> return "?"
+    }
+}
+
+@Test
+function primitiveScalarTextBuildsAscii() {
+    expect!(prmScalar(65) + prmScalar(66) == "AB")
+}
+
+// Two bytes and four bytes: a byte-wise implementation gives a different
+// answer here rather than a slightly wrong one.
+@Test
+function primitiveScalarTextBuildsMultiByteScalars() {
+    expect!(prmScalar(233).count * 10 + prmScalar(128512).count == 24)
+}
+
+// Below zero, past the last code point, and a surrogate half: none is a
+// scalar, so none has text.
+@Test
+function primitiveScalarTextOfANonScalarIsNothing() {
+    expect!(prmScalar(0 - 1) + prmScalar(1114112) + prmScalar(0xD800) == "???")
+}
+
+@Test
+function primitiveDropLastScalarOnAscii() {
+    expect!("kira".dropLastScalar() == "kir")
+}
+
+// The whole reason this is not `substring(0, count - 1)`: the last scalar is
+// two bytes, so a byte-wise drop leaves text that is no longer UTF-8.
+@Test
+function primitiveDropLastScalarOnATwoByteScalar() {
+    expect!("kirä".dropLastScalar() == "kir")
+}
+
+@Test
+function primitiveDropLastScalarOnAFourByteScalar() {
+    let text = "A" + prmScalar(128512)
+    expect!(text.dropLastScalar() == "A")
+}
+
+@Test
+function primitiveDropLastScalarOnEmptyTextIsEmpty() {
+    expect!("".dropLastScalar().count == 0)
+}
+
+// Appending a code point and taking it back off is what a text field does.
+@Test
+function primitiveScalarRoundTripsThroughATextField() {
+    var typed = ""
+    typed = typed + prmScalar(107)
+    typed = typed + prmScalar(105)
+    typed = typed + prmScalar(128512)
+    typed = typed.dropLastScalar()
+    expect!(typed == "ki")
+}
+
+// --- reading a number out of text ------------------------------------------
+
+// The number text spells, or `none`.
+function prmRead(text: borrow String) -> String {
+    match text.toNumber() {
+        Some(number) -> return String(number)
+        None -> return "none"
+    }
+}
+
+@Test
+function primitiveToNumberReadsAWholeNumber() {
+    expect!(prmRead("42") + " " + prmRead("-13") == "42 -13")
+}
+
+@Test
+function primitiveToNumberRefusesText() {
+    expect!(prmRead("abc") + " " + prmRead("") + " " + prmRead("1.2.3") == "none none none")
+}
+
+// A decimal is read exactly rather than refused or truncated.
+@Test
+function primitiveToNumberReadsADecimal() {
+    expect!(prmRead("3.5") == "3.5")
+}
+
+@Test
+function primitiveToNumberReadsSurroundingSpace() {
+    expect!(prmRead("  7 ") == "7")
+}
+
+// As a program uses it: read what reads, skip what does not.
+@Test
+function primitiveToNumberGuardsASum() {
+    var total: Number = 0
+    for each in ["10", "x", "20", "", "30"] {
+        match each.toNumber() {
+            Some(number) -> total = total + number
+            None -> {}
+        }
+    }
+    expect!(String(total) == "60")
+}

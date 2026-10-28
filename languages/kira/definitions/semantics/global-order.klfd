@@ -1,0 +1,213 @@
+// The order globals initialize in, settled once every reached body is
+// checked: a global's initializer may read another only through a function
+// it calls, or through a field default such a function fills in. Each global
+// comes after every global its initializer can reach through the functions it
+// names, and declaration order decides among the ready ones. An initializer
+// that reaches its own global is refused.
+//
+// A program checked to be evaluated -- a macro's body, run at compile time --
+// initializes only the globals its entries reach and the globals those
+// depend on. The libraries it imports declare globals of their own, made by
+// code that may call into native libraries, which an evaluation never
+// reaches; the body has no use for a global it does not read.
+
+extend Checker {
+    function orderGlobalInitialization(borrow mut self, evaluating: Optional<[Int]>) {
+        var initializer = 0
+        match program.globalInitializer {
+            Some(target) -> initializer = target
+            None -> return
+        }
+        var summaries = GlobalReadSummaries { calls = [], reads = [], walked = [], visits = [], visit = 0 }
+        let none: [Int] = []
+        for _ in 0..program.functions.count {
+            summaries.calls.append(none)
+            summaries.reads.append(none)
+            summaries.walked.append(false)
+            summaries.visits.append(0)
+        }
+        var dependencies: [[Int]] = []
+        for global in program.globals {
+            match global.initializer {
+                Some(value) -> {
+                    var walk = FunctionReach { called = [], dispatched = [], reads = [] }
+                    walk.expression(program, value)
+                    dependencies.append(summaries.reachable(program, walk))
+                }
+                None -> dependencies.append(none)
+            }
+        }
+        var order = placeGlobals(dependencies)
+        var placed: [Bool] = []
+        for _ in 0..program.globals.count { placed.append(false) }
+        for index in order { placed[index] = true }
+        var reported = false
+        for index in 0..placed.count {
+            if placed[index] { continue }
+            if !reported { report(.GlobalCycle, declarations.globals[index].name.span) }
+            reported = true
+            order.append(index)
+        }
+        match evaluating {
+            Some(roots) -> order = globalsReached(program, roots, dependencies, order)
+            None -> order = ownGlobals(move order)
+        }
+        program.globalInitOrder = order
+        var body: [Int] = []
+        for index in order {
+            match program.globals[index].initializer {
+                Some(value) -> body.append(program.addStatement(.InitializeGlobal(index, value)))
+                None -> {}
+            }
+        }
+        program.functions[initializer].body = body
+    }
+
+    // The globals of `order` the unit's own packages declare. Those of a
+    // package built apart initialize in its own unit, whose initializer the
+    // program's calls first, packages in the order they build.
+    function ownGlobals(borrow mut self, order: [Int]) -> [Int] {
+        var own: [Int] = []
+        var initialized: [Bool] = []
+        for _ in 0..declarations.modules.count { initialized.append(false) }
+        for index in order {
+            let position = declarations.sourcePosition(declarations.globals[index].name.span.file)
+            if position < 0 || !declarations.modules[declarations.sources[position].module].separate {
+                own.append(index)
+            } else {
+                initialized[declarations.sources[position].module] = true
+            }
+        }
+        if program.dependencyUnit { return own }
+        for position in 0..declarations.modules.count {
+            for module in 0..declarations.modules.count {
+                if initialized[module] && declarations.modules[module].apartPosition == position {
+                    program.apartInitializers.append(apartInitializerSymbol(declarations.modules[module].name))
+                }
+            }
+        }
+        return own
+    }
+}
+
+// The functions an evaluation of `evaluated` starts from: its entries, as
+// `checkRoots` finds them, without the global initializer. None for a
+// program built to run.
+function evaluationRoots(program: CheckedProgram, evaluated: Optional<[String]>) -> Optional<[Int]> {
+    match evaluated {
+        Some(symbols) -> {
+            var roots: [Int] = []
+            for index in 0..program.functions.count {
+                for symbol in symbols { if program.functions[index].symbol == symbol { roots.append(index) } }
+            }
+            return .Some(roots)
+        }
+        None -> return .None
+    }
+}
+
+// The globals of `order` that the functions reached from `roots` read, and
+// those each of them depends on, in the same order.
+function globalsReached(program: CheckedProgram, roots: [Int], dependencies: [[Int]], order: [Int]) -> [Int] {
+    let reached = reachableFunctions(program, roots)
+    var needed: [Bool] = []
+    for _ in 0..program.globals.count { needed.append(false) }
+    var pending: [Int] = []
+    for index in 0..reached.count {
+        if !reached[index] { continue }
+        var walk = FunctionReach { called = [], dispatched = [], reads = [] }
+        walk.statements(program, program.functions[index].body)
+        for global in walk.reads { pending.append(global) }
+    }
+    var position = 0
+    while position < pending.count {
+        let global = pending[position]
+        position += 1
+        if needed[global] { continue }
+        needed[global] = true
+        for dependency in dependencies[global] { pending.append(dependency) }
+    }
+    var kept: [Int] = []
+    for index in order { if needed[index] { kept.append(index) } }
+    return kept
+}
+
+// The globals in initialization order: each comes after every global it
+// depends on, and the lowest declared index goes first among the ready ones.
+// A global left waiting on itself or a cycle is not placed.
+function placeGlobals(dependencies: [[Int]]) -> [Int] {
+    var waiting: [Int] = []
+    var dependents: [[Int]] = []
+    let none: [Int] = []
+    for _ in 0..dependencies.count {
+        waiting.append(0)
+        dependents.append(none)
+    }
+    var seen: [Int] = []
+    for _ in 0..dependencies.count { seen.append(-1) }
+    for index in 0..dependencies.count {
+        for dependency in dependencies[index] {
+            if seen[dependency] == index { continue }
+            seen[dependency] = index
+            waiting[index] += 1
+            dependents[dependency].append(index)
+        }
+    }
+    var placed: [Bool] = []
+    for _ in 0..dependencies.count { placed.append(false) }
+    var order: [Int] = []
+    var start = 0
+    while start < dependencies.count {
+        if placed[start] || waiting[start] != 0 {
+            start += 1
+            continue
+        }
+        placed[start] = true
+        order.append(start)
+        let current = start
+        start += 1
+        for dependent in dependents[current] {
+            waiting[dependent] -= 1
+            if waiting[dependent] == 0 && !placed[dependent] && dependent < start { start = dependent }
+        }
+    }
+    return order
+}
+
+// Each function's own global reads and the functions it names, walked once.
+// A function a walk has visited is marked with that walk's number, so no walk
+// clears what the one before it marked.
+struct GlobalReadSummaries {
+    var calls: [[Int]]
+    var reads: [[Int]]
+    var walked: [Bool]
+    var visits: [Int]
+    var visit: Int
+
+    // The globals `start` reads, and those of every function it reaches
+    // through the functions each names.
+    function reachable(borrow mut self, program: CheckedProgram, start: FunctionReach) -> [Int] {
+        var found = start.reads
+        visit += 1
+        var pending = start.called
+        var position = 0
+        while position < pending.count {
+            let callee = pending[position]
+            position += 1
+            if visits[callee] == visit { continue }
+            visits[callee] = visit
+            if !walked[callee] {
+                var walk = FunctionReach { called = [], dispatched = [], reads = [] }
+                walk.statements(program, program.functions[callee].body)
+                calls[callee] = walk.called
+                reads[callee] = walk.reads
+                walked[callee] = true
+            }
+            for global in reads[callee] { found.append(global) }
+            for target in calls[callee] {
+                if visits[target] != visit { pending.append(target) }
+            }
+        }
+        return found
+    }
+}

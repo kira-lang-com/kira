@@ -1,0 +1,372 @@
+import Foundation
+
+// Overloading, in depth: several declarations answering to one name, and the
+// rule that picks among them at a call. Prefix: ovx / Ovx.
+//
+// Exercises: free functions overloaded by type and by arity; the specificity
+// rule (an argument that *is* the parameter's type beats one erased into it);
+// the directness rule (an exact arity beats one leaning on a default); struct,
+// class and construct-backed methods; a subclass overriding one overload and
+// inheriting the rest; and a construct-backed declaration constructed through
+// its parenthesized header or through any `init(…)` it declares, including one
+// whose trailing block fills a `some X` content parameter.
+//
+// Every result folds into one deterministic Int checksum, so a call that
+// silently reaches the wrong body changes the printed value even where no case
+// thought to assert it.
+
+// ---------------------------------------------------------------------------
+// O1: free functions, told apart by type and by arity.
+// ---------------------------------------------------------------------------
+
+function ovxDescribe(n: Int) -> Int {
+    return n * 10
+}
+
+function ovxDescribe(text: String) -> Int {
+    return text.count * 100
+}
+
+function ovxDescribe(a: Int, b: Int) -> Int {
+    return a + b
+}
+
+function ovxDescribe(f: Float) -> Int {
+    return 7
+}
+
+@Test
+function ovxFreeFunctionsByType() {
+    let got = ovxDescribe(3) + ovxDescribe("hi") + ovxDescribe(Float(1.5))
+    expect!(got == 237)
+}
+
+@Test
+function ovxFreeFunctionsByArity() {
+    expect!(ovxDescribe(2, 5) == 7)
+}
+
+// ---------------------------------------------------------------------------
+// O2: specificity — the concrete declaration beats the erased family.
+// ---------------------------------------------------------------------------
+
+construct OvxShape {
+    @Required function area() -> Int
+}
+
+construct OvxSquare(side: Int) extends OvxShape {
+    function area() -> Int { return side * side }
+}
+
+construct OvxStrip(length: Int) extends OvxShape {
+    function area() -> Int { return length }
+}
+
+function ovxSize(s: Any OvxShape) -> Int {
+    return s.area()
+}
+
+function ovxSize(s: OvxSquare) -> Int {
+    return s.area() * 1000
+}
+
+@Test
+function ovxConcreteBeatsErased() {
+    expect!(ovxSize(OvxSquare(side: 3)) == 9000)
+}
+
+@Test
+function ovxErasedTakesTheFamilyOverload() {
+    let erased: Any OvxShape = OvxSquare(side: 2)
+    expect!(ovxSize(move erased) == 4)
+}
+
+@Test
+function ovxAnUnrelatedVariantStillErases() {
+    expect!(ovxSize(OvxStrip(length: 6)) == 6)
+}
+
+// ---------------------------------------------------------------------------
+// O3: directness — an exact arity beats one that leans on a default.
+// ---------------------------------------------------------------------------
+
+function ovxTag(n: Int) -> Int {
+    return n
+}
+
+function ovxTag(n: Int, times: Int = 3) -> Int {
+    return n * times
+}
+
+@Test
+function ovxExactArityBeatsADefault() {
+    expect!(ovxTag(5) == 5)
+}
+
+@Test
+function ovxAFilledDefaultSlotReachesTheOtherOverload() {
+    expect!(ovxTag(5, 4) == 20)
+}
+
+// ---------------------------------------------------------------------------
+// O4: struct methods.
+// ---------------------------------------------------------------------------
+
+struct OvxVec2 {
+    var x: Int = 0
+    var y: Int = 0
+
+    function scaled(by: Int) -> Int { return (x + y) * by }
+    function scaled(by: Int, plus: Int) -> Int { return (x + y) * by + plus }
+    function scaled(label: String) -> Int { return label.count }
+}
+
+@Test
+function ovxStructMethodsOverload() {
+    let v = OvxVec2 { x: 2, y: 3 }
+    let got = v.scaled(by: 4) + v.scaled(by: 4, plus: 1) + v.scaled(label: "abc")
+    expect!(got == 44)
+}
+
+// ---------------------------------------------------------------------------
+// O5: class methods, and an override that takes one overload and leaves the
+// other inherited.
+// ---------------------------------------------------------------------------
+
+class OvxCounter {
+    var total: Int = 0
+
+    function bump() -> Int {
+        self.total = self.total + 1
+        return self.total
+    }
+
+    function bump(step: Int) -> Int {
+        self.total = self.total + step
+        return self.total
+    }
+}
+
+class OvxFastCounter extends OvxCounter {
+    override function bump(step: Int) -> Int {
+        self.total = self.total + step * 100
+        return self.total
+    }
+}
+
+@Test
+function ovxClassMethodsOverload() {
+    var c = OvxCounter {}
+    let got = c.bump() + c.bump(step: 10)
+    expect!(got == 12)
+}
+
+@Test
+function ovxOverridingOneOverloadInheritsTheRest() {
+    var f = OvxFastCounter {}
+    // The inherited `bump()` runs the base body; the overridden
+    // `bump(step:)` runs the subclass's.
+    let got = f.bump() + f.bump(step: 3)
+    expect!(got == 302)
+}
+
+// ---------------------------------------------------------------------------
+// O6: construct-backed members.
+// ---------------------------------------------------------------------------
+
+construct OvxWidget {
+    @Required function total() -> Int
+}
+
+construct OvxText(text: String) extends OvxWidget {
+    function total() -> Int { return text.count }
+}
+
+construct OvxLeaf(number: Int) extends OvxWidget {
+    function total() -> Int { return number }
+    function grown(by: Int) -> Int { return number + by }
+    function grown(by: Int, times: Int) -> Int { return (number + by) * times }
+}
+
+@Test
+function ovxConstructMembersOverload() {
+    let leaf = OvxLeaf(number: 3)
+    let got = leaf.grown(by: 1) + leaf.grown(by: 1, times: 5)
+    expect!(got == 24)
+}
+
+// ---------------------------------------------------------------------------
+// O7: `init(…)` — a declaration's secondary ways of being constructed.
+//
+// The parenthesized header fills the stored members; each `init` is another
+// way, told apart by what it takes, whose body ends in a construction through
+// the header. One of them takes the trailing block in a `some X` content
+// parameter.
+// ---------------------------------------------------------------------------
+
+construct OvxLink(destination: Any OvxWidget, label: Any OvxWidget) extends OvxWidget {
+    init(title: String, value: Int) {
+        return OvxLink(destination: OvxLeaf(number: value), label: OvxText(text: title))
+    }
+
+    init(value: Int, label: some OvxWidget) {
+        return OvxLink(destination: OvxLeaf(number: value), label: label)
+    }
+
+    function total() -> Int {
+        return destination.total() * 100 + label.total()
+    }
+}
+
+@Test
+function ovxConstructionReachesTheHeader() {
+    let link = OvxLink(destination: OvxLeaf(number: 3), label: OvxText(text: "ab"))
+    expect!(link.total() == 302)
+}
+
+@Test
+function ovxConstructionReachesAnInit() {
+    expect!(OvxLink(title: "abc", value: 7).total() == 703)
+}
+
+@Test
+function ovxATrailingBlockFillsAnInitContentParameter() {
+    expect!(OvxLink(value: 5) { OvxText(text: "wxyz") }.total() == 504)
+}
+
+@Test
+function ovxAnInitValueCrossesTheFamilyBoundary() {
+    // The chosen init erases its concrete argument into the family the
+    // header stores, so the value survives the crossing.
+    let inner: Any OvxWidget = OvxLeaf(number: 9)
+    expect!(OvxLink(value: 2) { move inner }.total() == 209)
+}
+
+// An `init` written in an `extend`, as a contract imports one, is another way
+// to construct the declaration, as one in its construct is.
+extend OvxLink {
+    function init(count: Int, text: String) -> OvxLink {
+        return OvxLink(destination: OvxLeaf(number: count), label: OvxText(text: text))
+    }
+}
+
+@Test
+function ovxConstructionReachesAnExtendedInit() {
+    expect!(OvxLink(count: 4, text: "abcde").total() == 405)
+}
+
+// ---------------------------------------------------------------------------
+// Entry: fold every area into one checksum with distinct weights, so a call
+// reaching the wrong body changes the printed value.
+// ---------------------------------------------------------------------------
+
+function ovxSection() -> Int {
+    var checksum = 0
+
+    let o1 = ovxDescribe(3) + ovxDescribe("hi") + ovxDescribe(2, 5) + ovxDescribe(Float(1.5))
+    let o2 = ovxSize(OvxSquare(side: 3)) + ovxSize(OvxStrip(length: 6))
+    let o3 = ovxTag(5) + ovxTag(5, 4)
+
+    let v = OvxVec2 { x: 2, y: 3 }
+    let o4 = v.scaled(by: 4) + v.scaled(by: 4, plus: 1) + v.scaled(label: "abc")
+
+    var slow = OvxCounter {}
+    var fast = OvxFastCounter {}
+    let o5 = slow.bump() + slow.bump(step: 10) + fast.bump() + fast.bump(step: 3)
+
+    let leaf = OvxLeaf(number: 3)
+    let o6 = leaf.grown(by: 1) + leaf.grown(by: 1, times: 5)
+
+    let o8 = ovxDoThing { return 1 } second: { return 2 } third: { return 3 }
+        +ovxPick(3) { return 1 } other: { return 2 }
+        +ovxPick(0) { return 1 } other: { return 2 }
+        +OvxRow(gap: 1) { OvxText(text: "ab") OvxText(text: "cde") }.total()
+
+    let o7 = OvxLink(destination: OvxLeaf(number: 3), label: OvxText(text: "ab")).total()
+        + OvxLink(title: "abc", value: 7).total()
+        + OvxLink(value: 5) { OvxText(text: "wxyz") }.total()
+
+    checksum = checksum + o1 * 1
+    checksum = checksum + o2 * 7
+    checksum = checksum + o3 * 31
+    checksum = checksum + o4 * 131
+    checksum = checksum + o5 * 521
+    checksum = checksum + o6 * 2099
+    checksum = checksum + o7 * 8419
+    checksum = checksum + o8 * 33769
+
+    // A rolling fold so position matters too.
+    var mix = 17
+    let parts = [o1, o2, o3, o4, o5, o6, o7, o8]
+    for i in 0..parts.count {
+        mix = mix * 33 + parts[i]
+    }
+    checksum = checksum + mix
+
+    return checksum
+}
+
+// ---------------------------------------------------------------------------
+// O8: a `{ … }` with no `in`. The same brace is a zero-parameter closure where
+// the parameter is a function and children where the callee is a
+// construct-backed declaration — the parser carries both readings and the
+// callee chooses.
+// ---------------------------------------------------------------------------
+
+function ovxDoThing(first: () -> Int, second: () -> Int, third: () -> Int) -> Int {
+    return first() * 100 + second() * 10 + third()
+}
+
+function ovxPick(n: Int, ok: () -> Int, other: () -> Int) -> Int {
+    if n > 0 { return ok() }
+    return other()
+}
+
+construct OvxRow(gap: Int = 0) extends OvxWidget {
+    @Content let children: [Any OvxWidget]
+    function total() -> Int {
+        var sum = gap
+        for child in children { sum = sum + child.total() }
+        return sum
+    }
+}
+
+@Test
+function ovxParenlessTrailingClosures() {
+    let got = ovxDoThing {
+        return 1
+    } second: {
+        return 2
+    } third: {
+        return 3
+    }
+    expect!(got == 123)
+}
+
+@Test
+function ovxAnArgumentThenTrailingClosures() {
+    let got = ovxPick(3) { return 1 } other: { return 2 }
+    expect!(got == 1)
+}
+
+@Test
+function ovxTheOtherBranchOfTrailingClosures() {
+    let got = ovxPick(0) { return 1 } other: { return 2 }
+    expect!(got == 2)
+}
+
+@Test
+function ovxTheSameBraceShapeStillPassesChildren() {
+    expect!(OvxRow(gap: 1) { OvxText(text: "ab") OvxText(text: "cde") }.total() == 6)
+}
+
+// A literal with a fraction point picks a `Float` declaration over an integer
+// one, as `1.0` did before a bare literal was a `Number`.
+function ovxFractionPick(value: Float) -> Int { return 1 }
+function ovxFractionPick(value: U64) -> Int { return 2 }
+
+@Test
+function ovxFractionLiteralPicksFloat() {
+    let got = ovxFractionPick(1.0) * 10 + ovxFractionPick(2)
+    expect!(got == 12)
+}

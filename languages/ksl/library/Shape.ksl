@@ -1,0 +1,23 @@
+// Signed distances shared by UI shaders. `import Shape` from any package
+// finds this file under the toolchain's library root.
+
+// The distance from `point` to a rectangle of half extent `halfSize`
+// centered on the origin, its corners rounded by `radius`.
+function sdRound(point: Float2, halfSize: Float2, radius: Float) -> Float {
+    let q = Float2(
+        abs(point.x) - halfSize.x + radius,
+        abs(point.y) - halfSize.y + radius
+    )
+    let outside = Float2(max(q.x, 0.0), max(q.y, 0.0))
+    return min(max(q.x, q.y), 0.0) + length(outside) - radius
+}
+
+// The union of two distances, blended over `k`; a hard union when `k` is
+// not positive.
+function smoothUnion(first: Float, second: Float, k: Float) -> Float {
+    if k <= 0.0 {
+        return min(first, second)
+    }
+    let e = max(k - abs(first - second), 0.0)
+    return min(first, second) - e * e * 0.25 / k
+}

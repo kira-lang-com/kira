@@ -1,0 +1,409 @@
+// The lexer: Kira source text to a token stream ending in `End`.
+//
+// Whitespace, `//` comments and nesting `/* */` comments are trivia. A newline
+// is whitespace like any other, and `;` is not Kira syntax. A UTF-8 byte-order
+// mark opening the file is skipped. Identifiers and
+// keywords are ASCII; anything else outside a string literal is an unexpected
+// character. Lexing stops at the first failure.
+
+let asciiTab = 9
+let asciiNewline = 10
+let asciiReturn = 13
+let asciiSpace = 32
+let asciiBang = 33
+let asciiQuote = 34
+let asciiHash = 35
+let asciiDollar = 36
+let asciiPercent = 37
+let asciiAmpersand = 38
+let asciiLeftParen = 40
+let asciiRightParen = 41
+let asciiStar = 42
+let asciiPlus = 43
+let asciiComma = 44
+let asciiMinus = 45
+let asciiDot = 46
+let asciiSlash = 47
+let asciiZero = 48
+let asciiNine = 57
+let asciiColon = 58
+let asciiSemicolon = 59
+let asciiLess = 60
+let asciiEquals = 61
+let asciiGreater = 62
+let asciiQuestion = 63
+let asciiAt = 64
+let asciiUpperA = 65
+let asciiUpperF = 70
+let asciiUpperX = 88
+let asciiUpperZ = 90
+let asciiLeftBracket = 91
+let asciiBackslash = 92
+let asciiRightBracket = 93
+let asciiCaret = 94
+let asciiUnderscore = 95
+let asciiLowerA = 97
+let asciiLowerE = 101
+let asciiLowerF = 102
+let asciiLowerN = 110
+let asciiLowerR = 114
+let asciiLowerT = 116
+let asciiLowerX = 120
+let asciiLowerZ = 122
+let asciiLeftBrace = 123
+let asciiPipe = 124
+let asciiRightBrace = 125
+let asciiTilde = 126
+
+// The value `byte` reads past the last byte of the source.
+let endOfInput = -1
+
+function isDigit(byte: Int) -> Bool {
+    return byte >= asciiZero && byte <= asciiNine
+}
+
+function isHexDigit(byte: Int) -> Bool {
+    return isDigit(byte)
+        || (byte >= asciiLowerA && byte <= asciiLowerF)
+        || (byte >= asciiUpperA && byte <= asciiUpperF)
+}
+
+function isIdentifierStart(byte: Int) -> Bool {
+    return byte == asciiUnderscore
+        || (byte >= asciiLowerA && byte <= asciiLowerZ)
+        || (byte >= asciiUpperA && byte <= asciiUpperZ)
+}
+
+function isIdentifierContinue(byte: Int) -> Bool {
+    return isIdentifierStart(byte) || isDigit(byte)
+}
+
+function isWhitespace(byte: Int) -> Bool {
+    return byte == asciiSpace || byte == asciiTab || byte == asciiNewline || byte == asciiReturn
+}
+
+function isLineBreak(byte: Int) -> Bool {
+    return byte == asciiNewline || byte == asciiReturn
+}
+
+// The tokens of a source and the doc comments it holds, in source order. The
+// doc comments are trivia to the grammar; the parser attaches them to the
+// declarations they document (docs/documentation.md).
+struct Lexed {
+    let tokens: [Token]
+    let docs: [DocComment]
+}
+
+function lex(source: String, file: Int) -> Result<[Token], Failure> {
+    match lexDocumented(source, file) {
+        Ok(lexed) -> return .Ok(lexed.tokens)
+        Error(failure) -> return .Error(failure)
+    }
+}
+
+function lexDocumented(source: String, file: Int) -> Result<Lexed, Failure> {
+    var lexer = Lexer { source = source, file = file, position = 0 }
+    if lexer.byte(0) == 239 && lexer.byte(1) == 187 && lexer.byte(2) == 191 { lexer.position = 3 }
+    var tokens: [Token] = []
+    var reachedEnd = false
+    while !reachedEnd {
+        match lexer.next() {
+            Ok(token) -> {
+                tokens.append(token)
+                reachedEnd = token.kind == .End
+            }
+            Error(failure) -> { return .Error(failure) }
+        }
+    }
+    recordTokens(tokens)
+    return .Ok(Lexed { tokens = tokens, docs = lexer.docs })
+}
+
+// A run of `///` lines documenting the declaration after it, or of `//!`
+// lines documenting the file. Lines with nothing but whitespace between them
+// are one comment.
+struct DocComment {
+    let span: Span
+    let inner: Bool
+}
+
+struct Lexer {
+    let source: String
+    let file: Int
+    var position: Int
+    var docs: [DocComment] = []
+
+    function byte(borrow self, ahead: Int) -> Int {
+        let at = position + ahead
+        if at >= utf8Count(source) { return endOfInput }
+        return utf8Byte(source, at)
+    }
+
+    function next(borrow mut self) -> Result<Token, Failure> {
+        match skipTrivia() {
+            Some(failure) -> { return .Error(failure) }
+            None -> {}
+        }
+        let start = position
+        let first = byte(0)
+        if first == endOfInput { return .Ok(token(.End, start)) }
+        if first == asciiQuote { return string() }
+        if isDigit(first) { return .Ok(number()) }
+        if isIdentifierStart(first) { return .Ok(word(start)) }
+        // `$name` names the value a property wrapper projects for `name`.
+        if first == asciiDollar && isIdentifierStart(byte(1)) {
+            position += 1
+            return .Ok(word(start))
+        }
+        return symbol()
+    }
+
+    function token(borrow self, kind: TokenKind, start: Int) -> Token {
+        return Token { kind = kind, span = Span { file = file, start = start, end = position } }
+    }
+
+    function failure(borrow self, diagnostic: Diagnostic, start: Int) -> Failure {
+        return Failure { diagnostic = diagnostic, span = Span { file = file, start = start, end = position } }
+    }
+
+    // Skips whitespace and comments, stopping at the next token.
+    function skipTrivia(borrow mut self) -> Optional<Failure> {
+        while true {
+            let current = byte(0)
+            if isWhitespace(current) {
+                position += 1
+            } else if current == asciiSlash && byte(1) == asciiSlash {
+                let start = position
+                while !isLineBreak(byte(0)) && byte(0) != endOfInput {
+                    position += 1
+                }
+                recordComment(source, file, start, position)
+                recordDoc(start, position)
+            } else if current == asciiSlash && byte(1) == asciiStar {
+                let start = position
+                match skipBlockComment() {
+                    Some(failure) -> { return .Some(failure) }
+                    None -> {}
+                }
+                recordComment(source, file, start, position)
+            } else {
+                return .None
+            }
+        }
+        return .None
+    }
+
+    // Records the line comment from `start` to `end` as a doc comment when it
+    // is `///` or `//!`. Four slashes is a plain comment, so a rule drawn
+    // across a line stays out of the docs.
+    function recordDoc(borrow mut self, start: Int, end: Int) {
+        if end - start < 3 { return }
+        var inner = false
+        let marker = utf8Byte(source, start + 2)
+        if marker == asciiBang {
+            inner = true
+        } else if marker == asciiSlash {
+            if end - start > 3 && utf8Byte(source, start + 3) == asciiSlash { return }
+        } else {
+            return
+        }
+        let count = docs.count
+        if count > 0 && docs[count - 1].inner == inner && blankBetween(docs[count - 1].span.end, start) {
+            let previous = docs[count - 1]
+            docs[count - 1] = DocComment { span = Span { file = file, start = previous.span.start, end = end }, inner = inner }
+            return
+        }
+        docs.append(DocComment { span = Span { file = file, start = start, end = end }, inner = inner })
+    }
+
+    // Whether the bytes from `from` to `to` are whitespace only.
+    function blankBetween(borrow self, from: Int, to: Int) -> Bool {
+        for index in from..to {
+            if !isWhitespace(utf8Byte(source, index)) { return false }
+        }
+        return true
+    }
+
+    // Block comments nest, so commenting out a region that holds one closes
+    // where it should.
+    function skipBlockComment(borrow mut self) -> Optional<Failure> {
+        let start = position
+        var depth = 0
+        while byte(0) != endOfInput {
+            if byte(0) == asciiSlash && byte(1) == asciiStar {
+                depth += 1
+                position += 2
+            } else if byte(0) == asciiStar && byte(1) == asciiSlash {
+                depth -= 1
+                position += 2
+                if depth == 0 { return .None }
+            } else {
+                position += 1
+            }
+        }
+        return .Some(failure(.UnterminatedComment, start))
+    }
+
+    function word(borrow mut self, start: Int) -> Token {
+        while isIdentifierContinue(byte(0)) {
+            position += 1
+        }
+        match keyword(utf8Slice(source, start, position)) {
+            Some(kind) -> { return token(kind, start) }
+            None -> { return token(.Identifier, start) }
+        }
+    }
+
+    // `0x` starts a hexadecimal literal only when a hex digit follows it, so
+    // `0xyz` is the literal `0` and the name `xyz`. A `.` is a decimal point
+    // only when a digit follows; otherwise it is member access on an integer.
+    function number(borrow mut self) -> Token {
+        let start = position
+        let marker = byte(1)
+        if byte(0) == asciiZero && (marker == asciiLowerX || marker == asciiUpperX) && isHexDigit(byte(2)) {
+            position += 2
+            while isHexDigit(byte(0)) {
+                position += 1
+            }
+            return token(.IntegerLiteral, start)
+        }
+        while isDigit(byte(0)) {
+            position += 1
+        }
+        if byte(0) == asciiDot && isDigit(byte(1)) {
+            position += 1
+            while isDigit(byte(0)) {
+                position += 1
+            }
+            return token(.FloatLiteral, start)
+        }
+        return token(.IntegerLiteral, start)
+    }
+
+    // A backslash before a line break continues the literal on the next line.
+    function string(borrow mut self) -> Result<Token, Failure> {
+        let start = position
+        position += 1
+        while byte(0) != asciiQuote {
+            let current = byte(0)
+            if current == endOfInput || isLineBreak(current) {
+                return .Error(failure(.UnterminatedString, start))
+            }
+            if current == asciiBackslash {
+                let escaped = byte(1)
+                if escaped == 40 {
+                    position += 2
+                    try interpolation()
+                    continue
+                }
+                if escaped == asciiReturn && byte(2) == asciiNewline {
+                    position += 1
+                } else if !isLineBreak(escaped) && !isKnownEscape(escaped) {
+                    let escape = position
+                    position += 2
+                    return .Error(failure(.UnknownEscape, escape))
+                }
+                position += 1
+            }
+            position += 1
+        }
+        position += 1
+        return .Ok(token(.StringLiteral, start))
+    }
+
+    function interpolation(borrow mut self) -> Result<Bool, Failure> {
+        let start = position
+        var depth = 1
+        while depth > 0 {
+            let current = byte(0)
+            if current == endOfInput { return .Error(failure(.UnterminatedString, start)) }
+            if current == asciiQuote { try string() continue }
+            if current == 40 { depth += 1 }
+            if current == 41 { depth -= 1 }
+            position += 1
+        }
+        return .Ok(true)
+    }
+
+    function symbol(borrow mut self) -> Result<Token, Failure> {
+        let start = position
+        match pairedSymbol(byte(0), byte(1)) {
+            Some(kind) -> {
+                position += 2
+                return .Ok(token(kind, start))
+            }
+            None -> {}
+        }
+        match singleSymbol(byte(0)) {
+            Some(kind) -> {
+                position += 1
+                return .Ok(token(kind, start))
+            }
+            None -> {}
+        }
+        let unexpected = byte(0)
+        position += utf8Length(unexpected)
+        if unexpected == asciiSemicolon {
+            return .Error(failure(.Semicolon, start))
+        }
+        return .Error(failure(.UnexpectedCharacter, start))
+    }
+}
+
+function isKnownEscape(byte: Int) -> Bool {
+    return byte == asciiLowerN || byte == asciiLowerT || byte == asciiLowerR || byte == asciiLowerE
+        || byte == asciiZero || byte == asciiQuote || byte == asciiBackslash
+}
+
+// The bytes a UTF-8 sequence occupies, from its first byte, so an unexpected
+// character's span covers the whole character.
+function utf8Length(first: Int) -> Int {
+    if first >= 240 { return 4 }
+    if first >= 224 { return 3 }
+    if first >= 192 { return 2 }
+    return 1
+}
+
+function pairedSymbol(first: Int, second: Int) -> Optional<TokenKind> {
+    if first == asciiMinus && second == asciiGreater { return .Some(.Arrow) }
+    if first == asciiEquals && second == asciiEquals { return .Some(.EqualEqual) }
+    if first == asciiBang && second == asciiEquals { return .Some(.BangEqual) }
+    if first == asciiLess && second == asciiEquals { return .Some(.LessEqual) }
+    if first == asciiGreater && second == asciiEquals { return .Some(.GreaterEqual) }
+    if first == asciiAmpersand && second == asciiAmpersand { return .Some(.AmpersandAmpersand) }
+    if first == asciiPipe && second == asciiPipe { return .Some(.PipePipe) }
+    if first == asciiLess && second == asciiLess { return .Some(.LessLess) }
+    if first == asciiGreater && second == asciiGreater { return .Some(.GreaterGreater) }
+    if first == asciiDot && second == asciiDot { return .Some(.DotDot) }
+    return .None
+}
+
+function singleSymbol(byte: Int) -> Optional<TokenKind> {
+    if byte == asciiHash { return .Some(.Hash) }
+    if byte == asciiLeftParen { return .Some(.LeftParen) }
+    if byte == asciiRightParen { return .Some(.RightParen) }
+    if byte == asciiLeftBrace { return .Some(.LeftBrace) }
+    if byte == asciiRightBrace { return .Some(.RightBrace) }
+    if byte == asciiLeftBracket { return .Some(.LeftBracket) }
+    if byte == asciiRightBracket { return .Some(.RightBracket) }
+    if byte == asciiComma { return .Some(.Comma) }
+    if byte == asciiColon { return .Some(.Colon) }
+    if byte == asciiDot { return .Some(.Dot) }
+    if byte == asciiAt { return .Some(.At) }
+    if byte == asciiBackslash { return .Some(.Backslash) }
+    if byte == asciiQuestion { return .Some(.Question) }
+    if byte == asciiEquals { return .Some(.Equals) }
+    if byte == asciiPlus { return .Some(.Plus) }
+    if byte == asciiMinus { return .Some(.Minus) }
+    if byte == asciiStar { return .Some(.Star) }
+    if byte == asciiSlash { return .Some(.Slash) }
+    if byte == asciiPercent { return .Some(.Percent) }
+    if byte == asciiLess { return .Some(.Less) }
+    if byte == asciiGreater { return .Some(.Greater) }
+    if byte == asciiAmpersand { return .Some(.Ampersand) }
+    if byte == asciiPipe { return .Some(.Pipe) }
+    if byte == asciiCaret { return .Some(.Caret) }
+    if byte == asciiTilde { return .Some(.Tilde) }
+    if byte == asciiBang { return .Some(.Bang) }
+    return .None
+}

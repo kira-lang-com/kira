@@ -1,0 +1,30 @@
+// A top-level `let` whose value is a constant is that constant where it is
+// read, and `namespace Name { ... }` names its members `Name.member`, beside a
+// type of the same name.
+
+import Foundation
+
+distinct Rights = U64
+
+namespace Rights {
+    let read: Rights = Rights(U64(4))
+    let write: Rights = Rights(U64(8))
+}
+
+let pageSize: U64 = 4096
+let scale: Number = 0.75
+let applications: String = "/Applications"
+let greeting: String = "say \"hi\""
+let enabled: Bool = true
+// Worked out at run time, so read from the global.
+let doubled: U64 = pageSize * U64(2)
+
+@Main
+function main() -> Int {
+    if (Rights.read.raw | Rights.write.raw) != U64(12) { return 1 }
+    if pageSize != U64(4096) || doubled != U64(8192) { return 2 }
+    if scale * Number(4) != Number(3) { return 3 }
+    if applications != "/Applications" || greeting.count != 8 { return 4 }
+    if !enabled { return 5 }
+    return 42
+}

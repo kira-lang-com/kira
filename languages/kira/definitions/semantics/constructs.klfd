@@ -1,0 +1,613 @@
+// Construct families and the declarations they back.
+//
+// A declaration becomes a struct: its inputs and stored members are fields,
+// a computed member is a zero-parameter method tagged `Computed`, and every
+// member takes the declaration as its receiver. A family becomes the enum
+// `Any Family`, with one case per declaration seen through it carrying that
+// declaration's struct. Each family member becomes a method on the enum that
+// matches on the case and calls the declaration's own member, so a family
+// value needs nothing beyond ordinary enums and calls.
+
+function materializeConstructs(move tree: SyntaxTree) -> SyntaxTree {
+    var prepared = move tree
+    var families: [Family] = []
+    for declared in prepared.constructs {
+        if declared.parameters.isNone() {
+            let members = familyMembers(prepared, declared, 0)
+            families.append(Family { declaration = declared, members = members })
+        }
+    }
+    let index = constructIndex(prepared.constructs)
+    // The module each family's values cross RIDL through, or nothing for a
+    // family whose values never leave the program (`witnessModule`).
+    var crossing: [String] = []
+    for family in families { crossing.append(witnessModule(prepared, family.declaration)) }
+    for declared in prepared.constructs {
+        match declared.parameters {
+            Some(parameters) -> {
+                var conforms: [Witnessing] = []
+                for number in 0..families.count {
+                    let name = families[number].declaration.name
+                    if !index.seenThrough(declared, name.text, 0) { continue }
+                    if utf8Count(crossing[number]) > 0 {
+                        conforms.append(Witnessing { family = name, module = crossing[number] })
+                    } else if extendsFromElsewhere(prepared, declared, name) {
+                        report(.PrivateFamilyExtended, declared.name.span)
+                    }
+                }
+                let imported = frameworkFile(prepared, declared.name.span.file)
+                let declaration = constructStruct(prepared, families, declared, parameters, imported, conforms)
+                if declared.typeParameters.count > 0 {
+                    prepared.genericStructs.append(genericConstruct(declaration, declared.typeParameters))
+                } else {
+                    prepared.structs.append(declaration)
+                }
+            }
+            None -> {}
+        }
+    }
+    for number in 0..families.count {
+        if utf8Count(crossing[number]) > 0 {
+            declareWitnessedFamily(prepared, families[number], crossing[number])
+        } else {
+            declareFamilyEnum(prepared, index, families[number])
+        }
+    }
+    return prepared
+}
+
+// A generic declaration's struct as the template its instances are minted
+// from (`mintStruct`), each joining the family as it is.
+function genericConstruct(declaration: StructDeclaration, parameters: [Identifier]) -> StructDeclaration {
+    return StructDeclaration {
+        name = declaration.name, genericParameters = parameters, typeArguments = [], callableModes = [],
+        ancestors = declaration.ancestors, genericBase = "Construct", baseNameSpan = declaration.baseNameSpan,
+        specialized = false, typeSuffix = declaration.typeSuffix, fields = declaration.fields, methods = declaration.methods
+    }
+}
+
+struct Family {
+    let declaration: ConstructDeclaration
+    let members: FamilyMembers
+}
+
+// A crossing family a declaration is seen through, and the module whose
+// RIDL trait it is.
+struct Witnessing {
+    let family: Identifier
+    let module: String
+}
+
+// What a family hands every declaration it backs, its parents' members
+// included.
+struct FamilyMembers {
+    var fields: [FieldDeclaration]
+    var requirements: [FieldDeclaration]
+    var computed: [FunctionDeclaration]
+    var methods: [FunctionDeclaration]
+    // The methods and computed values whose bodies read a requirement: the
+    // ones a member must answer itself to do without the requirement.
+    var reading: [String] = []
+
+    function empty() -> FamilyMembers {
+        return FamilyMembers { fields = [], requirements = [], computed = [], methods = [] }
+    }
+
+    function provides(borrow self, name: String) -> Bool {
+        for field in fields {
+            if field.name.text == name { return true }
+        }
+        for method in computed {
+            if method.name.text == name { return true }
+        }
+        for method in methods {
+            if method.name.text == name { return true }
+        }
+        return false
+    }
+}
+
+function constructNamed(constructs: [ConstructDeclaration], name: String) -> Optional<ConstructDeclaration> {
+    for declared in constructs {
+        if declared.name.text == name { return .Some(declared) }
+    }
+    return .None
+}
+
+// The family a parent reference names, or nothing after reporting that it
+// names no family.
+function parentFamily(constructs: [ConstructDeclaration], parent: TypeReference, reporting: Bool) -> Optional<ConstructDeclaration> {
+    match constructNamed(constructs, parent.name.text) {
+        Some(family) -> {
+            if family.parameters.isNone() { return .Some(family) }
+        }
+        None -> {}
+    }
+    if reporting { report(.UnknownConstruct, parent.name.span) }
+    return .None
+}
+
+function familyMembers(tree: borrow mut SyntaxTree, family: ConstructDeclaration, depth: Int) -> FamilyMembers {
+    var members = FamilyMembers.empty()
+    if depth > tree.constructs.count {
+        report(.ConstructCycle, family.name.span)
+        return members
+    }
+    let reporting = depth == 0
+    for parent in family.parents {
+        match parentFamily(tree.constructs, parent, depth == 0) {
+            Some(base) -> {
+                let inherited = familyMembers(tree, base, depth + 1)
+                for field in inherited.fields { addField(members.fields, field) }
+                for requirement in inherited.requirements { addField(members.requirements, requirement) }
+                for method in inherited.computed { addMethod(members.computed, method) }
+                for method in inherited.methods { addMethod(members.methods, method) }
+            }
+            None -> {}
+        }
+    }
+    for field in family.fields { addField(members.fields, field) }
+    for requirement in family.requirements { addField(members.requirements, requirement) }
+    for method in family.computed { addMethod(members.computed, computedMethod(tree, method)) }
+    for method in family.methods { addMethod(members.methods, method) }
+    for supplied in family.overrides {
+        match overrideMember(tree, members, supplied) {
+            Some(method) -> {
+                if hasAttribute(method.annotations, .Computed) {
+                    addMethod(members.computed, method)
+                } else {
+                    addMethod(members.methods, method)
+                }
+            }
+            None -> {
+                if reporting { report(.UndefinedFunction, supplied.name.span) }
+            }
+        }
+    }
+    var noReaders: [String] = []
+    members.reading = move noReaders
+    for method in members.methods {
+        if readsRequirement(tree, method, members.requirements) { members.reading.append(method.name.text) }
+    }
+    for method in members.computed {
+        if readsRequirement(tree, method, members.requirements) { members.reading.append(method.name.text) }
+    }
+    return members
+}
+
+// Whether the body of `method` names one of `requirements`, bare or through
+// `self`. The body's expressions are the ones its span holds.
+function readsRequirement(tree: borrow SyntaxTree, method: FunctionDeclaration, requirements: [FieldDeclaration]) -> Bool {
+    if requirements.count == 0 || method.body.count == 0 { return false }
+    let span = method.span
+    for expression in tree.expressions {
+        let at = expression.span
+        if at.file != span.file || at.start < span.start || at.end > span.end { continue }
+        var named = expression.kind.name()
+        if named.isNone() { named = expression.kind.memberName() }
+        match named {
+            Some(identifier) -> {
+                for requirement in requirements { if requirement.name.text == identifier.text { return true } }
+            }
+            None -> {}
+        }
+    }
+    return false
+}
+
+function addField(fields: borrow mut [FieldDeclaration], field: FieldDeclaration) {
+    for index in 0..fields.count {
+        if fields[index].name.text == field.name.text {
+            fields[index] = field
+            return
+        }
+    }
+    fields.append(field)
+}
+
+// A method stands in for one of the same name taking the same parameter
+// types; one taking others is another overload beside it.
+// A member the construct writes itself. One taking what an earlier one takes
+// redeclares it, as two such functions do; only a family's or a parent's member
+// is replaced.
+function addOwnMethod(methods: borrow mut [FunctionDeclaration], method: FunctionDeclaration) {
+    for earlier in methods {
+        if earlier.name.text == method.name.text && sameParameterReferences(earlier, method) {
+            report(.DuplicateFunction, method.name.span)
+            return
+        }
+    }
+    methods.append(method)
+}
+
+function addMethod(methods: borrow mut [FunctionDeclaration], method: FunctionDeclaration) {
+    for index in 0..methods.count {
+        if methods[index].name.text == method.name.text && sameParameterReferences(methods[index], method) {
+            methods[index] = method
+            return
+        }
+    }
+    methods.append(method)
+}
+
+// `name { ... }` as the member the family declares under `name`: a method
+// keeps the family's signature, and a value member becomes a computed one.
+function overrideMember(tree: borrow mut SyntaxTree, family: FamilyMembers, supplied: ConstructOverride) -> Optional<FunctionDeclaration> {
+    for method in family.methods {
+        if method.name.text == supplied.name.text {
+            return .Some(FunctionDeclaration {
+                name = supplied.name, annotations = [], receiver = method.receiver,
+                parameters = method.parameters, result = method.result, body = supplied.body, span = supplied.span,
+                typeParameters = [], scope = method.scope
+            })
+        }
+    }
+    var result: Optional<TypeReference> = .None
+    for requirement in family.requirements {
+        if requirement.name.text == supplied.name.text { result = .Some(requirement.annotation) }
+    }
+    for method in family.computed {
+        if method.name.text == supplied.name.text { result = method.result }
+    }
+    for field in family.fields {
+        if field.name.text == supplied.name.text { result = .Some(field.annotation) }
+    }
+    if result.isNone() { return .None }
+    return .Some(computedMethod(tree, FunctionDeclaration {
+        name = supplied.name, annotations = [implicitAnnotation(.Computed, supplied.name.span)],
+        receiver = .Free, parameters = [], result = result, body = supplied.body, span = supplied.span,
+        typeParameters = [], scope = GenericScope.none()
+    }))
+}
+
+// A computed member's body ends in the value it reads as.
+function computedMethod(tree: borrow mut SyntaxTree, method: FunctionDeclaration) -> FunctionDeclaration {
+    if method.body.count == 0 { return method }
+    let last = method.body[method.body.count - 1]
+    match tree.statements[last].kind.evaluatedExpression() {
+        Some(value) -> {
+            var body = truncated(method.body, method.body.count - 1)
+            body.append(tree.addStatement(.Return(.Some(value)), tree.statements[last].span))
+            return FunctionDeclaration {
+                name = method.name, annotations = method.annotations, receiver = method.receiver,
+                parameters = method.parameters, result = method.result, body = body, span = method.span,
+                typeParameters = method.typeParameters, scope = method.scope
+            }
+        }
+        None -> return method
+    }
+}
+
+// A declaration becomes its struct. `conforms` names the crossing families
+// it is seen through (`Any Family`), whose witness tables it answers through
+// its own methods. A declaration a framework's contract makes is the
+// framework's: its fields are the contract's and every member is answered
+// in the framework, so it takes nothing from its family here.
+function constructStruct(tree: borrow mut SyntaxTree, families: [Family], declared: ConstructDeclaration, parameters: [FieldDeclaration], imported: Bool, conforms: [Witnessing]) -> StructDeclaration {
+    var ancestors: [TypeReference] = []
+    var boxes: [FunctionDeclaration] = []
+    for witnessing in conforms {
+        ancestors.append(namedReference(Identifier { text = familyTypeName(witnessing.family.text), span = witnessing.family.span }))
+        boxes.append(witnessBox(tree, declared.name, selfReference(declared), witnessing, imported))
+    }
+    if imported {
+        // The contract's fields in its order: the inputs, then what the
+        // body declares, the child slots among it (KLF-RIDL section 27.7).
+        var inputs: [FieldDeclaration] = []
+        for field in parameters { addField(inputs, field) }
+        for field in declared.fields { addField(inputs, field) }
+        return StructDeclaration {
+            name = declared.name, genericParameters = [], typeArguments = [], callableModes = [],
+            ancestors = ancestors, genericBase = "Construct", baseNameSpan = declared.name.span,
+            specialized = false, typeSuffix = scopedTypeSuffix(declared.name.text), fields = inputs, methods = boxes
+        }
+    }
+    var family = FamilyMembers.empty()
+    var found = false
+    for candidate in families {
+        if candidate.declaration.name.text == declared.parents[0].name.text {
+            family = candidate.members
+            found = true
+        }
+    }
+    if !found {
+        if namesPrivateFamily(families, declared.parents[0].name.text) {
+            report(.PrivateFamilyExtended, declared.name.span)
+        } else {
+            report(.UnknownConstruct, declared.parents[0].name.span)
+        }
+    }
+    var fields: [FieldDeclaration] = []
+    for field in parameters { addField(fields, field) }
+    for field in declared.fields { addField(fields, field) }
+    for field in declared.requirements { addField(fields, field) }
+    var methods: [FunctionDeclaration] = []
+    // Methods no witness table names: they call through one.
+    var forwarded: [FunctionDeclaration] = []
+    for method in declared.methods { addOwnMethod(methods, method) }
+    for init in declared.inits { addOwnMethod(methods, init) }
+    for method in declared.computed { addMethod(methods, computedMethod(tree, method)) }
+    for supplied in declared.overrides {
+        match overrideMember(tree, family, supplied) {
+            Some(method) -> addMethod(methods, method)
+            None -> report(.UndefinedFunction, supplied.name.span)
+        }
+    }
+    for field in family.fields {
+        if !declaresConstructMember(fields, methods, field.name.text) { fields.append(field) }
+    }
+    for method in family.computed {
+        if !declaresConstructMember(fields, methods, method.name.text) { methods.append(method) }
+    }
+    for method in family.methods {
+        if declaresMethod(fields, methods, method) { continue }
+        // A crossing family's default is its module's, which the witness
+        // table falls back to (KLF-RIDL section 23.2); the declaration's
+        // value reaches it through its trait object (`forwardedDefault`).
+        if hasAttribute(method.annotations, .Ridl) {
+            match backingWitness(declared, conforms) {
+                Some(witnessing) -> forwarded.append(forwardedDefault(tree, declared, witnessing.family, method))
+                None -> {}
+            }
+            continue
+        }
+        if hasAttribute(method.annotations, .Required) {
+            report(.MissingConstructMember, declared.name.span)
+        } else {
+            methods.append(method)
+        }
+    }
+    // A declaration answering every family method itself has nothing left
+    // that could read a value it does not provide.
+    if !overridesEveryMethod(declared, family) {
+        for requirement in family.requirements {
+            if !declaresConstructMember(fields, methods, requirement.name.text) { report(.MissingConstructMember, declared.name.span) }
+        }
+    }
+    // A witness entry calls a function, so each value member the table
+    // answers is read through one, and every method a table may name is
+    // kept for it. An init makes a value rather than answering for one, so
+    // no table names it.
+    if conforms.count > 0 {
+        for field in family.requirements {
+            if holdsField(fields, field.name.text) { methods.append(witnessReader(tree, field)) }
+        }
+        for field in family.fields {
+            if holdsField(fields, field.name.text) { methods.append(witnessReader(tree, field)) }
+        }
+        var marked: [FunctionDeclaration] = []
+        for method in methods {
+            if method.name.text == "init" {
+                marked.append(method)
+            } else {
+                marked.append(annotated(tree, method, witnessExport))
+            }
+        }
+        methods = marked
+    }
+    for box in boxes { methods.append(box) }
+    if forwarded.count > 0 {
+        for method in forwarded { methods.append(method) }
+        methods.append(witnessUnboxMethod(tree, declared, backingWitness(declared, conforms).unwrap().family))
+    }
+    return StructDeclaration {
+        name = declared.name, genericParameters = [], typeArguments = [], callableModes = [],
+        ancestors = ancestors, genericBase = "Construct", baseNameSpan = declared.name.span,
+        specialized = false, typeSuffix = scopedTypeSuffix(declared.name.text), fields = fields, methods = methods
+    }
+}
+
+// The roles a function plays in a crossing family's witness tables, each
+// what its `Witness` attribute holds (`witnessRole`).
+let witnessExport = "export"
+let witnessDefault = "default"
+let witnessMember = "member"
+
+// `static function __witness_box_Family(value: Declaration) -> Any Family`,
+// which boxes a value as a trait object of `Family` (KLF-RIDL sections 21.6
+// and 21.7). Lowering writes its body: the box, and the witness table the
+// declaration's module exports, which the program defines when the
+// declaration is its own and imports otherwise. Its role carries the
+// trait's module, the declaration's, the family, the declaration and
+// whether it is imported.
+function witnessBox(tree: borrow mut SyntaxTree, declaration: Identifier, boxed: TypeReference, witnessing: Witnessing, imported: Bool) -> FunctionDeclaration {
+    let span = declaration.span
+    let role = joinText([
+        "box\t", witnessing.module, "\t", fileModuleName(tree, span.file), "\t", witnessing.family.text, "\t", declaration.text, "\t",
+        imported ? "1" : "0"
+    ])
+    let value = Parameter {
+        name = Identifier { text = "value", span = span }, mode = .Owned, annotation = boxed, copies = false, initial = .None
+    }
+    return FunctionDeclaration {
+        name = Identifier { text = witnessBoxName(witnessing.family.text), span = span }, annotations = [implicitTextAnnotation(tree, .Witness, role, span)],
+        receiver = .Static, parameters = [value],
+        result = .Some(namedReference(Identifier { text = familyTypeName(witnessing.family.text), span = witnessing.family.span })), body = [],
+        span = span, typeParameters = [], scope = GenericScope.none()
+    }
+}
+
+// The type a declaration's own methods take: its name, or for a generic
+// one `Name<Value>` over its own parameters, which each instance writes
+// with its arguments.
+function selfReference(declared: ConstructDeclaration) -> TypeReference {
+    if declared.typeParameters.count == 0 { return namedReference(declared.name) }
+    var arguments: [TypeReference] = []
+    for parameter in declared.typeParameters { arguments.append(namedReference(parameter)) }
+    return TypeReference {
+        qualifier = .None, name = declared.name, arguments = arguments, modes = [], instanceName = genericInstanceName(declared.name.text, arguments)
+    }
+}
+
+function witnessBoxName(family: String) -> String {
+    return joinText(["__witness_box_", family])
+}
+
+// `method` playing `role` in a witness table.
+function annotated(tree: borrow mut SyntaxTree, method: FunctionDeclaration, role: String) -> FunctionDeclaration {
+    var annotations = method.annotations
+    annotations.append(implicitTextAnnotation(tree, .Witness, role, method.name.span))
+    return FunctionDeclaration {
+        name = method.name, annotations = annotations, receiver = method.receiver, parameters = method.parameters, result = method.result,
+        body = method.body, span = method.span, typeParameters = method.typeParameters, scope = method.scope
+    }
+}
+
+// Whether `declared` joins the family `family` from another module than the
+// one declaring it. A family no module exports is one enum of its own
+// module's declarations, which each unit of a split build would otherwise
+// build with the cases it alone sees. Foundation's `Test` is the exception:
+// a test build is one unit (`untestedCases`).
+function extendsFromElsewhere(tree: SyntaxTree, declared: ConstructDeclaration, family: Identifier) -> Bool {
+    let home = fileModuleName(tree, family.span.file)
+    if home == "Foundation" || isExportedName(tree, family.span) { return false }
+    return home != fileModuleName(tree, declared.name.span.file)
+}
+
+// Whether `written` names a family of another module that this file cannot
+// see: a package built apart keeps its families as `Name#Module`, and a
+// private one is never renamed back where it is not exported.
+function namesPrivateFamily(families: [Family], written: String) -> Bool {
+    let prefix = joinText([written, "#"])
+    for family in families {
+        if startsWithText(family.declaration.name.text, prefix) { return true }
+    }
+    return false
+}
+
+// The name of the module `file` belongs to.
+function fileModuleName(tree: SyntaxTree, file: Int) -> String {
+    for source in tree.sources {
+        if source.file == file { return tree.modules[source.module].name }
+    }
+    return ""
+}
+
+// `__witness_name() -> T { return copy self.name }`, the function a witness
+// table reads the value member `name` through.
+function witnessReader(tree: borrow mut SyntaxTree, field: FieldDeclaration) -> FunctionDeclaration {
+    let span = field.name.span
+    let receiver = tree.addExpression(.Name(Identifier { text = "self", span = span }), span)
+    let read = tree.addExpression(.Member(receiver, field.name), span)
+    let copied = tree.addExpression(.Transfer(.Copy, read), span)
+    return FunctionDeclaration {
+        name = Identifier { text = witnessReaderName(field.name.text), span = span }, annotations = [], receiver = .Borrowed,
+        parameters = [], result = .Some(field.annotation), body = [tree.addStatement(.Return(.Some(copied)), span)], span = span,
+        typeParameters = [], scope = GenericScope.none()
+    }
+}
+
+function holdsField(fields: [FieldDeclaration], name: String) -> Bool {
+    for field in fields { if field.name.text == name { return true } }
+    return false
+}
+
+function witnessReaderName(member: String) -> String {
+    return joinText(["__witness_", member])
+}
+
+// Whether `file` is a framework's contract.
+function frameworkFile(tree: SyntaxTree, file: Int) -> Bool {
+    for source in tree.sources {
+        if source.file == file { return tree.modules[source.module].framework }
+    }
+    return false
+}
+
+// The module through which a family's values cross RIDL as trait objects
+// (KLF-RIDL sections 21.7 and 27.7), or nothing. A family crosses when a
+// framework's contract declares it, and when the library being built, or a
+// package built as a unit of its own, in its unit or another, makes it
+// `public`: then values of declarations other modules write reach it, and
+// its own values reach them, so neither side can list every declaration.
+function witnessModule(tree: SyntaxTree, family: ConstructDeclaration) -> String {
+    for source in tree.sources {
+        if source.file == family.name.span.file {
+            let module = tree.modules[source.module]
+            if module.framework { return module.name }
+            let apart = module.separate || (source.module == 0 && tree.dependencyUnit)
+            if ((module.package == "" && module.library) || apart) && isExportedName(tree, family.name.span) { return module.name }
+            return ""
+        }
+    }
+    return ""
+}
+
+function overridesEveryMethod(declared: ConstructDeclaration, family: FamilyMembers) -> Bool {
+    var names: [String] = []
+    for method in family.methods { names.append(method.name.text) }
+    for method in family.computed { names.append(method.name.text) }
+    if names.count == 0 { return false }
+    // A method that reads no requirement can keep its default.
+    if family.reading.count > 0 { names = copy family.reading }
+    for name in names {
+        var own = false
+        for written in declared.methods { if written.name.text == name { own = true } }
+        for written in declared.computed { if written.name.text == name { own = true } }
+        for supplied in declared.overrides { if supplied.name.text == name { own = true } }
+        if !own { return false }
+    }
+    return true
+}
+
+function declaresConstructMember(fields: [FieldDeclaration], methods: [FunctionDeclaration], name: String) -> Bool {
+    for field in fields {
+        if field.name.text == name { return true }
+    }
+    for method in methods {
+        if method.name.text == name && !hasAttribute(method.annotations, .Required) { return true }
+    }
+    return false
+}
+
+// Whether a family's `method` is already met: by a value member of its name
+// or by a method of its name taking the same parameter types.
+function declaresMethod(fields: [FieldDeclaration], methods: [FunctionDeclaration], method: FunctionDeclaration) -> Bool {
+    for field in fields {
+        if field.name.text == method.name.text { return true }
+    }
+    for declared in methods {
+        if declared.name.text == method.name.text && sameParameterReferences(declared, method) && !hasAttribute(declared.annotations, .Required) { return true }
+    }
+    return false
+}
+
+// The constructs by name, each filed in the bucket its name hashes to.
+struct ConstructIndex {
+    let constructs: [ConstructDeclaration]
+    var buckets: [[Int]]
+
+    // The first construct called `name`.
+    function named(borrow self, name: String) -> Optional<ConstructDeclaration> {
+        for index in buckets[nameHash(name) % nameSetBuckets] {
+            if constructs[index].name.text == name { return .Some(constructs[index]) }
+        }
+        return .None
+    }
+
+    // Whether `declared` is seen through `family`: backed by it, or by a
+    // family that extends it.
+    function seenThrough(borrow self, declared: ConstructDeclaration, family: String, depth: Int) -> Bool {
+        if depth > constructs.count { return false }
+        for parent in declared.parents {
+            if parent.name.text == family { return true }
+            match named(parent.name.text) {
+                Some(base) -> {
+                    if seenThrough(base, family, depth + 1) { return true }
+                }
+                None -> {}
+            }
+        }
+        return false
+    }
+}
+
+function constructIndex(constructs: [ConstructDeclaration]) -> ConstructIndex {
+    var buckets: [[Int]] = []
+    for bucket in 0..nameSetBuckets {
+        let empty: [Int] = []
+        buckets.append(empty)
+    }
+    for index in 0..constructs.count { buckets[nameHash(constructs[index].name.text) % nameSetBuckets].append(index) }
+    return ConstructIndex { constructs = constructs, buckets = buckets }
+}

@@ -1,0 +1,77 @@
+import Foundation
+import Heap
+
+enum Failure {
+    Missing
+}
+
+struct Measurement {
+    let amount: Number
+}
+
+distinct Rights = U32
+
+enum Key: U32 {
+    F12 = 69
+    Escape = 1
+}
+
+@Open
+enum ExternalKey {
+    Known
+}
+
+struct Identity {
+    function value<T>(borrow self, input: T) -> T {
+        return input
+    }
+}
+
+function completed() -> Result<Void, Failure> {
+    return .Ok
+}
+
+@Main
+function main() -> Int {
+    let amount = 0.1 + 0.2
+    if amount != 0.3 { return 1 }
+    let whole = 3
+    let values = [1, 2, 3]
+    if values[whole - 1] != 3 { return 2 }
+    if whole + values.count != 6 { return 3 }
+    var total: Number = 0
+    for index in 0..whole { total += index }
+    if total != 3 { return 4 }
+    var indexed: Number = 0
+    for (index, value) in values.enumerated() { indexed += index + value }
+    if indexed != 9 { return 9 }
+    let rights = Rights(U32(1)) | Rights(U32(2))
+    if !rights.has(Rights(U32(2))) { return 10 }
+    if code(Key.F12) != U32(69) { return 11 }
+    let external = fromCode<ExternalKey>(123)
+    match external {
+        Known -> return 12
+        else -> {}
+    }
+    let identity = Identity {}
+    if identity.value(3) != 3 { return 13 }
+    if "value \(amount)" != "value 0.3" { return 14 }
+    let present: Number? = .Some(whole)
+    let absent: [Number]? = .None
+    match present {
+        Some(value) -> { if value != whole { return 5 } }
+        None -> return 6
+    }
+    match absent {
+        Some(value) -> return 7
+        None -> {}
+    }
+    match completed() {
+        Ok -> {}
+        Error(failure) -> { log warn("completion failed", failure) return 8 }
+    }
+    let measured = Measurement { amount: amount }
+    print(measured)
+    log info("measured", amount)
+    return 42
+}

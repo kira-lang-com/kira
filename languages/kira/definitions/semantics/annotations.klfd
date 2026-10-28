@@ -1,0 +1,52 @@
+// Every annotation left on a function, a field or a member once the macros
+// have run is a built-in attribute written where it applies. A macro or a
+// property wrapper has taken up and expanded away the annotations naming it,
+// so one with no attribute names nothing (3402); a type declaration's names
+// a macro or is 5001 already. The tree is read as the parser left it, before
+// constructs, traits and classes are materialized with attributes of the
+// compiler's own.
+
+function checkAnnotations(tree: SyntaxTree) {
+    for declared in tree.globals { checkWritten(declared.annotations, .OnGlobal) }
+    for declared in tree.functions { checkWritten(declared.annotations, .OnFunction) }
+    for declared in tree.genericFunctions { checkWritten(declared.annotations, .OnFunction) }
+    for declared in tree.structs {
+        checkFieldAnnotations(declared.fields)
+        checkMethodAnnotations(declared.methods)
+    }
+    for declared in tree.genericStructs {
+        checkFieldAnnotations(declared.fields)
+        checkMethodAnnotations(declared.methods)
+    }
+    for declared in tree.classes {
+        checkFieldAnnotations(declared.fields)
+        checkMethodAnnotations(declared.methods)
+    }
+    for declared in tree.constructs {
+        checkFieldAnnotations(declared.fields)
+        checkFieldAnnotations(declared.requirements)
+        checkMethodAnnotations(declared.computed)
+        checkMethodAnnotations(declared.methods)
+    }
+    for declared in tree.traits { checkMethodAnnotations(declared.methods) }
+    for declared in tree.extensions { checkMethodAnnotations(declared.methods) }
+}
+
+function checkMethodAnnotations(methods: [FunctionDeclaration]) {
+    for method in methods { checkWritten(method.annotations, .OnFunction) }
+}
+
+function checkFieldAnnotations(fields: [FieldDeclaration]) {
+    for field in fields { checkWritten(field.annotations, .OnField) }
+}
+
+function checkWritten(annotations: [Annotation], site: AttributeSite) {
+    for annotation in annotations {
+        match annotation.attribute {
+            Some(attribute) -> {
+                if !attributeApplies(attribute, site) { report(.AnnotationNotApplicable, annotation.name.span) }
+            }
+            None -> report(.UnknownAnnotation, annotation.name.span)
+        }
+    }
+}

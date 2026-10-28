@@ -1,0 +1,168 @@
+import Foundation
+
+// A mailbox: any number of tasks send, one task receives, in order.
+//
+//     let jobs = Mailbox<Number>()
+//     spawn(produce(jobs))
+//     while true {
+//         match jobs.receive().await {
+//             Some(job) -> work(job)
+//             None -> break
+//         }
+//     }
+//
+// A mailbox is a class, so every holder shares the one queue. Sending never
+// waits: the queue is a ring that doubles when full, and a send wakes the
+// receiver if it is waiting. `close()` ends it; the receiver takes what was
+// sent before, then `.None`.
+//
+// `boundedMailbox(limit)` holds at most `limit` values: `send` refuses one
+// more, and `deliver(value).await` waits for room, each value received
+// waking one waiting sender.
+class Mailbox<Value> {
+    var ring: [Value?] = []
+    var head: Number = 0
+    var length: Number = 0
+    var closed: Bool = false
+    var receiver: Waker? = .None
+    // At most this many queued values; 0 for no limit.
+    var limit: Number = 0
+    // Senders waiting for room: a stack of `senderCount` entries.
+    var senders: [Waker?] = []
+    var senderCount: Number = 0
+
+    // Queues `value` for the receiver. False, dropping it, once closed or
+    // while a bounded mailbox is full.
+    function send(value: Value) -> Bool {
+        if self.closed || self.full() { return false }
+        if self.length == self.ring.count { self.grow() }
+        let mask = self.ring.count - 1
+        self.ring[(self.head + self.length) & mask] = .Some(move value)
+        self.length += 1
+        self.wakeReceiver()
+        return true
+    }
+
+    // The next value, once one is sent; `.None` once the mailbox is closed
+    // and empty.
+    function receive() -> Receive<Value> {
+        return Receive<Value> { mailbox = self }
+    }
+
+    // Queues `value` once there is room: `true` when queued, `false` once
+    // the mailbox is closed.
+    function deliver(value: Value) -> Deliver<Value> {
+        return Deliver<Value> { mailbox = self, value = .Some(move value) }
+    }
+
+    // Values queued and not yet received.
+    function count() -> Number {
+        return self.length
+    }
+
+    // Whether a bounded mailbox holds its limit.
+    function full() -> Bool {
+        return self.limit > 0 && self.length >= self.limit
+    }
+
+    function close() {
+        self.closed = true
+        self.wakeReceiver()
+        while self.senderCount > 0 { self.wakeSender() }
+    }
+
+    function take() -> Value? {
+        if self.length == 0 { return .None }
+        let taken: Value? = move self.ring[self.head]
+        self.ring[self.head] = .None
+        self.head = (self.head + 1) & (self.ring.count - 1)
+        self.length -= 1
+        if self.senderCount > 0 { self.wakeSender() }
+        return move taken
+    }
+
+    function awaitRoom(waker: Waker) {
+        if self.senderCount == self.senders.count {
+            self.senders.append(.Some(waker))
+        } else {
+            self.senders[self.senderCount] = .Some(waker)
+        }
+        self.senderCount += 1
+    }
+
+    function wakeSender() {
+        self.senderCount -= 1
+        let waiting: Waker? = move self.senders[self.senderCount]
+        self.senders[self.senderCount] = .None
+        match waiting {
+            Some(waker) -> waker.wakeUp()
+            None -> {}
+        }
+    }
+
+    function wakeReceiver() {
+        match self.receiver {
+            Some(waker) -> {
+                self.receiver = .None
+                waker.wakeUp()
+            }
+            None -> {}
+        }
+    }
+
+    // Doubles the ring, keeping the queued values in order from slot 0.
+    function grow() {
+        var capacity = self.ring.count * 2
+        if capacity == 0 { capacity = 8 }
+        var grown: [Value?] = []
+        let mask = self.ring.count - 1
+        for index in 0..self.length {
+            let moved: Value? = move self.ring[(self.head + index) & mask]
+            grown.append(move moved)
+        }
+        for index in self.length..capacity { grown.append(.None) }
+        self.ring = move grown
+        self.head = 0
+    }
+}
+
+struct Receive<Value>: Future<Value?> {
+    let mailbox: Mailbox<Value>
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Value?> {
+        if self.mailbox.length > 0 { return .Ready(self.mailbox.take()) }
+        if self.mailbox.closed { return .Ready(.None) }
+        self.mailbox.receiver = .Some(context.waker)
+        return .Pending
+    }
+}
+
+struct Deliver<Value>: Future<Bool> {
+    let mailbox: Mailbox<Value>
+    var value: Value?
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Bool> {
+        if self.mailbox.closed {
+            self.value = .None
+            return .Ready(false)
+        }
+        if self.mailbox.full() {
+            self.mailbox.awaitRoom(context.waker)
+            return .Pending
+        }
+        let taken: Value? = move self.value
+        self.value = .None
+        match move taken {
+            Some(value) -> return .Ready(self.mailbox.send(move value))
+            None -> {}
+        }
+        // Polled again after it was ready.
+        runtimeTrap()
+        return .Pending
+    }
+}
+
+// A mailbox holding at most `limit` values.
+function boundedMailbox<Value>(limit: Number) -> Mailbox<Value> {
+    return Mailbox<Value> { limit = max(limit, 1) }
+}

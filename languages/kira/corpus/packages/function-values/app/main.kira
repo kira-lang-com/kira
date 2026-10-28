@@ -1,0 +1,41 @@
+import Foundation
+
+struct Point {
+    let x: Int
+}
+
+function increment(value: Int) -> Int {
+    return value + 1
+}
+
+function bump(value: borrow mut Int) {
+    value = value + 1
+}
+
+function makePoint(value: Int) -> Point {
+    return Point(x: value)
+}
+
+function apply(callback: (Int) -> Int, value: Int) -> Int {
+    return callback(value)
+}
+
+function update(callback: (borrow mut Int) -> Void) -> Int {
+    var number: Int = 4
+    callback(number)
+    return number
+}
+
+function selectCallback() -> (Int) -> Int {
+    return increment
+}
+
+@Main
+function main() -> Int {
+    let callback: (Int) -> Int = selectCallback()
+    let first = apply(move callback, 40)
+    let second = selectCallback()(1)
+    let maker: (Int) -> Point = makePoint
+    let point = maker(7)
+    return first + second + update(bump) + point.x
+}

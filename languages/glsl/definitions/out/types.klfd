@@ -1,0 +1,337 @@
+// GLSL spellings of types, zero values, and the std140 and std430 extents
+// that padding members are computed against.
+
+function glslScalar(scalar: String) -> String {
+    match scalar {
+        "bool" -> return "bool"
+        "i32" -> return "int"
+        "u32" -> return "uint"
+        "f32" -> return "float"
+        "f64" -> return "double"
+        else -> return typeFailure(joinText(["GLSL 4.30 has no ", scalar]))
+    }
+}
+
+function vectorPrefix(scalar: String) -> String {
+    match scalar {
+        "bool" -> return "b"
+        "i32" -> return "i"
+        "u32" -> return "u"
+        "f32" -> return ""
+        "f64" -> return "d"
+        else -> return typeFailure(joinText(["GLSL 4.30 has no vector of ", scalar]))
+    }
+}
+
+function glslVector(lanes: Int, scalar: String) -> String {
+    let prefix = vectorPrefix(scalar)
+    if failedText(prefix) { return prefix }
+    return joinText([prefix, "vec", decimalText(lanes)])
+}
+
+function scalarZero(scalar: String) -> String {
+    let shape = scalarKind(scalar)
+    if shape == "bool" { return "false" }
+    if shape == "sint" { return "0" }
+    if shape == "uint" { return "0u" }
+    if scalar == "f64" { return "0.0lf" }
+    return "0.0"
+}
+
+function glslFormat(format: String) -> String {
+    match format {
+        "r8unorm" -> return "r8"
+        "rg8unorm" -> return "rg8"
+        "rgba8unorm" -> return "rgba8"
+        "rgba8snorm" -> return "rgba8_snorm"
+        "rgba8uint" -> return "rgba8ui"
+        "rgba8sint" -> return "rgba8i"
+        "r16float" -> return "r16f"
+        "rg16float" -> return "rg16f"
+        "rgba16float" -> return "rgba16f"
+        "rgba16uint" -> return "rgba16ui"
+        "rgba16sint" -> return "rgba16i"
+        "r32float" -> return "r32f"
+        "r32uint" -> return "r32ui"
+        "r32sint" -> return "r32i"
+        "rg32float" -> return "rg32f"
+        "rg32uint" -> return "rg32ui"
+        "rg32sint" -> return "rg32i"
+        "rgba32float" -> return "rgba32f"
+        "rgba32uint" -> return "rgba32ui"
+        "rgba32sint" -> return "rgba32i"
+        "rgb10a2unorm" -> return "rgb10_a2"
+        "rg11b10ufloat" -> return "r11f_g11f_b10f"
+        else -> return typeFailure(joinText(["GLSL has no ", format, " image format"]))
+    }
+}
+
+// The components of a coordinate into an image of `dimension`.
+function coordinateCount(dimension: String) -> Int {
+    if dimension == "1d" { return 1 }
+    if dimension == "2d" { return 2 }
+    return 3
+}
+
+extend TextOut {
+    // The combined sampler or image type of an image; `shadow` picks the
+    // comparison form of a depth image.
+    function glslImage(borrow self, typeIndex: Int, shadow: Bool) -> String {
+        let dimension = typeText(typeIndex, "dimension")
+        var dim = "Cube"
+        if dimension == "1d" {
+            dim = "1D"
+        } else if dimension == "2d" {
+            dim = "2D"
+        } else if dimension == "3d" {
+            dim = "3D"
+        }
+        var array = ""
+        if flag("types", -1, typeIndex, "arrayed") { array = "Array" }
+        let multisampled = flag("types", -1, typeIndex, "multisampled")
+        var ms = ""
+        if multisampled { ms = "MS" }
+        let imageClass = typeText(typeIndex, "class")
+        let shape = scalarKind(typeText(typeIndex, "scalar"))
+        var prefix = ""
+        if shape == "sint" {
+            prefix = "i"
+        } else if shape == "uint" {
+            prefix = "u"
+        }
+        if imageClass == "storage" { return joinText([prefix, "image", dim, array]) }
+        if imageClass == "depth" {
+            var comparison = ""
+            if shadow && !multisampled { comparison = "Shadow" }
+            return joinText(["sampler", dim, ms, array, comparison])
+        }
+        if shape == "bool" { return typeFailure("a texture of bool") }
+        return joinText([prefix, "sampler", dim, ms, array])
+    }
+
+    // A type's text, or a failure.
+    function glslType(borrow self, typeIndex: Int) -> String {
+        let shape = typeKind(typeIndex)
+        let scalar = typeText(typeIndex, "scalar")
+        match shape {
+            "struct" -> return structName(typeIndex)
+            "scalar" -> return glslScalar(scalar)
+            "atomic" -> return glslScalar(scalar)
+            "vector" -> return glslVector(typeField(typeIndex, "lanes"), scalar)
+            "matrix" -> {
+                if scalarKind(scalar) != "float" { return typeFailure("a matrix that is not of floats") }
+                var prefix = ""
+                if scalar == "f64" { prefix = "d" }
+                let columns = typeField(typeIndex, "columns")
+                let rows = typeField(typeIndex, "rows")
+                if columns == rows { return joinText([prefix, "mat", decimalText(columns)]) }
+                return joinText([prefix, "mat", decimalText(columns), "x", decimalText(rows)])
+            }
+            "pointer" -> return glslType(typeField(typeIndex, "base"))
+            "array" -> {
+                let base = glslType(typeField(typeIndex, "base"))
+                if failedText(base) { return base }
+                let length = typeField(typeIndex, "length")
+                if length >= 0 { return joinText([base, "[", decimalText(length), "]"]) }
+                if typeField(typeIndex, "length_override") >= 0 {
+                    return typeFailure("an array sized by a kept override")
+                }
+                return joinText([base, "[]"])
+            }
+            "image" -> return glslImage(typeIndex, false)
+            "sampler" -> return typeFailure("a sampler on its own")
+            else -> return typeFailure(joinText(["a ", shape]))
+        }
+    }
+
+    // A type's text where the module declares something of it; a type GLSL
+    // cannot spell is refused at the type.
+    function typeName(borrow self, typeIndex: Int) -> String {
+        let written = glslType(typeIndex)
+        if failedText(written) {
+            refuseAt(failureText(written), "types", -1, typeIndex)
+            return ""
+        }
+        return written
+    }
+
+    function resultType(borrow self, expression: Int) -> String {
+        return commentedText(glslType(typeOf(expression)))
+    }
+
+    // `T name` for a declaration; a runtime-sized array puts `[]` after the
+    // name, as a buffer block requires.
+    function declare(borrow self, typeIndex: Int, name: String) -> String {
+        if typeKind(typeIndex) == "array" && typeField(typeIndex, "length") < 0
+            && typeField(typeIndex, "length_override") < 0 {
+            return joinText([typeName(typeField(typeIndex, "base")), " ", name, "[]"])
+        }
+        return joinText([typeName(typeIndex), " ", name])
+    }
+
+    // The zero value of a type, or a failure; GLSL has no default
+    // constructor.
+    function zeroText(borrow self, typeIndex: Int) -> String {
+        let shape = typeKind(typeIndex)
+        let scalar = typeText(typeIndex, "scalar")
+        if shape == "struct" {
+            var parts: [String] = []
+            let members = count("members", typeIndex)
+            for member in 0..members {
+                let zero = zeroText(field("members", typeIndex, member, "type"))
+                if failedText(zero) { return zero }
+                parts.append(zero)
+            }
+            return structValue(typeIndex, parts)
+        }
+        if shape == "scalar" || shape == "atomic" { return scalarZero(scalar) }
+        if shape == "vector" || shape == "matrix" {
+            let written = glslType(typeIndex)
+            if failedText(written) { return written }
+            return joinText([written, "(", scalarZero(scalar), ")"])
+        }
+        let length = typeField(typeIndex, "length")
+        if shape == "array" && length >= 0 {
+            let zero = zeroText(typeField(typeIndex, "base"))
+            if failedText(zero) { return zero }
+            let written = glslType(typeIndex)
+            if failedText(written) { return written }
+            var parts: [String] = []
+            for at in 0..length {
+                parts.append(zero)
+            }
+            return joinText([written, "(", joinWith(parts, ", "), ")"])
+        }
+        return typeFailure("a zero value of a type with no constructor")
+    }
+
+    // A struct constructor from its members' values, with padding.
+    function structValue(borrow self, typeIndex: Int, parts: [String]) -> String {
+        let name = structName(typeIndex)
+        if !dialect.padded[typeIndex] { return joinText([name, "(", joinWith(parts, ", "), ")"]) }
+        var texts: [String] = []
+        for slot in dialect.slots[typeIndex] {
+            if slot < 0 {
+                for pad in 0..(0 - slot) {
+                    texts.append("0u")
+                }
+            } else if slot < parts.count {
+                texts.append(parts[slot])
+            } else {
+                texts.append("")
+            }
+        }
+        return joinText([name, "(", joinWith(texts, ", "), ")"])
+    }
+
+    // The size and alignment GLSL gives a type under `rule`, with structs
+    // at their recorded size.
+    function naturalSize(borrow self, typeIndex: Int, rule: String) -> Int {
+        let shape = typeKind(typeIndex)
+        if shape == "struct" { return typeField(typeIndex, "size") }
+        if shape == "array" {
+            var length = typeField(typeIndex, "length")
+            if length < 0 { length = 1 }
+            return length * typeField(typeIndex, "stride")
+        }
+        if shape == "pointer" || shape == "image" || shape == "sampler" { return 0 }
+        return typeField(typeIndex, joinText(["size_", rule]))
+    }
+
+    function naturalAlign(borrow self, typeIndex: Int, rule: String) -> Int {
+        let shape = typeKind(typeIndex)
+        var align = 1
+        if shape == "struct" {
+            let members = count("members", typeIndex)
+            align = 4
+            if members > 0 { align = 0 }
+            for member in 0..members {
+                let memberAlign = naturalAlign(field("members", typeIndex, member, "type"), rule)
+                if memberAlign > align { align = memberAlign }
+            }
+        } else if shape == "array" {
+            align = naturalAlign(typeField(typeIndex, "base"), rule)
+        } else if shape == "pointer" || shape == "image" || shape == "sampler" {
+            return 1
+        } else {
+            return typeField(typeIndex, joinText(["align_", rule]))
+        }
+        if rule == "std140" && align < 16 { align = 16 }
+        return align
+    }
+
+    // The array stride GLSL gives an element under `rule`.
+    function glslStride(borrow self, base: Int, rule: String) -> Int {
+        var align = naturalAlign(base, rule)
+        if rule == "std140" && align < 16 { align = 16 }
+        return alignUp(naturalSize(base, rule), align)
+    }
+
+    function markRule(borrow mut self, typeIndex: Int, rule: String) {
+        let shape = typeKind(typeIndex)
+        if shape == "struct" {
+            let known = dialect.rules[typeIndex]
+            if known != "std140" && known != rule {
+                dialect.rules[typeIndex] = rule
+                let members = count("members", typeIndex)
+                for member in 0..members {
+                    markRule(field("members", typeIndex, member, "type"), rule)
+                }
+            }
+        } else if shape == "array" {
+            markRule(typeField(typeIndex, "base"), rule)
+        }
+    }
+
+    // Pads every struct a uniform or storage buffer reaches to its recorded
+    // layout under the rule of that buffer.
+    function prepareSlots(borrow mut self) {
+        let types = count("types", -1)
+        for typeIndex in 0..types {
+            dialect.rules.append("")
+        }
+        let globals = count("globals", -1)
+        for global in 0..globals {
+            if text("globals", -1, global, "space") == "uniform" {
+                markRule(field("globals", -1, global, "type"), "std140")
+            }
+        }
+        for global in 0..globals {
+            if text("globals", -1, global, "space") == "storage" {
+                markRule(field("globals", -1, global, "type"), "std430")
+            }
+        }
+        for typeIndex in 0..types {
+            var slots: [Int] = []
+            var padded = false
+            let rule = dialect.rules[typeIndex]
+            if typeKind(typeIndex) == "struct" && utf8Count(rule) > 0 {
+                let members = count("members", typeIndex)
+                var sizes: [Int] = []
+                var aligns: [Int] = []
+                for member in 0..members {
+                    let memberType = field("members", typeIndex, member, "type")
+                    let stride = typeField(memberType, "stride")
+                    if typeKind(memberType) == "array" && glslStride(typeField(memberType, "base"), rule) != stride {
+                        refuseAt(joinText(["member `", text("members", typeIndex, member, "name"),
+                            "` has array stride ", decimalText(stride), ", which ", rule, " cannot give"]), "types",
+                            -1, typeIndex)
+                    }
+                    sizes.append(naturalSize(memberType, rule))
+                    aligns.append(naturalAlign(memberType, rule))
+                }
+                var size = typeField(typeIndex, "size")
+                if runtimeTail(typeIndex) { size = 0 }
+                let padding = paddedSlots(typeIndex, size, sizes, aligns)
+                if utf8Count(padding.problem) > 0 {
+                    refuseAt(padding.problem, "types", -1, typeIndex)
+                } else {
+                    slots = padding.slots
+                    padded = true
+                }
+            }
+            dialect.padded.append(padded)
+            dialect.slots.append(slots)
+        }
+    }
+}

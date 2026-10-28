@@ -1,0 +1,115 @@
+struct Task<Element> {
+    let id: Int
+}
+
+enum DeferredTaskStatus {
+    Queued
+    Running
+    Finished
+    Cancelled
+}
+
+struct DeferredTaskState {
+    var work: () -> Any
+    var result: Any?
+    var status: DeferredTaskStatus
+    var consumed: Bool
+}
+
+// Stands in for work already done or dropped, so the closure it replaces is
+// released; nothing calls it.
+function emptyDeferredWork() -> Any {
+    return 0
+}
+
+function createDeferredTask(work: () -> Any) -> Int {
+    let id = runtimeContext.deferredTasks.count
+    runtimeContext.deferredTasks.append(
+        DeferredTaskState { work = move work, result = .None, status = .Queued, consumed = false }
+    )
+    runtimeContext.deferredQueue.append(id)
+    return id
+}
+
+function readyDeferredTask(value: Any) -> Int {
+    let id = runtimeContext.deferredTasks.count
+    runtimeContext.deferredTasks.append(
+        DeferredTaskState {
+            work = emptyDeferredWork,
+            result = .Some(move value),
+            status = .Finished,
+            consumed = false
+        }
+    )
+    return id
+}
+
+function driveDeferredTask() -> Bool {
+    if runtimeContext.deferredCursor >= runtimeContext.deferredQueue.count { return false }
+    let id = runtimeContext.deferredQueue[runtimeContext.deferredCursor]
+    runtimeContext.deferredCursor = runtimeContext.deferredCursor + 1
+    if runtimeContext.deferredTasks[id].status != .Queued { return true }
+    runtimeContext.deferredTasks[id].status = .Running
+    let work = runtimeContext.deferredTasks[id].work
+    let result: Any = work()
+    runtimeContext.deferredTasks[id].result = .Some(move result)
+    runtimeContext.deferredTasks[id].work = emptyDeferredWork
+    runtimeContext.deferredTasks[id].status = .Finished
+    return true
+}
+
+function awaitDeferredTask(id: Int) -> Any {
+    if runtimeContext.deferredTasks[id].consumed { runtimeTrap() }
+    while true {
+        match runtimeContext.deferredTasks[id].status {
+            Finished -> break
+            Cancelled -> runtimeTrap()
+            Queued, Running -> {
+                if !driveDeferredTask() { runtimeTrap() }
+            }
+        }
+    }
+    runtimeContext.deferredTasks[id].consumed = true
+    let result: Any? = copy runtimeContext.deferredTasks[id].result
+    runtimeContext.deferredTasks[id].result = .None
+    match result {
+        Some(value) -> { return move value }
+        None -> { runtimeTrap() return 0 }
+    }
+}
+
+function cancelDeferredTask(id: Int) {
+    if runtimeContext.deferredTasks[id].status == .Queued {
+        runtimeContext.deferredTasks[id].status = .Cancelled
+        runtimeContext.deferredTasks[id].work = emptyDeferredWork
+    }
+}
+
+function detachDeferredTask(id: Int) {
+    if runtimeContext.deferredTasks[id].status == .Cancelled {
+        if runtimeContext.deferredTasks[id].consumed { runtimeTrap() }
+        runtimeContext.deferredTasks[id].consumed = true
+        return
+    }
+    // A detached task runs to its end, and nobody asked for its value.
+    let discarded: Any = awaitDeferredTask(id)
+}
+
+// A cooperative suspend point: the oldest queued task gets a turn, driven on
+// this stack, and control comes back. With nothing queued it does nothing.
+function taskYield() {
+    // With nothing queued there is nothing to drive, which is not a failure.
+    let driven = driveDeferredTask()
+}
+
+// Nothing sleeps in real time: the clock is a counter the executor owns, so
+// tasks order the same way on every engine and a test never waits.
+function taskSleep(milliseconds: Number) {
+    runtimeContext.clock = runtimeContext.clock + milliseconds
+    taskYield()
+}
+
+// The handle `MainThread.spawn` returns; `.await` is its only operation.
+struct MainThreadTask<Element> {
+    let id: Int
+}

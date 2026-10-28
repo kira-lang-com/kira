@@ -1,0 +1,61 @@
+import Foundation
+import Heap
+
+// Threads share the heap: a body sees what it captured, its changes through
+// atomics are seen after `join`, and a dropped `Thread` is joined.
+
+@Test
+function joinSeesEveryWorkerAddition() {
+    let cell = Heap.allocateRaw(8, 8)
+    atomicStore<N32>(cell, 0, .Relaxed)
+    var workers: [Thread] = []
+    for index in 0..4 {
+        workers.append(
+            spawnThread(
+                { in
+                    for step in 0..1000 { atomicAdd<N32>(cell, 1, .Relaxed) }
+                }
+            )
+        )
+    }
+    for index in 0..workers.count { workers[index].join() }
+    expect!(Number(atomicLoad<N32>(cell, .Acquire)) == 4000)
+    Heap.freeRaw(cell)
+}
+
+@Test
+function threadBodyKeepsWhatItCaptured() {
+    let cell = Heap.allocateRaw(8, 8)
+    atomicStore<N32>(cell, 0, .Relaxed)
+    let words = ["one", "two", "three"]
+    var worker = spawnThread(
+        { in
+            var letters = 0
+            for word in words { letters += word.count }
+            atomicStore<N32>(cell, N32(letters), .Release)
+        }
+    )
+    worker.join()
+    expect!(Number(atomicLoad<N32>(cell, .Acquire)) == 11)
+    Heap.freeRaw(cell)
+}
+
+@Test
+function droppedThreadIsJoinedBeforeReturn() {
+    let cell = Heap.allocateRaw(8, 8)
+    atomicStore<N32>(cell, 0, .Relaxed)
+    if true {
+        let worker = spawnThread({ in atomicStore<N32>(cell, 7, .Release) })
+    }
+    expect!(Number(atomicLoad<N32>(cell, .Acquire)) == 7)
+    Heap.freeRaw(cell)
+}
+
+@Test
+function threadsHaveStableIdentityAndParallelism() {
+    let here = currentThread()
+    expect!(here == currentThread())
+    expect!(threadParallelism() >= 1)
+    parkThreadFor(1000)
+    yieldThread()
+}

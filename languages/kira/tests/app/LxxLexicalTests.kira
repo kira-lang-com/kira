@@ -1,0 +1,95 @@
+﻿import Foundation
+
+// LxxLexicalTests.kira — what the lexer and the grammar's delimiters mean:
+// this file opens with a UTF-8 byte-order mark (skipped), block comments nest,
+// newlines are whitespace, and lists are comma-separated with a trailing comma
+// allowed.
+// PREFIX: lxx / Lxx  (all top-level names use this prefix).
+
+/* A block comment at the top level, /* with one nested inside it, */ and text
+   after the nested one that is still comment. */
+
+struct LxxPoint {
+    let x: Int
+    let y: Int
+}
+
+// --- comments ---------------------------------------------------------------
+
+@Test
+function lxxBlockCommentsNest() {
+    let a = /* inline /* nested */ still comment */ 40
+    let got = a + /* before */ 2 /* after */
+    expect!(got == 42)
+}
+
+// --- newlines are whitespace ------------------------------------------------
+
+// Two statements on one line, delimited by the grammar alone.
+function lxxStatementsShareALineAnswer() -> Number {
+var a = 1 a = a + 1 let b = a * 10 return b
+}
+
+@Test
+function lxxStatementsShareALine() {
+    expect!(lxxStatementsShareALineAnswer() == 20)
+}
+
+// An expression continues onto the next line when the next token can continue
+// it: the `- 2` below is part of the initializer, not a statement of its own.
+@Test
+function lxxAnOperatorContinuesAcrossALine() {
+    let a = 5
+        - 2
+    let got = a
+    expect!(got == 3)
+}
+
+// A member access on the next line continues the chain.
+@Test
+function lxxAMemberAccessContinuesAcrossALine() {
+    let p = LxxPoint(x: 7, y: 8)
+    let v = p
+    .x
+    let got = v
+    expect!(got == 7)
+}
+
+// --- comma-separated lists --------------------------------------------------
+
+@Test
+function lxxTrailingCommaInAnArrayLiteral() {
+    let xs = [
+        1,
+        2,
+        3,
+    ]
+    let got = xs.count
+    expect!(got == 3)
+}
+
+@Test
+function lxxTrailingCommaInAStructLiteral() {
+    let p = LxxPoint { x: 3, y: 4, }
+    let got = p.x * 10 + p.y
+    expect!(got == 34)
+}
+
+function lxxSum(a: Int, b: Int) -> Int {
+    return a + b
+}
+
+@Test
+function lxxTrailingCommaInAnArgumentList() {
+    let got = lxxSum(30, 12,)
+    expect!(got == 42)
+}
+
+// --- escapes ----------------------------------------------------------------
+
+// `\e` is the escape character, one byte.
+@Test
+function lxxEscapeCharacterIsOneByte() {
+    let got = "\e[2K".count
+    expect!(got == 4)
+}

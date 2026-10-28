@@ -1,0 +1,129 @@
+// kira's own subcommands, as the uniform driver arguments they stand for.
+// `kira test [path]` builds the package's tests and runs them, and
+// `kira run [path] [-- arguments]` builds its program and runs it with the
+// arguments after `--`. A path left out is the package in the current
+// directory. `kira build [step...]` without `-o` or `--emit`, inside a
+// project, runs the project's build program (`std/Build/DESIGN.md`
+// section 7).
+
+enum Subcommand {
+    Test
+    Run
+}
+
+function subcommandNamed(name: String) -> Optional<Subcommand> {
+    match name {
+        "test" -> return .Some(.Test)
+        "run" -> return .Some(.Run)
+        else -> return .None
+    }
+}
+
+// The driver arguments `arguments` stand for, or none when they do not
+// start with a subcommand.
+function subcommandRequest(arguments: [String]) -> Optional<DriverRequest> {
+    if arguments.count == 0 { return .None }
+    if arguments[0] == "build" { return buildRequest(arguments) }
+    if arguments[0] == "doc" { return docRequest(arguments) }
+    var normalized: [String] = []
+    match subcommandNamed(arguments[0]) {
+        None -> return .None
+        Some(subcommand) -> {
+            match subcommand {
+                Test -> normalized.append("--test")
+                Run -> {}
+            }
+        }
+    }
+    normalized.append("--emit")
+    normalized.append("run")
+    var input = false
+    var programArguments = false
+    var optionValue = false
+    for index in 1..arguments.count {
+        let argument = arguments[index]
+        if programArguments || optionValue {
+            optionValue = false
+        } else if argument == "--" {
+            if !input {
+                normalized.append(".")
+                input = true
+            }
+            programArguments = true
+        } else if takesValue(argument) {
+            optionValue = true
+        } else if utf8Count(argument) == 0 || utf8Byte(argument, 0) != asciiMinus {
+            input = true
+        }
+        normalized.append(argument)
+    }
+    if !input { normalized.append(".") }
+    return .Some(DriverRequest { arguments = normalized })
+}
+
+// Whether the driver option `argument` is followed by its value.
+function takesValue(argument: String) -> Bool {
+    match argument {
+        "-o", "--emit", "--export", "--target" -> return true
+        else -> return false
+    }
+}
+
+// Whether the driver arguments of a build ask for its tests.
+function requestsTests(driverArguments: [String]) -> Bool {
+    for argument in driverArguments {
+        match argument {
+            "--" -> return false
+            "--test" -> return true
+            else -> {}
+        }
+    }
+    return false
+}
+
+// `kira build` as the run of the project's build program, with every
+// argument after `build` handed to it: a project is the nearest directory at
+// or above the working directory holding `build/package.kira`. With `-o` or
+// `--emit` it is a compile, and outside a project it stays one.
+function buildRequest(arguments: [String]) -> Optional<DriverRequest> {
+    for argument in arguments {
+        match argument {
+            "--" -> break
+            "-o", "--emit" -> return .None
+            else -> {
+                if startsWithText(argument, "--emit=") { return .None }
+            }
+        }
+    }
+    var directory = driverDirectory()
+    while true {
+        let program = joinPath(directory, "build")
+        if driverPathExists(joinPath(program, "package.kira")) {
+            var normalized = ["--emit", "run", program, "--"]
+            for index in 1..arguments.count { normalized.append(arguments[index]) }
+            return .Some(DriverRequest { arguments = normalized })
+        }
+        let parent = directoryOf(directory)
+        if parent == directory || parent == "." { return .None }
+        directory = parent
+    }
+    return .None
+}
+
+// `kira doc [path] [--check] [--format markdown|json]`: the package checked with
+// its documentation rendered, or with `--check` its undocumented public API
+// reported. A path left out is the package in the current directory
+// (docs/documentation.md).
+function docRequest(arguments: [String]) -> Optional<DriverRequest> {
+    var normalized = ["check", "--doc"]
+    for index in 1..arguments.count {
+        if arguments[index] == "--check" {
+            normalized.append("--doc-check")
+        } else if arguments[index] == "--format" {
+            normalized.append("--doc-format")
+        } else {
+            normalized.append(arguments[index])
+        }
+    }
+    return .Some(DriverRequest { arguments = normalized })
+}

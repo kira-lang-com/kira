@@ -1,0 +1,544 @@
+// Rewrites a tree so each type name means one declaration (see
+// namespaces.klfd): declarations take their module's spelling and every
+// reference the spelling of the declaration its file sees. A name a generic
+// declaration binds as a type parameter is the parameter, not a type.
+
+// A stretch of source inside a generic declaration and the type parameters it
+// may name there: a generic function or method (an extension's included), a
+// generic struct's field, a generic enum's case payload, or a generic alias's
+// target.
+struct ParameterScope {
+    let file: Int
+    let start: Int
+    let end: Int
+    let names: [String]
+}
+
+// Every stretch of source where a declaration binds type parameters. A name
+// written there is the parameter, whatever type elsewhere shares its spelling.
+function typeParameterScopes(tree: SyntaxTree) -> [ParameterScope] {
+    var scopes: [ParameterScope] = []
+    for declared in tree.genericFunctions { addFunctionScope(scopes, declared, []) }
+    for declared in tree.genericStructs {
+        let names = identifierTexts(declared.genericParameters)
+        for method in declared.methods { addFunctionScope(scopes, method, names) }
+        for field in declared.fields { addReferenceScope(scopes, field.annotation, names) }
+    }
+    for declared in tree.genericEnums {
+        let names = identifierTexts(declared.genericParameters)
+        for method in declared.methods { addFunctionScope(scopes, method, names) }
+        for written in declared.cases {
+            match written.payload {
+                Some(payload) -> addReferenceScope(scopes, payload, names)
+                None -> {}
+            }
+        }
+    }
+    for declared in tree.constructs {
+        if declared.typeParameters.count == 0 { continue }
+        let names = identifierTexts(declared.typeParameters)
+        match declared.parameters {
+            Some(inputs) -> {
+                for field in inputs { addReferenceScope(scopes, field.annotation, names) }
+            }
+            None -> {}
+        }
+        for field in declared.fields { addReferenceScope(scopes, field.annotation, names) }
+        for field in declared.requirements { addReferenceScope(scopes, field.annotation, names) }
+        for method in declared.computed { addFunctionScope(scopes, method, names) }
+        for method in declared.methods { addFunctionScope(scopes, method, names) }
+        for method in declared.inits { addFunctionScope(scopes, method, names) }
+    }
+    for declared in tree.classes {
+        for method in declared.methods { addFunctionScope(scopes, method, identifierTexts(declared.genericParameters)) }
+    }
+    for declared in tree.traits {
+        for method in declared.methods { addFunctionScope(scopes, method, identifierTexts(declared.genericParameters)) }
+    }
+    for declared in tree.aliases {
+        addReferenceScope(scopes, declared.target, identifierTexts(declared.genericParameters))
+    }
+    // A generic method an extension adds binds its parameters as any
+    // generic function does, function types in its signature included. Once
+    // a block on a construct family has joined the family's enum and struct,
+    // its methods are theirs.
+    for declared in tree.extensions {
+        for method in declared.methods { addFunctionScope(scopes, method, []) }
+    }
+    for declared in tree.structs {
+        for method in declared.methods { addFunctionScope(scopes, method, []) }
+    }
+    for declared in tree.enums {
+        for method in declared.methods { addFunctionScope(scopes, method, []) }
+    }
+    return scopes
+}
+
+function addFunctionScope(scopes: borrow mut [ParameterScope], declared: FunctionDeclaration, enclosing: [String]) {
+    var names = enclosing
+    for parameter in declared.typeParameters { names.append(parameter.text) }
+    if names.count == 0 { return }
+    scopes.append(ParameterScope {
+        file = declared.span.file, start = declared.span.start, end = declared.span.end, names = names
+    })
+}
+
+// A reference written outside any function body: its own names and its
+// arguments' are the stretch the parameters cover.
+function addReferenceScope(scopes: borrow mut [ParameterScope], reference: TypeReference, names: [String]) {
+    if names.count == 0 { return }
+    let span = reference.name.span
+    scopes.append(ParameterScope {
+        file = span.file, start = span.start, end = referenceEnd(reference), names = names
+    })
+}
+
+function referenceEnd(reference: TypeReference) -> Int {
+    var end = reference.name.span.end
+    for argument in reference.arguments {
+        let inner = referenceEnd(argument)
+        if inner > end { end = inner }
+    }
+    return end
+}
+
+// The type parameters in scope where `span` is written.
+function scopedParameters(scopes: borrow [ParameterScope], span: Span) -> [String] {
+    var names: [String] = []
+    for scope in scopes {
+        if scope.file == span.file && scope.start <= span.start && span.end <= scope.end {
+            for name in scope.names { names.append(name) }
+        }
+    }
+    return names
+}
+
+function scopeTypeNames(tree: SyntaxTree) -> SyntaxTree {
+    let scopes = typeScopes(tree)
+    if scopes.scoped.count == 0 { return tree }
+    let rewriter = NamespaceRewriter { scopes = scopes, parameterScopes = typeParameterScopes(tree) }
+    return rewriter.rewrite(tree)
+}
+
+struct NamespaceRewriter {
+    let scopes: TypeScopes
+    var parameterScopes: [ParameterScope]
+
+    // The type parameters in scope where `span` is written.
+    function parametersAt(borrow self, span: Span) -> [String] {
+        return scopedParameters(parameterScopes, span)
+    }
+
+    function rewrite(borrow self, tree: SyntaxTree) -> SyntaxTree {
+        var result = tree
+        var references: [TypeReference] = []
+        for reference in tree.typeReferences {
+            references.append(self.rewriteReference(reference, parametersAt(reference.name.span)))
+        }
+        result.typeReferences = references
+        var expressions: [Expression] = []
+        for expression in tree.expressions { expressions.append(self.rewriteExpression(expression)) }
+        result.expressions = expressions
+        result.functions = self.functions(tree.functions, [])
+        result.genericFunctions = self.functions(tree.genericFunctions, [])
+        result.structs = self.structs(tree.structs)
+        result.genericStructs = self.structs(tree.genericStructs)
+        result.enums = self.enums(tree.enums)
+        result.genericEnums = self.enums(tree.genericEnums)
+        result.aliases = self.aliases(tree.aliases)
+        result.distincts = self.distincts(tree.distincts)
+        result.classes = self.classes(tree.classes)
+        result.constructs = self.constructs(tree.constructs)
+        result.traits = self.traits(tree.traits)
+        result.conformances = self.conformances(tree.conformances)
+        result.bounds = self.bounds(tree.bounds)
+        result.extensions = self.extensions(tree.extensions)
+        result.foreignMarks = self.foreignMarks(tree.foreignMarks)
+        return result
+    }
+
+    // The types an `@FFI.*` mark names, as the file that wrote it means them.
+    function foreignMarks(borrow self, marks: [ForeignMark]) -> [ForeignMark] {
+        var result: [ForeignMark] = []
+        for mark in marks {
+            var fields: [ForeignField] = []
+            for field in mark.fields {
+                match field.value {
+                    Named(reference) -> {
+                        fields.append(ForeignField { key = field.key, value = .Named(self.rewriteReference(reference, [])), span = field.span, names = field.names })
+                    }
+                    Listed(references) -> {
+                        fields.append(ForeignField { key = field.key, value = .Listed(self.referenceList(references, [])), span = field.span, names = field.names })
+                    }
+                    Word -> fields.append(field)
+                    Count -> fields.append(field)
+                }
+            }
+            result.append(ForeignMark { form = mark.form, span = mark.span, block = mark.block, fields = fields })
+        }
+        return result
+    }
+
+    // A type name written in an expression: a call, a literal or a receiver.
+    function expressionName(borrow self, name: Identifier) -> Identifier {
+        if hasText(parametersAt(name.span), name.text) { return name }
+        return Identifier { text = scopes.expressionName(name.text, name.span.file), span = name.span }
+    }
+
+    // A struct literal's name, which `Library.Point { ... }` qualifies.
+    function literalName(borrow self, name: Identifier) -> Identifier {
+        let dot = lastDot(name.text)
+        if dot < 0 { return expressionName(name) }
+        let qualifier = utf8Slice(name.text, 0, dot)
+        let written = utf8Slice(name.text, dot + 1, utf8Count(name.text))
+        return Identifier { text = scopes.qualifiedTypeName(written, qualifier, name.span.file), span = name.span }
+    }
+
+    function rewriteExpression(borrow self, expression: Expression) -> Expression {
+        match expression.kind {
+            Name(name) -> return Expression { kind = .Name(expressionName(name)), span = expression.span }
+            Call(name, arguments) -> return Expression { kind = .Call(expressionName(name), arguments), span = expression.span }
+            GenericCall(name, typeArguments, arguments) -> {
+                let parameters = parametersAt(name.span)
+                return Expression {
+                    kind = .GenericCall(expressionName(name), self.referenceList(typeArguments, parameters), arguments),
+                    span = expression.span
+                }
+            }
+            StructLiteral(name, types, values) -> {
+                let parameters = parametersAt(name.span)
+                return Expression {
+                    kind = .StructLiteral(literalName(name), self.referenceList(types, parameters), values),
+                    span = expression.span
+                }
+            }
+            Lambda(declared) -> {
+                let parameters = parametersAt(declared.span)
+                var annotations: [Optional<TypeReference>] = []
+                for annotation in declared.annotations { annotations.append(self.optionalReference(annotation, parameters)) }
+                return Expression {
+                    kind = .Lambda(LambdaDeclaration {
+                        parameters = declared.parameters, annotations = annotations, body = declared.body, span = declared.span
+                    }),
+                    span = expression.span
+                }
+            }
+            KeyPath(declared) -> {
+                return Expression {
+                    kind = .KeyPath(KeyPathDeclaration {
+                        root = self.optionalReference(declared.root, parametersAt(declared.span)), members = declared.members, span = declared.span
+                    }),
+                    span = expression.span
+                }
+            }
+            Quote -> return expression
+            IntegerLiteral -> return expression
+            FloatLiteral -> return expression
+            BooleanLiteral -> return expression
+            StringLiteral -> return expression
+            ArrayLiteral -> return expression
+            Index -> return expression
+            Transfer -> return expression
+            Labelled -> return expression
+            TypeQuery -> return expression
+            Member -> return expression
+            ExpandedMacro -> return expression
+            MacroCall -> return expression
+            MethodCall -> return expression
+            IndirectCall -> return expression
+            Task -> return expression
+            Try -> return expression
+            Variant -> return expression
+            Unary -> return expression
+            Binary -> return expression
+            Conditional -> return expression
+            MatchValue -> return expression
+            Content -> return expression
+        }
+    }
+
+    // `reference` naming the declaration its file sees, `parameters` aside.
+    function rewriteReference(borrow self, reference: TypeReference, parameters: [String]) -> TypeReference {
+        let arguments = self.referenceList(reference.arguments, parameters)
+        let file = reference.name.span.file
+        var name = reference.name.text
+        var instanceName = reference.instanceName
+        match familyName(reference) {
+            Some(family) -> {
+                let renamed = scopes.typeName(family.name, file)
+                name = joinText([family.keyword, " ", renamed])
+                instanceName = familyTypeName(renamed)
+            }
+            None -> {
+                match reference.qualifier {
+                    Some(qualifier) -> name = scopes.qualifiedTypeName(name, qualifier.text, file)
+                    None -> {
+                        if !hasText(parameters, name) { name = scopes.typeName(name, file) }
+                    }
+                }
+                if name != reference.name.text || !sameInstances(arguments, reference.arguments) {
+                    instanceName = referenceInstanceName(name, arguments, reference.modes)
+                }
+            }
+        }
+        return TypeReference {
+            qualifier = reference.qualifier,
+            name = Identifier { text = name, span = reference.name.span },
+            arguments = arguments,
+            modes = reference.modes,
+            instanceName = instanceName
+        }
+    }
+
+    function referenceList(borrow self, references: [TypeReference], parameters: [String]) -> [TypeReference] {
+        var result: [TypeReference] = []
+        for reference in references { result.append(self.rewriteReference(reference, parameters)) }
+        return result
+    }
+
+    function optionalReference(borrow self, reference: Optional<TypeReference>, parameters: [String]) -> Optional<TypeReference> {
+        match reference {
+            Some(written) -> return .Some(self.rewriteReference(written, parameters))
+            None -> return .None
+        }
+    }
+
+    function declaredName(borrow self, name: Identifier) -> Identifier {
+        return Identifier { text = scopes.declaredName(name.text, name.span.file), span = name.span }
+    }
+
+    function rewriteFunction(borrow self, declared: FunctionDeclaration, enclosing: [String]) -> FunctionDeclaration {
+        var parameters = enclosing
+        for parameter in declared.typeParameters { parameters.append(parameter.text) }
+        var written: [Parameter] = []
+        for parameter in declared.parameters {
+            written.append(Parameter {
+                name = parameter.name, mode = parameter.mode,
+                annotation = self.rewriteReference(parameter.annotation, parameters),
+                copies = parameter.copies, initial = parameter.initial
+            })
+        }
+        return FunctionDeclaration {
+            name = declared.name, annotations = declared.annotations, receiver = declared.receiver,
+            parameters = written, result = self.optionalReference(declared.result, parameters),
+            body = declared.body, span = declared.span, typeParameters = declared.typeParameters,
+            scope = GenericScope {
+                parameters = declared.scope.parameters,
+                arguments = self.referenceList(declared.scope.arguments, parameters)
+            }
+        }
+    }
+
+    function functions(borrow self, declared: [FunctionDeclaration], enclosing: [String]) -> [FunctionDeclaration] {
+        var result: [FunctionDeclaration] = []
+        for member in declared { result.append(self.rewriteFunction(member, enclosing)) }
+        return result
+    }
+
+    function fields(borrow self, declared: [FieldDeclaration], parameters: [String]) -> [FieldDeclaration] {
+        var result: [FieldDeclaration] = []
+        for field in declared {
+            result.append(FieldDeclaration {
+                name = field.name, mutable = field.mutable,
+                annotation = self.rewriteReference(field.annotation, parameters),
+                initial = field.initial, annotations = field.annotations, inferred = field.inferred,
+                span = field.span
+            })
+        }
+        return result
+    }
+
+    function structs(borrow self, declared: [StructDeclaration]) -> [StructDeclaration] {
+        var result: [StructDeclaration] = []
+        for structure in declared {
+            let parameters = identifierTexts(structure.genericParameters)
+            let name = declaredName(structure.name)
+            var suffix = structure.typeSuffix
+            if !structure.specialized { suffix = scopedTypeSuffix(name.text) }
+            result.append(StructDeclaration {
+                name = name, genericParameters = structure.genericParameters,
+                typeArguments = self.referenceList(structure.typeArguments, parameters),
+                callableModes = structure.callableModes,
+                ancestors = self.referenceList(structure.ancestors, parameters),
+                genericBase = structure.genericBase, baseNameSpan = structure.baseNameSpan,
+                specialized = structure.specialized, typeSuffix = suffix,
+                fields = self.fields(structure.fields, parameters),
+                methods = self.functions(structure.methods, parameters)
+            })
+        }
+        return result
+    }
+
+    function enums(borrow self, declared: [EnumDeclaration]) -> [EnumDeclaration] {
+        var result: [EnumDeclaration] = []
+        for enumeration in declared {
+            let parameters = identifierTexts(enumeration.genericParameters)
+            let name = declaredName(enumeration.name)
+            var suffix = enumeration.typeSuffix
+            if !enumeration.specialized { suffix = scopedTypeSuffix(name.text) }
+            var cases: [CaseDeclaration] = []
+            for case in enumeration.cases {
+                cases.append(CaseDeclaration {
+                    name = case.name, payload = self.optionalReference(case.payload, parameters), initial = case.initial
+                })
+            }
+            result.append(EnumDeclaration {
+                name = name, genericParameters = enumeration.genericParameters,
+                typeArguments = self.referenceList(enumeration.typeArguments, parameters),
+                baseNameSpan = enumeration.baseNameSpan, specialized = enumeration.specialized,
+                typeSuffix = suffix, cases = cases,
+                methods = self.functions(enumeration.methods, parameters),
+                existential = enumeration.existential
+            })
+        }
+        return result
+    }
+
+    function aliases(borrow self, declared: [AliasDeclaration]) -> [AliasDeclaration] {
+        var result: [AliasDeclaration] = []
+        for alias in declared {
+            result.append(AliasDeclaration {
+                name = declaredName(alias.name), genericParameters = alias.genericParameters,
+                target = self.rewriteReference(alias.target, identifierTexts(alias.genericParameters))
+            })
+        }
+        return result
+    }
+
+    function distincts(borrow self, declared: [DistinctDeclaration]) -> [DistinctDeclaration] {
+        var result: [DistinctDeclaration] = []
+        for declaredDistinct in declared {
+            result.append(DistinctDeclaration {
+                name = declaredName(declaredDistinct.name), representation = self.rewriteReference(declaredDistinct.representation, [])
+            })
+        }
+        return result
+    }
+
+    function classes(borrow self, declared: [ClassDeclaration]) -> [ClassDeclaration] {
+        var result: [ClassDeclaration] = []
+        for declaredClass in declared {
+            let parameters = identifierTexts(declaredClass.genericParameters)
+            var overrides: [ClassFieldOverride] = []
+            for written in declaredClass.overrides {
+                overrides.append(ClassFieldOverride {
+                    name = written.name, annotation = self.optionalReference(written.annotation, parameters), initial = written.initial
+                })
+            }
+            result.append(ClassDeclaration {
+                name = declaredName(declaredClass.name), genericParameters = declaredClass.genericParameters,
+                parents = self.referenceList(declaredClass.parents, parameters),
+                fields = self.fields(declaredClass.fields, parameters),
+                methods = self.functions(declaredClass.methods, parameters),
+                overrides = overrides
+            })
+        }
+        return result
+    }
+
+    function constructs(borrow self, declared: [ConstructDeclaration]) -> [ConstructDeclaration] {
+        var result: [ConstructDeclaration] = []
+        for declaredConstruct in declared {
+            let names = identifierTexts(declaredConstruct.typeParameters)
+            var parameters: Optional<[FieldDeclaration]> = .None
+            match declaredConstruct.parameters {
+                Some(written) -> parameters = .Some(self.fields(written, names))
+                None -> {}
+            }
+            result.append(ConstructDeclaration {
+                name = declaredName(declaredConstruct.name), parameters = parameters,
+                parents = self.referenceList(declaredConstruct.parents, []),
+                fields = self.fields(declaredConstruct.fields, names),
+                requirements = self.fields(declaredConstruct.requirements, names),
+                computed = self.functions(declaredConstruct.computed, names),
+                methods = self.functions(declaredConstruct.methods, names),
+                overrides = declaredConstruct.overrides,
+                inits = self.functions(declaredConstruct.inits, names),
+                typeParameters = declaredConstruct.typeParameters
+            })
+        }
+        return result
+    }
+
+    function traits(borrow self, declared: [TraitDeclaration]) -> [TraitDeclaration] {
+        var result: [TraitDeclaration] = []
+        for declaredTrait in declared {
+            let parameters = identifierTexts(declaredTrait.genericParameters)
+            result.append(TraitDeclaration {
+                name = declaredName(declaredTrait.name), genericParameters = declaredTrait.genericParameters,
+                supertraits = self.referenceList(declaredTrait.supertraits, parameters),
+                methods = self.functions(declaredTrait.methods, parameters),
+                associatedTypes = declaredTrait.associatedTypes
+            })
+        }
+        return result
+    }
+
+    function conformances(borrow self, declared: [TypeConformance]) -> [TypeConformance] {
+        var result: [TypeConformance] = []
+        for conformance in declared {
+            let parameters = parametersAt(conformance.owner.name.span)
+            result.append(TypeConformance {
+                owner = self.rewriteReference(conformance.owner, parameters),
+                traitName = self.rewriteReference(conformance.traitName, parameters)
+            })
+        }
+        return result
+    }
+
+    function bounds(borrow self, declared: [GenericBound]) -> [GenericBound] {
+        var result: [GenericBound] = []
+        for bound in declared {
+            let file = bound.traitName.name.span.file
+            result.append(GenericBound {
+                template = scopes.typeName(bound.template, file), parameter = bound.parameter,
+                traitName = self.rewriteReference(bound.traitName, parametersAt(bound.traitName.name.span))
+            })
+        }
+        return result
+    }
+
+    function extensions(borrow self, declared: [ExtensionDeclaration]) -> [ExtensionDeclaration] {
+        var result: [ExtensionDeclaration] = []
+        for extension in declared {
+            result.append(ExtensionDeclaration {
+                owner = self.rewriteReference(extension.owner, []),
+                traits = self.referenceList(extension.traits, []),
+                methods = self.functions(extension.methods, []),
+                bodiesElsewhere = extension.bodiesElsewhere
+            })
+        }
+        return result
+    }
+}
+
+// `some Family` or `Any Family`: the keyword and the family's name.
+struct FamilyName {
+    let keyword: String
+    let name: String
+}
+
+function familyName(reference: TypeReference) -> Optional<FamilyName> {
+    if reference.arguments.count > 0 || reference.qualifier.isSome() { return .None }
+    let text = reference.name.text
+    for index in 0..utf8Count(text) {
+        if utf8Byte(text, index) == asciiSpace {
+            return .Some(FamilyName { keyword = utf8Slice(text, 0, index), name = utf8Slice(text, index + 1, utf8Count(text)) })
+        }
+    }
+    return .None
+}
+
+function sameInstances(left: [TypeReference], right: [TypeReference]) -> Bool {
+    for index in 0..left.count {
+        if left[index].instanceName != right[index].instanceName { return false }
+    }
+    return true
+}
+
+function hasText(texts: [String], text: String) -> Bool {
+    for listed in texts {
+        if listed == text { return true }
+    }
+    return false
+}

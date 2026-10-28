@@ -1,0 +1,94 @@
+// Structural order and hash: which types `<`, `compare` and `hash` reach,
+// as Kira's `Ordered` and `Hashable` classifiers decide, walked as
+// `equalityLeaf` walks equality. No declaration opts a type in.
+//
+// An order needs a total order at every leaf: a signed integer, a float, a
+// boolean or a string, and the structs, arrays and enums built from them. An
+// unsigned integer is refused, since Kira's walk compares every integer
+// signed. A hash needs leaves whose bits are their value, so it takes any
+// integer, a boolean and a string, and refuses a float, whose equal values
+// `0.0` and `-0.0` differ in bits.
+
+enum ShapeRule {
+    Ordered
+    Hashable
+}
+
+// The leaf that keeps values of `valueType` from following `rule`, or
+// nothing when every leaf follows it. `visiting` holds the aggregates being
+// walked, so a recursive type is walked once.
+function shapeLeaf(program: CheckedProgram, declarations: Declarations, valueType: Type, rule: ShapeRule, visiting: [Int]) -> Optional<Type> {
+    match valueType.kind {
+        Integer -> {
+            if rule == .Ordered && !valueType.signed { return .Some(valueType) }
+            return .None
+        }
+        // `Number` is equatable, ordered and hashable.
+        Decimal -> return .None
+        Floating -> {
+            if rule == .Hashable { return .Some(valueType) }
+            return .None
+        }
+        Boolean -> return .None
+        Pointer -> return .Some(valueType)
+        Void -> return .Some(valueType)
+        Invalid -> return .None
+        Enumeration -> {
+            let key = program.structs.count + valueType.declaration
+            if contains(visiting, key) { return .None }
+            var walked = visiting
+            walked.append(key)
+            for variant in program.enums[valueType.declaration].variants {
+                match variant.payload {
+                    Some(payload) -> {
+                        let leaf = shapeLeaf(program, declarations, payload, rule, walked)
+                        if leaf.isSome() { return leaf }
+                    }
+                    None -> {}
+                }
+            }
+            return .None
+        }
+        Structure -> return structShapeLeaf(program, declarations, valueType, rule, visiting)
+    }
+}
+
+function structShapeLeaf(program: CheckedProgram, declarations: Declarations, valueType: Type, rule: ShapeRule, visiting: [Int]) -> Optional<Type> {
+    if contains(visiting, valueType.declaration) || isStringType(program, valueType) { return .None }
+    let declared = program.structs[valueType.declaration]
+    if isDistinctType(program, valueType) { return shapeLeaf(program, declarations, declared.fields[0].valueType, rule, visiting) }
+    if opaqueShape(program, declarations, valueType) { return .Some(valueType) }
+    match declared.shape {
+        Plain -> {}
+        CPointer -> return .Some(valueType)
+        Callback -> return .Some(valueType)
+        CLayout -> return .Some(valueType)
+        CUnion -> return .Some(valueType)
+        CArray -> return .Some(valueType)
+    }
+    var walked = visiting
+    walked.append(valueType.declaration)
+    if isArrayType(program, valueType) { return shapeLeaf(program, declarations, declared.typeArguments[0], rule, walked) }
+    for index in 0..comparedFields(program, valueType) {
+        let leaf = shapeLeaf(program, declarations, declared.fields[index].valueType, rule, walked)
+        if leaf.isSome() { return leaf }
+    }
+    return .None
+}
+
+// How many of a struct's fields, from the first, its equality, order and
+// hash walk: all of them, except a key path's. A key path is the members it
+// reads, so it compares by its `path` alone and not by the function reading
+// them (Foundation's `KeyPath`).
+function comparedFields(program: CheckedProgram, valueType: Type) -> Int {
+    if isKeyPathType(program, valueType) { return 1 }
+    return program.structs[valueType.declaration].fields.count
+}
+
+// A struct whose value is a handle or an identity rather than its fields:
+// neither ordered nor hashed.
+function opaqueShape(program: CheckedProgram, declarations: Declarations, valueType: Type) -> Bool {
+    return isAnyType(program, valueType) || isClassType(program, valueType) || isTaskType(program, valueType)
+        || isClosureType(program, valueType) || isWitnessedType(program, valueType) || isDescriptorType(declarations, valueType) || isNativeStateType(program, declarations, valueType)
+        || isCStringType(program, valueType) || isForeignPointerValue(program, valueType)
+}

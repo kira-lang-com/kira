@@ -1,0 +1,556 @@
+import Foundation
+
+// MxxMacroTests.kira
+// Declarative macro tests (mx / Mxx prefix). Macros expand in the frontend, so these run
+// identically on vm / llvm / hybrid.
+
+macro mxSquare(value: expr) {
+    expand {
+        value * value
+    }
+}
+
+macro mxAdd3(a: expr, b: expr, c: expr) {
+    expand {
+        a + b + c
+    }
+}
+
+macro mxSwap(a: place, b: place) {
+    expand {
+        let temporary = a
+        a = b
+        b = temporary
+    }
+}
+
+@Test
+function mxxSquare() {
+    expect!(mxSquare!(6) == 36)
+}
+
+@Test
+function mxxAdd3() {
+    expect!(mxAdd3!(1, 2, 3) == 6)
+}
+
+@Test
+function mxxSwapAndHygiene() {
+    var x = 10
+    var y = 20
+    mxSwap!(x, y)
+    // Hygiene: the macro's internal `temporary` must not collide with this one.
+    let temporary = 100
+    expect!(x + y + temporary == 130)
+}
+
+@Test
+function mxxNestedExprSingleEval() {
+    // square used in a larger expression -> hoisted single-eval, then used.
+    let r = mxSquare!(3) + mxSquare!(4)
+    expect!(r == 25)
+}
+
+// --- Procedural derive macros (comptime macro) ------------------------------
+// These run a compile-time evaluator: target.fields reflection, for-loops, quote/splice,
+// Syntax.join, then re-parse + splice of the generated functions. Validated across backends.
+
+comptime macro MxFieldCount {
+    kind { derive }
+    appliesTo { struct }
+    expand(target: Declaration) -> Syntax {
+        var count: Int = 0
+        for field in target.fields {
+            count = count + 1
+        }
+        return quote {
+            function mxxVecFieldCount() -> Int {
+                return #{count}
+            }
+        }
+    }
+}
+
+comptime macro MxSum {
+    kind { derive }
+    appliesTo { struct }
+    expand(target: Declaration) -> Syntax {
+        var parts: [Syntax] = []
+        for field in target.fields {
+            parts.append(quote { p.#{field.name} })
+        }
+        let joined: Syntax = Syntax.join(parts, separator: " + ")
+        return quote {
+            function mxxSumVec(p: borrow MxVec3) -> Int {
+                return #{joined}
+            }
+        }
+    }
+}
+
+@Derive(MxFieldCount, MxSum)
+struct MxVec3 {
+    var x: Int
+    var y: Int
+    var z: Int
+}
+
+@Test
+function mxxDeriveFieldCount() {
+    expect!(mxxVecFieldCount() == 3)
+}
+
+@Test
+function mxxDeriveSum() {
+    let v = MxVec3 { x: 4, y: 5, z: 6 }
+    expect!(mxxSumVec(v) == 15)
+}
+
+// --- Procedural attribute macro (@Name) -------------------------------------
+
+comptime macro MxTagged {
+    kind { attribute }
+    appliesTo { struct }
+    expand(target: Declaration) -> Syntax {
+        var count: Int = 0
+        for field in target.fields {
+            count = count + 1
+        }
+        return quote {
+            function mxxTaggedFieldCount() -> Int {
+                return #{count}
+            }
+        }
+    }
+}
+
+@MxTagged
+struct MxTagHolder {
+    var a: Int
+    var b: Int
+}
+
+@Test
+function mxxAttributeMacro() {
+    expect!(mxxTaggedFieldCount() == 2)
+}
+
+// --- Procedural function-position macro (name!(args) -> declarations) --------
+
+comptime macro mxBits {
+    kind { function }
+    expand(input: Syntax) -> Syntax {
+        let names: [Identifier] = input.identifiers()
+        var fns: [Syntax] = []
+        var value: Int = 1
+        for name in names {
+            fns.append(
+                quote {
+                    function #{name}() -> Int {
+                        return #{value}
+                    }
+                }
+            )
+            value = value * 2
+        }
+        return quote {
+            #{fns}
+        }
+    }
+}
+
+mxBits!(MxRead, MxWrite, MxExec)
+
+@Test
+function mxxFunctionMacro() {
+    expect!(MxRead() + MxWrite() + MxExec() == 7)
+}
+
+// --- Function-position procedural macro in EXPRESSION position --------------
+// The macro's expansion must re-parse as a single expression that becomes the value.
+
+comptime macro mxConst {
+    kind { function }
+    expand(input: Syntax) -> Syntax {
+        return quote { 42 }
+    }
+}
+
+@Test
+function mxxFuncMacroExpr() {
+    expect!(mxConst!() == 42)
+}
+
+// --- Function-position procedural macro in STATEMENT position ---------------
+// Procedural macros generate raw source (no hygiene gensym), so `r` binds the caller's `r`.
+
+comptime macro mxAssignTen {
+    kind { function }
+    expand(input: Syntax) -> Syntax {
+        return quote { r = 10 }
+    }
+}
+
+@Test
+function mxxFuncMacroStmt() {
+    var r = 0
+    mxAssignTen!()
+    expect!(r == 10)
+}
+
+// --- Mid-identifier splice gluing (`mxp_#{name}` -> `mxp_Foo`) ---------------
+
+comptime macro mxPrefixed {
+    kind { function }
+    expand(input: Syntax) -> Syntax {
+        let names: [Identifier] = input.identifiers()
+        var fns: [Syntax] = []
+        for name in names {
+            fns.append(
+                quote {
+                    function mxp_#{name}() -> Int {
+                        return 1
+                    }
+                }
+            )
+        }
+        return quote {
+            #{fns}
+        }
+    }
+}
+
+mxPrefixed!(Foo, Bar)
+
+@Test
+function mxxSpliceGlue() {
+    expect!(mxp_Foo() + mxp_Bar() == 2)
+}
+
+// --- Enum annotations: derive macro over an enum ----------------------------
+// Enum variants surface through `target.fields` reflection (name = variant name).
+
+comptime macro mxVariantCount {
+    kind { derive }
+    appliesTo { enum }
+    expand(target: Declaration) -> Syntax {
+        var count: Int = 0
+        for field in target.fields {
+            count = count + 1
+        }
+        return quote {
+            function mxxEnumVariantCount() -> Int {
+                return #{count}
+            }
+        }
+    }
+}
+
+@Derive(mxVariantCount)
+enum MxColor {
+    Red
+    Green
+    Blue
+}
+
+@Test
+function mxxEnumDerive() {
+    expect!(mxxEnumVariantCount() == 3)
+}
+
+// --- Property-wrapper attribute macro (@PropertyWrapper) ---------------------
+// Validates the annotated struct exposes a `wrappedValue` field, records whether it also has
+// `projectedValue`, and generates free query functions (name-glued to the type via mid-identifier
+// splice) reporting that conformance. Kira `extend` applies only to *constructs* and there is no
+// `static`, so conformance is surfaced as generated free functions rather than the
+// `extend T: Conformance { static let ... }` sketch in the property-wrapper docs. The missing-`wrappedValue`
+// diagnostic path (KMAC021) is covered by tests/fail/semantics/macro_property_wrapper_missing.
+
+comptime macro MxPropertyWrapper {
+    kind { attribute }
+    appliesTo { struct }
+    expand(target: Declaration) -> Syntax {
+        var hasWrapped: Bool = false
+        var hasProjected: Bool = false
+        for field in target.fields {
+            if field.name.asString() == "wrappedValue" {
+                hasWrapped = true
+            }
+            if field.name.asString() == "projectedValue" {
+                hasProjected = true
+            }
+        }
+        if hasWrapped == false {
+            Diagnostics.error("PropertyWrapper requires a wrappedValue field", at: target.syntax)
+            return quote {}
+        }
+        return quote {
+            function is_#{target.name}_propertyWrapper() -> Bool {
+                return true
+            }
+            function has_#{target.name}_projectedValue() -> Bool {
+                return #{hasProjected}
+            }
+        }
+    }
+}
+
+@MxPropertyWrapper
+struct MxStateWrapper {
+    var wrappedValue: Int
+    var projectedValue: Bool
+}
+
+@MxPropertyWrapper
+struct MxPlainWrapper {
+    var wrappedValue: Int
+}
+
+@Test
+function mxxPropertyWrapperConformance() {
+    expect!(is_MxStateWrapper_propertyWrapper() == true)
+}
+
+@Test
+function mxxPropertyWrapperHasProjected() {
+    expect!(has_MxStateWrapper_projectedValue() == true)
+}
+
+@Test
+function mxxPropertyWrapperNoProjected() {
+    expect!(has_MxPlainWrapper_projectedValue() == false)
+}
+
+// --- Wrapper rewrite: a wrapped property as a named argument ------------------
+// `f(count = count)` is a call with a LABEL, not an assignment. The wrapped
+// field becomes a computed property, so the label stays a label and only the
+// value beside it reads the property through its getter.
+
+comptime macro MxWrap {
+    kind { wrapper }
+    appliesTo { form }
+
+    expand(target: Declaration, wrapper: Declaration) -> Syntax {
+        if target.name.asString() == wrapper.name.asString() {
+            return quote {}
+        }
+        var monos: [Syntax] = []
+        var rewritten: Declaration = target
+        for field in target.fields {
+            if field.hasAnnotation(wrapper.name.asString()) {
+                let monoName = "__mx_" + target.name.asString() + "_" + field.name.asString()
+                var mono: Syntax = wrapper.syntax.replaceIdentifier(
+                    wrapper.name.asString(),
+                    monoName
+                )
+                mono = mono.replaceIdentifier("Wrapped", field.type.asSyntax())
+                monos.append(mono)
+                rewritten = rewritten.replaceField(
+                    field.name,
+                    quote {
+                        var #{field.name}: #{field.type.asSyntax()} {
+                            get {
+                                let backing = __mx_#{target.name}_#{field.name} {
+                                    wrappedValue: #{field.initializer}
+                                }
+                                return backing.get()
+                            }
+                            set(value) {
+                                let backing = __mx_#{target.name}_#{field.name} {
+                                    wrappedValue: #{field.initializer}
+                                }
+                                backing.set(move value)
+                            }
+                        }
+                    }
+                )
+            }
+        }
+        return quote {
+            #{monos}
+            #{rewritten.syntax}
+        }
+    }
+}
+
+@MxWrap
+struct MxSeed {
+    var wrappedValue: Wrapped
+
+    function get() -> Wrapped {
+        return self.wrappedValue
+    }
+
+    function set(value: Wrapped) {
+        let ignored = value
+    }
+}
+
+construct MxCounter {
+    @Required function total() -> Int
+}
+
+function mxxAddOne(count: Int) -> Int {
+    return count + 1
+}
+
+construct MxLabelledCall() extends MxCounter {
+    @MxSeed var count: Int = 7
+
+    function total() -> Int {
+        return mxxAddOne(count = count)
+    }
+}
+
+@Test
+function mxxWrappedPropertyIsANamedArgumentLabel() {
+    expect!(MxLabelledCall().total() == 8)
+}
+
+// --- String(syntax): a macro reads its input as plain text -------------------
+// Reflection hands a macro its input as syntax; `String` renders the text it
+// was written with, so a lint or generator can search and join it.
+
+comptime macro mxMarkerText {
+    kind { function }
+    expand(input: Syntax) -> Syntax {
+        let text: String = String(input)
+        var answer: Int = 0
+        if text.contains("marker") {
+            answer = answer + 1
+        }
+        if text.contains("+") {
+            answer = answer + 10
+        }
+        return quote {
+            function mxxMarkerTextResult() -> Int {
+                return #{answer}
+            }
+        }
+    }
+}
+
+mxMarkerText!(let marker = 7 + 2)
+
+@Test
+function mxxStringOfSyntax() {
+    expect!(mxxMarkerTextResult() == 11)
+}
+
+// --- Identifier(text): a macro names what only exists as a string ----------
+// `Identifier` builds the use-site identifier its text spells, so generated
+// code can call a conversion whose width arrives as text — one branch per
+// spelling is the alternative, and it stops scaling at two.
+
+comptime macro mxNarrowTo {
+    kind { function }
+    expand(input: Syntax) -> Syntax {
+        let names: [Identifier] = input.identifiers()
+        let value: Identifier = names[0]
+        let width: String = names[1].asString()
+        return quote {
+            #{Identifier(width)}(#{value})
+        }
+    }
+}
+
+@Test
+function mxxIdentifierNamesAConversion() {
+    let wide: Int = 200
+    let narrow: U8 = mxNarrowTo!(wide, U8)
+    let back: Int = Int(narrow)
+    expect!(back == 200)
+}
+
+// --- Hygiene over every binding form ----------------------------------------
+// A `let`, a `var` and a `for` variable are not the only names a template
+// introduces. A `match` arm and a `handle` arm each bind a payload, and a
+// closure binds its parameters; a template that writes one of those must not
+// capture a fragment that mentions the same name. Each case below passes the
+// caller's own binding in as the fragment and reads it back through the arm, so
+// an unrenamed binder would answer with the payload instead.
+
+enum MxNote {
+    Tag(Int)
+    Blank
+}
+
+enum MxReadFailure {
+    Missing(Int)
+}
+
+function mxxReadFails() -> Result<Int, MxReadFailure> {
+    return .Error(.Missing(99))
+}
+
+macro mxArmPayload(subject: expr, value: expr) {
+    expand {
+        match subject {
+            Tag(text) -> { answer = value }
+            Blank -> { answer = 0 }
+        }
+    }
+}
+
+macro mxHandlerPayload(value: expr) {
+    expand {
+        attempt {
+            let got = try mxxReadFails()
+            answer = got
+        } handle {
+            Missing(reason) { answer = value }
+        }
+    }
+}
+
+macro mxClosureParameter(seed: expr) {
+    expand {
+        let step: (Int) -> Int = { n in return n + seed }
+        answer = step(1)
+    }
+}
+
+@Test
+function mxxAMatchArmPayloadDoesNotCaptureAFragment() {
+    let text = 5
+    var answer = 0
+    let note: MxNote = .Tag(9)
+    mxArmPayload!(note, text)
+    expect!(answer == 5)
+}
+
+@Test
+function mxxAHandlerPayloadDoesNotCaptureAFragment() {
+    let reason = 4
+    var answer = 0
+    mxHandlerPayload!(reason)
+    expect!(answer == 4)
+}
+
+@Test
+function mxxAClosureParameterDoesNotCaptureAFragment() {
+    let n = 30
+    var answer = 0
+    mxClosureParameter!(n)
+    expect!(answer == 31)
+}
+
+// Handler arms are whitespace-insensitive: the payload binds the same way with
+// the whole `handle` on one line, which is the spelling a program is most
+// likely to write. Asking for a line break would leave this binder unrenamed.
+macro mxSameLineHandlerPayload(value: expr) {
+    expand {
+        attempt {
+            let got = try mxxReadFails()
+            answer = got
+        } handle { Missing(reason) { answer = value } }
+    }
+}
+
+@Test
+function mxxASameLineHandlerPayloadDoesNotCaptureAFragment() {
+    let reason = 6
+    var answer = 0
+    mxSameLineHandlerPayload!(reason)
+    expect!(answer == 6)
+}

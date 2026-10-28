@@ -1,0 +1,82 @@
+extend FunctionLowering {
+    function lowerArrayBuilderBody(borrow mut self) -> Bool {
+        if checked.body.count != 4 || checked.entry || checked.lambda { return false }
+        var array = -1
+        match emptyArrayDeclaration(program.statements[checked.body[0]]) {
+            Some(local) -> array = local
+            None -> return false
+        }
+        if !checked.result.equals(checked.locals[array].valueType) || !isArrayType(program, checked.result) { return false }
+        if checked.locals[array].cell || checked.locals[array].byReference { return false }
+        var counter = -1
+        match zeroCounterDeclaration(program.statements[checked.body[1]]) {
+            Some(local) -> counter = local
+            None -> return false
+        }
+        if !checked.locals[counter].valueType.equals(Type.int()) || checked.locals[counter].cell { return false }
+        var shape = ArrayBuilderLoop { limit = -1, body = [] }
+        match checkedBuilderLoop(program.statements[checked.body[2]], counter) {
+            Some(found) -> shape = found
+            None -> return false
+        }
+        if !returnsArray(program.statements[checked.body[3]], array) { return false }
+        let element = program.structs[checked.result.declaration].typeArguments[0]
+        if needsArrayCleanup(program, element) { return false }
+        let appends = builderAppendCount(shape.body, array, counter)
+        if appends == 0 { return false }
+        var destination = storage[array]
+        match result {
+            Some(address) -> destination = address
+            None -> return false
+        }
+        let iterations = nonnegativeArrayCount(value(shape.limit))
+        let length = kir.binary(kirOperator(.Multiply, true), true, true, iterations, kir.integer(types.integer64, appends))
+        allocateBuilderArray(destination, length)
+        let zero = kir.integer(types.integer64, 0)
+        kir.store(zero, storage[counter])
+        let cursor = temporary(Type.int())
+        kir.store(zero, cursor)
+        let limit = builderFastLimit(shape.body, counter, array)
+        if limit == 0 {
+            emitArrayBuilderLoop(shape.body, counter, destination, cursor, iterations, false)
+        } else {
+            let fast = kir.block()
+            let slow = kir.block()
+            let done = kir.block()
+            kir.branchIf(kir.compare(kirPredicate(.LessEqual, true), iterations, kir.integer(types.integer64, limit)), fast, slow)
+            enter(fast)
+            emitArrayBuilderLoop(shape.body, counter, destination, cursor, iterations, true)
+            flowInto(done)
+            enter(slow)
+            emitArrayBuilderLoop(shape.body, counter, destination, cursor, iterations, false)
+            flowInto(done)
+            enter(done)
+        }
+        cleanupValues()
+        kir.returnVoid()
+        open = false
+        return true
+    }
+
+    function emitArrayBuilderLoop(borrow mut self, statements: [Int], counter: Int, destination: KirAddress, cursor: KirAddress, iterations: KirValue, fast: Bool) {
+        let elementType = types.of(program.structs[checked.result.declaration].typeArguments[0])
+        let elements = kir.typedMemory(arrayData(destination, checked.result), kir_type_array(0, elementType))
+        let test = kir.block()
+        let body = kir.block()
+        let done = kir.block()
+        flowInto(test)
+        enter(test)
+        kir.branchIf(kir.compare(kirPredicate(.Less, true), kir.load(storage[counter]), iterations), body, done)
+        enter(body)
+        for index in 0..(statements.count - 1) {
+            let mark = lifetimes.count
+            emitBuilderStatement(program.statements[statements[index]], elements, cursor, fast)
+            endStatement(mark)
+        }
+        let next = kir.binary(kirOperator(.Add, true), false, true, kir.load(storage[counter]), kir.integer(types.integer64, 1))
+        kir.store(next, storage[counter])
+        flowInto(test)
+        enter(done)
+    }
+
+}

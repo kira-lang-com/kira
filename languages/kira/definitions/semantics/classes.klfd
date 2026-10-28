@@ -1,0 +1,280 @@
+// A class is a struct whose fields and methods include its ancestors'. A
+// generic class is a template like a generic struct; what it inherits is
+// written in its own type parameters, through the arguments its `extends`
+// clause passes each parent.
+function materializeClasses(move tree: SyntaxTree) -> SyntaxTree {
+    var prepared = move tree
+    for declared in prepared.classes {
+        let declaration = StructDeclaration {
+            name = declared.name, genericParameters = declared.genericParameters, typeArguments = [], callableModes = [],
+            ancestors = classAncestors(prepared.classes, declared, 0),
+            genericBase = "Class", baseNameSpan = declared.name.span,
+            specialized = false, typeSuffix = scopedTypeSuffix(declared.name.text),
+            fields = inheritedClassFields(prepared.classes, declared, 0),
+            methods = inheritedClassMethods(prepared.classes, declared, 0)
+        }
+        if declared.genericParameters.count > 0 {
+            prepared.genericStructs.append(declaration)
+        } else {
+            prepared.structs.append(declaration)
+        }
+    }
+    return prepared
+}
+
+function classNamed(classes: [ClassDeclaration], name: String) -> Optional<ClassDeclaration> {
+    for declared in classes {
+        if declared.name.text == name { return .Some(declared) }
+    }
+    return .None
+}
+
+// Every class `declared` extends, nearest first, as `declared` spells it.
+function classAncestors(classes: [ClassDeclaration], declared: ClassDeclaration, depth: Int) -> [TypeReference] {
+    if depth > classes.count { report(.ClassInheritanceCycle, declared.name.span) return [] }
+    var ancestors: [TypeReference] = []
+    for parent in declared.parents {
+        match classNamed(classes, parent.name.text) {
+            Some(base) -> {
+                if base.genericParameters.count != parent.arguments.count {
+                    report(.TypeArgumentCount, parent.name.span)
+                    continue
+                }
+                addAncestor(ancestors, parent)
+                for inherited in classAncestors(classes, base, depth + 1) {
+                    addAncestor(ancestors, substituteGenericReference(inherited, base.genericParameters, parent.arguments))
+                }
+            }
+            None -> report(.UnknownType, parent.name.span)
+        }
+    }
+    return ancestors
+}
+
+function addAncestor(ancestors: borrow mut [TypeReference], ancestor: TypeReference) {
+    for earlier in ancestors {
+        if earlier.instanceName == ancestor.instanceName { return }
+    }
+    ancestors.append(ancestor)
+}
+
+function classFieldBaseName(name: String) -> String {
+    var start = 0
+    for index in 0..utf8Count(name) {
+        if utf8Byte(name, index) == 46 { start = index + 1 }
+    }
+    return utf8Slice(name, start, utf8Count(name))
+}
+
+function inheritedClassFields(classes: [ClassDeclaration], declared: ClassDeclaration, depth: Int) -> [FieldDeclaration] {
+    if depth > classes.count { return [] }
+    var fields: [FieldDeclaration] = []
+    for parent in declared.parents {
+        match classNamed(classes, parent.name.text) {
+            Some(base) -> {
+                if base.genericParameters.count != parent.arguments.count { continue }
+                for field in inheritedClassFields(classes, base, depth + 1) {
+                    var present = false
+                    for earlier in fields {
+                        if earlier.name.text == field.name.text { present = true }
+                    }
+                    if !present {
+                        fields.append(FieldDeclaration {
+                            name = field.name, mutable = field.mutable, initial = field.initial, annotations = field.annotations,
+                            inferred = field.inferred, span = field.span,
+                            annotation = substituteGenericReference(field.annotation, base.genericParameters, parent.arguments)
+                        })
+                    }
+                }
+            }
+            None -> {}
+        }
+    }
+    for field in declared.fields {
+        fields.append(FieldDeclaration {
+            name = Identifier { text = joinText([declared.name.text, ".", field.name.text]), span = field.name.span },
+            mutable = field.mutable, annotation = field.annotation, initial = field.initial, annotations = field.annotations,
+            inferred = field.inferred, span = field.span
+        })
+    }
+    for supplied in declared.overrides {
+        var matched = false
+        for index in 0..fields.count {
+            let field = fields[index]
+            if classFieldBaseName(field.name.text) == supplied.name.text {
+                fields[index] = FieldDeclaration {
+                    name = field.name, mutable = field.mutable, annotation = field.annotation, initial = .Some(supplied.initial),
+                    annotations = field.annotations, inferred = field.inferred, span = field.span
+                }
+                matched = true
+            }
+        }
+        if !matched { report(.UnknownField, supplied.name.span) }
+    }
+    return fields
+}
+
+// A restated `override let name: T` must name the type of the slot it
+// rebinds; a different type means the author meant some other field.
+function checkClassOverrideTypes(declarations: Declarations, classes: [ClassDeclaration]) {
+    for declared in classes {
+        match declarations.typeNamed(declared.name.text) {
+            Some(owner) -> {
+                for supplied in declared.overrides {
+                    match supplied.annotation {
+                        Some(annotation) -> {
+                            let written = declarations.resolve(annotation)
+                            for field in declarations.structs[owner.declaration].fields {
+                                if classFieldBaseName(field.name.text) == supplied.name.text
+                                    && !written.isInvalid() && !field.valueType.isInvalid() && !written.equals(field.valueType) {
+                                    report(.OverrideTypeMismatch, annotation.name.span)
+                                }
+                            }
+                        }
+                        None -> {}
+                    }
+                }
+            }
+            None -> {}
+        }
+    }
+}
+
+function renamedClassMethod(method: FunctionDeclaration, name: String) -> FunctionDeclaration {
+    return FunctionDeclaration {
+        name = Identifier { text = name, span = method.name.span }, annotations = method.annotations,
+        receiver = method.receiver, parameters = method.parameters, result = method.result, body = method.body, span = method.span,
+        typeParameters = method.typeParameters, scope = method.scope
+    }
+}
+
+// A method stands in for an inherited one of the same name that takes the
+// same parameter types; one taking others is another overload beside it.
+function addClassMethod(methods: borrow mut [FunctionDeclaration], method: FunctionDeclaration, replace: Bool) {
+    for index in 0..methods.count {
+        if methods[index].name.text == method.name.text && sameParameterReferences(methods[index], method) {
+            if replace { methods[index] = method }
+            return
+        }
+    }
+    methods.append(method)
+}
+
+function sameParameterReferences(first: FunctionDeclaration, second: FunctionDeclaration) -> Bool {
+    if first.parameters.count != second.parameters.count { return false }
+    for index in 0..first.parameters.count {
+        if first.parameters[index].annotation.instanceName != second.parameters[index].annotation.instanceName { return false }
+        if first.parameters[index].name.text != second.parameters[index].name.text { return false }
+    }
+    return true
+}
+
+function inheritedClassMethods(classes: [ClassDeclaration], declared: ClassDeclaration, depth: Int) -> [FunctionDeclaration] {
+    if depth > classes.count { return [] }
+    var methods: [FunctionDeclaration] = []
+    for parent in declared.parents {
+        match classNamed(classes, parent.name.text) {
+            Some(base) -> {
+                if base.genericParameters.count != parent.arguments.count { continue }
+                let inherited = specializeMethods(inheritedClassMethods(classes, base, depth + 1), base.genericParameters, parent.arguments)
+                for method in inherited {
+                    addClassMethod(methods, method, false)
+                    if classFieldBaseName(method.name.text) == method.name.text {
+                        addClassMethod(methods, renamedClassMethod(method, joinText([base.name.text, ".", method.name.text])), false)
+                    }
+                }
+            }
+            None -> {}
+        }
+    }
+    for method in declared.methods { addClassMethod(methods, method, true) }
+    let unqualified = methods
+    for method in unqualified {
+        if classFieldBaseName(method.name.text) == method.name.text {
+            addClassMethod(methods, renamedClassMethod(method, joinText([declared.name.text, ".", method.name.text])), true)
+        }
+    }
+    return methods
+}
+
+function classIsSubtype(program: CheckedProgram, actual: Type, expected: Type) -> Bool {
+    if !isClassType(program, actual) || !isClassType(program, expected) { return false }
+    if actual.equals(expected) { return true }
+    return hasBoundName(program.structs[actual.declaration].ancestors, program.structs[expected.declaration].name.text)
+}
+
+function classMethodOrigin(classes: [ClassDeclaration], method: FunctionDeclaration) -> String {
+    for declared in classes {
+        for original in declared.methods {
+            if original.span.file == method.span.file && original.span.start == method.span.start && original.span.end == method.span.end {
+                return declared.name.text
+            }
+        }
+    }
+    return ""
+}
+
+function classFieldInContext(declared: StructType, name: String, origin: String) -> Optional<Int> {
+    let preferred = joinText([origin, ".", name])
+    for index in 0..declared.fields.count {
+        if declared.fields[index].name.text == preferred { return .Some(index) }
+    }
+    return declared.field(name)
+}
+
+extend Checker {
+    function parentClassField(borrow mut self, base: Int, field: Identifier, span: Span) -> Optional<Int> {
+        match signature().owner {
+            Some(selfType) -> {
+                if !isClassType(program, selfType) { return .None }
+                let owner = selfType.declaration
+                match tree.expressions[base].kind.name() {
+                    Some(name) -> {
+                        if lookup(name.text).isSome() { return .None }
+                        match declarations.typeNamed(name.text) {
+                            Some(parent) -> {
+                                if !classIsSubtype(program, selfType, parent) { return .None }
+                                let parentClass = program.structs[parent.declaration]
+                                match classFieldInContext(parentClass, field.text, parentClass.name.text) {
+                                    Some(parentField) -> {
+                                        let key = parentClass.fields[parentField].name.text
+                                        match program.structs[owner].field(key) {
+                                            Some(index) -> {
+                                                let receiver = add(.Read(0), selfType, span)
+                                                return .Some(add(.Member(receiver, index), program.structs[owner].fields[index].valueType, span))
+                                            }
+                                            None -> {}
+                                        }
+                                    }
+                                    None -> {}
+                                }
+                                report(.UnknownField, field.span)
+                                return .Some(add(.Integer(0), Type.invalid(), span))
+                            }
+                            None -> {}
+                        }
+                    }
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+        return .None
+    }
+
+    function dynamicClassCall(borrow mut self, target: Int, receiver: Int, arguments: [Int], span: Span) -> Int {
+        let checked = call(target, .Some(receiver), arguments, span)
+        // A method another module exports through RIDL is its entry: that
+        // module chooses the override, so the call is a direct one.
+        if hasAttribute(declarations.signatures[target].declaration.annotations, .Ridl) { return checked }
+        match program.expressions[checked].operation.invocation() {
+            Some(invocation) -> return add(.ClassCall(target, invocation.arguments), typeOf(checked), span)
+            None -> return checked
+        }
+    }
+}
+
+function isClassType(program: CheckedProgram, valueType: Type) -> Bool {
+    if valueType.kind != .Structure { return false }
+    return program.structs[valueType.declaration].genericBase == "Class"
+}

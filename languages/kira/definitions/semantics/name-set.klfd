@@ -1,0 +1,35 @@
+// A set of names, each filed in the bucket its text hashes to, so asking for
+// one reads a single bucket rather than every name.
+
+let nameSetBuckets = 1024
+
+struct NameSet {
+    var buckets: [[String]]
+
+    function contains(borrow self, name: String) -> Bool {
+        for filed in buckets[nameHash(name) % nameSetBuckets] {
+            if filed == name { return true }
+        }
+        return false
+    }
+
+    function insert(borrow mut self, name: String) {
+        if self.contains(name) { return }
+        buckets[nameHash(name) % nameSetBuckets].append(name)
+    }
+}
+
+function emptyNameSet() -> NameSet {
+    var buckets: [[String]] = []
+    for bucket in 0..nameSetBuckets {
+        let empty: [String] = []
+        buckets.append(empty)
+    }
+    return NameSet { buckets = buckets }
+}
+
+function nameHash(name: String) -> Int {
+    var hash = 0
+    for offset in 0..utf8Count(name) { hash = (hash * 31 + utf8Byte(name, offset)) % 65521 }
+    return hash
+}

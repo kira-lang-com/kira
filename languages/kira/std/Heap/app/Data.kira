@@ -1,0 +1,55 @@
+struct ArrayBufferOps {
+    let abi: U32
+    let flags: U32
+    let reallocate: RawPtr
+    let free: RawPtr
+}
+
+function makeArrayData(byteCount: Int) -> RawPtr {
+    let buffer = makeHeapBuffer(byteCount)
+    return heapBufferData(buffer)
+}
+
+function retainArrayData(data: RawPtr) -> RawPtr {
+    let buffer = HeapBuffer { allocation = heapOffset(data, -16) }
+    retainHeapBuffer(buffer)
+    return data
+}
+
+function releaseArrayData(data: RawPtr) {
+    releaseHeapBuffer(HeapBuffer { allocation = heapOffset(data, -16) })
+}
+
+function ensureUniqueArrayData(data: RawPtr) -> RawPtr {
+    var buffer = HeapBuffer { allocation = heapOffset(data, -16) }
+    ensureUniqueHeapBuffer(buffer)
+    return heapBufferData(buffer)
+}
+
+function resizeArrayData(data: RawPtr, byteCount: Int) -> RawPtr {
+    var buffer = HeapBuffer { allocation = heapOffset(data, -16) }
+    resizeHeapBuffer(buffer, byteCount)
+    return heapBufferData(buffer)
+}
+
+function arrayDataIsUnique(data: RawPtr) -> Bool {
+    return heapBufferIsUnique(HeapBuffer { allocation = heapOffset(data, -16) })
+}
+
+function reallocateArrayBufferOps(
+    data: RawPtr,
+    oldCapacity: Int,
+    newCapacity: Int,
+    elementSize: Int,
+    alignment: Int
+) -> RawPtr {
+    return resizeArrayData(data, newCapacity * elementSize)
+}
+
+function freeArrayBufferOps(data: RawPtr, capacity: Int, elementSize: Int, alignment: Int) {
+    releaseArrayData(data)
+}
+
+function freeClosureContextData(box: RawPtr) {
+    releaseArrayData(box)
+}

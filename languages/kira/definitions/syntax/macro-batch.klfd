@@ -1,0 +1,301 @@
+// Evaluating a round's macros together. Each evaluation runs the macro in a
+// program of the libraries and compile-time functions, and checking and
+// lowering that program costs far more than running the macro. So before a
+// round expands anything, the evaluations it will make are planned and run
+// in one program, each from an entry of its own on a fresh machine.
+//
+// Expanding then takes each result from the batch while the program a macro
+// would run in is still the one the batch ran: no declaration it holds came
+// or went, and no macro call within its files was expanded. Otherwise, and
+// for any evaluation the plan did not foresee or the batch did not finish,
+// the macro is evaluated alone, exactly as without a batch.
+
+struct MacroJob {
+    let macro: ProceduralMacroDeclaration
+    let arguments: [String]
+    let origin: Span
+}
+
+struct MacroBatch {
+    let jobs: [MacroJob]
+    // The file holding each job's syntax, or -1 when it has none.
+    let files: [Int]
+    // The `expand` functions the batch ran, and the key of the program it
+    // ran them in.
+    let expansions: [FunctionDeclaration]
+    let key: [Int]
+    var current: Bool
+}
+
+function emptyMacroBatch() -> MacroBatch {
+    return MacroBatch { jobs = [], files = [], expansions = [], key = [], current = false }
+}
+
+function batchedMacro(batch: MacroBatch, tree: SyntaxTree, declared: ProceduralMacroDeclaration, arguments: [String], origin: Span) -> Optional<Int> {
+    if !batch.current { return .None }
+    for index in 0..batch.jobs.count {
+        let job = batch.jobs[index]
+        if batch.files[index] >= 0 && job.origin.same(origin) && sameMacro(job.macro, declared) && sameTexts(job.arguments, arguments) {
+            if sameInts(batch.key, macroEvaluatorKey(tree, batch.expansions)) { return .Some(batch.files[index]) }
+            return .None
+        }
+    }
+    return .None
+}
+
+function sameMacro(first: ProceduralMacroDeclaration, second: ProceduralMacroDeclaration) -> Bool {
+    return first.name.text == second.name.text && first.expansion.name.span.same(second.expansion.name.span)
+}
+
+function sameTexts(first: [String], second: [String]) -> Bool {
+    if first.count != second.count { return false }
+    for index in 0..first.count { if first[index] != second[index] { return false } }
+    return true
+}
+
+function sameInts(first: [Int], second: [Int]) -> Bool {
+    if first.count != second.count { return false }
+    for index in 0..first.count { if first[index] != second[index] { return false } }
+    return true
+}
+
+// Whether a macro call in `file` may be part of the program the batch's
+// macros run in.
+function macroEvaluatorFile(tree: SyntaxTree, batch: MacroBatch, file: Int) -> Bool {
+    if macroEvaluationFile(macroEvaluationFiles(tree, macroEvaluationLibraries(tree, batch.expansions)), file) { return true }
+    for expansion in batch.expansions { if expansion.name.span.file == file { return true } }
+    for candidate in tree.functions {
+        if candidate.name.span.file == file && hasAttribute(candidate.annotations, .Comptime) { return true }
+    }
+    return false
+}
+
+// The evaluations a round makes, as far as the tree at its start tells:
+// those of its annotated declarations, its invocations and the macro calls
+// among the expressions from `first` up to `end`.
+function plannedMacroJobs(tree: SyntaxTree, annotated: [AnnotatedDeclaration], templates: [MacroTemplate], invocations: [SourceMacroInvocation], first: Int, end: Int) -> [MacroJob] {
+    var jobs: [MacroJob] = []
+    for declaration in annotated { appendAnnotatedJobs(jobs, tree, declaration, templates) }
+    for invocation in invocations { appendCallJob(jobs, tree, invocation.name, invocation.input, invocation.span) }
+    for index in first..end {
+        let expression = tree.expressions[index]
+        match expression.kind {
+            MacroCall(name, arguments, written) -> appendCallJob(jobs, tree, name, written, expression.span)
+            ExpandedMacro -> {}
+            Quote -> {}
+            IntegerLiteral -> {}
+            FloatLiteral -> {}
+            BooleanLiteral -> {}
+            StringLiteral -> {}
+            ArrayLiteral -> {}
+            Index -> {}
+            Transfer -> {}
+            Labelled -> {}
+            TypeQuery -> {}
+            Name -> {}
+            Member -> {}
+            Call -> {}
+            GenericCall -> {}
+            MethodCall -> {}
+            IndirectCall -> {}
+            Lambda -> {}
+            KeyPath -> {}
+            Task -> {}
+            Try -> {}
+            Variant -> {}
+            StructLiteral -> {}
+            Unary -> {}
+            Binary -> {}
+            Conditional -> {}
+            MatchValue -> {}
+            Content -> {}
+        }
+    }
+    return jobs
+}
+
+function appendCallJob(jobs: borrow mut [MacroJob], tree: SyntaxTree, name: Identifier, input: String, origin: Span) {
+    match findProceduralMacro(tree, name) {
+        Some(declared) -> {
+            match declared.kind {
+                MacroFunction -> jobs.append(MacroJob { macro = declared, arguments = [macroSyntaxArgument(input)], origin = origin })
+                MacroDerive -> {}
+                MacroAttribute -> {}
+                MacroWrapper -> {}
+                MacroCollector -> {}
+            }
+        }
+        None -> {}
+    }
+}
+
+// The evaluations `expandAnnotated` makes for `declaration`.
+function appendAnnotatedJobs(jobs: borrow mut [MacroJob], tree: SyntaxTree, declaration: AnnotatedDeclaration, templates: [MacroTemplate]) {
+    let reflection = [declaration.reflection]
+    var template = false
+    for annotation in declaration.annotations {
+        let derived = isAttribute(annotation, .Derive)
+        var names = [annotation.name]
+        if derived { names = derivedMacros(tree, annotation) }
+        for name in names {
+            match findProceduralMacro(tree, name) {
+                Some(declared) -> {
+                    let applies = appliesTo(declared, declaration)
+                    match declared.kind {
+                        MacroDerive -> { if applies && derived { jobs.append(MacroJob { macro = declared, arguments = reflection, origin = name.span }) } }
+                        MacroAttribute -> { if applies && !derived { jobs.append(MacroJob { macro = declared, arguments = reflection, origin = name.span }) } }
+                        MacroWrapper -> {
+                            if !derived {
+                                template = true
+                                jobs.append(MacroJob { macro = declared, arguments = [declaration.reflection, declaration.reflection], origin = name.span })
+                            }
+                        }
+                        MacroFunction -> {}
+                        MacroCollector -> {}
+                    }
+                }
+                None -> {}
+            }
+        }
+    }
+    if template || wrapsGenerically(tree, declaration) { return }
+    var summoned: [String] = []
+    for annotation in declaration.fieldAnnotations {
+        var seen = false
+        for name in summoned { if name == annotation.name.text { seen = true } }
+        if seen { continue }
+        match templateNamed(templates, annotation.name.text) {
+            Some(found) -> {
+                summoned.append(annotation.name.text)
+                jobs.append(MacroJob { macro = found.macro, arguments = [declaration.reflection, found.reflection], origin = annotation.name.span })
+            }
+            None -> {
+                match findProceduralMacro(tree, annotation.name) {
+                    Some(declared) -> {
+                        if declared.triggerField {
+                            summoned.append(annotation.name.text)
+                            if appliesTo(declared, declaration) {
+                                jobs.append(MacroJob { macro = declared, arguments = reflection, origin = annotation.name.span })
+                            }
+                        }
+                    }
+                    None -> {}
+                }
+            }
+        }
+    }
+}
+
+// An entry the batch parsed into its program: the job it runs, and its
+// source and file.
+struct MacroEntry {
+    let job: Int
+    let source: String
+    let file: Int
+}
+
+// The program for `expansions` with the `parsed` entries in it.
+function macroEntriesTree(tree: SyntaxTree, expansions: [FunctionDeclaration], jobs: [MacroJob], parsed: [MacroEntry]) -> SyntaxTree {
+    var evaluator = macroEvaluationTree(tree, expansions)
+    for entry in parsed {
+        match withMacroEntry(move evaluator, tree, jobs[entry.job].macro, entry.source, entry.file) {
+            Ok(withEntry) -> evaluator = withEntry
+            Error -> evaluator = macroEvaluationTree(tree, expansions)
+        }
+    }
+    return evaluator
+}
+
+// Runs `jobs` in one program. A job whose entry does not parse, or whose
+// evaluation fails or reports a diagnostic, is left without a file, to be
+// evaluated alone when expanding comes to it.
+function evaluateMacroBatch(session: Session, unit: Unit, tree: SyntaxTree, jobs: [MacroJob]) -> MacroBatch {
+    if jobs.count == 0 { return emptyMacroBatch() }
+    var files: [Int] = []
+    var entries: [String] = []
+    var expansions: [FunctionDeclaration] = []
+    for job in jobs {
+        files.append(-1)
+        entries.append("")
+        var known = false
+        for expansion in expansions { if expansion.name.span.same(job.macro.expansion.name.span) { known = true } }
+        if !known { expansions.append(job.macro.expansion) }
+    }
+    // An answer an earlier build kept is taken as it is; only the others
+    // are evaluated. Each is keyed by the program its macro runs in alone,
+    // whose answer the batch gives: the round's other macros do not change
+    // it.
+    var programs: [String] = []
+    for expansion in expansions { programs.append(macroProgramKey(session, tree, [expansion])) }
+    var keys: [String] = []
+    var pending = false
+    for index in 0..jobs.count {
+        let job = jobs[index]
+        keys.append("")
+        if job.macro.expansion.parameters.count != job.arguments.count { continue }
+        var program = ""
+        for position in 0..expansions.count {
+            if expansions[position].name.span.same(job.macro.expansion.name.span) { program = programs[position] }
+        }
+        keys[index] = macroAnswerKey(program, tree, job.macro, job.arguments)
+        files[index] = subquery_recall(session, job.origin.file as SourceFile, keys[index])
+        if files[index] < 0 { pending = true }
+    }
+    let batch = MacroBatch { jobs = jobs, files = files, expansions = expansions, key = macroEvaluatorKey(tree, expansions), current = true }
+    if !pending || !tree.compileTimeBodies { return batch }
+    var evaluator = macroEvaluationTree(tree, expansions)
+    var symbols: [String] = []
+    var parsed: [MacroEntry] = []
+    for index in 0..jobs.count {
+        let job = jobs[index]
+        if job.macro.expansion.parameters.count != job.arguments.count || files[index] >= 0 { continue }
+        let entry = joinText(["__source_macro_entry_", decimalText(index)])
+        let source = macroEntrySource(entry, job.macro, job.arguments)
+        let file = addSource(session, job.macro.name.span.file as SourceFile, source)
+        if file < 0 { continue }
+        // The evaluator goes into the parse, so a failed entry leaves it to
+        // be built again from the entries that did parse.
+        match withMacroEntry(move evaluator, tree, job.macro, source, file) {
+            Ok(withEntry) -> {
+                evaluator = withEntry
+                entries[index] = entry
+                symbols.append(entry)
+                parsed.append(MacroEntry { job = index, source = source, file = file })
+            }
+            Error -> evaluator = macroEntriesTree(tree, expansions, jobs, parsed)
+        }
+    }
+    if symbols.count == 0 { return batch }
+    let program = check(evaluator, .Some(symbols))
+    var targets: [Int] = []
+    var roots: [Int] = []
+    for entry in entries {
+        var target = -1
+        if entry != "" {
+            for index in 0..program.functions.count { if program.functions[index].symbol == entry { target = index } }
+        }
+        targets.append(target)
+        if target >= 0 { roots.append(target) }
+    }
+    match program.globalInitializer {
+        Some(initializer) -> roots.append(initializer)
+        None -> {}
+    }
+    let builder = kir_module_detached(session, unit)
+    let functions = lowerCheckedProgram(builder, program, roots, false)
+    for target in targets { if target >= 0 { kir_module_evaluation_root(builder, functions[target]) } }
+    let prepared = kir_module_evaluator(builder)
+    var evaluated = batch
+    for index in 0..jobs.count {
+        if targets[index] < 0 { continue }
+        let result = kir_evaluator_evaluate_buffer(prepared, functions[targets[index]], 0, 1, macroStepBudget, macroMemoryBudget)
+        if kir_evaluation_status(result) != 1 { continue }
+        let file = kir_evaluation_source(session, jobs[index].origin.file as SourceFile, result)
+        if file >= 0 && !macroReported(fileText(session, file as SourceFile)) {
+            evaluated.files[index] = file
+            subquery_keep(session, keys[index], file as SourceFile)
+        }
+    }
+    kir_evaluator_release(prepared)
+    return evaluated
+}

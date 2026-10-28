@@ -1,0 +1,29 @@
+import Foundation
+
+@Main
+function main() -> Int {
+    let identifier: String = klist!("Info.klist", "BundleIdentifier")
+    if identifier != "com.kira-lang.harmony" { return 1 }
+    let build = U64(klist!("Info.klist", "BuildNumber"))
+    if build != U64(412) { return 2 }
+    let mask = U32(klist!("Info.klist", "Mask"))
+    if mask != U32(0xFF000000) { return 3 }
+    let bits = U64(klist!("Info.klist", "AllBits"))
+    if bits != 0xffffffffffffffff { return 12 }
+    let scale: Number = klist!("Info.klist", "Scale")
+    if String(scale) != "0.75" { return 4 }
+    let multiple: Bool = klist!("Info.klist", "SupportsMultipleWindows")
+    if !multiple { return 5 }
+    let date: String = klist!("Info.klist", "BuildDate")
+    if date != "2026-10-05T14:30:00Z" { return 6 }
+    let platforms: [String] = klist!("Info.klist", "SupportedPlatforms")
+    if platforms.count != 2 || platforms[1] != "Tessera & co" { return 7 }
+    let extension: String = klist!("Info.klist", "DocumentTypes.0.Extension")
+    if extension != "klist" { return 8 }
+    let hash: [UN8] = klist!("Info.klist", "IconHash")
+    if hash.count != 4 || hash[0] != 222 || hash[3] != 239 { return 9 }
+    let applications: String = klist!(SharedLists, "Paths.klist", "Applications")
+    if applications != "/Applications" { return 10 }
+    if !Build.debug() || Build.release() { return 11 }
+    return 42
+}

@@ -1,0 +1,67 @@
+import Foundation
+
+// Closures: function types, named references, inline literals, higher-order
+// functions, immutable by-value captures, and shared mutable `var` captures.
+
+function cloAdd(a: Number, b: Number) -> Number {
+    return a + b
+}
+
+function cloApplyTwice(f: (Number) -> Number, x: Number) -> Number {
+    return f(f(x))
+}
+
+function cloReduce(xs: borrow [Number], f: (Number) -> Number) -> Number {
+    var total: Number = 0
+    for i in 0..xs.count {
+        total = total + f(xs[i])
+    }
+    return total
+}
+
+@Test
+function namedFunctionIsPassedAsAValue() {
+    let f: (Number, Number) -> Number = cloAdd
+    expect!((f(20, 22)) == (42))
+    expect!((f(0, 0)) == (0))
+}
+
+@Test
+function inlineLiteralIsAppliedTwice() {
+    let inc: (Number) -> Number = { x in return x + 1 }
+    expect!((cloApplyTwice(move inc, 10)) == (12))
+}
+
+@Test
+function immutableCaptureStaysFixed() {
+    let base: Number = 1000
+    let addBase: (Number) -> Number = { x in return x + base }
+    var total: Number = 0
+    for i in 0..20 {
+        total = total + addBase(i)
+    }
+    expect!((total) == (20190))
+    expect!((addBase(0)) == (1000))
+}
+
+@Test
+function closureIsPassedIntoAReducer() {
+    let data: [Number] = [1, 2, 3, 4, 5, 6, 7, 8]
+    let square: (Number) -> Number = { x in return x * x }
+    expect!((cloReduce(data, move square)) == (204))
+}
+
+@Test
+function closureMutatesAnOuterVar() {
+    var total: Number = 0
+    let accumulate: (Number) -> Number = { x in
+        total = total + x
+        return total
+    }
+    var last: Number = 0
+    for j in 1..11 {
+        last = accumulate(j)
+    }
+    expect!((total) == (55))
+    expect!((last) == (55))
+}

@@ -1,0 +1,70 @@
+import Foundation
+
+// Received packet numbers collapse into ascending ACK ranges, and the ACK
+// delay is carried through unchanged.
+@Test
+function receivedNumbersBecomeAckRanges() {
+    var received = QuicReceivedRanges {}
+    for number in [0, 1, 2, 5, 7, 6, 3, 9] { received.add(number, QuicInstant(number)) }
+    let ack = match received.frame(QuicInstant(12), 0) {
+        Some(value) -> value
+        None -> {
+            expect!(("no ack") == "")
+            return
+        }
+    }
+    expect!((ack.ranges.count) == (3))
+    expect!("\(ack.ranges[0].smallest)" == "9")
+    expect!("\(ack.ranges[0].largest)" == "9")
+    expect!("\(ack.ranges[1].smallest)" == "5")
+    expect!("\(ack.ranges[1].largest)" == "7")
+    expect!("\(ack.ranges[2].smallest)" == "0")
+    expect!("\(ack.ranges[2].largest)" == "3")
+    expect!("\(ack.delay)" == "3")
+}
+
+function sentAt(number: Number, at: Number) -> QuicSentPacket {
+    return QuicSentPacket {
+        number: number,
+        sentAt: QuicInstant(at),
+        size: 1200,
+        elicitsAck: true,
+        inFlight: true,
+        frames: [.Ping]
+    }
+}
+
+// Four sent, the last acknowledged: the first is three behind, so lost; the
+// rest wait on the loss timer. The ACK grows the window by a packet before
+// the loss halves it.
+@Test
+function packetThresholdLossHalvesTheWindow() {
+    var recovery = QuicLossRecovery { congestion: quicNewReno(1200) }
+    let start = recovery.congestion.window()
+    for number in 0..4 { recovery.onSent(.Application, sentAt(number, number * 1000)) }
+    let ack = QuicAckFrame { ranges: [QuicAckRange { smallest: 3, largest: 3 }], delay: 0 }
+    let outcome = match recovery.onAck(.Application, ack, QuicInstant(50000)) {
+        Ok(value) -> value
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    var lost: [Number] = []
+    for packet in outcome.lost { lost.append(packet.number) }
+    expect!((traceText(lost)) == "[0]")
+    expect!("\(recovery.rtt.latest)" == "47000")
+    expect!((traceText(recovery.timer().isSome())) == "true")
+    expect!("\(start)" == "12000")
+    expect!("\(recovery.congestion.window())" == "6600")
+    expect!("\(recovery.congestion.inFlight())" == "2400")
+}
+
+// An ACK for a packet never sent is a protocol violation.
+@Test
+function acknowledgingUnsentPacketsIsAViolation() {
+    var recovery = QuicLossRecovery { congestion: quicNewReno(1200) }
+    recovery.onSent(.Initial, sentAt(0, 0))
+    let ack = QuicAckFrame { ranges: [QuicAckRange { smallest: 0, largest: 4 }], delay: 0 }
+    expect!(traceText(recovery.onAck(.Initial, ack, QuicInstant(10))) == "Error(QuicTransportError.ProtocolViolation)")
+}

@@ -1,0 +1,317 @@
+// Lowering calls, operators and conversions.
+//
+// Arithmetic traps when its result leaves the range of the written width, and
+// a shift traps when its count is outside `0..width`. A conversion to a type
+// that cannot hold every value of the source is checked, and traps on a value
+// the destination cannot hold.
+
+extend FunctionLowering {
+    // Every argument is evaluated before any is pushed: a nested call would
+    // otherwise take the pending arguments as its own.
+    function pushArguments(borrow mut self, target: Int, arguments: [Int], destination: Optional<KirAddress>) {
+        let callee = program.functions[target]
+        var values: [KirValue] = []
+        match destination {
+            Some(result) -> values.append(kir.pointer(result))
+            None -> {}
+        }
+        for index in 0..arguments.count {
+            let parameter = callee.locals[index]
+            values.append(passedArgument(parameter.valueType, parameter.passingMode, parameter.byReference, arguments[index]))
+        }
+        for argument in values {
+            kir.argument(argument)
+        }
+    }
+
+    // An argument as the callee takes it: an owned aggregate moves into a
+    // temporary the callee drops, another aggregate or a reference passes the
+    // address of its storage, and a scalar passes its value.
+    function passedArgument(borrow mut self, valueType: Type, mode: PassingMode, byReference: Bool, argument: Int) -> KirValue {
+        if !byReference && !valueType.isAggregate() { return value(argument) }
+        if byReference { prepareArrayPlace(argument) }
+        if mode == .Owned && valueType.isAggregate() {
+            let owned = temporary(valueType)
+            write(argument, owned)
+            forgetTracked(owned)
+            return kir.pointer(owned)
+        }
+        return kir.pointer(address(argument))
+    }
+
+    function call(borrow mut self, target: Int, arguments: [Int], result: Type) -> KirValue {
+        match foreignOf(target) {
+            Some(foreign) -> return foreignCall(target, foreign, arguments, .None, program.functions[target].name)
+            None -> {}
+        }
+        pushArguments(target, arguments, .None)
+        return kir.call(functions[target], types.of(result))
+    }
+
+    function callInto(borrow mut self, target: Int, arguments: [Int], destination: KirAddress) {
+        match foreignOf(target) {
+            Some(foreign) -> {
+                foreignCall(target, foreign, arguments, .Some(destination), program.functions[target].name)
+                return
+            }
+            None -> {}
+        }
+        pushArguments(target, arguments, .Some(destination))
+        kir.callVoid(functions[target])
+    }
+
+    function callVoid(borrow mut self, target: Int, arguments: [Int]) {
+        match foreignOf(target) {
+            Some(foreign) -> {
+                foreignCall(target, foreign, arguments, .None, program.functions[target].name)
+                return
+            }
+            None -> {}
+        }
+        pushArguments(target, arguments, .None)
+        kir.callVoid(functions[target])
+    }
+
+    function unary(borrow mut self, operator: UnaryOperator, operand: Int, valueType: Type) -> KirValue {
+        let operandValue = value(operand)
+        if valueType.kind == .Floating { return kir_value_float_negate(kir, operandValue) }
+        match operator {
+            Negate -> {
+                let zero = kir.integer(types.of(valueType), 0)
+                return kir.binary(kirOperator(.Subtract, valueType.signed), true, valueType.signed, zero, operandValue)
+            }
+            Not -> return kir.compare(kirPredicate(.Equal, false), operandValue, kir.integer(types.boolean, 0))
+            Complement -> {
+                let ones = kir.integer(types.of(valueType), 0 - 1)
+                return kir.binary(kirOperator(.BitXor, false), false, false, operandValue, ones)
+            }
+        }
+    }
+
+    function arithmetic(borrow mut self, operator: ArithmeticOperator, left: Int, right: Int, span: Span) -> KirValue {
+        let valueType = program.typeOf(left)
+        if valueType.kind == .Floating {
+            return kir_value_float_binary(kir, floatOperator(operator), value(left), value(right))
+        }
+        let signed = valueType.signed
+        if operator == .ShiftLeft || operator == .ShiftRight {
+            let shifted = value(left)
+            let count = shiftCount(right, valueType, span)
+            return kir.binary(kirOperator(operator, signed), false, signed, shifted, count)
+        }
+        let divides = operator == .Divide || operator == .Remainder
+        let traps = operator == .Add || operator == .Subtract || operator == .Multiply
+            || (divides && signed)
+        return kir.binary(kirOperator(operator, signed), traps, signed, value(left), value(right))
+    }
+
+    // A shift count at the shifted value's width, after trapping unless it is
+    // in `0..width`.
+    function shiftCount(borrow mut self, index: Int, shifted: Type, span: Span) -> KirValue {
+        let countType = program.typeOf(index)
+        let count = value(index)
+        let width = kir.integer(types.of(countType), shifted.bits)
+        let inRange = kir.compare(kirPredicate(.Less, false), count, width)
+        let shiftedName = spelledType(program, shifted)
+        let report = TrapReport {
+            code = checkTrap,
+            headline = joinText(["shift count out of range: the count is {0} but a `", shiftedName, "` has {1} bits"]),
+            label = "this shift",
+            note = joinText(["a shift moves the bits of a `", shiftedName, "` by at least 0 and less than its width"]),
+            help = "keep the count below the width, or mask it as `count & (width - 1)` where wrapping is meant"
+        }
+        trapUnlessReported(inRange, span, report, [wideOperand(count, countType), kir.integer(types.integer64, shifted.bits)])
+        return resize(count, countType, shifted)
+    }
+
+    function compare(borrow mut self, comparison: Comparison, left: Int, right: Int) -> KirValue {
+        let operandType = program.typeOf(left)
+        // Structs, arrays and enums with a payload compare structurally by
+        // `equalValues`, and order by the sign `orderValues` walks; an enum
+        // without one orders by its variant.
+        let equality = comparison == .Equal || comparison == .NotEqual
+        if !equality && ((operandType.kind == .Structure && !isStringType(program, operandType)) || carriesPayload(program, operandType)) {
+            let sign = orderValues(address(left), address(right), operandType)
+            return kir.compare(kirPredicate(comparison, true), sign, kir.integer(types.integer64, 0))
+        }
+        if (operandType.kind == .Structure && !isStringType(program, operandType)) || (equality && carriesPayload(program, operandType)) {
+            let same = equalValues(address(left), address(right), operandType)
+            if comparison == .Equal { return same }
+            return kir.compare(kirPredicate(.Equal, false), same, kir.integer(types.boolean, 0))
+        }
+        if operandType.kind == .Floating {
+            return kir_value_float_compare(kir, kirPredicate(comparison, true), value(left), value(right))
+        }
+        if operandType.kind == .Pointer {
+            let first = kir.convert(convertBitcast, value(left), types.integer64)
+            let second = kir.convert(convertBitcast, value(right), types.integer64)
+            return kir.compare(kirPredicate(comparison, false), first, second)
+        }
+        if isStringType(program, operandType) { return compareStrings(comparison, left, right) }
+        if operandType.kind == .Enumeration {
+            let leftTag = kir.tag(address(left))
+            let rightTag = kir.tag(address(right))
+            return kir.compare(kirPredicate(comparison, false), leftTag, rightTag)
+        }
+        return kir.compare(kirPredicate(comparison, operandType.signed), value(left), value(right))
+    }
+
+    // `&&` and `||` evaluate their right side only when the left side does
+    // not decide the answer, and meet in a block that takes the result.
+    function logical(borrow mut self, connective: Connective, left: Int, right: Int) -> KirValue {
+        let first = value(left)
+        let rightBlock = kir.block()
+        kir.blockParameter(types.boolean)
+        let join = kir.block()
+        match connective {
+            And -> {
+                kir.elseArgument(first)
+                kir.branchIf(first, rightBlock, join)
+            }
+            Or -> {
+                kir.argument(first)
+                kir.branchIf(first, join, rightBlock)
+            }
+        }
+        enter(rightBlock)
+        kir.argument(value(right))
+        kir.branch(join)
+        enter(join)
+        return kir.blockValue(join, 0)
+    }
+
+    // `? :` runs one branch, and both hand their value to a join block.
+    function select(borrow mut self, condition: Int, whenTrue: Int, whenFalse: Int, valueType: Type) -> KirValue {
+        let thenBlock = kir.block()
+        let elseBlock = kir.block()
+        kir.blockParameter(types.of(valueType))
+        let join = kir.block()
+        kir.branchIf(value(condition), thenBlock, elseBlock)
+        enter(thenBlock)
+        kir.argument(value(whenTrue))
+        kir.branch(join)
+        enter(elseBlock)
+        kir.argument(value(whenFalse))
+        kir.branch(join)
+        enter(join)
+        return kir.blockValue(join, 0)
+    }
+
+    // `? :` of structs or enums: each branch copies its value into one
+    // temporary.
+    function selectInto(borrow mut self, condition: Int, whenTrue: Int, whenFalse: Int, valueType: Type) -> KirAddress {
+        let destination = temporary(valueType)
+        let thenBlock = kir.block()
+        let elseBlock = kir.block()
+        let join = kir.block()
+        kir.branchIf(value(condition), thenBlock, elseBlock)
+        enter(thenBlock)
+        write(whenTrue, destination)
+        flowInto(join)
+        enter(elseBlock)
+        write(whenFalse, destination)
+        flowInto(join)
+        enter(join)
+        markInitialized(destination)
+        return destination
+    }
+
+    // An integer at another integer type. Nothing is checked when the target
+    // holds every source value; otherwise a value outside the target's range
+    // traps before it is resized.
+    function convert(borrow mut self, operand: Int, target: Type, span: Span) -> KirValue {
+        let source = program.typeOf(operand)
+        let converted = value(operand)
+        if target.kind == .Pointer {
+            let word = resize(converted, source, Type.integer(64, source.signed))
+            return kir.convert(convertBitcast, word, types.pointer)
+        }
+        if source.kind == .Pointer { return kir.convert(convertBitcast, converted, types.of(target)) }
+        if source.kind == .Floating {
+            if target.kind == .Floating {
+                return kir.convert(target.bits > source.bits ? 8 : 9, converted, types.of(target))
+            }
+            // An unsigned target refuses any negative float, `-0.5` included,
+            // though it truncates to zero.
+            if !target.signed {
+                let zero = kir.convert(4, kir.integer(types.integer64, 0), types.of(source))
+                let negative = TrapReport {
+                    code = checkTrap,
+                    headline = joinText(["conversion out of range: a negative `", spelledType(program, source), "` is outside ", rangeText(target)]),
+                    label = "this conversion",
+                    note = "an unsigned conversion refuses every negative value, `-0.5` included, though it would truncate to 0",
+                    help = "check that the value is at least 0 before converting, or keep it a `Number`"
+                }
+                trapUnlessReported(kir_value_float_compare(kir, kirPredicate(.GreaterEqual, true), converted, zero), span, negative, [])
+            }
+            // Machines convert a float only to a 32- or 64-bit integer, so a
+            // narrower one is reached through `Int`, range-checked there.
+            if target.bits < 32 {
+                let whole = kir.convert(6, converted, types.integer64)
+                let wide = Type.int()
+                trapUnlessReported(inRange(whole, wide, target), span, narrowingReport(source, target), [whole])
+                return resize(whole, wide, target)
+            }
+            return kir.convert(target.signed ? 6 : 7, converted, types.of(target))
+        }
+        if target.kind == .Floating {
+            return kir.convert(source.signed ? 4 : 5, converted, types.of(target))
+        }
+        if !source.fitsIn(target) {
+            trapUnlessReported(inRange(converted, source, target), span, narrowingReport(source, target), [wideOperand(converted, source)])
+        }
+        return resize(converted, source, target)
+    }
+
+    // The report of a conversion to `target` that the value does not fit,
+    // which names the value as `{0}`. A sized number converts through its
+    // storage integer, which the source never spells, so the report names
+    // the range rather than the type.
+    function narrowingReport(borrow self, source: Type, target: Type) -> TrapReport {
+        let range = rangeText(target)
+        return TrapReport {
+            code = checkTrap,
+            headline = joinText(["conversion out of range: {0} is outside ", range]),
+            label = joinText(["converted to a type that holds ", range]),
+            note = "a conversion to a narrower type checks the value rather than cutting it",
+            help = joinText(["check that the value lies in ", range, " before converting, or keep it a `Number`"])
+        }
+    }
+
+    // Whether `converted`, of type `source`, is a value of `target`.
+    function inRange(borrow mut self, converted: KirValue, source: Type, target: Type) -> KirValue {
+        let sourceType = types.of(source)
+        var fits = kir.integer(types.boolean, 1)
+        if source.signed && (!target.signed || target.bits < source.bits) {
+            let lowest = kir.integer(sourceType, target.minimum())
+            fits = kir.compare(kirPredicate(.GreaterEqual, true), converted, lowest)
+        }
+        if target.bits < source.bits || (target.signed && !source.signed && target.bits == source.bits) {
+            let highest = kir.integer(sourceType, target.maximum())
+            let below = kir.compare(kirPredicate(.LessEqual, source.signed), converted, highest)
+            fits = kir.binary(kirOperator(.BitAnd, false), false, false, fits, below)
+        }
+        return fits
+    }
+
+    // The same value at another width: extended by the source's sign when the
+    // target is wider, truncated when it is narrower.
+    function resize(borrow mut self, converted: KirValue, source: Type, target: Type) -> KirValue {
+        if target.bits > source.bits {
+            let kind = source.signed ? convertSignExtend : convertZeroExtend
+            return kir.convert(kind, converted, types.of(target))
+        }
+        if target.bits < source.bits {
+            return kir.convert(convertTruncate, converted, types.of(target))
+        }
+        return converted
+    }
+}
+
+function carriesPayload(program: CheckedProgram, valueType: Type) -> Bool {
+    if valueType.kind != .Enumeration { return false }
+    for variant in program.enums[valueType.declaration].variants {
+        if variant.payload.isSome() { return true }
+    }
+    return false
+}

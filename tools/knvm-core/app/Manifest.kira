@@ -1,0 +1,302 @@
+import Foundation
+
+// `toolchain.klfd`: the languages a repository defines.
+//
+// The file is KLFD, the same notation as the definitions beside it, so a
+// repository says what it ships in the language it is written in. knvm reads it
+// as text rather than running it: it holds nothing but literals, and a version
+// manager that needed a compiler to learn which compilers to build would need
+// one before it could install one.
+
+// The file at a repository's root that lists its languages.
+public let manifestFileName: String = "toolchain.klfd"
+
+// One file or tree copied from a language package into its installed toolchain.
+public struct ToolchainFile {
+    // Relative to the language package.
+    var from: String = ""
+    // Relative to the toolchain root.
+    var to: String = ""
+}
+
+// One language a repository defines.
+public struct ToolchainLanguage {
+    var name: String = ""
+    // The definition package, relative to the repository root.
+    var path: String = ""
+    // The driver `klf build` produces, and the name its launcher answers to.
+    var binary: String = ""
+    var isDefault: Bool = false
+    var files: [ToolchainFile] = []
+    // The shader languages whose `emit` reaches this one. A shader surface
+    // language names the outs it can target; `klf build` links each into the
+    // driver, and the driver selects the out around the `emit` call. Naming no
+    // out is right for an out itself, and for a language that writes no shader.
+    var shaderOuts: [String] = []
+}
+
+public enum ManifestRead {
+    Read([ToolchainLanguage])
+    Failed(String)
+}
+
+// The languages `text` lists, or why it lists none that can be built.
+//
+// A language missing a field is refused rather than skipped: a manifest that
+// silently lost a language is how a toolchain stops being installed without
+// anyone deciding it should.
+public function parseToolchainManifest(path: borrow String, text: borrow String) -> ManifestRead {
+    var languages: [ToolchainLanguage] = []
+    var defaults = 0
+    for block in blocksOf(withoutComments(text), "ToolchainLanguage") {
+        let language = ToolchainLanguage {
+            name: fieldValue(block, "name"),
+            path: fieldValue(block, "path"),
+            binary: fieldValue(block, "binary"),
+            isDefault: fieldValue(block, "isDefault") == "true",
+            files: filesOf(block),
+            shaderOuts: namesOf(block, "shaderOuts")
+        }
+        if language.name.isEmpty() || language.path.isEmpty() || language.binary.isEmpty() {
+            return .Failed("`" + path + "`: every language needs a `name`, a `path` and a `binary`")
+        }
+        if !isSingleComponent(language.name) || !isSingleComponent(language.binary) {
+            return .Failed(
+                "`" + path + "`: `" + language.name + "` is not a name a directory or a binary can carry"
+            )
+        }
+        if language.isDefault { defaults = defaults + 1 }
+        languages.append(language)
+    }
+    if languages.count == 0 { return .Failed("`" + path + "` lists no languages") }
+    if defaults > 1 { return .Failed("`" + path + "` makes more than one language the default") }
+    // An out named by a shader front has to be a language this same manifest
+    // lists. A front that names one it does not builds a driver that cannot
+    // reach the out it was promised, and reports every shader for that target
+    // as one the toolchain cannot express.
+    for language in languages {
+        for out in language.shaderOuts {
+            if !isLanguageNamed(languages, out) {
+                return .Failed(
+                    "`" + path + "`: `" + language.name + "` names `" + out + "` as a shader out, and no language here is called that"
+                )
+            }
+            if out == language.name {
+                return .Failed(
+                    "`" + path + "`: `" + language.name + "` names itself as a shader" + " out; a frontend holds one definition once"
+                )
+            }
+        }
+    }
+    return .Read(languages)
+}
+
+// Whether any of `languages` is called `name`.
+public function isLanguageNamed(languages: borrow [ToolchainLanguage], name: borrow String) -> Bool {
+    for language in languages {
+        if language.name == name { return true }
+    }
+    return false
+}
+
+// The path of the language called `name`, or the empty string.
+public function pathOfLanguage(languages: borrow [ToolchainLanguage], name: borrow String) -> String {
+    for language in languages {
+        if language.name == name { return language.path }
+    }
+    return ""
+}
+
+// The names in `field = ["a", "b"]` of one language block.
+//
+// `fieldValue` cannot read this: it ends a value at the first comma, which
+// inside a list is the one between two names.
+public function namesOf(block: borrow String, field: borrow String) -> [String] {
+    var names: [String] = []
+    let inner = listBody(block, field)
+    if inner.count == 0 { return names }
+    for raw in inner.split(",") {
+        let name = unquoted(raw.trim())
+        if name.count != 0 { names.append(name) }
+    }
+    return names
+}
+
+// The text between the `[` and `]` of `key = [...]` in `block`, or "" when the
+// block holds no such list.
+public function listBody(block: borrow String, key: borrow String) -> String {
+    for after in valuesAfter(block, key) {
+        if !after.startsWith("[") { continue }
+        match closingOf(after, 0, Brackets.square) {
+            Some(closing) -> return after.substring(1, closing)
+            None -> {}
+        }
+    }
+    return ""
+}
+
+// What follows `key =` at each place `key` stands alone in `block`, trimmed:
+// a name inside a longer one, like `to` in `isDefault`, is not the key.
+public function valuesAfter(block: borrow String, key: borrow String) -> [String] {
+    var values: [String] = []
+    var from: Number = 0
+    while true {
+        match block.indexOf(key, from) {
+            Some(found) -> {
+                from = found + key.count
+                if found > 0 && isNameByte(UN8(block.byteAt(found - 1))) { continue }
+                let rest = block.substring(from, block.count).trim()
+                if rest.startsWith("=") { values.append(rest.substring(1, rest.count).trim()) }
+            }
+            None -> return values
+        }
+    }
+    return values
+}
+
+// A pair of brackets a manifest nests.
+public struct Bracket {
+    let opens: UN8
+    let closes: UN8
+}
+
+namespace Brackets {
+    let square: Bracket = Bracket { opens: UN8(0x5B), closes: UN8(0x5D) }
+    let curly: Bracket = Bracket { opens: UN8(0x7B), closes: UN8(0x7D) }
+}
+
+// Where the bracket closing the one at `opening` is, or nothing when it is
+// never closed.
+public function closingOf(text: borrow String, opening: Number, bracket: borrow Bracket) -> Number? {
+    var depth = 0
+    for index in opening..text.count {
+        let byte = UN8(text.byteAt(index))
+        if byte == bracket.opens { depth++ }
+        if byte == bracket.closes {
+            depth--
+            if depth == 0 { return .Some(Number(index)) }
+        }
+    }
+    return .None
+}
+
+// The `ToolchainFile` entries of one language block.
+public function filesOf(block: borrow String) -> [ToolchainFile] {
+    var files: [ToolchainFile] = []
+    for entry in blocksOf(block, "ToolchainFile") {
+        files.append(ToolchainFile { from: fieldValue(entry, "from"), to: fieldValue(entry, "to") })
+    }
+    return files
+}
+
+// `text` with every `//` comment removed, line by line.
+public function withoutComments(text: borrow String) -> String {
+    var kept = ""
+    for line in text.split("\n") {
+        kept = kept + line.before("//") + "\n"
+    }
+    return kept
+}
+
+// The body of every `<typeName> { ... }` in `text`, braces matched.
+public function blocksOf(text: borrow String, typeName: borrow String) -> [String] {
+    var blocks: [String] = []
+    var from: Number = 0
+    while true {
+        match text.indexOf(typeName, from) {
+            Some(found) -> {
+                match text.indexOf("{", found + typeName.count) {
+                    Some(opening) -> {
+                        match closingOf(text, opening, Brackets.curly) {
+                            Some(closing) -> {
+                                blocks.append(text.substring(opening + 1, closing))
+                                from = closing + 1
+                            }
+                            None -> return blocks
+                        }
+                    }
+                    None -> return blocks
+                }
+            }
+            None -> return blocks
+        }
+    }
+    return blocks
+}
+
+// The value of `key = value` in a block: a quoted string unquoted, anything else
+// as written, "" when the block does not set it.
+public function fieldValue(block: borrow String, key: borrow String) -> String {
+    let values = valuesAfter(block, key)
+    if values.count == 0 { return "" }
+    return unquoted(values[0].substring(0, valueEnd(values[0])).trim())
+}
+
+// Where a value written at the start of `text` ends: its closing quote when it
+// is quoted, else the first `,`, `}` or line break.
+public function valueEnd(text: borrow String) -> Number {
+    if text.startsWith("\"") {
+        match text.indexOf("\"", 1) {
+            Some(closing) -> return closing + 1
+            None -> return text.count
+        }
+    }
+    for index in 0..text.count {
+        match Number(text.byteAt(index)) {
+            0x2C, 0x7D, 0x0A -> return index
+            else -> {}
+        }
+    }
+    return text.count
+}
+
+public function unquoted(text: borrow String) -> String {
+    if text.count >= 2 && text.startsWith("\"") && text.endsWith("\"") {
+        return text.substring(1, text.count - 1)
+    }
+    return text
+}
+
+// A letter, a digit or `_`.
+public function isNameByte(byte: UN8) -> Bool {
+    match Number(byte) {
+        0x30..0x3A, 0x41..0x5B, 0x5F, 0x61..0x7B -> return true
+        else -> return false
+    }
+}
+
+// The manifest of the repository enclosing `start`, read, or why there is none.
+public struct EnclosingManifest {
+    // The repository root: the directory holding the manifest.
+    var root: String = ""
+    var languages: [ToolchainLanguage] = []
+}
+
+public enum ManifestLookup {
+    Found(EnclosingManifest)
+    Missing
+    Failed(String)
+}
+
+public function enclosingManifest(start: borrow String) -> ManifestLookup {
+    var current = start
+    if current.isEmpty() { return .Missing }
+    while true {
+        let path = joinPath(current, manifestFileName)
+        if fileExists(path) {
+            let text = match textOf(path) {
+                Some(read) -> read
+                None -> return .Failed("cannot read `" + path + "`")
+            }
+            match parseToolchainManifest(path, text) {
+                Read(languages) -> {
+                    return .Found(EnclosingManifest { root: current, languages: copy languages })
+                }
+                Failed(detail) -> { return .Failed(detail) }
+            }
+        }
+        let parent = directoryOfPath(current)
+        if parent.isEmpty() || parent == current { return .Missing }
+        current = parent
+    }
+}

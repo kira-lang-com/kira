@@ -1,0 +1,31 @@
+import Foundation
+
+// `is` tests which declaration a family value holds, and `as` takes that
+// declaration's value out of it.
+construct Shape {
+    @Required function area() -> Number
+}
+
+construct Square(side: Number) extends Shape {
+    function area() -> Number { return side * side }
+}
+
+construct Circle(radius: Number) extends Shape {
+    function area() -> Number { return radius * radius * 3 }
+}
+
+function sideOf(shape: borrow Any Shape) -> Number {
+    if shape is Square {
+        let square = shape as Square
+        return square.side
+    }
+    return 0
+}
+
+@Main
+function main() -> Int {
+    let circle: Any Shape = Circle(radius: 2)
+    if circle is Square { return 1 }
+    if !(circle is Circle) { return 2 }
+    return Int(sideOf(Square(side: 40)) + sideOf(circle) + (circle as Circle).radius)
+}

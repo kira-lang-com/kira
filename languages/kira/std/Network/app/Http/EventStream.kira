@@ -1,0 +1,141 @@
+import Foundation
+
+// `text/event-stream` (the WHATWG HTML standard, section 9.2.6), decoded
+// from body bytes as they arrive into `ServerEvent`s. Lines end in CRLF, LF
+// or CR, and either may be split across two chunks.
+
+struct ServerEvent {
+    // "message" unless the stream named it.
+    let name: String
+    let data: String
+    // The last event ID seen, which persists across events.
+    let id: String
+    // A reconnection time the stream asked for, in milliseconds.
+    let retry: Number?
+}
+
+namespace EventStreamLimit {
+    // A line longer than this is a stream gone wrong.
+    let lineBytes: Number = 1048576
+    let byteOrderMark: [UN8] = [239, 187, 191]
+}
+
+struct EventStream {
+    var line: [UN8] = []
+    // The last byte was a CR, so an LF that follows ends nothing more.
+    var afterReturn: Bool = false
+    var started: Bool = false
+    var name: String = ""
+    var data: String = ""
+    var hasData: Bool = false
+    var lastId: String = ""
+    var retry: Number? = .None
+    var events: [ServerEvent] = []
+    var delivered: Number = 0
+
+    function event(borrow mut self) -> ServerEvent? {
+        if delivered == events.count {
+            if delivered > 0 {
+                events = []
+                delivered = 0
+            }
+            return .None
+        }
+        let next = copy events[delivered]
+        delivered += 1
+        return .Some(next)
+    }
+
+    // Bytes of the stream; false when a line is too long to be one.
+    function feed(borrow mut self, bytes: borrow [UN8]) -> Bool {
+        for byte in bytes {
+            let value = Number(byte)
+            if afterReturn {
+                afterReturn = false
+                if value == Http1.lineFeed { continue }
+            }
+            if value == Http1.carriageReturn || value == Http1.lineFeed {
+                afterReturn = value == Http1.carriageReturn
+                endLine()
+            } else {
+                line.append(byte)
+                if line.count > EventStreamLimit.lineBytes { return false }
+            }
+        }
+        return true
+    }
+
+    function endLine(borrow mut self) {
+        var bytes = line
+        line = []
+        // One byte order mark may open the stream.
+        if !started {
+            started = true
+            if bytes.count >= 3 && byteRun(bytes, 0, 3) == EventStreamLimit.byteOrderMark {
+                bytes = byteRun(bytes, 3, bytes.count)
+            }
+        }
+        let text = match textFromBytes(bytes) {
+            Some(value) -> value
+            // Invalid UTF-8 is replaced by the decoder in the standard; a
+            // line that is not text is dropped here.
+            None -> return
+        }
+        if text.count == 0 { return dispatch() }
+        if text.startsWith(":") { return }
+        match text.indexOf(":") {
+            Some(colon) -> {
+                var value = text.substring(colon + 1, text.count)
+                if value.startsWith(" ") { value = value.substring(1, value.count) }
+                takeField(text.substring(0, colon), value)
+            }
+            None -> takeField(text, "")
+        }
+    }
+
+    function takeField(borrow mut self, field: borrow String, value: borrow String) {
+        match field {
+            "event" -> name = copy value
+            "data" -> {
+                data += hasData ? "\n\(value)" : copy value
+                hasData = true
+            }
+            "id" -> if !value.contains("\0") { lastId = copy value }
+            "retry" -> {
+                match retryMilliseconds(value) {
+                    Some(milliseconds) -> retry = .Some(milliseconds)
+                    None -> {}
+                }
+            }
+            // Other fields are ignored.
+            else -> {}
+        }
+    }
+
+    function dispatch(borrow mut self) {
+        if hasData {
+            events.append(
+                ServerEvent {
+                    name: name.count == 0 ? "message" : copy name,
+                    data: copy data,
+                    id: copy lastId,
+                    retry: copy retry
+                }
+            )
+        }
+        name = ""
+        data = ""
+        hasData = false
+    }
+}
+
+function retryMilliseconds(text: borrow String) -> Number? {
+    if text.count == 0 || text.count > LengthLimit.digits { return .None }
+    var value: Number = 0
+    for byte in text.utf8() {
+        let digit = Number(byte) - StatusRange.zero
+        if digit < 0 || digit >= StatusRange.radix { return .None }
+        value = value * StatusRange.radix + digit
+    }
+    return .Some(value)
+}

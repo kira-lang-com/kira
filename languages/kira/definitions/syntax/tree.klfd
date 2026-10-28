@@ -1,0 +1,1067 @@
+// The syntax tree: what the parser builds and semantic analysis reads.
+//
+// Expressions and statements live in two arenas and name each other by
+// index, because a node cannot hold another node by value. The type
+// references they write live in a third, so a node is no larger than its
+// commonest shapes need. Declarations are kept by kind; Kira does not care
+// in which order they are written.
+
+struct SyntaxTree {
+    // Type arguments written on a family, which a family does not take but a
+    // generic construct infers its own from (`FamilyArguments`).
+    var familyArguments: [FamilyArguments] = []
+    var expressions: [Expression]
+    var statements: [Statement]
+    var typeReferences: [TypeReference]
+    var functions: [FunctionDeclaration]
+    var genericFunctions: [FunctionDeclaration]
+    var macros: [MacroDeclaration]
+    var proceduralMacros: [ProceduralMacroDeclaration]
+    var sourceInvocations: [SourceMacroInvocation]
+    var annotated: [AnnotatedDeclaration]
+    var copyAssertions: [Identifier]
+    // The declarations written `public`, by name.
+    var exports: [Identifier]
+    // The members written `private`, by name.
+    var privateMembers: [Identifier]
+    // Every top-level declaration, in the order its file writes it.
+    var declarationSites: [DeclarationSite]
+    // The doc comments of the file's declarations and members, and of each
+    // file's module (`documentation.klfd`).
+    var documentation: [DocEntry]
+    var conformances: [TypeConformance]
+    var traits: [TraitDeclaration]
+    var bounds: [GenericBound]
+    var extensions: [ExtensionDeclaration]
+    var structs: [StructDeclaration]
+    var genericStructs: [StructDeclaration]
+    var enums: [EnumDeclaration]
+    var genericEnums: [EnumDeclaration]
+    var openEnums: [Identifier]
+    // `@Instance(Number) struct Holder<Value>`: the named instances a
+    // generic declaration exports (KLF-RIDL sections 20.7 and 23.5), each as
+    // the instance it names, `Holder<Number>`.
+    var namedInstances: [TypeReference] = []
+    var taggedEnums: [TaggedEnum]
+    var aliases: [AliasDeclaration]
+    var constructs: [ConstructDeclaration]
+    var contentItems: [ContentItem]
+    var globals: [GlobalDeclaration]
+    var distincts: [DistinctDeclaration]
+    var classes: [ClassDeclaration]
+    // The `@FFI.*` annotations, each at the span of the annotation naming it.
+    var foreignMarks: [ForeignMark]
+    // The type declarations a mark rides, by name.
+    var foreignTypes: [ForeignTypeMark]
+    // The `@Bits(n)` widths C struct members declare.
+    var fieldBits: [FieldBits]
+    // Every package's native libraries, their paths resolved.
+    var nativeLibraries: [NativeLink]
+    // Every package's assets, staged where Kira stages them: the file, a tab,
+    // and its place in the entry package's bundle directory.
+    var resources: [String]
+    // Every `log` statement, in the order the parser met them.
+    var trailSites: [TrailSiteSyntax]
+    var sources: [SourceUnit]
+    var modules: [Module]
+    var limitedReferences: Bool
+    // Built by `--test`: entered through the generated test runner, with
+    // `Build.testing()` true while macros run.
+    var testing: Bool
+    // The compilation target, also visible while source macros run.
+    var buildTarget: String
+    // Built by `--release`: `Build.release()` is true, and `klist!` writes
+    // its value as a literal rather than reading the file at run time.
+    var release: Bool
+    // Built as a framework, `--emit shared` or its contract `--emit ridl`:
+    // a library other programs call through RIDL, whose process state lives
+    // in the library because no call carries it (6001 does not apply).
+    var framework: Bool = false
+    // Built as the unit of a package the program depends on
+    // (`separate-packages.klfd`): the program's own unit initializes its
+    // globals and enters it.
+    var dependencyUnit: Bool = false
+    // Whether the packages built apart that compile-time code imports were
+    // read with their bodies. Without them no macro runs; one that must is
+    // 5036, and the program is read again with them (`loadProgram`).
+    var compileTimeBodies: Bool = true
+    // Whether the `extend` blocks of the packages built apart were read with
+    // their methods' bodies. A block on a generic template or an instance
+    // joins it, and each unit naming an instance compiles its methods, but
+    // reading cannot tell a template or an alias from a type: a block read
+    // without them that names one is read again with them (`loadProgram`).
+    var extensionBodies: Bool = false
+
+    function empty() -> SyntaxTree {
+        return SyntaxTree {
+            expressions = [], statements = [], typeReferences = [], functions = [], genericFunctions = [], macros = [], proceduralMacros = [], sourceInvocations = [], annotated = [], copyAssertions = [], exports = [], privateMembers = [], declarationSites = [], documentation = [], conformances = [], traits = [], bounds = [], extensions = [], structs = [], genericStructs = [],
+            enums = [], genericEnums = [], openEnums = [], taggedEnums = [], aliases = [], constructs = [], contentItems = [], globals = [], distincts = [], classes = [], foreignMarks = [], foreignTypes = [], fieldBits = [], nativeLibraries = [], resources = [], trailSites = [],
+            sources = [], modules = [], limitedReferences = false, testing = false, buildTarget = "", release = false
+        }
+    }
+
+    function addExpression(borrow mut self, move kind: ExpressionKind, span: Span) -> Int {
+        expressions.append(Expression { kind = move kind, span = span })
+        return expressions.count - 1
+    }
+
+    function addStatement(borrow mut self, move kind: StatementKind, span: Span) -> Int {
+        statements.append(Statement { kind = move kind, span = span })
+        return statements.count - 1
+    }
+
+    function addTypeReference(borrow mut self, move reference: TypeReference) -> Int {
+        typeReferences.append(move reference)
+        return typeReferences.count - 1
+    }
+}
+
+struct Identifier {
+    let text: String
+    let span: Span
+}
+
+// A type by name, or `Library.Type` through a file's import.
+struct TypeReference {
+    let qualifier: Optional<Identifier>
+    let name: Identifier
+    let arguments: [TypeReference]
+    let modes: [PassingMode]
+    let instanceName: String
+}
+
+// A module: the program's own `app/` sources, or a library it imports. The
+// module a package's manifest names is what `import` spells.
+struct Module {
+    let name: String
+    let root: String
+    // The file id of the module's `package.kira`, when it has one.
+    let manifest: Optional<Int>
+    // The package's identity, `name@version#root`, which tells two
+    // packages' same-named types apart; empty for the program's own.
+    let package: String
+    let library: Bool
+    // Whether the module's own dependencies are still being loaded, which is
+    // what finds a dependency cycle.
+    var loading: Bool
+    // Dependencies available to this package, including their dependencies.
+    var libraries: [Int]
+    // Whether the module is a framework of the SDK, read from its `.ridl`
+    // contract (KLF-RIDL section 27.7) rather than from Kira sources.
+    var framework: Bool = false
+    // Whether the package's manifest grants it system calls
+    // (`package/manifest.klfd`).
+    var systemCalls: Bool = false
+    // Whether a unit of its own checks and lowers the package's bodies
+    // (`separate-packages.klfd`), so this unit only declares what it calls.
+    var separate: Bool = false
+    // Where a package built apart comes among those of the build,
+    // dependencies first, or -1: its globals initialize in that order.
+    var apartPosition: Int = -1
+    // Whether compile-time code may import the module: a macro's evaluator
+    // runs its functions (`source-macro-evaluation.klfd`), so a package
+    // built apart keeps their bodies.
+    var compileTime: Bool = false
+    // Whether its types carry its name, `Name#Module`, in every unit that
+    // sees them: a package built apart, or the one a dependency unit builds,
+    // unless the toolchain bundles it. A unit sees only some of the
+    // program's packages, so a name one of them keeps where it is alone
+    // could be another's where two declare it.
+    var namedApart: Bool = false
+}
+
+// One source file of the program: its module, its content hash (the selector
+// the kernel reads names through), and the libraries it imports.
+struct SourceUnit {
+    let file: Int
+    let module: Int
+    let hash: Int
+    var imports: [Import]
+    // Written by a macro expansion rather than read from the package.
+    let generated: Bool = false
+}
+
+// `import Name` or `import Name as Alias`. `module` is the library it
+// resolves to, when the package loader has resolved it.
+struct Import {
+    let name: Identifier
+    let alias: Identifier
+    var module: Optional<Int>
+}
+
+enum PassingMode {
+    Owned
+    Borrowed
+    MutablyBorrowed
+}
+
+struct Parameter {
+    let name: Identifier
+    let mode: PassingMode
+    let annotation: TypeReference
+    // Written `copy T`: the callee takes its own copy, so a caller cannot
+    // hand the value over with `move`.
+    let copies: Bool
+    // Written `= value`: what a call that leaves the slot empty passes.
+    let initial: Optional<Int>
+}
+
+// A method's receiver. A method that leaves it out borrows the value, as one
+// that writes `borrow self` does.
+enum Receiver {
+    Free
+    Borrowed
+    MutablyBorrowed
+    Static
+}
+
+// An annotation as written, `@Name` or `@Name(arguments)`, or one the
+// compiler puts on a declaration it reads or makes. A built-in one is
+// resolved where it is made (`attributeNamed`); any other names a macro or a
+// property wrapper, which takes it up with its arguments.
+struct Annotation {
+    let name: Identifier
+    let attribute: Optional<Attribute>
+    // What it is written with, as a call's arguments.
+    let arguments: [Int]
+}
+
+struct FunctionDeclaration {
+    let name: Identifier
+    let annotations: [Annotation]
+    let receiver: Receiver
+    let parameters: [Parameter]
+    let result: Optional<TypeReference>
+    let body: [Int]
+    let span: Span
+    // A generic function's own parameters, `<Value>`; an instance has none.
+    let typeParameters: [Identifier]
+    // What the type parameters named in the body stand for.
+    let scope: GenericScope
+}
+
+// Type parameters and the types they stand for, as written at an instance.
+// An inherited member's scope maps its declaring type's parameters, so the
+// names may repeat; the first match is the innermost.
+struct GenericScope {
+    let parameters: [Identifier]
+    let arguments: [TypeReference]
+
+    function none() -> GenericScope {
+        return GenericScope { parameters = [], arguments = [] }
+    }
+
+    // This scope seen from an instance that binds `parameters` to
+    // `arguments`.
+    function within(borrow self, parameters: [Identifier], arguments: [TypeReference]) -> GenericScope {
+        var names: [Identifier] = []
+        var bound: [TypeReference] = []
+        for index in 0..self.parameters.count {
+            names.append(self.parameters[index])
+            bound.append(substituteGenericReference(self.arguments[index], parameters, arguments))
+        }
+        for index in 0..parameters.count {
+            names.append(parameters[index])
+            bound.append(arguments[index])
+        }
+        return GenericScope { parameters = names, arguments = bound }
+    }
+}
+
+// `reference` with each type parameter replaced by the argument bound to it.
+function substituteGenericReference(reference: TypeReference, parameters: [Identifier], arguments: [TypeReference]) -> TypeReference {
+    if reference.arguments.count == 0 && reference.qualifier.isNone() {
+        for index in 0..parameters.count {
+            if reference.name.text == parameters[index].text { return arguments[index] }
+        }
+    }
+    // `Value.ID`, an associated type of a type parameter: the alias its
+    // argument's conformance registered, `Row.ID` (traits.klfd).
+    match reference.qualifier {
+        Some(qualifier) -> {
+            for index in 0..parameters.count {
+                if qualifier.text == parameters[index].text {
+                    let named = associatedTypeName(arguments[index].instanceName, reference.name.text)
+                    return TypeReference {
+                        qualifier = .None,
+                        name = Identifier { text = named, span = reference.name.span },
+                        arguments = [],
+                        modes = reference.modes,
+                        instanceName = named
+                    }
+                }
+            }
+        }
+        None -> {}
+    }
+    if reference.arguments.count == 0 { return reference }
+    var substituted: [TypeReference] = []
+    for argument in reference.arguments {
+        substituted.append(substituteGenericReference(argument, parameters, arguments))
+    }
+    return TypeReference {
+        qualifier = reference.qualifier,
+        name = reference.name,
+        arguments = substituted,
+        modes = reference.modes,
+        instanceName = referenceInstanceName(reference.name.text, substituted, reference.modes)
+    }
+}
+
+// The alias an associated type is bound by for one conforming type:
+// `Row.ID`.
+function associatedTypeName(owner: String, associated: String) -> String {
+    return joinText([owner, ".", associated])
+}
+
+// Type arguments written on a construct family, as SwiftUI writes a result
+// builder's: `[some TableColumnContent<Value>]` on a slot, `extends
+// TableColumnContent<RowValue>` on a generic construct. A family takes no
+// type parameters (it is one existential over every declaration), so the
+// reference itself stays the bare family; what the arguments do is let a
+// generic construct written in such a slot without its own arguments take
+// them from the slot's, by matching its `extends`. A slot's are keyed by
+// where its family is named; a construct's by the construct.
+struct FamilyArguments {
+    // The construct whose `extends` wrote them, or empty for a slot's, and
+    // where it is named: its name may be scoped by the time it is checked.
+    let owner: String
+    let ownerSpan: Span
+    let family: String
+    let span: Span
+    let arguments: [TypeReference]
+}
+
+struct FieldDeclaration {
+    let name: Identifier
+    let mutable: Bool
+    let annotation: TypeReference
+    let initial: Optional<Int>
+    // `@Name` written before the field; a wrapper macro reads them.
+    let annotations: [Annotation]
+    // A construct member written without a type takes its initializer's.
+    let inferred: Bool
+    // The field as written, its annotations included: what a macro replaces
+    // when it rewrites the field.
+    let span: Span
+}
+
+struct StructDeclaration {
+    let name: Identifier
+    let genericParameters: [Identifier]
+    let typeArguments: [TypeReference]
+    let callableModes: [PassingMode]
+    let ancestors: [TypeReference]
+    let genericBase: String
+    let baseNameSpan: Span
+    let specialized: Bool
+    let typeSuffix: Int
+    let fields: [FieldDeclaration]
+    var methods: [FunctionDeclaration]
+}
+
+struct CaseDeclaration {
+    let name: Identifier
+    let payload: Optional<TypeReference>
+    // The payload `.Case` takes when it is written without one.
+    let initial: Optional<Int>
+}
+
+// An `@Open` enum with raw values, `@Open enum Key: U32 { F12 = 69 }`: each
+// case's raw value is its tag, so a code no case names is kept as it is.
+struct TaggedEnum {
+    let name: Identifier
+    let representation: TypeReference
+    let tags: [Int]
+}
+
+struct EnumDeclaration {
+    let name: Identifier
+    let genericParameters: [Identifier]
+    let typeArguments: [TypeReference]
+    let baseNameSpan: Span
+    let specialized: Bool
+    let typeSuffix: Int
+    let cases: [CaseDeclaration]
+    var methods: [FunctionDeclaration]
+    // A family's or trait's values: each case carries one type seen through it.
+    let existential: Bool
+}
+
+struct AliasDeclaration {
+    let name: Identifier
+    let genericParameters: [Identifier]
+    let target: TypeReference
+}
+
+struct DistinctDeclaration {
+    let name: Identifier
+    let representation: TypeReference
+}
+
+struct ClassDeclaration {
+    let name: Identifier
+    let genericParameters: [Identifier]
+    let parents: [TypeReference]
+    let fields: [FieldDeclaration]
+    let methods: [FunctionDeclaration]
+    let overrides: [ClassFieldOverride]
+}
+
+struct ClassFieldOverride {
+    let name: Identifier
+    let annotation: Optional<TypeReference>
+    let initial: Int
+}
+
+// A construct family, or with a parameter list a declaration backed by one.
+struct ConstructDeclaration {
+    let name: Identifier
+    // The construction inputs. A family has no parameter list.
+    let parameters: Optional<[FieldDeclaration]>
+    let parents: [TypeReference]
+    let fields: [FieldDeclaration]
+    // `@Required let name: T`, discharged by a field or a computed member.
+    let requirements: [FieldDeclaration]
+    // `let name: T { ... }`, zero-parameter methods read as properties.
+    let computed: [FunctionDeclaration]
+    let methods: [FunctionDeclaration]
+    let overrides: [ConstructOverride]
+    // `init(...) { ... }`: further ways to construct the declaration, each a
+    // static method returning it.
+    let inits: [FunctionDeclaration]
+    // `construct TabView<Selection>(...)`: a generic declaration, whose
+    // instances each join its family as they are named.
+    var typeParameters: [Identifier] = []
+}
+
+// `name { ... }`: the body of the member the family calls `name`.
+struct ConstructOverride {
+    let name: Identifier
+    let body: [Int]
+    let span: Span
+}
+
+struct LambdaDeclaration {
+    let parameters: [Identifier]
+    let annotations: [Optional<TypeReference>]
+    let body: [Int]
+    let span: Span
+}
+
+// `\Root.member.member`, or `\.member` where the root is known from the
+// type expected: the members read from a value of the root, in order.
+struct KeyPathDeclaration {
+    let root: Optional<TypeReference>
+    let members: [Identifier]
+    let span: Span
+}
+
+// `Task { ... }`, or with an operation `MainThread.invoke { ... }`, `spawn`
+// or `post`, a request to run the block's call on the main thread.
+// `written` holds arguments put in parentheses, which a request refuses.
+struct TaskDeclaration {
+    let body: [Int]
+    let span: Span
+    let mainThread: Optional<Identifier>
+    let written: [Int]
+}
+
+// A direct call: `name(arguments)`, or with a receiver a method call.
+struct TaskCallSyntax {
+    let receiver: Optional<Int>
+    let name: Identifier
+    let arguments: [Int]
+}
+
+enum UnaryOperator {
+    Negate
+    Not
+    Complement
+}
+
+enum OwnershipMode {
+    Move
+    Copy
+}
+
+enum TypeQueryMode {
+    Is
+    Cast
+}
+
+enum BinaryOperator {
+    Or
+    And
+    BitOr
+    BitXor
+    BitAnd
+    Equal
+    NotEqual
+    Less
+    LessEqual
+    Greater
+    GreaterEqual
+    ShiftLeft
+    ShiftRight
+    Add
+    Subtract
+    Multiply
+    Divide
+    Remainder
+}
+
+struct FieldValue {
+    let name: Identifier
+    let value: Int
+}
+
+// An integer literal carries its value and whether it was written in
+// hexadecimal, which decides whether it may name a `U64` above `Int`'s range.
+// A string literal carries its text when an escape or a continuation makes
+// it differ from its source.
+enum ExpressionKind {
+    Quote([QuotePart])
+    IntegerLiteral(Int, Bool)
+    FloatLiteral(String)
+    BooleanLiteral(Bool)
+    StringLiteral(Optional<String>)
+    ArrayLiteral([Int])
+    Index(Int, Int)
+    Transfer(OwnershipMode, Int)
+    Labelled(Identifier, Int)
+    TypeQuery(TypeQueryMode, Int, Int)
+    Name(Identifier)
+    Member(Int, Identifier)
+    ExpandedMacro([Int], Optional<Int>)
+    MacroCall(Identifier, [Int], String)
+    Call(Identifier, [Int])
+    GenericCall(Identifier, [TypeReference], [Int])
+    MethodCall(Int, Identifier, [Int])
+    IndirectCall(Int, [Int])
+    Lambda(LambdaDeclaration)
+    KeyPath(KeyPathDeclaration)
+    Task(TaskDeclaration)
+    Try(Int)
+    Variant(Identifier, Optional<Int>)
+    StructLiteral(Identifier, [TypeReference], [FieldValue])
+    Unary(UnaryOperator, Int)
+    Binary(BinaryOperator, Int, Int)
+    Conditional(Int, Int, Int)
+    MatchValue(Int, [MatchArm])
+    Content(ContentSyntax)
+
+    // Whether this is the literal whole number written in the source, as
+    // opposed to a decimal one or anything computed. A checker that has to
+    // tell an `Int` from a `Number` before it knows what the expression is for
+    // asks this, because a whole number is exactly both.
+    function isIntegerLiteral(borrow self) -> Bool {
+        match self {
+            Name -> { return false }
+            IntegerLiteral -> { return true }
+            FloatLiteral -> { return false }
+            BooleanLiteral -> { return false }
+            StringLiteral -> { return false }
+            ArrayLiteral -> { return false }
+            Index -> { return false }
+            Transfer -> { return false }
+            Labelled -> { return false }
+            TypeQuery -> { return false }
+            Member -> { return false }
+            Call -> { return false }
+            GenericCall -> { return false }
+            MethodCall -> { return false }
+            IndirectCall -> { return false }
+            Lambda -> { return false }
+            KeyPath -> { return false }
+            Task -> { return false }
+            ExpandedMacro -> { return false }
+            Quote -> { return false }
+            MacroCall -> { return false }
+            Try -> { return false }
+            Variant -> { return false }
+            StructLiteral -> { return false }
+            Unary -> { return false }
+            Binary -> { return false }
+            Conditional -> { return false }
+            MatchValue -> { return false }
+            Content -> { return false }
+        }
+    }
+
+    // A closure written in place, `{ x in ... }`.
+    function isLambdaLiteral(borrow self) -> Bool {
+        match self {
+            Name -> { return false }
+            IntegerLiteral -> { return false }
+            FloatLiteral -> { return false }
+            BooleanLiteral -> { return false }
+            StringLiteral -> { return false }
+            ArrayLiteral -> { return false }
+            Index -> { return false }
+            Transfer -> { return false }
+            Labelled -> { return false }
+            TypeQuery -> { return false }
+            Member -> { return false }
+            Call -> { return false }
+            GenericCall -> { return false }
+            MethodCall -> { return false }
+            IndirectCall -> { return false }
+            Lambda -> { return true }
+            KeyPath -> { return false }
+            Task -> { return false }
+            ExpandedMacro -> { return false }
+            Quote -> { return false }
+            MacroCall -> { return false }
+            Try -> { return false }
+            Variant -> { return false }
+            StructLiteral -> { return false }
+            Unary -> { return false }
+            Binary -> { return false }
+            Conditional -> { return false }
+            MatchValue -> { return false }
+            Content -> { return false }
+        }
+    }
+
+    // A key path written in place, `\.name`.
+    function isKeyPathLiteral(borrow self) -> Bool {
+        match self {
+            Name -> { return false }
+            IntegerLiteral -> { return false }
+            FloatLiteral -> { return false }
+            BooleanLiteral -> { return false }
+            StringLiteral -> { return false }
+            ArrayLiteral -> { return false }
+            Index -> { return false }
+            Transfer -> { return false }
+            Labelled -> { return false }
+            TypeQuery -> { return false }
+            Member -> { return false }
+            Call -> { return false }
+            GenericCall -> { return false }
+            MethodCall -> { return false }
+            IndirectCall -> { return false }
+            Lambda -> { return false }
+            KeyPath -> { return true }
+            Task -> { return false }
+            ExpandedMacro -> { return false }
+            Quote -> { return false }
+            MacroCall -> { return false }
+            Try -> { return false }
+            Variant -> { return false }
+            StructLiteral -> { return false }
+            Unary -> { return false }
+            Binary -> { return false }
+            Conditional -> { return false }
+            MatchValue -> { return false }
+            Content -> { return false }
+        }
+    }
+
+    // The whole number this expression spells, when it is an integer literal
+    // that is not written as bits. `0` is the zero and `0x10` is nothing,
+    // because a hexadecimal literal names bits and not a quantity.
+    function wholeIntegerLiteral(borrow self) -> Optional<Int> {
+        match self {
+            Name -> { return .None }
+            IntegerLiteral(value, hexadecimal) -> {
+                if hexadecimal { return .None }
+                return .Some(value)
+            }
+            FloatLiteral -> { return .None }
+            BooleanLiteral -> { return .None }
+            StringLiteral -> { return .None }
+            ArrayLiteral -> { return .None }
+            Index -> { return .None }
+            Transfer -> { return .None }
+            Labelled -> { return .None }
+            TypeQuery -> { return .None }
+            Member -> { return .None }
+            Call -> { return .None }
+            GenericCall -> { return .None }
+            MethodCall -> { return .None }
+            IndirectCall -> { return .None }
+            Lambda -> { return .None }
+            KeyPath -> { return .None }
+            Task -> { return .None }
+            ExpandedMacro -> { return .None }
+            Quote -> { return .None }
+            MacroCall -> { return .None }
+            Try -> { return .None }
+            Variant -> { return .None }
+            StructLiteral -> { return .None }
+            Unary -> { return .None }
+            Binary -> { return .None }
+            Conditional -> { return .None }
+            MatchValue -> { return .None }
+            Content -> { return .None }
+        }
+    }
+
+    // The integer a raw enum case's code spells, decimal or hexadecimal: a
+    // code is bits as often as it is a count, as a file format's four-byte
+    // tags are.
+    function codeLiteral(borrow self) -> Optional<Int> {
+        match self {
+            Name -> { return .None }
+            IntegerLiteral(value, hexadecimal) -> { return .Some(value) }
+            FloatLiteral -> { return .None }
+            BooleanLiteral -> { return .None }
+            StringLiteral -> { return .None }
+            ArrayLiteral -> { return .None }
+            Index -> { return .None }
+            Transfer -> { return .None }
+            Labelled -> { return .None }
+            TypeQuery -> { return .None }
+            Member -> { return .None }
+            Call -> { return .None }
+            GenericCall -> { return .None }
+            MethodCall -> { return .None }
+            IndirectCall -> { return .None }
+            Lambda -> { return .None }
+            KeyPath -> { return .None }
+            Task -> { return .None }
+            ExpandedMacro -> { return .None }
+            Quote -> { return .None }
+            MacroCall -> { return .None }
+            Try -> { return .None }
+            Variant -> { return .None }
+            StructLiteral -> { return .None }
+            Unary -> { return .None }
+            Binary -> { return .None }
+            Conditional -> { return .None }
+            MatchValue -> { return .None }
+            Content -> { return .None }
+        }
+    }
+
+    // Whether this expression is one that produces a value by being called:
+    // a call of some kind, a `try`, a `match` used as a value, a variant built
+    // from one. An assignment and an index produce nothing new — they change
+    // somewhere that already exists — so dropping one of those drops no
+    // failure.
+    function isCallLike(borrow self) -> Bool {
+        match self {
+            Name -> { return false }
+            IntegerLiteral -> { return false }
+            FloatLiteral -> { return false }
+            BooleanLiteral -> { return false }
+            StringLiteral -> { return false }
+            ArrayLiteral -> { return false }
+            Index -> { return false }
+            Transfer -> { return false }
+            Labelled -> { return false }
+            TypeQuery -> { return false }
+            Member -> { return false }
+            Call -> { return true }
+            GenericCall -> { return true }
+            MethodCall -> { return true }
+            IndirectCall -> { return true }
+            Lambda -> { return false }
+            KeyPath -> { return false }
+            Task -> { return false }
+            ExpandedMacro -> { return true }
+            Quote -> { return false }
+            MacroCall -> { return false }
+            Try -> { return true }
+            Variant -> { return true }
+            StructLiteral -> { return false }
+            Unary -> { return false }
+            Binary -> { return false }
+            Conditional -> { return false }
+            MatchValue -> { return true }
+            Content -> { return false }
+        }
+    }
+
+    // The identifier of a bare name, the one expression that can name an
+    // undefined binding.
+    function name(borrow self) -> Optional<Identifier> {
+        match self {
+            Name(identifier) -> return .Some(identifier)
+            IntegerLiteral -> return .None
+            FloatLiteral -> return .None
+            BooleanLiteral -> return .None
+            StringLiteral -> return .None
+            ArrayLiteral -> return .None
+            Index -> return .None
+            Transfer -> return .None
+            Labelled -> return .None
+            TypeQuery -> return .None
+            Member -> return .None
+            Call -> return .None
+            GenericCall -> return .None
+            MethodCall -> return .None
+            IndirectCall -> return .None
+            Lambda -> return .None
+            KeyPath -> return .None
+            Task -> return .None
+            ExpandedMacro -> return .None
+            Quote -> return .None
+            MacroCall -> return .None
+            Try -> return .None
+            Variant -> return .None
+            StructLiteral -> return .None
+            Unary -> return .None
+            Binary -> return .None
+            Conditional -> return .None
+            MatchValue -> return .None
+            Content -> return .None
+        }
+    }
+
+    // The text of a string literal the parser has spelled out
+    // (`spellStrings`).
+    function spelledText(borrow self) -> Optional<String> {
+        match self {
+            StringLiteral(text) -> return text
+            Name -> return .None
+            IntegerLiteral -> return .None
+            FloatLiteral -> return .None
+            BooleanLiteral -> return .None
+            ArrayLiteral -> return .None
+            Index -> return .None
+            Transfer -> return .None
+            Labelled -> return .None
+            TypeQuery -> return .None
+            Member -> return .None
+            Call -> return .None
+            GenericCall -> return .None
+            MethodCall -> return .None
+            IndirectCall -> return .None
+            Lambda -> return .None
+            KeyPath -> return .None
+            Task -> return .None
+            ExpandedMacro -> return .None
+            Quote -> return .None
+            MacroCall -> return .None
+            Try -> return .None
+            Variant -> return .None
+            StructLiteral -> return .None
+            Unary -> return .None
+            Binary -> return .None
+            Conditional -> return .None
+            MatchValue -> return .None
+            Content -> return .None
+        }
+    }
+
+    // An argument written `label: value`, as its label and value.
+    function labelled(borrow self) -> Optional<FieldValue> {
+        match self {
+            Labelled(label, value) -> return .Some(FieldValue { name = label, value = value })
+            Name -> return .None
+            IntegerLiteral -> return .None
+            FloatLiteral -> return .None
+            BooleanLiteral -> return .None
+            StringLiteral -> return .None
+            ArrayLiteral -> return .None
+            Index -> return .None
+            Transfer -> return .None
+            TypeQuery -> return .None
+            Member -> return .None
+            Call -> return .None
+            GenericCall -> return .None
+            MethodCall -> return .None
+            IndirectCall -> return .None
+            Lambda -> return .None
+            KeyPath -> return .None
+            Task -> return .None
+            ExpandedMacro -> return .None
+            Quote -> return .None
+            MacroCall -> return .None
+            Try -> return .None
+            Variant -> return .None
+            StructLiteral -> return .None
+            Unary -> return .None
+            Binary -> return .None
+            Conditional -> return .None
+            MatchValue -> return .None
+            Content -> return .None
+        }
+    }
+
+    // A key path, as written.
+    function keyPath(borrow self) -> Optional<KeyPathDeclaration> {
+        match self {
+            Labelled -> return .None
+            Name -> return .None
+            IntegerLiteral -> return .None
+            FloatLiteral -> return .None
+            BooleanLiteral -> return .None
+            StringLiteral -> return .None
+            ArrayLiteral -> return .None
+            Index -> return .None
+            Transfer -> return .None
+            TypeQuery -> return .None
+            Member -> return .None
+            Call -> return .None
+            GenericCall -> return .None
+            MethodCall -> return .None
+            IndirectCall -> return .None
+            Lambda -> return .None
+            KeyPath(declared) -> return .Some(declared)
+            Task -> return .None
+            ExpandedMacro -> return .None
+            Quote -> return .None
+            MacroCall -> return .None
+            Try -> return .None
+            Variant -> return .None
+            StructLiteral -> return .None
+            Unary -> return .None
+            Binary -> return .None
+            Conditional -> return .None
+            MatchValue -> return .None
+            Content -> return .None
+        }
+    }
+
+    // A lambda, as written.
+    function lambda(borrow self) -> Optional<LambdaDeclaration> {
+        match self {
+            Labelled -> return .None
+            Name -> return .None
+            IntegerLiteral -> return .None
+            FloatLiteral -> return .None
+            BooleanLiteral -> return .None
+            StringLiteral -> return .None
+            ArrayLiteral -> return .None
+            Index -> return .None
+            Transfer -> return .None
+            TypeQuery -> return .None
+            Member -> return .None
+            Call -> return .None
+            GenericCall -> return .None
+            MethodCall -> return .None
+            IndirectCall -> return .None
+            Lambda(declared) -> return .Some(declared)
+            KeyPath -> return .None
+            Task -> return .None
+            ExpandedMacro -> return .None
+            Quote -> return .None
+            MacroCall -> return .None
+            Try -> return .None
+            Variant -> return .None
+            StructLiteral -> return .None
+            Unary -> return .None
+            Binary -> return .None
+            Conditional -> return .None
+            MatchValue -> return .None
+            Content -> return .None
+        }
+    }
+
+    // The member a `base.member` read names.
+    function memberName(borrow self) -> Optional<Identifier> {
+        match self {
+            Name -> return .None
+            IntegerLiteral -> return .None
+            FloatLiteral -> return .None
+            BooleanLiteral -> return .None
+            StringLiteral -> return .None
+            ArrayLiteral -> return .None
+            Index -> return .None
+            Transfer -> return .None
+            Labelled -> return .None
+            TypeQuery -> return .None
+            Member(base, identifier) -> return .Some(identifier)
+            Call -> return .None
+            GenericCall -> return .None
+            MethodCall -> return .None
+            IndirectCall -> return .None
+            Lambda -> return .None
+            KeyPath -> return .None
+            Task -> return .None
+            ExpandedMacro -> return .None
+            Quote -> return .None
+            MacroCall -> return .None
+            Try -> return .None
+            Variant -> return .None
+            StructLiteral -> return .None
+            Unary -> return .None
+            Binary -> return .None
+            Conditional -> return .None
+            MatchValue -> return .None
+            Content -> return .None
+        }
+    }
+
+    // What a `log` argument is: a labelled field, the message, a literal no
+    // name can be read from, or a value named by its source text.
+    function logArgument(borrow self) -> LogArgument {
+        match self {
+            Quote -> return .Value
+            IntegerLiteral -> return .Literal
+            FloatLiteral -> return .Literal
+            BooleanLiteral -> return .Literal
+            StringLiteral -> return .Message
+            ArrayLiteral -> return .Value
+            Index -> return .Value
+            Transfer -> return .Value
+            Labelled(label, value) -> return .Labelled(label, value)
+            TypeQuery -> return .Value
+            Name -> return .Value
+            Member -> return .Value
+            ExpandedMacro -> return .Value
+            MacroCall -> return .Value
+            Call -> return .Value
+            GenericCall -> return .Value
+            MethodCall -> return .Value
+            IndirectCall -> return .Value
+            Lambda -> return .Value
+            KeyPath -> return .Value
+            Task -> return .Value
+            Try -> return .Value
+            Variant -> return .Value
+            StructLiteral -> return .Value
+            Unary -> return .Value
+            Binary -> return .Value
+            Conditional -> return .Value
+            MatchValue -> return .Value
+            Content -> return .Value
+        }
+    }
+
+    // Whether the expression, as the left operand of a binary operator,
+    // takes its type from the right one: a leading-dot variant names no enum,
+    // and a literal fits whichever type the other side has.
+    function takesOperandType(borrow self) -> Bool {
+        match self {
+            Variant -> return true
+            IntegerLiteral -> return true
+            FloatLiteral -> return true
+            BooleanLiteral -> return false
+            StringLiteral -> return false
+            ArrayLiteral -> return false
+            Index -> return false
+            Transfer -> return false
+            Labelled -> return false
+            TypeQuery -> return false
+            Name -> return false
+            Member -> return false
+            Call -> return false
+            GenericCall -> return false
+            MethodCall -> return false
+            IndirectCall -> return false
+            Lambda -> return false
+            KeyPath -> return false
+            Task -> return false
+            ExpandedMacro -> return false
+            Quote -> return false
+            MacroCall -> return false
+            Try -> return false
+            StructLiteral -> return false
+            Unary -> return false
+            Binary -> return false
+            Conditional -> return false
+            MatchValue -> return false
+            Content -> return false
+        }
+    }
+}
+
+struct Expression {
+    let kind: ExpressionKind
+    let span: Span
+}

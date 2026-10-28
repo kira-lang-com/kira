@@ -1,0 +1,304 @@
+import Foundation
+
+// Which connection a request takes (DESIGN.md section 7.5): QUIC when the
+// request is pinned to HTTP/3, TCP with TLS otherwise, and cleartext TCP for
+// `http://` to loopback or where the program allowed it. A route's key names
+// the connections it can share.
+
+// A request's authority taken apart.
+struct Authority {
+    let host: String
+    let port: Number
+}
+
+struct Route {
+    let authority: Authority
+    let key: String
+    let quic: Bool
+    let secure: Bool
+}
+
+namespace RouteLimit {
+    let httpPort: Number = 80
+    let loopbackPrefix: String = "127."
+    let loopbackNames: [String] = ["localhost", "::1"]
+}
+
+extend Network {
+    // Puts request `id` on a connection for its route, or starts one.
+    function routeRequest(borrow mut self, id: RequestId) {
+        let index = match requestIndex(id) {
+            Some(value) -> value
+            None -> return
+        }
+        let route = copy requests[index].route
+        if route.quic {
+            match sessionFor(route.key) {
+                Some(session) -> {
+                    requests[index].session = .Some(sessions[session].id)
+                    if sessions[session].connected { startRequests(session) }
+                    return
+                }
+                None -> {}
+            }
+        } else {
+            match linkFor(route.key) {
+                Some(link) -> {
+                    requests[index].session = .Some(links[link].id)
+                    startLink(link)
+                    return
+                }
+                None -> {}
+            }
+        }
+        for lookup in lookups {
+            if lookup.route.key == route.key { return }
+        }
+        if tlsIsAddressLiteral(route.authority.host) {
+            connectRoute(route, route.authority.host)
+        } else {
+            resolve(route)
+        }
+    }
+
+    // A session for `key` that can still take requests.
+    function sessionFor(borrow self, key: borrow String) -> Number? {
+        for (index, session) in sessions.enumerated() {
+            if session.origin == key && !session.going && !session.closed { return .Some(index) }
+        }
+        return .None
+    }
+
+    // A link for `key` that will carry another request.
+    function linkFor(borrow self, key: borrow String) -> Number? {
+        for (index, link) in links.enumerated() {
+            if link.origin == key && !link.closed && !link.finishing && !link.closeAfter {
+                return .Some(index)
+            }
+        }
+        return .None
+    }
+
+    // Every request still waiting for a connection on `key` fails.
+    function failRoute(borrow mut self, key: borrow String, failure: borrow HttpFailure) {
+        var waiting: [RequestId] = []
+        for request in requests {
+            if request.route.key == key && request.session.isNone() { waiting.append(request.id) }
+        }
+        for id in waiting { endRequestId(id, .Some(copy failure)) }
+    }
+
+    // Requests waiting on `key` go on connection `connection`.
+    function attachWaiting(borrow mut self, key: borrow String, connection: Number) {
+        for index in 0..requests.count {
+            if requests[index].route.key == key && requests[index].session.isNone() {
+                requests[index].session = .Some(connection)
+            }
+        }
+    }
+
+    function resolve(borrow mut self, route: borrow Route) {
+        let token = takeToken()
+        match poller.resolve(route.authority.host, token) {
+            Ok(lookup) -> lookups.append(
+                PendingLookup { token: token, lookup: lookup, route: copy route }
+            )
+            Error(failure) -> {
+                absorb failure
+                failRoute(route.key, .Resolve(copy route.authority.host))
+            }
+        }
+    }
+
+    function takeLookup(borrow mut self, token: Number) {
+        var found: PendingLookup? = .None
+        var rest: [PendingLookup] = []
+        for lookup in lookups {
+            if lookup.token == token {
+                found = .Some(copy lookup)
+            } else {
+                rest.append(copy lookup)
+            }
+        }
+        let pending = match found {
+            Some(value) -> value
+            None -> return
+        }
+        let addresses = match pending.lookup.addresses() {
+            Ok(value) -> value
+            Error(failure) -> {
+                match failure {
+                    WouldBlock -> return
+                    // A failed lookup answers no addresses.
+                    Refused, Unreachable, AddressInUse, InvalidHandle, InvalidAddress, TimedOut, Reset, NotFound, Io -> {}
+                }
+                []
+            }
+        }
+        lookups = rest
+        match pending.lookup.close() {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+        if addresses.count == 0 {
+            return failRoute(pending.route.key, .Resolve(copy pending.route.authority.host))
+        }
+        connectRoute(pending.route, addresses[0])
+    }
+
+    // A connection for `route` to `address`, its host resolved.
+    function connectRoute(borrow mut self, route: borrow Route, address: borrow String) {
+        let peer = socketAddress(address, route.authority.port)
+        if !route.quic {
+            let link = match openLink(route.key, route.authority.host, peer, route.secure) {
+                Ok(value) -> value
+                Error(failure) -> return failRoute(route.key, failure)
+            }
+            attachWaiting(route.key, link)
+            // A cleartext link carries HTTP at once; a TLS one starts when
+            // its handshake ends.
+            match linkIndex(link) {
+                Some(index) -> startLink(index)
+                None -> {}
+            }
+            return
+        }
+        let slot = match clientSlot(address.contains(":")) {
+            Ok(value) -> value
+            Error(failure) -> return failRoute(route.key, .Connect(failure))
+        }
+        let settings = QuicClientSettings {
+            serverName: copy route.authority.host,
+            protocols: [DriverLimit.alpn],
+            seconds: floor(unixMillis() / DriverLimit.millisecondsPerSecond),
+            anchors: copy options.anchors,
+            limits: copy options.quic
+        }
+        let started = slots[slot].endpoint.connect(move settings, peer, now())
+        let handle = match started {
+            Ok(value) -> value
+            Error(problem) -> return failRoute(route.key, .Protocol(code(problem)))
+        }
+        let key = takeToken()
+        sessions.append(
+            SessionEntry {
+                id: key,
+                slot: slot,
+                handle: handle,
+                origin: copy route.key,
+                peer: peer,
+                http: http3Session(.Client)
+            }
+        )
+        attachWaiting(route.key, key)
+    }
+
+    // The client socket for one address family, opened on first use.
+    function clientSlot(borrow mut self, ipv6: Bool) -> Result<Number, NetFailure> {
+        for (index, slot) in slots.enumerated() {
+            if slot.server.isNone() && slot.ipv6 == ipv6 { return .Ok(index) }
+        }
+        return openSlot(
+            ipv6 ? DriverLimit.anyIpv6 : DriverLimit.anyIpv4,
+            QuicEndpointSettings {},
+            .None
+        )
+    }
+}
+
+function routeFor(
+    target: borrow Target,
+    transport: borrow Transport
+) -> Result<Route, HttpFailure> {
+    let secure = match target.scheme {
+        "https" -> true
+        "http" -> false
+        else -> return .Error(.Protocol(code(Http3Error.MessageError)))
+    }
+    let fallback = secure ? DriverLimit.httpsPort : RouteLimit.httpPort
+    let authority = match splitAuthority(target.authority, fallback) {
+        Some(value) -> value
+        None -> return .Error(.Resolve(copy target.authority))
+    }
+    let quic = match transport {
+        Http3Only -> true
+        Automatic -> false
+        Cleartext -> false
+    }
+    if !secure {
+        // HTTP/3 has no cleartext form.
+        if quic { return .Error(.Protocol(code(Http3Error.VersionFallback))) }
+        let allowed = match transport {
+            Cleartext -> true
+            Automatic -> isLoopback(authority.host)
+            Http3Only -> false
+        }
+        if !allowed { return .Error(.Connect(.Refused)) }
+    }
+    let scheme = quic ? "h3" : copy target.scheme
+    return .Ok(
+        Route {
+            key: "\(scheme) \(authority.host.lowercased()):\(authority.port)",
+            authority: authority,
+            quic: quic,
+            secure: secure
+        }
+    )
+}
+
+function isLoopback(host: borrow String) -> Bool {
+    return host.startsWith(RouteLimit.loopbackPrefix) || RouteLimit.loopbackNames.contains(
+        host.lowercased()
+    )
+}
+
+// "host", "host:port" or "[v6]:port", with `fallback` when the port is left
+// out.
+function splitAuthority(text: borrow String, fallback: Number) -> Authority? {
+    var host = copy text
+    var port = ""
+    if text.startsWith("[") {
+        let close = match text.indexOf("]") {
+            Some(value) -> value
+            None -> return .None
+        }
+        host = text.substring(1, close)
+        let rest = text.substring(close + 1, text.count)
+        if rest.count > 0 {
+            if !rest.startsWith(":") { return .None }
+            port = rest.substring(1, rest.count)
+        }
+    } else {
+        match text.indexOf(":") {
+            Some(colon) -> {
+                host = text.substring(0, colon)
+                port = text.substring(colon + 1, text.count)
+            }
+            None -> {}
+        }
+        if host.contains(":") { return .None }
+    }
+    if host.count == 0 { return .None }
+    if port.count == 0 { return .Some(Authority { host: host, port: fallback }) }
+    return match portNumber(port) {
+        Some(value) -> .Some(Authority { host: host, port: value })
+        None -> .None
+    }
+}
+
+function portNumber(text: borrow String) -> Number? {
+    if text.count == 0 || text.count > DriverLimit.portDigits { return .None }
+    var value: Number = 0
+    for byte in text.utf8() {
+        let digit = Number(byte) - StatusRange.zero
+        if digit < 0 || digit >= StatusRange.radix { return .None }
+        value = value * StatusRange.radix + digit
+    }
+    if value == 0 || value > DriverLimit.highestPort { return .None }
+    return .Some(value)
+}
+
+// An address and port as the kernel takes them.
+function socketAddress(address: borrow String, port: Number) -> String {
+    return address.contains(":") ? "[\(address)]:\(port)" : "\(address):\(port)"
+}

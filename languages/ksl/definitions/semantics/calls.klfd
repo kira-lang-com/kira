@@ -1,0 +1,397 @@
+// Calls: a construction or conversion, a built-in, or a declared function.
+
+function builtinFunction(name: String) -> Optional<BuiltinFunction> {
+    match name {
+        "mul" -> return .Some(.Mul)
+        "dot" -> return .Some(.Dot)
+        "cross" -> return .Some(.Cross)
+        "normalize" -> return .Some(.Normalize)
+        "length" -> return .Some(.Length)
+        "abs" -> return .Some(.Abs)
+        "floor" -> return .Some(.Floor)
+        "ceil" -> return .Some(.Ceil)
+        "min" -> return .Some(.Min)
+        "max" -> return .Some(.Max)
+        "clamp" -> return .Some(.Clamp)
+        "mix" -> return .Some(.Mix)
+        "step" -> return .Some(.Step)
+        "smoothstep" -> return .Some(.Smoothstep)
+        "fma" -> return .Some(.Fma)
+        "pack2x16float" -> return .Some(.Pack2x16Float)
+        "unpack2x16float" -> return .Some(.Unpack2x16Float)
+        "pow" -> return .Some(.Pow)
+        "sqrt" -> return .Some(.Sqrt)
+        "sin" -> return .Some(.Sin)
+        "cos" -> return .Some(.Cos)
+        "tan" -> return .Some(.Tan)
+        "atan2" -> return .Some(.Atan2)
+        "exp" -> return .Some(.Exp)
+        "exp2" -> return .Some(.Exp2)
+        "log" -> return .Some(.Log)
+        "log2" -> return .Some(.Log2)
+        "fract" -> return .Some(.Fract)
+        "round" -> return .Some(.Round)
+        "sign" -> return .Some(.Sign)
+        "dpdx" -> return .Some(.Dpdx)
+        "dpdy" -> return .Some(.Dpdy)
+        "fwidth" -> return .Some(.Fwidth)
+        "sample" -> return .Some(.Sample)
+        "load" -> return .Some(.Load)
+        "store" -> return .Some(.Store)
+        "atomicAdd" -> return .Some(.AtomicAdd)
+        else -> {
+            let none: Optional<BuiltinFunction> = .None
+            return none
+        }
+    }
+}
+
+function arity(which: BuiltinFunction) -> Int {
+    match which {
+        Mul -> return 2
+        Dot -> return 2
+        Cross -> return 2
+        Min -> return 2
+        Max -> return 2
+        Step -> return 2
+        Pow -> return 2
+        Atan2 -> return 2
+        Load -> return 2
+        Clamp -> return 3
+        Mix -> return 3
+        Smoothstep -> return 3
+        Fma -> return 3
+        Pack2x16Float -> return 1
+        Unpack2x16Float -> return 1
+        Sample -> return 3
+        Store -> return 3
+        AtomicAdd -> return 3
+        Normalize -> return 1
+        Length -> return 1
+        Abs -> return 1
+        Floor -> return 1
+        Ceil -> return 1
+        Sqrt -> return 1
+        Sin -> return 1
+        Cos -> return 1
+        Tan -> return 1
+        Exp -> return 1
+        Exp2 -> return 1
+        Log -> return 1
+        Log2 -> return 1
+        Fract -> return 1
+        Round -> return 1
+        Sign -> return 1
+        Dpdx -> return 1
+        Dpdy -> return 1
+        Fwidth -> return 1
+    }
+}
+
+// Component-wise math over floats and float vectors of one shape.
+function wantsFloats(which: BuiltinFunction) -> Bool {
+    let family: [BuiltinFunction] = [
+        .Abs, .Floor, .Ceil, .Min, .Max, .Clamp, .Mix, .Step, .Smoothstep, .Fma, .Pow, .Sqrt, .Sin, .Cos, .Tan,
+        .Exp, .Exp2, .Log, .Log2, .Fract, .Round, .Sign, .Dpdx, .Dpdy, .Fwidth
+    ]
+    for member in family {
+        if member == which { return true }
+    }
+    return false
+}
+
+// Geometry over float vectors of one shape, with no scalar beside them.
+function wantsVectors(which: BuiltinFunction) -> Bool {
+    return which == .Dot || which == .Cross || which == .Normalize || which == .Length
+}
+
+extend Checker {
+    // The name a callee spells: `f`, or `Alias.f` as `Alias_f`.
+    function calleeName(borrow self, callee: Int) -> Optional<String> {
+        let none: Optional<String> = .None
+        let written = tree.expressions[callee]
+        if written.kind == .Name { return .Some(written.text) }
+        if written.kind != .Field { return none }
+        let base = tree.expressions[written.left]
+        if base.kind != .Name { return none }
+        return .Some(joinText([base.text, "_", written.text]))
+    }
+
+    function call(borrow mut self, written: Expression) -> Int {
+        var name = ""
+        match calleeName(written.left) {
+            Some(spelled) -> name = spelled
+            None -> {
+                report(.UnknownName, written.span)
+                return invalid(written.span)
+            }
+        }
+        // Inside an imported file, an unqualified call reaches that file's
+        // own function first.
+        let own = qualified(name)
+        if own != name && signatureNamed(own) >= 0 { name = own }
+        match builtinType(name) {
+            Some(builtin) -> return construction(builtin, written.arguments, written.span)
+            None -> {}
+        }
+        var structure = structNamed(name)
+        if structure < 0 { structure = structNamed(own) }
+        if structure >= 0 { return construction(structType(structure), written.arguments, written.span) }
+        match builtinFunction(name) {
+            Some(which) -> return builtinCall(which, written.arguments, written.span)
+            None -> {}
+        }
+        let found = signatureNamed(name)
+        if found < 0 {
+            report(.UnknownName, written.span)
+            return invalid(written.span)
+        }
+        let callee = signatures[found]
+        if written.arguments.count != callee.parameters.count {
+            report(.ArgumentCount, written.span)
+            return invalid(written.span)
+        }
+        var arguments: [Int] = []
+        for position in 0..written.arguments.count {
+            let argument = checkExpression(written.arguments[position])
+            arguments.append(coerce(argument, callee.parameters[position], written.span))
+        }
+        calls.append(callee.checkedFunction)
+        var expression = blank(.Call, callee.result, written.span)
+        expression.target = callee.checkedFunction
+        expression.arguments = arguments
+        return push(expression)
+    }
+
+    // A value built from parts, or one scalar converted to another.
+    function construction(borrow mut self, built: ShaderType, written: [Int], span: Span) -> Int {
+        var checked: [Int] = []
+        for argument in written {
+            checked.append(checkExpression(argument))
+        }
+        match built.shape {
+            ScalarShape -> {
+                if checked.count == 1 {
+                    if !typeOf(checked[0]).isNumeric() {
+                        report(.TypeMismatch, span)
+                        return invalid(span)
+                    }
+                    var expression = blank(.Cast, built, span)
+                    expression.left = checked[0]
+                    return push(expression)
+                }
+            }
+            Vector -> return constructVector(built, checked, span)
+            Struct -> {
+                let fields = program.structs[built.index].fields
+                if checked.count != fields.count {
+                    report(.ArgumentCount, span)
+                    return invalid(span)
+                }
+                var coerced: [Int] = []
+                for position in 0..checked.count {
+                    coerced.append(coerce(checked[position], fields[position].fieldType, span))
+                }
+                var expression = blank(.Construct, built, span)
+                expression.arguments = coerced
+                return push(expression)
+            }
+            Matrix -> {
+                var expression = blank(.Construct, built, span)
+                expression.arguments = checked
+                return push(expression)
+            }
+            Void -> {}
+            Texture -> {}
+            Sampler -> {}
+        }
+        report(.TypeMismatch, span)
+        return invalid(span)
+    }
+
+    // One scalar fills every lane; one vector as wide of another numeric
+    // kind converts lane by lane; otherwise the parts' lanes add up to the
+    // vector's width.
+    function constructVector(borrow mut self, built: ShaderType, checked: [Int], span: Span) -> Int {
+        if checked.count == 1 {
+            let only = typeOf(checked[0])
+            let converts = only.shape == .Vector && only.width == built.width && only.scalar != built.scalar
+            if converts && only.isNumeric() && built.scalar != .Bool {
+                var expression = blank(.Cast, built, span)
+                expression.left = checked[0]
+                return push(expression)
+            }
+        }
+        var lanes = 0
+        for argument in checked {
+            let part = typeOf(argument)
+            if part.shape == .ScalarShape && !part.array { lanes += 1 }
+            if part.shape == .Vector && !part.array { lanes += part.width }
+        }
+        let splat = checked.count == 1 && lanes == 1
+        if !splat && lanes != built.width {
+            report(.ArgumentCount, span)
+            return invalid(span)
+        }
+        var coerced: [Int] = []
+        for argument in checked {
+            let part = typeOf(argument)
+            var expected = scalarType(built.scalar)
+            if part.shape == .Vector { expected = vectorType(built.scalar, part.width) }
+            coerced.append(coerce(argument, expected, span))
+        }
+        var expression = blank(.Construct, built, span)
+        expression.arguments = coerced
+        return push(expression)
+    }
+
+    function builtinCall(borrow mut self, which: BuiltinFunction, written: [Int], span: Span) -> Int {
+        if written.count != arity(which) {
+            report(.ArgumentCount, span)
+            return invalid(span)
+        }
+        var arguments: [Int] = []
+        for argument in written {
+            arguments.append(checkExpression(argument))
+        }
+        // A failed argument was reported where it failed.
+        for argument in arguments {
+            if typeOf(argument).isVoid() { return invalid(span) }
+        }
+        if (wantsFloats(which) || wantsVectors(which)) && !floatShaped(which, arguments) {
+            report(.TypeMismatch, span)
+            return invalid(span)
+        }
+        let first = typeOf(arguments[0])
+        var resultType = first
+        match which {
+            Mul -> {
+                let second = typeOf(arguments[1])
+                if first.shape != .Matrix || first.array || second.array {
+                    report(.TypeMismatch, span)
+                    return invalid(span)
+                }
+                if second.shape == .Vector {
+                    resultType = vectorType(.Float, first.rows)
+                } else if second.shape == .Matrix {
+                    resultType = second
+                } else {
+                    report(.TypeMismatch, span)
+                    return invalid(span)
+                }
+            }
+            Dot -> resultType = scalarType(.Float)
+            Length -> resultType = scalarType(.Float)
+            Sample -> {
+                if !isImage(arguments[0]) || typeOf(arguments[1]).shape != .Sampler || typeOf(arguments[1]).array {
+                    report(.TypeMismatch, span)
+                    return invalid(span)
+                }
+                arguments[2] = coerce(arguments[2], vectorType(.Float, 2), span)
+                resultType = vectorType(.Float, 4)
+            }
+            Load -> {
+                if !isImage(arguments[0]) {
+                    report(.TypeMismatch, span)
+                    return invalid(span)
+                }
+                var texel: Scalar = .Float
+                if first.texture == .Texture2dUint { texel = .UInt }
+                resultType = vectorType(texel, 4)
+            }
+            Store -> {
+                if !isImage(arguments[0]) {
+                    report(.TypeMismatch, span)
+                    return invalid(span)
+                }
+                resultType = voidType()
+            }
+            AtomicAdd -> {
+                if !isAtomicTarget(arguments[0]) {
+                    report(.TypeMismatch, span)
+                    return invalid(span)
+                }
+                arguments[1] = coerce(arguments[1], scalarType(.UInt), span)
+                arguments[2] = coerce(arguments[2], scalarType(.UInt), span)
+                resultType = scalarType(.UInt)
+            }
+            Cross -> {}
+            Normalize -> {}
+            Abs -> {}
+            Floor -> {}
+            Ceil -> {}
+            Min -> {}
+            Max -> {}
+            Clamp -> {}
+            Mix -> {}
+            Step -> {}
+            Smoothstep -> {}
+            Fma -> {}
+            Pack2x16Float -> {
+                arguments[0] = coerce(arguments[0], vectorType(.Float, 2), span)
+                resultType = scalarType(.UInt)
+            }
+            Unpack2x16Float -> {
+                arguments[0] = coerce(arguments[0], scalarType(.UInt), span)
+                resultType = vectorType(.Float, 2)
+            }
+            Pow -> {}
+            Sqrt -> {}
+            Sin -> {}
+            Cos -> {}
+            Tan -> {}
+            Atan2 -> {}
+            Exp -> {}
+            Exp2 -> {}
+            Log -> {}
+            Log2 -> {}
+            Fract -> {}
+            Round -> {}
+            Sign -> {}
+            Dpdx -> derivatives.append(span)
+            Dpdy -> derivatives.append(span)
+            Fwidth -> derivatives.append(span)
+        }
+        var expression = blank(.Builtin, resultType, span)
+        expression.builtin = which
+        expression.arguments = arguments
+        return push(expression)
+    }
+
+    // Floats and same-shaped float vectors; the vector family needs a vector
+    // and `cross` a `Float3`.
+    function floatShaped(borrow self, which: BuiltinFunction, arguments: [Int]) -> Bool {
+        var shaped = true
+        var hasVector = false
+        var vector = voidType()
+        for argument in arguments {
+            let part = typeOf(argument)
+            if part.isScalar(.Float) || part.isScalar(.Half) {
+                continue
+            }
+            if part.shape == .Vector && !part.array && (!hasVector || part.same(vector)) {
+                hasVector = true
+                vector = part
+                continue
+            }
+            shaped = false
+        }
+        if wantsVectors(which) && !hasVector { shaped = false }
+        if which == .Cross && hasVector && !vector.same(vectorType(.Float, 3)) { shaped = false }
+        return shaped
+    }
+
+    function isImage(borrow self, argument: Int) -> Bool {
+        let part = typeOf(argument)
+        return part.shape == .Texture && !part.array
+    }
+
+    // A `read_write` storage array of `UInt`, named directly.
+    function isAtomicTarget(borrow self, argument: Int) -> Bool {
+        let checked = program.expressions[argument]
+        if checked.kind != .Resource { return false }
+        let resource = program.resources[checked.target]
+        return resource.access == .ReadWrite && resource.resourceType.array
+            && resource.resourceType.element().isScalar(.UInt)
+    }
+}

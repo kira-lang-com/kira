@@ -1,0 +1,593 @@
+import KnvmCore
+
+// What the version manager's decisions rest on, checked where they can be
+// checked cheaply: the digest it verifies a download against, the version order
+// a listing and `latest` both read, the state files the launcher reads back,
+// and the argument shapes the verbs accept.
+//
+// The parts that need a network or a built driver — `binstall`, `sinstall`, an
+// install from a feed — are exercised by running them, not by a case here.
+
+var checks: Int = 0
+var failures: Int = 0
+
+function expect(label: borrow String, condition: Bool) {
+    checks = checks + 1
+    if !condition {
+        failures = failures + 1
+        print("FAILED " + label)
+    }
+    return
+}
+
+function expectEqual(label: borrow String, got: borrow String, want: borrow String) {
+    checks = checks + 1
+    if got != want {
+        failures = failures + 1
+        print("FAILED " + label + ": got `" + got + "`, want `" + want + "`")
+    }
+    return
+}
+
+function bytesOfText(text: borrow String) -> [UN8] {
+    var bytes: [UN8] = []
+    for index in 0..text.count {
+        bytes.append(UN8(text.charAt(index)))
+    }
+    return bytes
+}
+
+// The NIST vectors and the block boundaries a streaming hasher gets wrong:
+// 55, 56, 63 and 64 bytes are the lengths where padding either fills the block
+// or spills into the next one.
+function digestCases() {
+    expectEqual("digest of nothing", digestHex(digestOf([])), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    expectEqual("digest of abc", digestHex(digestOf(bytesOfText("abc"))), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    expectEqual(
+        "digest of the fox",
+        digestHex(digestOf(bytesOfText("The quick brown fox jumps over the lazy dog"))),
+        "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592"
+    )
+    expectEqual(
+        "digest of a padded million a",
+        digestHex(digestOf(filled(1000000, UN8(97)))),
+        "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+    )
+    for length in 0..70 {
+        let hex = digestHex(digestOf(filled(length, UN8(98))))
+        let read = parseDigestHex(hex)
+        match read {
+            None -> { expect("digest hex round trip at " + String(length), false) }
+            Some(again) -> {
+                expect("digest hex round trip at " + String(length), sameDigest(again, digestOf(filled(length, UN8(98)))))
+            }
+        }
+    }
+    match parseDigestHex("not a digest") {
+        None -> { expect("a malformed digest is refused", true) }
+        Some(digest) -> { expect("a malformed digest is refused", false) }
+    }
+    match parseDigestHex("ABCDEF0123456789") {
+        None -> { expect("a short digest is refused", true) }
+        Some(digest) -> { expect("a short digest is refused", false) }
+    }
+    expectEqual(
+        "an upper-case digest reads as its bytes",
+        digestHex(matchingDigest("E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855")),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    )
+    expectEqual(
+        "a bare sidecar digest reads",
+        digestHex(matchingDigest("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n")),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    )
+    expectEqual(
+        "a named sidecar digest reads",
+        digestHex(matchingDigest("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  kira.tar.gz\n")),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    )
+    match parseChecksumFile("shasum wrote something else\n") {
+        None -> { expect("an unreadable sidecar is refused", true) }
+        Some(digest) -> { expect("an unreadable sidecar is refused", false) }
+    }
+    expectEqual("the sidecar names the artifact", checksumFileName("kira-1.7.3-x86_64-linux-gnu.tar.gz"), "kira-1.7.3-x86_64-linux-gnu.tar.gz.sha256")
+}
+
+function matchingDigest(text: borrow String) -> Digest {
+    match parseChecksumFile(text) {
+        None -> { return digestOf([]) }
+        Some(digest) -> { return digest }
+    }
+    return digestOf([])
+}
+
+function versionCases() {
+    expect("2026.07.10 is above 2026.07.2", compareVersions("2026.07.10", "2026.07.2") > 0)
+    expect("1.7.3 is below 1.10.0", compareVersions("1.7.3", "1.10.0") < 0)
+    expect("a version equals itself", compareVersions("1.7.3", "1.7.3") == 0)
+    expect("a longer version is above its prefix", compareVersions("1.7.3", "1.7") > 0)
+    expect("a prerelease tag sorts above its release", compareVersions("1.7.0-rc1", "1.7.0") > 0)
+    expectEqual("sorting is newest first", join(sortNewestFirst(["1.7.3", "1.10.0", "1.9.12"])), "1.10.0,1.9.12,1.7.3")
+    expectEqual("sorting one version is itself", join(sortNewestFirst(["2026.07.2"])), "2026.07.2")
+    expectEqual("sorting nothing is nothing", join(sortNewestFirst([])), "")
+}
+
+function join(versions: borrow [String]) -> String {
+    var text = ""
+    for index in 0..versions.count {
+        if index > 0 { text = text + "," }
+        text = text + versions[index]
+    }
+    return text
+}
+
+// A version is a directory name, and every verb that joins one runs this before
+// touching the filesystem.
+function versionNameCases() {
+    for good in ["1.7.3", "2026.07.2", "1.7.0-rc1"] {
+        expect("`" + good + "` names a version", isSingleComponent(good))
+    }
+    for bad in ["", ".", "..", "../llvm", "a/b", "1.7.3/", "a\\b"] {
+        expect("`" + bad + "` is refused", !isSingleComponent(bad))
+    }
+}
+
+// What a release names its artifacts by, and the host this one is.
+//
+// The host key is not derived here: it is the framework's, read through
+// `klf.host`, and it is the same string the framework names its own provisioned
+// bundles by. What this case can check is that the service answered at all, that
+// what it answered is one this tool will install for, and that the artifact name
+// is built from it.
+function artifactCases() {
+    let host = currentHostKey()
+    expect("the host service answered", !host.isEmpty())
+    expect("this host is one artifacts are published for", isKnownHostKey(host))
+    expect("a host the framework does not name is not one", !isKnownHostKey("unknown"))
+    expectEqual(
+        "the host artifact is named for the host",
+        archiveFileName(kiraCompiler(), "1.7.3", host),
+        "kira-1.7.3-" + host + ".tar.gz"
+    )
+    expectEqual(
+        "an artifact is named for its compiler's binary",
+        archiveFileName(klfCompiler(), "0.1.0", host),
+        "klf-0.1.0-" + host + ".tar.gz"
+    )
+}
+
+// What `current.toml` and a pin file hold, and what a file that is not one of
+// them is answered as.
+function stateFileCases() {
+    let selection = Selection { channel = .Dev, version = "2026.07.2", primary = "kira" }
+    let text = "channel = \"dev\"\nversion = \"2026.07.2\"\nprimary = \"kira\"\n"
+    match parseSelection("/t/current.toml", text) {
+        Selected(parsed) -> {
+            expect("a selection round trips", parsed.version == "2026.07.2")
+            expect("its channel round trips", parsed.channel == .Dev)
+            expect("its primary round trips", parsed.primary == "kira")
+            expect("it matches itself", namesSelection(selection.channel, selection.version, parsed))
+        }
+        NothingSelected -> { expect("a selection round trips", false) }
+        Unusable(failure) -> { expect("a selection round trips", false) }
+    }
+    match parseSelection("/t/current.toml", "channel = \"release\"\n") {
+        Selected(parsed) -> { expect("a selection without a version is refused", false) }
+        NothingSelected -> { expect("a selection without a version is refused", false) }
+        Unusable(failure) -> { expect("a selection without a version is refused", true) }
+    }
+    match parseSelection("/t/current.toml", "channel = \"nightly\"\nversion = \"1.0.0\"\n") {
+        Selected(parsed) -> { expect("an unknown channel is refused", false) }
+        NothingSelected -> { expect("an unknown channel is refused", false) }
+        Unusable(failure) -> { expect("an unknown channel is refused", true) }
+    }
+    expect("a comment line is not a field", !hasField(tomlFields("# channel = \"dev\"\n"), "channel"))
+    expect("a blank line is not a field", !hasField(tomlFields("\n\n"), "version"))
+
+    match parsePin("/p/kira-toolchain.toml", "version = \"1.10.0\"\n") {
+        Pinned(pin) -> {
+            expect("a pin defaults to the release channel", pin.channel == .Release)
+            expect("a pin keeps its version", pin.version == "1.10.0")
+            expect("a pin names the file it came from", pin.path == "/p/kira-toolchain.toml")
+        }
+        NoPin -> { expect("a pin reads", false) }
+        Unusable(failure) -> { expect("a pin reads", false) }
+    }
+    match parsePin("/p/kira-toolchain.toml", "channel = \"dev\"\nversion = \"2026.07.2\"\n") {
+        Pinned(pin) -> { expect("a pin keeps its channel", pin.channel == .Dev) }
+        NoPin -> { expect("a pin keeps its channel", false) }
+        Unusable(failure) -> { expect("a pin keeps its channel", false) }
+    }
+    match parsePin("/p/kira-toolchain.toml", "channel = \"release\"\n") {
+        Pinned(pin) -> { expect("a pin without a version is refused", false) }
+        NoPin -> { expect("a pin without a version is refused", false) }
+        Unusable(failure) -> { expect("a pin without a version is refused", true) }
+    }
+    match parsePin("/p/kira-toolchain.toml", "version = \"1.0\"\nchannel = \"nightly\"\n") {
+        Pinned(pin) -> { expect("a pin naming an unknown channel is refused", false) }
+        NoPin -> { expect("a pin naming an unknown channel is refused", false) }
+        Unusable(failure) -> { expect("a pin naming an unknown channel is refused", true) }
+    }
+}
+
+// Every verb, and every refusal a caller can provoke from the command line.
+function cliCases() {
+    let plain = Output { }
+    let compilers = fixtureCompilers()
+    match parseCommand([], compilers) {
+        Accepted(command) -> { expect("a bare invocation is the overview", isOverview(command)) }
+        Refused(failure) -> { expect("a bare invocation is the overview", false) }
+    }
+    for spelling in ["help", "--help", "-h"] {
+        match parseCommand([spelling], compilers) {
+            Accepted(command) -> { expect("`" + spelling + "` asks for help", isHelp(command)) }
+            Refused(failure) -> { expect("`" + spelling + "` asks for help", false) }
+        }
+    }
+    match parseCommand(["install", "latest"], compilers) {
+        Accepted(command) -> {
+            expect("`install latest` is latest", installsLatest(command))
+            expect("`install` defaults to the release channel", installsOn(command, .Release))
+        }
+        Refused(failure) -> { expect("`install latest` parses", false) }
+    }
+    match parseCommand(["install", "1.7.3", "--channel", "dev"], compilers) {
+        Accepted(command) -> {
+            expect("`install 1.7.3 --channel dev` names the version", installsVersion(command, "1.7.3"))
+            expect("it takes the channel", installsOn(command, .Dev))
+        }
+        Refused(failure) -> { expect("`install --channel dev 1.7.3` parses", false) }
+    }
+    match parseCommand(["install", "--channel", "dev", "1.7.3"], compilers) {
+        Accepted(command) -> { expect("the channel flag reads on either side", installsVersion(command, "1.7.3")) }
+        Refused(failure) -> { expect("the channel flag reads on either side", false) }
+    }
+    match parseCommand(["install"], compilers) {
+        Accepted(command) -> { expect("`install` alone is refused", false) }
+        Refused(failure) -> { expect("`install` alone names the missing version", isInstallMissingVersion(failure)) }
+    }
+    match parseCommand(["install", "latest", "--channel", "nightly"], compilers) {
+        Accepted(command) -> { expect("an unknown channel is refused", false) }
+        Refused(failure) -> { expect("an unknown channel is named", isUnknownChannel(failure, "nightly")) }
+    }
+    match parseCommand(["install", "latest", "--channel"], compilers) {
+        Accepted(command) -> { expect("a channel without a value is refused", false) }
+        Refused(failure) -> { expect("a channel without a value is named", isChannelMissingValue(failure)) }
+    }
+    match parseCommand(["install", "latest", "--verbose"], compilers) {
+        Accepted(command) -> { expect("an unknown option is refused", false) }
+        Refused(failure) -> { expect("an unknown option is named", isUnknownOption(failure, "--verbose")) }
+    }
+    match parseCommand(["install", "1.7.3", "2.0.0"], compilers) {
+        Accepted(command) -> { expect("a second version is refused", false) }
+        Refused(failure) -> { expect("a second version is named", isUnexpectedArgument(failure, "2.0.0")) }
+    }
+    match parseCommand(["use", "1.7.3"], compilers) {
+        Accepted(command) -> { expect("`use 1.7.3` selects it", uses(command, "1.7.3")) }
+        Refused(failure) -> { expect("`use 1.7.3` parses", false) }
+    }
+    match parseCommand(["switch", "1.7.3"], compilers) {
+        Accepted(command) -> { expect("`switch` is a spelling of `use`", uses(command, "1.7.3")) }
+        Refused(failure) -> { expect("`switch` is a spelling of `use`", false) }
+    }
+    match parseCommand(["use"], compilers) {
+        Accepted(command) -> { expect("`use` alone is refused", false) }
+        Refused(failure) -> { expect("`use` alone is named", isMissingVersion(failure, "use")) }
+    }
+    match parseCommand(["switch"], compilers) {
+        Accepted(command) -> { expect("`switch` alone reports the canonical verb", false) }
+        Refused(failure) -> { expect("`switch` alone reports `use`", isMissingVersion(failure, "use")) }
+    }
+    match parseCommand(["use", "latest"], compilers) {
+        Accepted(command) -> {
+            expect("`use latest` takes it as a version name", uses(command, "latest"))
+        }
+        Refused(failure) -> { expect("`use latest` parses", false) }
+    }
+    match parseCommand(["uninstall", "1.7.3", "--channel", "dev"], compilers) {
+        Accepted(command) -> { expect("`uninstall` takes a channel", uninstalls(command, "1.7.3", .Dev)) }
+        Refused(failure) -> { expect("`uninstall 1.7.3 --channel dev` parses", false) }
+    }
+    match parseCommand(["pin", "1.10.0"], compilers) {
+        Accepted(command) -> { expect("`pin` pins", pins(command, "1.10.0")) }
+        Refused(failure) -> { expect("`pin 1.10.0` parses", false) }
+    }
+    match parseCommand(["pin"], compilers) {
+        Accepted(command) -> { expect("`pin` alone is refused", false) }
+        Refused(failure) -> { expect("`pin` alone is named", isMissingVersion(failure, "pin")) }
+    }
+    match parseCommand(["unpin"], compilers) {
+        Accepted(command) -> { expect("`unpin` takes no arguments", isUnpin(command)) }
+        Refused(failure) -> { expect("`unpin` parses", false) }
+    }
+    match parseCommand(["unpin", "1.10.0"], compilers) {
+        Accepted(command) -> { expect("`unpin 1.10.0` is refused", false) }
+        Refused(failure) -> { expect("`unpin 1.10.0` is named", isUnexpectedArgument(failure, "1.10.0")) }
+    }
+    match parseCommand(["list"], compilers) {
+        Accepted(command) -> { expect("`list` reports the disk", lists(command, false)) }
+        Refused(failure) -> { expect("`list` parses", false) }
+    }
+    match parseCommand(["list", "--remote"], compilers) {
+        Accepted(command) -> { expect("`list --remote` reports the feed", lists(command, true)) }
+        Refused(failure) -> { expect("`list --remote` parses", false) }
+    }
+    match parseCommand(["list", "--channel", "dev"], compilers) {
+        Accepted(command) -> { expect("`list` refuses a channel filter", false) }
+        Refused(failure) -> { expect("`list` refuses a channel filter", isUnknownOption(failure, "--channel")) }
+    }
+    match parseCommand(["list", "1.7.3"], compilers) {
+        Accepted(command) -> { expect("`list` refuses a version", false) }
+        Refused(failure) -> { expect("`list` refuses a version", isUnexpectedArgument(failure, "1.7.3")) }
+    }
+    match parseCommand(["list", "--remote", "dev"], compilers) {
+        Accepted(command) -> { expect("`list --remote` refuses a channel", false) }
+        Refused(failure) -> { expect("`list --remote` refuses a channel", isUnexpectedArgument(failure, "dev")) }
+    }
+    match parseCommand(["binstall"], compilers) {
+        Accepted(command) -> {
+            expect("`binstall` alone builds every language the manifest lists", binstallsManifest(command))
+        }
+        Refused(failure) -> { expect("`binstall` parses", false) }
+    }
+    match parseCommand(["binstall", "--debug"], compilers) {
+        Accepted(command) -> { expect("`binstall --debug` is refused: klf build has one profile", false) }
+        Refused(failure) -> { expect("`binstall --debug` is refused", isUnknownOption(failure, "--debug")) }
+    }
+    match parseCommand(["setup"], compilers) {
+        Accepted(command) -> { expect("`setup` runs", isSetup(command)) }
+        Refused(failure) -> { expect("`setup` parses", false) }
+    }
+    match parseCommand(["setup", "now"], compilers) {
+        Accepted(command) -> { expect("`setup` takes nothing", false) }
+        Refused(failure) -> { expect("`setup now` is refused", isUnexpectedArgument(failure, "now")) }
+    }
+    match parseCommand(["sinstall"], compilers) {
+        Accepted(command) -> { expect("`sinstall` runs", isSinstall(command)) }
+        Refused(failure) -> { expect("`sinstall` parses", false) }
+    }
+    match parseCommand(["list"], compilers) {
+        Accepted(command) -> { expect("a verb alone acts on the default compiler", compilerOf(command) == "kira") }
+        Refused(failure) -> { expect("a verb alone acts on the default compiler", false) }
+    }
+    match parseCommand(["klf", "use", "0.1.0"], compilers) {
+        Accepted(command) -> {
+            expect("a named compiler is the one acted on", compilerOf(command) == "klf")
+            expect("its verb reads as the default's does", uses(command, "0.1.0"))
+        }
+        Refused(failure) -> { expect("`klf use 0.1.0` parses", false) }
+    }
+    match parseCommand(["kira", "unpin"], compilers) {
+        Accepted(command) -> { expect("the default compiler may be named too", isUnpin(command)) }
+        Refused(failure) -> { expect("`kira unpin` parses", false) }
+    }
+    match parseCommand(["klf"], compilers) {
+        Accepted(command) -> { expect("a compiler without a verb is refused", false) }
+        Refused(failure) -> { expect("a compiler without a verb is named", isMissingVerb(failure, "klf")) }
+    }
+    match parseCommand(["klf", "sinstall"], compilers) {
+        Accepted(command) -> { expect("`sinstall` after a compiler is the same `sinstall`", isSinstall(command)) }
+        Refused(failure) -> { expect("`klf sinstall` parses", false) }
+    }
+    match parseCommand(["ksl", "binstall"], compilers) {
+        Accepted(command) -> { expect("a named language binstalls alone", compilerOf(command) == "ksl") }
+        Refused(failure) -> { expect("`ksl binstall` parses", false) }
+    }
+    match parseCommand(["list"], [klfCompiler()]) {
+        Accepted(command) -> { expect("with no default language a bare verb is refused", false) }
+        Refused(failure) -> { expect("with no default language the verb is named", isNoDefault(failure, "list")) }
+    }
+    match parseCommand(["frobnicate"], compilers) {
+        Accepted(command) -> { expect("an unknown verb is refused", false) }
+        Refused(failure) -> { expect("an unknown verb is named", isUnknownCommand(failure, "frobnicate")) }
+    }
+    for verb in verbSummaries() {
+        expect("the usage text names `" + verb.name + "`", usageText(plain, compilers).contains(verb.name))
+    }
+    expect("the usage text starts with the tool", usageText(plain, compilers).startsWith("knvm"))
+    for compiler in compilers {
+        expect("the usage text offers `" + compiler.name + "`", usageText(plain, compilers).contains("knvm " + compiler.name))
+    }
+}
+
+// Whether a feed was refused as not the documented shape.
+function isMalformed(read: borrow Result<[ReleaseEntry], SourceFailure>) -> Bool {
+    match read {
+        Ok(entries) -> return false
+        Error(failure) -> {
+            match failure {
+                MalformedFeed(reason) -> return true
+                else -> return false
+            }
+        }
+    }
+}
+
+// The feeds a release arrives through, read from the text they send.
+function feedCases() {
+    let feed = "[{\"tag_name\":\"v1.10.0\",\"prerelease\":false,\"draft\":false,\"assets\":[{\"name\":\"kira-1.10.0-x86_64-linux-gnu.tar.gz\",\"browser_download_url\":\"https://example.invalid/1.10.0-linux\"},{\"name\":\"kira-1.10.0-x86_64-linux-gnu.tar.gz.sha256\",\"browser_download_url\":\"https://example.invalid/1.10.0-linux.sha256\"}]},{\"tag_name\":\"v1.7.3\",\"prerelease\":false,\"draft\":false,\"assets\":[]},{\"tag_name\":\"2026.07.2\",\"prerelease\":true,\"draft\":false,\"assets\":[]},{\"tag_name\":\"v9.9.9\",\"prerelease\":false,\"draft\":true,\"assets\":[]},{\"tag_name\":\"llvm-v21.1.8-kira.1\",\"prerelease\":false,\"draft\":false,\"assets\":[]}]"
+    match parseReleaseFeed(feed) {
+        Ok(entries) -> {
+            expectEqual("a draft release is skipped and an LLVM bundle is not a version", String(entries.count), "3")
+            expectEqual("the tag prefix is stripped", entries[0].version, "1.10.0")
+            expect("a stable release is on the release channel", entries[0].channel == .Release)
+            expectEqual("a stable release keeps its order", entries[1].version, "1.7.3")
+            expect("a prerelease is on the dev channel", entries[2].channel == .Dev)
+            expectEqual("its tag needs no prefix", entries[2].version, "2026.07.2")
+            expectEqual("its assets are listed", String(entries[0].assets.count), "2")
+            match assetUrl(entries[0], "kira-1.10.0-x86_64-linux-gnu.tar.gz") {
+                None -> { expect("the host artifact is selectable", false) }
+                Some(url) -> { expect("the host artifact is selectable", url == "https://example.invalid/1.10.0-linux") }
+            }
+            match assetUrl(entries[0], "kira-1.10.0-aarch64-macos.tar.gz") {
+                None -> { expect("an artifact this host does not want is absent", true) }
+                Some(url) -> { expect("an artifact this host does not want is absent", false) }
+            }
+        }
+        Error(failure) -> expect("the feed reads", false)
+    }
+    expect("a feed that is not a list is refused", isMalformed(parseReleaseFeed("{}")))
+    expect("an asset with no address is refused", isMalformed(parseReleaseFeed("[{\"tag_name\":\"v1.0.0\",\"assets\":[{\"name\":\"a\"}]}]")))
+    // Which source a release-directory variable names, asked of the decision
+    // rather than of the environment: this case must not depend on whether the
+    // machine running it happens to have the variable set.
+    var published = kiraCompiler()
+    published.repository = "example/kira"
+    expect("a named directory is the source", isDirectorySource(releaseSourceFor(published, "/srv/releases")))
+    expect("an unset variable leaves the repository as the source", isGitHubSource(releaseSourceFor(published, "")))
+    expect(
+        "an empty variable leaves the repository as the source",
+        isGitHubSource(releaseSourceFor(published, environmentValue("KNVM_TEST_UNUSED")))
+    )
+    let unpublished = Compiler { name: "lone", binary: "lone", feedVariable: feedVariableFor("lone") }
+    expect(
+        "a compiler nothing publishes has no source but a named directory",
+        isUnpublishedSource(releaseSourceFor(unpublished, ""), "KNVM_LONE_RELEASE_DIR")
+    )
+    expect("klf comes from the framework's releases", isGitHubSource(releaseSourceFor(klfCompiler(), "")))
+    expect("a named directory stands in for a feed", isDirectorySource(releaseSourceFor(klfCompiler(), "/srv/klf")))
+    expect("a dotted tag names a release", namesARelease("v1.8.3"))
+    expect("an undotted tag does not", !namesARelease("nightly"))
+    expect("a tag with a non-numeric component does not", !namesARelease("v1.x.3"))
+    expect("an LLVM bundle tag does not", !namesARelease("llvm-v21.1.8-kira.1"))
+}
+
+// Where a checkout is found, and the version it names.
+function checkoutCases() {
+    expectEqual(
+        "a version is read from the definition",
+        textOrEmpty(versionFromManifest("    let name: String = \"kira\"\n    let version: String = \"1.10.0\"\n")),
+        "1.10.0"
+    )
+    expectEqual(
+        "a version is read from a cargo manifest",
+        textOrEmpty(versionFromManifest("[workspace.package]\nversion = \"0.1.0\"\nedition = \"2024\"\n")),
+        "0.1.0"
+    )
+    expect("a definition without a version names none", !isSet(versionFromManifest("let name: String = \"kira\"\n")))
+    // The search walks up from a directory, so it is answered against a tree this
+    // case builds under a temporary root and takes away again.
+    let root = joinPath("/tmp", "knvm-manifest-case")
+    removeTree(root)
+    makeDirectoryTree(root)
+    let written = succeeded(writeFile(
+        joinPath(root, manifestFileName),
+        "construct T() extends Toolchains {\n    let languages: [ToolchainLanguage] = [\n"
+        + "        ToolchainLanguage { name = \"kira\", path = \"languages/kira\", binary = \"kira\", isDefault = true,\n"
+        + "            files = [ToolchainFile { from = \"std\", to = \"std\" }] },\n"
+        + "        ToolchainLanguage { name = \"ksl\", path = \"languages/ksl\", binary = \"ksl\", isDefault = false }\n"
+        + "    ]\n}\n"
+    ))
+    expect("the manifest case is written", written)
+    expect("a repository is found by its manifest", isManifestFound(enclosingManifest(root)))
+    let inner = joinPath(joinPath(root, "languages"), "kira")
+    makeDirectoryTree(inner)
+    expect("the search walks up from a subdirectory", isManifestFound(enclosingManifest(inner)))
+    removeTree(root)
+    expect("a directory that was never a repository is not one", !isManifestFound(enclosingManifest("/elsewhere")))
+}
+
+// What a `toolchain.klfd` lists, read as text.
+function manifestCases() {
+    let both = "ToolchainLanguage { name = \"a\", path = \"p/a\", binary = \"a\", isDefault = true }\n"
+        + "// ToolchainLanguage { name = \"commented\" }\n"
+        + "ToolchainLanguage { name = \"b\", path = \"p/b\", binary = \"b\",\n"
+        + "    files = [ToolchainFile { from = \"lib\", to = \"share/b/lib\" }] }\n"
+    expect("every language is read and a comment is not one", readsLanguages(parseToolchainManifest("m", both), 2))
+    expect("a manifest with no languages is refused", !readsLanguages(parseToolchainManifest("m", "construct T() {}\n"), 0))
+    expect(
+        "a language without a path is refused",
+        !readsLanguages(parseToolchainManifest("m", "ToolchainLanguage { name = \"a\", binary = \"a\" }\n"), 1)
+    )
+    let twoDefaults = "ToolchainLanguage { name = \"a\", path = \"a\", binary = \"a\", isDefault = true }\n"
+        + "ToolchainLanguage { name = \"b\", path = \"b\", binary = \"b\", isDefault = true }\n"
+    expect("two defaults are refused", !readsLanguages(parseToolchainManifest("m", twoDefaults), 2))
+    expectEqual("a quoted field is unquoted", fieldValue("name = \"ksl\", to = \"x\"", "name"), "ksl")
+    expectEqual("a key is not found inside another", fieldValue("isDefault = true, to = \"x\"", "to"), "x")
+    let ksl = kslCompiler()
+    expectEqual("a language's tree needs its driver first", ksl.parts[0], "bin/ksl")
+    expectEqual("then every file the manifest copies", ksl.parts[1], "share/ksl/library")
+    expectEqual("its version is its definition's", ksl.versionFile, "languages/ksl/definitions/language.klfd")
+    expectEqual("its feed variable is named for it", ksl.feedVariable, "KNVM_KSL_RELEASE_DIR")
+}
+
+// The channels, and the paths every verb derives from them.
+function layoutCases() {
+    expectEqual("release comes first in a listing", channelName(allChannels()[0]), "release")
+    expectEqual("dev comes second", channelName(allChannels()[1]), "dev")
+    expect("`release` names a channel", isChannel(parseChannel("release")))
+    expect("`nightly` names no channel", !isChannel(parseChannel("nightly")))
+    let kira = kiraCompiler()
+    let klf = klfCompiler()
+    expect(
+        "each compiler's selection sits under its own directory",
+        currentToolchainPath(kira).endsWith("/toolchains/kira/current.toml")
+    )
+    expect("a toolchain root is its compiler, channel and version", toolchainRoot(klf, .Release, "1.7.3").endsWith("/toolchains/klf/release/1.7.3"))
+    expect("staging is shared by every compiler", stagingRoot().endsWith("/toolchains/.staging"))
+    expectEqual("the binary is under bin", binaryPath("/t", kira), "/t/bin/kira")
+    expectEqual("a tree is pinned per compiler", pinFileName(klf), "klf-toolchain.toml")
+    expectEqual("a kira tree needs its driver first", kira.parts[0], "bin/kira")
+    expectEqual("then the definitions it reads", kira.parts[1], "definitions")
+    expectEqual("then its standard library", kira.parts[2], "std")
+    expectEqual("a klf tree needs its driver", klf.parts[0], "bin/klf")
+    expectEqual("joining keeps one separator", joinPath("/a", "b"), "/a/b")
+    expectEqual("joining onto a separator does not double it", joinPath("/a/", "b"), "/a/b")
+    expectEqual("a path's directory is what is above it", directoryOfPath("/a/b/c"), "/a/b")
+    expectEqual("a bare name has no directory", directoryOfPath("b"), "")
+    expectEqual("a path's last component is its name", lastComponentOfPath("/a/b/c/"), "c")
+    expect("a root is inside itself", isInsideDirectory("/home/kira", "/home"))
+    expect("a sibling prefix is not inside", !isInsideDirectory("/home/kira-tool", "/home/kira"))
+}
+
+// The registry, and every name it is reached by.
+function compilerCases() {
+    let compilers = fixtureCompilers()
+    expectEqual("kira is the default", nameOf(defaultCompiler(compilers)), "kira")
+    expectEqual("with no language registered there is no default", nameOf(defaultCompiler([klfCompiler()])), "")
+    expectEqual("a compiler is found by name", nameOf(compilerNamed(compilers, "klf")), "klf")
+    expectEqual("a registered language is found by name", nameOf(compilerNamed(compilers, "ksl")), "ksl")
+    expectEqual("no compiler is called nothing", nameOf(compilerNamed(compilers, "")), "")
+    expectEqual("a verb is not a compiler", nameOf(compilerNamed(compilers, "install")), "")
+    expectEqual("a launcher resolves by its binary", nameOf(compilerForBinary(compilers, "kira")), "kira")
+    expectEqual("knvm itself is no compiler's launcher", nameOf(compilerForBinary(compilers, "knvm")), "")
+    expectEqual("a feed variable is upper-cased", feedVariableFor("my-lang"), "KNVM_MY_LANG_RELEASE_DIR")
+    expectEqual("sinstall puts the manager first", installedToolNames()[0], "knvm")
+    expectEqual("then a launcher per compiler", String(installedToolNames().count), String(allCompilers().count + 1))
+    expectEqual(
+        "klf is installed from the framework's releases",
+        provisionCommandFrom(klfCompiler(), releaseSourceFor(klfCompiler(), "")),
+        "knvm klf install latest"
+    )
+    expectEqual(
+        "a named feed is installed from",
+        provisionCommandFrom(klfCompiler(), releaseSourceFor(klfCompiler(), "/srv/klf")),
+        "knvm klf install latest"
+    )
+    expectEqual("a release-channel hint names no channel", installCommand(klfCompiler(), .Release, "0.1.0"), "knvm klf install 0.1.0")
+    expectEqual(
+        "a dev-channel hint names its channel",
+        installCommand(kiraCompiler(), .Dev, "0.1.0"),
+        "knvm kira install 0.1.0 --channel dev"
+    )
+}
+
+
+
+
+@Main
+function main() -> Int {
+    digestCases()
+    versionCases()
+    versionNameCases()
+    artifactCases()
+    stateFileCases()
+    cliCases()
+    feedCases()
+    checkoutCases()
+    manifestCases()
+    layoutCases()
+    compilerCases()
+    print(String(checks) + " checks, " + String(failures) + " failed")
+    return failures
+}

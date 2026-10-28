@@ -1,0 +1,65 @@
+import Foundation
+
+// SHA-256 against FIPS 180-4's published digests, the hex form both ways,
+// and digests of files.
+
+function digestOfText(text: borrow String) -> String {
+    return digestHex(digestOf(text.utf8()))
+}
+
+// Nothing, one block, a message whose padding spills into a block of its
+// own, and a sentence with a well-known digest.
+@Test
+function sha256OfTheEmptyText() {
+    expect!(digestOfText("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+}
+
+@Test
+function sha256OfOneBlock() {
+    expect!(digestOfText("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+}
+
+@Test
+function sha256OfTwoBlocks() {
+    expect!(digestOfText("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq") == "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+}
+
+@Test
+function sha256OfASentence() {
+    expect!(digestOfText("The quick brown fox jumps over the lazy dog") == "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592")
+}
+
+// A digest is 64 hex digits, and parsing its own text gives it back.
+@Test
+function digestHexHasSixtyFourDigitsAndRoundTrips() {
+    let text = digestOfText("abc")
+    expect!((text.count) == (64))
+    let outcome = match parseDigestHex(text) {
+        Some(digest) -> digestHex(digest)
+        None -> "refused"
+    }
+    expect!((outcome) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+}
+
+// Text of the wrong length, or with a character that is not a hex digit, is
+// refused rather than read as some digest.
+@Test
+function parseDigestRefusesWrongLengthAndNonHexText() {
+    expect!((parseDigestHex("ba7816bf").isNone()) == (true))
+    let text = digestOfText("abc")
+    expect!((parseDigestHex(text.substring(0, 63) + "g").isNone()) == (true))
+}
+
+// A file's digest is the digest of its bytes; a file that is not there has
+// none.
+@Test
+function digestOfAFileIsTheDigestOfItsBytes() {
+    let path = "/Users/priamc/Code/kira-projects/karc-work/knvm-core-digest-scratch.bin"
+    absorb writeFileBytes(path, "abc".utf8())
+    let outcome = match digestOfFile(path) {
+        Some(digest) -> digestHex(digest)
+        None -> "missing"
+    }
+    expect!((outcome) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    expect!((digestOfFile("/Users/priamc/Code/kira-projects/karc-work/knvm-core-no-such-file.bin").isNone()) == (true))
+}

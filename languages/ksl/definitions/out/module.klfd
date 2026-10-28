@@ -1,0 +1,303 @@
+// The file: structs, constants and helper functions, then the shader with
+// its options, groups and one stage block per entry point.
+
+extend KslOut {
+    function writeModule(borrow mut self) {
+        prepareTypes()
+        functionNames = []
+        let functions = count("functions", -1)
+        for index in 0..functions {
+            functionNames.append(kslName(text("functions", -1, index, "name")))
+        }
+        prepareGlobals()
+        writeStructs()
+        writeUniformWrappers()
+        let entries = fieldCount("unit", -1, 0, "entries")
+        for position in 0..entries {
+            writeEntryTypes(fieldItem("unit", -1, 0, "entries", position))
+        }
+        writeConstants()
+        // A function that reaches a resource can only be written in a stage
+        // block, where the shader's resources are in scope.
+        for index in 0..functions {
+            if kind("functions", -1, index) == "function" && fieldCount("functions", -1, index, "uses") == 0 {
+                writeFunction(index, functionNames[index])
+                line("")
+            }
+        }
+        checkGlobals()
+        if kind("unit", -1, 0) != "library" { writeShader() }
+    }
+
+    function writeConstants(borrow mut self) {
+        let constants = count("constants", -1)
+        for index in 0..constants {
+            let value = globalValue(field("constants", -1, index, "init"))
+            line(joinText([
+                "const ", kslName(text("constants", -1, index, "name")), ": ",
+                typeName(field("constants", -1, index, "type"), -1), " = ", value
+            ]))
+        }
+        if constants > 0 { line("") }
+    }
+
+    // A global expression as KSL writes a constant or an option's default.
+    function globalValue(borrow mut self, expression: Int) -> String {
+        let which = kind("expressions", -1, expression)
+        match which {
+            // The declared type retypes a bare literal, which a constant
+            // and an option default must be.
+            "literal" -> return literalText(
+                text("expressions", -1, expression, "literal"), text("expressions", -1, expression, "scalar"), -1, false
+            )
+            "constant" -> return constantName(field("expressions", -1, expression, "constant"))
+            "override" -> return optionName(field("expressions", -1, expression, "override"))
+            else -> {
+                refuse(joinText(["constant built by `", which, "`"]), -1)
+                return "0"
+            }
+        }
+    }
+
+    function constantName(borrow self, index: Int) -> String {
+        return kslName(text("constants", -1, index, "name"))
+    }
+
+    function optionName(borrow self, index: Int) -> String {
+        return kslName(text("overrides", -1, index, "name"))
+    }
+
+    // Every global KSL can declare is a resource in one of the shader's
+    // groups.
+    function checkGlobals(borrow mut self) {
+        let globals = count("globals", -1)
+        let groups = count("groups", -1)
+        for global in 0..globals {
+            let space = text("globals", -1, global, "space")
+            var grouped = false
+            for group in 0..groups {
+                let members = fieldCount("groups", -1, group, "globals")
+                for position in 0..members {
+                    if fieldItem("groups", -1, group, "globals", position) == global { grouped = true }
+                }
+            }
+            let resource = space == "uniform" || space == "storage" || space == "handle"
+            if !resource {
+                refuse(joinText(["`", space, "` global `", text("globals", -1, global, "name"), "`"]), -1)
+            } else if !grouped {
+                refuse(joinText(["resource outside a group: `", text("globals", -1, global, "name"), "`"]), -1)
+            }
+        }
+    }
+
+    function writeShader(borrow mut self) {
+        line(joinText(["shader ", kslName(text("unit", -1, 0, "shader")), " {"]))
+        indent += 1
+        let options = fieldCount("unit", -1, 0, "options")
+        let overrides = count("overrides", -1)
+        for index in 0..overrides {
+            var position = -1
+            for at in 0..options {
+                if fieldItem("unit", -1, 0, "options", at) == index { position = at }
+            }
+            if position < 0 {
+                refuse(joinText(["override outside the shader's options: `", optionName(index), "`"]), -1)
+            } else {
+                writeOption(index, position)
+            }
+        }
+        if options > 0 { line("") }
+        let groups = count("groups", -1)
+        for group in 0..groups {
+            writeGroup(group)
+        }
+        let entries = fieldCount("unit", -1, 0, "entries")
+        for position in 0..entries {
+            writeStage(fieldItem("unit", -1, 0, "entries", position))
+        }
+        indent -= 1
+        line("}")
+    }
+
+    // KSL numbers an option by its position among the shader's options.
+    function writeOption(borrow mut self, index: Int, position: Int) {
+        let name = optionName(index)
+        let init = field("overrides", -1, index, "init")
+        if init < 0 {
+            refuse(joinText(["option `", name, "` without a default"]), -1)
+            return
+        }
+        let value = globalValue(init)
+        line(joinText(["option ", name, ": ", typeName(field("overrides", -1, index, "type"), -1), " = ", value]))
+    }
+
+    // KSL takes a group's class from its name, and numbers groups and the
+    // resources in each by position unless `@binding` says otherwise.
+    function writeGroup(borrow mut self, group: Int) {
+        let name = text("groups", -1, group, "name")
+        let groupKind = kind("groups", -1, group)
+        if groupClass(name) != groupKind {
+            refuse(joinText(["`", groupKind, "` group named `", name, "`"]), -1)
+        }
+        line(joinText(["group ", kslName(name), " {"]))
+        indent += 1
+        let globals = fieldCount("groups", -1, group, "globals")
+        for position in 0..globals {
+            writeResource(fieldItem("groups", -1, group, "globals", position), group, position)
+        }
+        indent -= 1
+        line("}")
+        line("")
+    }
+
+    function writeResource(borrow mut self, global: Int, group: Int, position: Int) {
+        let name = kslName(text("globals", -1, global, "name"))
+        let typeIndex = field("globals", -1, global, "type")
+        if field("globals", -1, global, "group") != group {
+            refuse(joinText(["resource `", name, "` in a group numbered other than its position"]), -1)
+        }
+        let binding = field("globals", -1, global, "binding")
+        var prefix = ""
+        if binding != position { prefix = joinText(["@binding(", decimalText(binding), ") "]) }
+        var declared = joinText([name, ": ", typeName(typeIndex, -1)])
+        let space = text("globals", -1, global, "space")
+        let access = text("globals", -1, global, "access")
+        let which = kind("types", -1, typeIndex)
+        if space == "uniform" {
+            if wrapsUniform(global) { declared = joinText([name, ": ", uniformWrapper(global)]) }
+            line(joinText([prefix, "uniform ", declared]))
+        } else if space == "storage" {
+            if which != "array" { refuse(joinText(["storage `", name, "` that is not a runtime array"]), -1) }
+            if which == "array" {
+                let stride = field("types", -1, typeIndex, "stride")
+                if stride != storageStride(field("types", -1, typeIndex, "base")) {
+                    refuse(joinText(["storage stride ", decimalText(stride), " for `", name, "`"]), -1)
+                }
+            }
+            var mode = "read"
+            if access != "load" { mode = "read_write" }
+            line(joinText([prefix, "storage ", mode, " ", declared]))
+        } else if which == "sampler" {
+            line(joinText([prefix, "sampler ", declared]))
+        } else {
+            var mode = ""
+            if text("types", -1, typeIndex, "class") == "storage" {
+                mode = "read_write "
+                if text("types", -1, typeIndex, "access") == "store" { mode = "write " }
+            }
+            line(joinText([prefix, "texture ", mode, declared]))
+        }
+    }
+
+    function writeStage(borrow mut self, entry: Int) {
+        current = entry
+        let stage = text("functions", -1, entry, "stage")
+        line(joinText([stage, " {"]))
+        indent += 1
+        if stage == "compute" { writeThreads(entry) }
+        let arguments = count("arguments", entry)
+        if !plainInput(entry) {
+            line(joinText(["input ", inputName(entry)]))
+        } else if arguments == 1 {
+            line(joinText(["input ", typeName(field("arguments", entry, 0, "type"), -1)]))
+        }
+        let result = field("functions", -1, entry, "result")
+        if !plainOutput(entry) {
+            line(joinText(["output ", outputName(entry)]))
+        } else if result >= 0 {
+            line(joinText(["output ", typeName(result, -1)]))
+        }
+        if utf8Count(text("functions", -1, entry, "early_depth_test")) > 0 {
+            refuse("early depth test", -1)
+        }
+        line("")
+        for helper in stageHelpers(entry) {
+            writeFunction(helper, functionNames[helper])
+            line("")
+        }
+        writeFunction(entry, "entry")
+        indent -= 1
+        line("}")
+        current = -1
+    }
+
+    // The functions `entry` reaches that reach a resource, in arena order.
+    function stageHelpers(borrow self, entry: Int) -> [Int] {
+        var reached: [Bool] = []
+        let functions = count("functions", -1)
+        for index in 0..functions {
+            reached.append(false)
+        }
+        var pending = [entry]
+        var at = 0
+        while at < pending.count {
+            let calls = fieldCount("functions", -1, pending[at], "calls")
+            for position in 0..calls {
+                let callee = fieldItem("functions", -1, pending[at], "calls", position)
+                if !reached[callee] {
+                    reached[callee] = true
+                    pending.append(callee)
+                }
+            }
+            at += 1
+        }
+        var helpers: [Int] = []
+        for index in 0..functions {
+            if reached[index] && kind("functions", -1, index) == "function"
+                && fieldCount("functions", -1, index, "uses") > 0 {
+                helpers.append(index)
+            }
+        }
+        return helpers
+    }
+
+    function writeThreads(borrow mut self, entry: Int) {
+        var extents: [String] = []
+        for axis in 0..3 {
+            let fixed = fieldItem("functions", -1, entry, "workgroup", axis)
+            if fixed >= 0 {
+                extents.append(decimalText(fixed))
+            } else {
+                extents.append(globalValue(fieldItem("functions", -1, entry, "workgroup_override", axis)))
+            }
+        }
+        line(joinText(["threads(", extents[0], ", ", extents[1], ", ", extents[2], ")"]))
+    }
+
+    function writeFunction(borrow mut self, index: Int, name: String) {
+        current = index
+        prepareFunction(index)
+        let entry = kind("functions", -1, index) == "entry"
+        var parameters: [String] = []
+        if entry && !plainInput(index) {
+            parameters.append(joinText(["_input: ", inputName(index)]))
+        } else {
+            let arguments = count("arguments", index)
+            for position in 0..arguments {
+                let argumentType = field("arguments", index, position, "type")
+                parameters.append(joinText([argumentNames[position], ": ", typeName(argumentType, -1)]))
+            }
+        }
+        var signature = joinText(["function ", name, "(", joinWith(parameters, ", "), ")"])
+        let result = field("functions", -1, index, "result")
+        if entry && !plainOutput(index) {
+            signature = joinText([signature, " -> ", outputName(index)])
+        } else if result >= 0 {
+            signature = joinText([signature, " -> ", typeName(result, -1)])
+        }
+        line(joinText([signature, " {"]))
+        indent += 1
+        writeBody(index, result)
+        indent -= 1
+        line("}")
+    }
+}
+
+function joinWith(parts: [String], separator: String) -> String {
+    var pieces: [String] = []
+    for position in 0..parts.count {
+        if position > 0 { pieces.append(separator) }
+        pieces.append(parts[position])
+    }
+    return joinText(pieces)
+}

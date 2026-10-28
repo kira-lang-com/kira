@@ -1,0 +1,334 @@
+// Functions: their signatures, prototypes, templates and bodies.
+//
+// A prototype and the definition that follows it are one function. A
+// template is checked once per list of argument types its calls deduce,
+// after every item is declared; each instance is a function of its own.
+// A buffer, texture or sampler parameter is bound: lowering replaces it
+// with the global each call passes, so only an entry's own resources and
+// what functions pass them on ever reach memory.
+
+extend Checker {
+    // What a written parameter of a function that is not an entry is.
+    function parameterOf(borrow mut self, parameter: ParameterDeclaration) -> CheckedParameter {
+        let written = tree.types[parameter.typeSyntax]
+        var parameterType = resolve(parameter.typeSyntax)
+        var mode: ParameterMode = .ByValue
+        var readOnly = written.constant
+        if parameter.attributes.count > 0 { report(.UnsupportedAttribute, parameter.attributes[0].span) }
+        let buffer = written.space == .ConstantSpace || written.space == .DeviceSpace
+        if isHandle(parameterType) {
+            mode = .Bound
+            readOnly = true
+            if written.pointer || written.reference || written.space != .NoSpace {
+                report(.UnsupportedType, parameter.span)
+            }
+        } else if buffer {
+            mode = .Bound
+            readOnly = written.space == .ConstantSpace || written.constant
+            if written.pointer {
+                parameterType = arrayType(parameterType, -1)
+            } else if !written.reference {
+                report(.UnsupportedType, parameter.span)
+            }
+        } else if written.pointer {
+            report(.StoredPointer, parameter.span)
+        } else if written.reference {
+            if written.space == .ThreadSpace {
+                mode = .ThreadReference
+            } else if written.space == .ThreadgroupSpace {
+                mode = .ThreadgroupReference
+            } else {
+                report(.UnsupportedType, parameter.span)
+            }
+        } else if written.space != .NoSpace {
+            report(.UnsupportedType, parameter.span)
+        }
+        let storable = isConstructible(parameterType) || isVoid(parameterType) || mode == .Bound
+            || (mode != .ByValue && containsAtomic(parameterType))
+        if !storable { report(.UnsupportedType, parameter.span) }
+        return CheckedParameter {
+            name = parameter.name, parameterType = parameterType, mode = mode, readOnly = readOnly, plain = false,
+            comparison = false
+        }
+    }
+
+    function resultOf(borrow mut self, declared: FunctionDeclaration) -> Int {
+        let written = tree.types[declared.result]
+        let resultType = resolve(declared.result)
+        if written.pointer || written.reference || written.space != .NoSpace { report(.StoredPointer, declared.span) }
+        if !isVoid(resultType) && !isConstructible(resultType) { report(.UnsupportedType, declared.span) }
+        return resultType
+    }
+
+    function addFunction(borrow mut self, declared: FunctionDeclaration, parameters: [CheckedParameter], resultType: Int) -> Int {
+        program.functions.append(CheckedFunction {
+            name = declared.name, parameters = parameters, locals = [], result = resultType, body = [], calls = [],
+            stage = declared.stage, span = declared.span
+        })
+        return program.functions.count - 1
+    }
+
+    function parameterTypes(borrow self, parameters: [CheckedParameter]) -> [Int] {
+        var types: [Int] = []
+        for parameter in parameters {
+            types.append(parameter.parameterType)
+        }
+        return types
+    }
+
+    // A function at its place in the file.
+    function declareFunction(borrow mut self, index: Int) {
+        let declared = tree.functions[index]
+        let outer = prefix
+        prefix = declared.prefix
+        checkFunctionAttributes(declared)
+        if declared.templateParameters.count > 0 {
+            if declared.stage != .NoStage { report(.UnsupportedConstruct, declared.span) }
+            functionEntries.append(FunctionEntry {
+                name = declared.name, declaration = index, routine = -1, parameterTypes = []
+            })
+        } else if declared.stage != .NoStage {
+            declareEntry(declared)
+        } else {
+            declareHelper(index, declared)
+        }
+        prefix = outer
+    }
+
+    function declareHelper(borrow mut self, index: Int, declared: FunctionDeclaration) {
+        var parameters: [CheckedParameter] = []
+        for parameter in declared.parameters {
+            parameters.append(parameterOf(parameter))
+        }
+        let types = parameterTypes(parameters)
+        let resultType = resultOf(declared)
+        var routine = -1
+        for known in functionEntries {
+            if known.name == declared.name && known.routine >= 0 && sameTypes(known.parameterTypes, types) {
+                routine = known.routine
+                let previous = tree.functions[known.declaration]
+                if previous.defined && declared.defined { report(.Redeclared, declared.span) }
+                if program.functions[routine].result != resultType { report(.Redeclared, declared.span) }
+            }
+        }
+        if routine < 0 {
+            routine = addFunction(declared, parameters, resultType)
+            functionEntries.append(FunctionEntry {
+                name = declared.name, declaration = index, routine = routine, parameterTypes = types
+            })
+        } else if declared.defined {
+            program.functions[routine].parameters = parameters
+        }
+        if !declared.defined { return }
+        beginFunction(routine)
+        bindParameters()
+        finishFunction(checkBlock(declared.body, false))
+    }
+
+    // `[[mesh]]`, `[[visible]]` and their kin name what the subset leaves
+    // out; an entry may also carry the two attributes that change nothing
+    // KSIR expresses.
+    function checkFunctionAttributes(borrow mut self, declared: FunctionDeclaration) {
+        for attribute in declared.attributes {
+            let name = attribute.name
+            if name == "mesh" || name == "object" {
+                report(.MeshShader, attribute.span)
+            } else if name == "visible" || name == "stitchable" || name == "intersection" {
+                report(.FunctionTable, attribute.span)
+            } else if declared.stage == .NoStage {
+                report(.UnsupportedAttribute, attribute.span)
+            } else if name != "early_fragment_tests" && name != "max_total_threads_per_threadgroup" {
+                report(.UnsupportedAttribute, attribute.span)
+            }
+        }
+    }
+
+    // A `vertex`, `fragment` or `kernel` function.
+    function declareEntry(borrow mut self, declared: FunctionDeclaration) {
+        if !declared.defined { report(.UnsupportedConstruct, declared.span) }
+        let routine = addFunction(declared, [], voidType())
+        beginFunction(routine)
+        let resultType = resultOf(declared)
+        program.functions[routine].result = resultType
+        result = resultType
+        let inputs = entryParameters(declared)
+        let shape = entryResult(declared, resultType)
+        finishFunction(checkBlock(declared.body, false))
+        program.entries.append(CheckedEntry {
+            routine = routine, inputs = inputs, resultBuiltin = shape.resultBuiltin,
+            resultLocation = shape.resultLocation
+        })
+    }
+
+    function beginFunction(borrow mut self, routine: Int) {
+        current = routine
+        locals = []
+        visible = []
+        scopes = []
+        calls = []
+        handles = []
+        loops = 0
+        switches = 0
+        result = program.functions[routine].result
+        stage = program.functions[routine].stage
+    }
+
+    // Each parameter is a local at its position; a bound one is named as
+    // the resource it stands for.
+    function bindParameters(borrow mut self) {
+        let parameters = program.functions[current].parameters
+        for position in 0..parameters.count {
+            let parameter = parameters[position]
+            let shared = parameter.mode == .ThreadgroupReference
+            locals.append(LocalVariable {
+                name = parameter.name, localType = parameter.parameterType, readOnly = parameter.readOnly,
+                shared = shared
+            })
+            if parameter.mode == .Bound {
+                handles.append(HandleName { name = parameter.name, global = -1, parameter = position })
+            } else {
+                visible.append(position)
+            }
+        }
+    }
+
+    function finishFunction(borrow mut self, body: [Int]) {
+        program.functions[current].locals = locals
+        program.functions[current].body = body
+        program.functions[current].calls = calls
+        if !isVoid(result) && finishes(body, false) { report(.MissingReturn, program.functions[current].span) }
+        current = -1
+    }
+
+    // A new local of the function in the innermost scope.
+    function bind(borrow mut self, name: String, localType: Int, readOnly: Bool, span: Span) -> Int {
+        var start = 0
+        if scopes.count > 0 { start = scopes[scopes.count - 1] }
+        for at in start..visible.count {
+            if locals[visible[at]].name == name { report(.Redeclared, span) }
+        }
+        locals.append(LocalVariable { name = name, localType = localType, readOnly = readOnly, shared = false })
+        visible.append(locals.count - 1)
+        return locals.count - 1
+    }
+
+    // The instance of template `declaration` for `arguments`, made on first use;
+    // its body is checked later.
+    function instantiate(borrow mut self, declaration: Int, arguments: [Int]) -> Int {
+        for known in instances {
+            if known.declaration == declaration && sameTypes(known.arguments, arguments) { return known.routine }
+        }
+        let declared = tree.functions[declaration]
+        let parameters = templateSignature(declared, arguments)
+        let outerBindings = bindings
+        let outerPrefix = prefix
+        bindings = templateBindings(declared, arguments)
+        prefix = declared.prefix
+        let routine = addFunction(declared, parameters, resultOf(declared))
+        bindings = outerBindings
+        prefix = outerPrefix
+        instances.append(Instance { declaration = declaration, arguments = arguments, routine = routine, checked = false })
+        return routine
+    }
+
+    // A template's parameters for `arguments`.
+    function templateSignature(borrow mut self, declared: FunctionDeclaration, arguments: [Int]) -> [CheckedParameter] {
+        let outerBindings = bindings
+        let outerPrefix = prefix
+        bindings = templateBindings(declared, arguments)
+        prefix = declared.prefix
+        var parameters: [CheckedParameter] = []
+        for parameter in declared.parameters {
+            parameters.append(parameterOf(parameter))
+        }
+        bindings = outerBindings
+        prefix = outerPrefix
+        return parameters
+    }
+
+    function templateBindings(borrow self, declared: FunctionDeclaration, arguments: [Int]) -> [NamedType] {
+        var bound: [NamedType] = []
+        for position in 0..declared.templateParameters.count {
+            bound.append(NamedType { name = declared.templateParameters[position], named = arguments[position] })
+        }
+        return bound
+    }
+
+    // Checks each instance's body; checking one may make more.
+    function checkInstances(borrow mut self) {
+        var next = 0
+        while next < instances.count {
+            let instance = instances[next]
+            instances[next].checked = true
+            let declared = tree.functions[instance.declaration]
+            bindings = templateBindings(declared, instance.arguments)
+            prefix = declared.prefix
+            beginFunction(instance.routine)
+            bindParameters()
+            finishFunction(checkBlock(declared.body, false))
+            next += 1
+        }
+        bindings = []
+        prefix = ""
+    }
+
+    // Whether control can reach the end of `body`; with `leaves`, a
+    // `break` or `continue` there leaves it instead, as from a case.
+    function finishes(borrow self, body: [Int], leaves: Bool) -> Bool {
+        for index in body {
+            if !statementFinishes(program.statements[index], leaves) { return false }
+        }
+        return true
+    }
+
+    function statementFinishes(borrow self, statement: CheckedStatement, leaves: Bool) -> Bool {
+        match statement.kind {
+            ReturnValue -> return false
+            IfElse -> return finishes(statement.body, leaves) || finishes(statement.otherwise, leaves)
+            Nested -> return finishes(statement.body, leaves)
+            LoopFor -> return statement.value >= 0 || breaks(statement.body)
+            SwitchCases -> {
+                for case in statement.cases {
+                    if breaks(case.body) { return true }
+                }
+                let last = statement.cases[statement.cases.count - 1]
+                return finishes(last.body, false)
+            }
+            DeclareLocal -> return true
+            EvaluateValue -> return true
+            BreakOut -> return !leaves
+            ContinueOn -> return !leaves
+        }
+    }
+
+    // Whether `body` holds a `break` that leaves the statement it is in.
+    function breaks(borrow self, body: [Int]) -> Bool {
+        for index in body {
+            let statement = program.statements[index]
+            match statement.kind {
+                BreakOut -> return true
+                IfElse -> {
+                    if breaks(statement.body) || breaks(statement.otherwise) { return true }
+                }
+                Nested -> {
+                    if breaks(statement.body) { return true }
+                }
+                LoopFor -> {}
+                SwitchCases -> {}
+                DeclareLocal -> {}
+                EvaluateValue -> {}
+                ContinueOn -> {}
+                ReturnValue -> {}
+            }
+        }
+        return false
+    }
+}
+
+function sameTypes(left: [Int], right: [Int]) -> Bool {
+    if left.count != right.count { return false }
+    for index in 0..left.count {
+        if left[index] != right[index] { return false }
+    }
+    return true
+}

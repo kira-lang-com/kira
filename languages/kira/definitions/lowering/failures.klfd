@@ -1,0 +1,95 @@
+struct LoweredErrorHandler {
+    let local: Int
+    let block: KirBlockBuilder
+}
+
+extend FunctionLowering {
+    // The failure out of the result at `header` into `to`: moved when the
+    // result is a temporary, which is then forgotten, and copied otherwise.
+    function takeError(borrow mut self, header: KirAddress, error: KirAddress, to: KirAddress, errorType: Type) {
+        if isTemporaryAddress(header) {
+            moveValue(error, to, errorType)
+            forgetTracked(header)
+        } else {
+            copyValue(error, to, errorType)
+        }
+    }
+
+    function tryAddress(borrow mut self, operand: Int, destination: Optional<Int>, valueType: Type) -> KirAddress {
+        let resultType = program.typeOf(operand)
+        let header = address(operand)
+        let success = kir.block()
+        let failure = kir.block()
+        kir.switchCase(0, success)
+        kir.switchCase(1, failure)
+        kir.switchEnum(header)
+        enter(failure)
+        let error = payloadPlace(header, resultType, 1)
+        match destination {
+            Some(local) -> {
+                let semanticError = checked.locals[local].valueType
+                releaseTracked(storage[local])
+                takeError(header, error, storage[local], semanticError)
+                markInitialized(storage[local])
+                var found = false
+                for handler in handlers {
+                    if handler.local == local {
+                        kir.branch(handler.block)
+                        found = true
+                        break
+                    }
+                }
+                if !found { abort() }
+            }
+            None -> {
+                match result {
+                    Some(returned) -> {
+                        let semanticError = program.enums[checked.result.declaration].variants[1].payload
+                        match semanticError {
+                            Some(carried) -> takeError(header, error, newPayloadPlace(returned, checked.result, 1), carried)
+                            None -> abort()
+                        }
+                        kir.inject(returned, 1)
+                        cleanupValues()
+                        kir.returnVoid()
+                    }
+                    None -> abort()
+                }
+            }
+        }
+        enter(success)
+        if valueType.kind == .Void { return header }
+        let payload = payloadPlace(header, resultType, 0)
+        // A result that is a temporary hands its value over: the value moves
+        // into a temporary of its own and the result is forgotten, so the
+        // value is dropped once, by whoever takes it, and never again with
+        // the result at the statement's end.
+        if !isTemporaryAddress(header) || !needsArrayCleanup(program, valueType) { return payload }
+        let taken = temporary(valueType)
+        moveValue(payload, taken, valueType)
+        forgetTracked(header)
+        markInitialized(taken)
+        return taken
+    }
+
+    function lowerAttempt(borrow mut self, body: [Int], local: Int, subject: Int, arms: [CheckedArm]) {
+        let catch = kir.block()
+        let done = kir.block()
+        handlers.append(LoweredErrorHandler { local = local, block = catch })
+        statements(body)
+        var continuing = open
+        flowInto(done)
+        var outer: [LoweredErrorHandler] = []
+        for index in 0..handlers.count - 1 { outer.append(handlers[index]) }
+        handlers = outer
+        enter(catch)
+        dispatch(subject, arms, .None)
+        continuing = continuing || open
+        flowInto(done)
+        enter(done)
+        if !continuing {
+            kir.unreachable()
+            open = false
+        }
+    }
+}

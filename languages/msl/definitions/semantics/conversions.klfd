@@ -1,0 +1,193 @@
+// Literals and conversions.
+//
+// Every conversion C++ performs implicitly becomes an explicit node here,
+// following the usual arithmetic conversions: `bool` takes part as `int`,
+// and the operand of lower rank takes the other's scalar. A scalar beside
+// a vector takes the vector's scalar and is splatted to its lanes, as
+// Clang's vectors do; two vectors must agree, as MSL converts vectors only
+// when asked. A literal converted to another scalar is folded.
+
+function isFloatText(text: String) -> Bool {
+    for index in 0..utf8Count(text) {
+        let byte = utf8Byte(text, index)
+        if byte == asciiDot || lowered(byte) == asciiLowerE { return true }
+    }
+    return false
+}
+
+// A float's KSIR text: digits on both sides of its point.
+function floatText(text: String) -> String {
+    var written = text
+    if utf8Byte(written, 0) == asciiDot { written = joinText(["0", written]) }
+    if utf8Byte(written, utf8Count(written) - 1) == asciiDot { written = joinText([written, "0"]) }
+    if !isFloatText(written) { written = joinText([written, ".0"]) }
+    return written
+}
+
+// The text of literal `value` as `to`, or "" when it changes the value or
+// is not a plain decimal.
+function foldedText(value: ConstValue, to: Scalar) -> String {
+    let from = value.scalar
+    if from == to { return value.text }
+    let negative = utf8Byte(value.text, 0) == asciiMinus
+    if from == .Bool {
+        if to.isFloat() {
+            if value.text == "true" { return "1.0" }
+            return "0.0"
+        }
+        if value.text == "true" { return "1" }
+        return "0"
+    }
+    if to == .Bool {
+        if from.isFloat() { return "" }
+        if value.text == "0" { return "false" }
+        return "true"
+    }
+    if from.isInteger() && to.isFloat() { return floatText(value.text) }
+    if from.isFloat() && to.isFloat() { return value.text }
+    if from.isInteger() && to.isInteger() && !negative {
+        if to == .Int && utf8Count(value.text) >= 10 && !fitsSigned(value.text) { return "" }
+        return value.text
+    }
+    return ""
+}
+
+function fitsSigned(text: String) -> Bool {
+    match integerValue(text) {
+        Some(found) -> return found.value <= 2147483647
+        None -> return false
+    }
+}
+
+extend Checker {
+    function literal(borrow mut self, scalar: Scalar, text: String, span: Span) -> Int {
+        var made = expressionOf(.Literal, scalarType(scalar), span)
+        made.value = ConstValue { scalar = scalar, text = text }
+        return add(made)
+    }
+
+    // A decimal literal is `int`; a hexadecimal or octal one `int` when it
+    // fits and `uint` otherwise; `u` makes it `uint`. `long` is refused.
+    function integerLiteral(borrow mut self, syntax: Expression) -> Int {
+        match integerValue(syntax.text) {
+            Some(found) -> {
+                if found.long || found.value > 4294967295 { return refuse(.BadLiteral, syntax.span) }
+                let decimal = utf8Count(syntax.text) == 1 || utf8Byte(syntax.text, 0) != asciiZero
+                var scalar: Scalar = .Int
+                if found.unsigned || (found.value > 2147483647 && !decimal) { scalar = .UInt }
+                if scalar == .Int && found.value > 2147483647 { return refuse(.BadLiteral, syntax.span) }
+                return literal(scalar, decimalText(found.value), syntax.span)
+            }
+            None -> return refuse(.BadLiteral, syntax.span)
+        }
+    }
+
+    function floatLiteral(borrow mut self, syntax: Expression) -> Int {
+        match floatValue(syntax.text) {
+            Some(found) -> {
+                var scalar: Scalar = .Float
+                if found.half { scalar = .Half }
+                return literal(scalar, floatText(found.text), syntax.span)
+            }
+            None -> return refuse(.BadLiteral, syntax.span)
+        }
+    }
+
+    // `bool` operands of arithmetic as `int`.
+    function promote(borrow mut self, operand: Int) -> Int {
+        let operandType = typeOf(operand)
+        if isLaned(operandType) && typeAt(operandType).scalar == .Bool {
+            return convertTo(operand, withScalar(operandType, .Int))
+        }
+        return operand
+    }
+
+    // The type both operands of an arithmetic operator take, or -1 after
+    // reporting.
+    function commonType(borrow mut self, left: Int, right: Int, span: Span) -> Int {
+        let leftType = typeAt(typeOf(left))
+        let rightType = typeAt(typeOf(right))
+        if leftType.shape == .Vector && rightType.shape == .Vector {
+            if leftType.width != rightType.width || leftType.scalar != rightType.scalar {
+                report(.TypeMismatch, span)
+                return -1
+            }
+            return typeOf(left)
+        }
+        if leftType.shape == .Vector { return vectorBeside(typeOf(left), right, span) }
+        if rightType.shape == .Vector { return vectorBeside(typeOf(right), left, span) }
+        var scalar = leftType.scalar
+        if rightType.scalar.rank() > scalar.rank() { scalar = rightType.scalar }
+        return scalarType(scalar)
+    }
+
+    // A scalar beside a vector converts to the vector's scalar, unless it
+    // is a float that would lose its fraction to an integer vector.
+    function vectorBeside(borrow mut self, vector: Int, scalar: Int, span: Span) -> Int {
+        let lane = typeAt(typeOf(scalar)).scalar
+        let into = typeAt(vector).scalar
+        let literal = program.expressions[scalar].kind == .Literal
+        if lane.isFloat() && into.isInteger() && !literal {
+            report(.TypeMismatch, span)
+            return -1
+        }
+        return vector
+    }
+
+    // `expression` as `target`, which the caller has checked it converts to.
+    function convertTo(borrow mut self, expression: Int, target: Int) -> Int {
+        let source = typeOf(expression)
+        if source == target || broken(expression) { return expression }
+        let from = typeAt(source)
+        let to = typeAt(target)
+        let checked = program.expressions[expression]
+        if from.shape == .ScalarShape && to.shape == .Vector {
+            let lane = convertTo(expression, scalarType(to.scalar))
+            var made = expressionOf(.Splat, target, checked.span)
+            made.left = lane
+            return add(made)
+        }
+        if checked.kind == .Literal && to.shape == .ScalarShape {
+            let text = foldedText(checked.value, to.scalar)
+            if utf8Count(text) > 0 { return literal(to.scalar, text, checked.span) }
+        }
+        var made = expressionOf(.Convert, target, checked.span)
+        made.left = expression
+        return add(made)
+    }
+
+    // Whether a value of `source` converts to `target`: between scalars,
+    // a scalar to a vector, and, when `explicit`, between vectors and
+    // matrices of the same shape.
+    function converts(borrow self, source: Int, target: Int, explicit: Bool) -> Bool {
+        if source == target { return true }
+        let from = typeAt(source)
+        let to = typeAt(target)
+        if from.shape == .ScalarShape && (to.shape == .ScalarShape || to.shape == .Vector) { return true }
+        if !explicit || from.shape != to.shape { return false }
+        if from.shape == .Vector { return from.width == to.width }
+        if from.shape == .Matrix { return from.width == to.width && from.rows == to.rows }
+        return false
+    }
+
+    function convertImplicitly(borrow mut self, expression: Int, target: Int, span: Span) -> Int {
+        if broken(expression) { return expression }
+        if !converts(typeOf(expression), target, false) { return refuse(.TypeMismatch, span) }
+        return convertTo(expression, target)
+    }
+
+    function convertExplicitly(borrow mut self, expression: Int, target: Int, span: Span) -> Int {
+        if broken(expression) { return expression }
+        if !converts(typeOf(expression), target, true) { return refuse(.TypeMismatch, span) }
+        return convertTo(expression, target)
+    }
+
+    // A condition: a scalar as `bool`.
+    function toCondition(borrow mut self, condition: Int) -> Int {
+        if broken(condition) { return condition }
+        if !isScalar(typeOf(condition)) {
+            return refuse(.TypeMismatch, program.expressions[condition].span)
+        }
+        return convertTo(condition, scalarType(.Bool))
+    }
+}

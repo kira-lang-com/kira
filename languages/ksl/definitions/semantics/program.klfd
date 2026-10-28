@@ -1,0 +1,203 @@
+// The checked program: what `elaborate` hands to `lower`.
+//
+// Names are resolved to indices, types are decided, and every `const`,
+// enum variant and literal is folded to a `ConstValue`, so lowering never
+// looks a name up. Expressions and statements live in arenas, as in the
+// syntax tree.
+
+struct CheckedProgram {
+    var structs: [CheckedStruct]
+    var functions: [CheckedFunction]
+    var expressions: [CheckedExpression]
+    var statements: [CheckedStatement]
+    var resources: [CheckedResource]
+    var groups: [CheckedGroup]
+    var options: [CheckedOption]
+    var stages: [CheckedStage]
+    var hasShader: Bool
+    var shaderName: String
+
+    function empty() -> CheckedProgram {
+        return CheckedProgram {
+            structs = [], functions = [], expressions = [], statements = [], resources = [], groups = [],
+            options = [], stages = [], hasShader = false, shaderName = ""
+        }
+    }
+}
+
+// A folded scalar: its kind and its decimal spelling, which KSIR's literal
+// reads directly. Integer literals are never negative.
+struct ConstValue {
+    let scalar: Scalar
+    let text: String
+}
+
+struct CheckedStruct {
+    let name: String
+    let fields: [CheckedField]
+    let span: Span
+}
+
+// A field's KSL built-in word and interpolation word, empty when absent.
+struct CheckedField {
+    let name: String
+    let fieldType: ShaderType
+    let builtin: String
+    let interpolation: String
+    let span: Span
+}
+
+struct LocalVariable {
+    let name: String
+    let localType: ShaderType
+}
+
+// A function's parameters are its first `parameters` locals. `calls` holds
+// the functions its body calls, so lowering can finish callees first;
+// `derivatives` where its body takes one, which only a fragment may reach.
+struct CheckedFunction {
+    var name: String
+    var locals: [LocalVariable]
+    var parameters: Int
+    var result: ShaderType
+    var body: [Int]
+    var calls: [Int]
+    var derivatives: [Span]
+    var checked: Bool
+    let span: Span
+}
+
+struct CheckedResource {
+    let name: String
+    let kind: ResourceKind
+    let access: Access
+    let binding: Int
+    let resourceType: ShaderType
+    let span: Span
+}
+
+struct CheckedGroup {
+    let name: String
+    let resources: [Int]
+}
+
+struct CheckedOption {
+    let name: String
+    let optionType: ShaderType
+    let value: ConstValue
+    let span: Span
+}
+
+// A stage's interface structs (-1 when absent), its entry function, and
+// for compute its three extents, each folded or, when it names an option,
+// that option's index in `optionExtents`.
+struct CheckedStage {
+    let stage: StageKind
+    let input: Int
+    let output: Int
+    let threads: [Int]
+    let optionExtents: [Int]
+    let entry: Int
+    let span: Span
+}
+
+enum CheckedKind {
+    Constant
+    Local
+    Resource
+    OptionValue
+    Field
+    Swizzle
+    ArrayLength
+    Index
+    Construct
+    Call
+    Builtin
+    Unary
+    Binary
+    Cast
+    Invalid
+}
+
+enum BuiltinFunction {
+    Mul
+    Dot
+    Cross
+    Normalize
+    Length
+    Abs
+    Floor
+    Ceil
+    Min
+    Max
+    Clamp
+    Mix
+    Step
+    Smoothstep
+    Fma
+    Pack2x16Float
+    Unpack2x16Float
+    Pow
+    Sqrt
+    Sin
+    Cos
+    Tan
+    Atan2
+    Exp
+    Exp2
+    Log
+    Log2
+    Fract
+    Round
+    Sign
+    Dpdx
+    Dpdy
+    Fwidth
+    Sample
+    Load
+    Store
+    AtomicAdd
+}
+
+// One checked expression. `target` is the local, resource, option, field
+// or function an expression names; `left` and `right` its operands;
+// `arguments` a call's or construction's parts; `components` a swizzle's.
+struct CheckedExpression {
+    var kind: CheckedKind
+    var expressionType: ShaderType
+    var value: ConstValue
+    var target: Int
+    var left: Int
+    var right: Int
+    var arguments: [Int]
+    var components: [Int]
+    var operator: Operator
+    var builtin: BuiltinFunction
+    var span: Span
+}
+
+enum CheckedStatementKind {
+    LetLocal
+    AssignPlace
+    IfElse
+    WhileLoop
+    ReturnValue
+    Nested
+    EvaluateValue
+}
+
+// One checked statement. `LetLocal` declares `local`, with `value` -1 when
+// it has no initializer; `AssignPlace` writes `value` to the place `target`
+// names; `IfElse` tests `value` and runs `body` or `otherwise`; `WhileLoop`
+// tests `value` before each run of `body`; `ReturnValue` returns `value`
+// or nothing; `Nested` is a bare block.
+struct CheckedStatement {
+    let kind: CheckedStatementKind
+    let local: Int
+    let target: Int
+    let value: Int
+    let body: [Int]
+    let otherwise: [Int]
+    let hasElse: Bool
+    let span: Span
+}

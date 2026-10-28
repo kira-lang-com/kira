@@ -1,0 +1,38 @@
+// `try X otherwise Y` on an optional value: `Some`'s value, or the fallback
+// for `None`, as an expression, as a statement that returns, and on an
+// owned payload that moves out.
+
+import Foundation
+
+function digit(text: borrow String) -> Int? {
+    if text == "7" { return .Some(7) }
+    return .None
+}
+
+function named(found: Bool) -> String? {
+    if found { return .Some("forty") }
+    return .None
+}
+
+function digitOrZero(text: borrow String) -> Int {
+    return try digit(text) otherwise 0
+}
+
+function digitOrLeave(text: borrow String) -> Int {
+    let value = try digit(text) otherwise return 0 - 1
+    return value + 1
+}
+
+function nameLength(found: Bool) -> Int {
+    let name = try named(found) otherwise return 0
+    return name.count
+}
+
+@Main
+function main() -> Int {
+    // 7 + 0, then 8 - 1 + 1, then 5 + 0, then 22
+    var total = digitOrZero("7") + digitOrZero("x")
+    total = total + digitOrLeave("7") + digitOrLeave("x") + 1
+    total = total + nameLength(true) + nameLength(false)
+    return total + 22
+}

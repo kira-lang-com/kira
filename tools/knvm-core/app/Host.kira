@@ -1,0 +1,110 @@
+import Foundation
+import Heap
+
+// The machine this runs on, and the paths a tool resolves against it.
+//
+// The host key is the framework's, read through `klf.host`: it is the same
+// `<arch>-<os>` string the framework names its own provisioned bundles by, so a
+// machine is spelled one way across the whole toolchain tree. A program cannot
+// work this out for itself — nothing above the kernel names the machine — which
+// is why it is a service and not something an app asks the kernel directly.
+
+// The byte length of this host's key. The service ABI is the kernel's own
+// `Int`, so these two declarations keep it; every caller converts at the call.
+@Service("klfsvc_host_key_length")
+public function hostKeyLength() -> Int
+
+// This host's key, copied to `destination` when it fits in `capacity` bytes.
+@Service("klfsvc_host_key_copy")
+public function hostKeyCopy(destination: RawPtr, capacity: Int) -> Int
+
+// The release-artifact key of this host: `<arch>-<os>`.
+public function currentHostKey() -> String {
+    let length = Number(hostKeyLength())
+    if length <= 0 { return unknownHostKey() }
+    let buffer = allocateRaw(length, 8)
+    let copied = Number(hostKeyCopy(buffer, length))
+    if copied <= 0 { return unknownHostKey() }
+    return textOfRaw(buffer, copied)
+}
+
+// What a host the framework does not name reads as. Distinct from every real
+// key, so a release that publishes nothing for it fails as a missing artifact
+// rather than as an unknown host.
+public function unknownHostKey() -> String {
+    return "unknown"
+}
+
+// Whether a host key is one a release publishes artifacts for.
+//
+// The framework names a host it has no key for `unknown`, so that is what a
+// refusal here is really about.
+public function isKnownHostKey(key: borrow String) -> Bool {
+    return key == "x86_64-linux-gnu"
+        || key == "aarch64-linux-gnu"
+        || key == "x86_64-macos"
+        || key == "aarch64-macos"
+        || key == "x86_64-windows-msvc"
+}
+
+// The user's home directory, `HOME` then `USERPROFILE`, or nothing.
+public function userHomeDirectory() -> Optional<String> {
+    let unix = environmentValue("HOME")
+    if !unix.isEmpty() { return .Some(unix) }
+    let windows = environmentValue("USERPROFILE")
+    if !windows.isEmpty() { return .Some(windows) }
+    return .None
+}
+
+// The directory this invocation is about: `PWD`, which the shell that started it
+// set to where it actually is.
+public function workingDirectory() -> Optional<String> {
+    let directory = environmentValue("PWD")
+    if directory.isEmpty() { return .None }
+    return .Some(directory)
+}
+
+// `a` and `b` as one path, with exactly one separator between them.
+public function joinPath(directory: borrow String, relative: borrow String) -> String {
+    if directory.isEmpty() { return relative }
+    if relative.isEmpty() { return directory }
+    if directory.endsWith("/") { return directory + relative }
+    return directory + "/" + relative
+}
+
+// Everything above the last separator in `path`, or "" when it has none.
+public function directoryOfPath(path: borrow String) -> String {
+    let separator = lastSeparatorIn(path)
+    if separator < 0 { return "" }
+    return path.substring(0, separator)
+}
+
+// The last component of `path`: its file or directory name.
+public function lastComponentOfPath(path: borrow String) -> String {
+    let trimmed = trimTrailingSeparators(path)
+    if trimmed.isEmpty() { return "" }
+    let separator = lastSeparatorIn(trimmed)
+    if separator < 0 { return trimmed }
+    return trimmed.substring(separator + 1, trimmed.count)
+}
+
+// Where the last `/` in `text` is, or -1 when it has none.
+public function lastSeparatorIn(text: borrow String) -> Number {
+    var index = text.count - 1
+    while index >= 0 {
+        if text.charAt(index) == asSlash { return index }
+        index = index - 1
+    }
+    return -1
+}
+
+// A path without the separators a listing or an argument may leave on its end.
+public function trimTrailingSeparators(path: borrow String) -> String {
+    var end = path.count
+    while end > 1 && path.charAt(end - 1) == asSlash {
+        end = end - 1
+    }
+    return path.substring(0, end)
+}
+
+public let asSlash: Number = 47

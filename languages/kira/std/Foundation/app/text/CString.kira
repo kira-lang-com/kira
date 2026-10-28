@@ -1,0 +1,60 @@
+import Heap
+
+// A NUL-terminated C string: one pointer word at the C seam. A `String`
+// becomes one where a `CString` is expected, as a copy of its bytes and a
+// NUL in a buffer of its own; the zero value is null.
+@FFI.Struct { layout: c }
+struct CString {
+    var address: RawPtr
+}
+
+function cStringFrom(text: borrow String) -> CString {
+    let data = makeArrayData(text.count + 1)
+    heapCopyBytes(data, text.data, text.count)
+    heapWriteByte(heapOffset(data, text.count), UN8(0))
+    return CString { address = data }
+}
+
+// The bytes up to the NUL as a `String`; a null `CString` reads as "".
+function stringFromCString(value: CString) -> String {
+    let empty: String = ""
+    if rawPointerWord(value.address) == 0 { return empty }
+    var count: Number = 0
+    while heapReadByte(heapOffset(value.address, count)) != UN8(0) { count = count + 1 }
+    let data = makeArrayData(count)
+    heapCopyBytes(data, value.address, count)
+    return String { data = data, count = count, capacity = count, ops = empty.ops }
+}
+
+// The bytes at `source` up to a NUL or `limit` bytes, whichever comes first,
+// as a `String`: a C string in a field of fixed size, or one whose length is
+// known; a null pointer reads as "".
+function stringFromCBytes(source: RawPtr, limit: Number) -> String {
+    let empty: String = ""
+    if rawPointerWord(source) == 0 { return empty }
+    let most = Number(limit)
+    var count: Number = 0
+    while count < most && heapReadByte(heapOffset(source, count)) != UN8(0) { count = count + 1 }
+    let data = makeArrayData(count)
+    heapCopyBytes(data, source, count)
+    return String { data = data, count = count, capacity = count, ops = empty.ops }
+}
+
+// A copy C keeps past the call (`retains:`): storage nothing collects, held
+// for the rest of the process.
+function cStringKept(text: borrow String) -> CString {
+    let data = allocateRaw(text.count + 1, 1)
+    heapCopyBytes(data, text.data, text.count)
+    heapWriteByte(heapOffset(data, text.count), UN8(0))
+    return CString { address = data }
+}
+
+// A `CString` C keeps past the call, copied out of collected storage.
+function cStringKeptCopy(value: CString) -> CString {
+    if rawPointerWord(value.address) == 0 { return value }
+    var count: Number = 0
+    while heapReadByte(heapOffset(value.address, count)) != UN8(0) { count = count + 1 }
+    let data = allocateRaw(count + 1, 1)
+    heapCopyBytes(data, value.address, count + 1)
+    return CString { address = data }
+}

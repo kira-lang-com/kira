@@ -1,0 +1,565 @@
+import Heap
+
+// Cryptographic primitives and certificate path validation on the kernel's
+// `klf.crypto` services (framework D-385): constant-time arithmetic and X.509
+// chain building, the two places a subtle bug is a silent remote break.
+// Everything built from them, a TLS 1.3 handshake, its key schedule, QUIC
+// packet protection, is `Network`'s Kira. A private key Kira never reads stays
+// in the kernel behind a handle. Algorithms are named by their TLS registry
+// code points, so an unknown one read off the wire survives as itself.
+
+@Service("klfsvc_crypto_random")
+function kernelRandom(destination: RawPtr, count: Int) -> Int
+
+@Service("klfsvc_crypto_digest")
+function kernelDigest(
+    hash: Int,
+    data: RawPtr,
+    count: Int,
+    destination: RawPtr,
+    capacity: Int
+) -> Int
+
+@Service("klfsvc_crypto_hmac")
+function kernelHmac(
+    hash: Int,
+    key: RawPtr,
+    keyCount: Int,
+    data: RawPtr,
+    count: Int,
+    destination: RawPtr,
+    capacity: Int
+) -> Int
+
+@Service("klfsvc_crypto_hkdf_extract")
+function kernelHkdfExtract(
+    hash: Int,
+    salt: RawPtr,
+    saltCount: Int,
+    keying: RawPtr,
+    keyingCount: Int,
+    destination: RawPtr,
+    capacity: Int
+) -> Int
+
+@Service("klfsvc_crypto_hkdf_expand")
+function kernelHkdfExpand(
+    hash: Int,
+    pseudorandom: RawPtr,
+    pseudorandomCount: Int,
+    info: RawPtr,
+    infoCount: Int,
+    destination: RawPtr,
+    count: Int
+) -> Int
+
+@Service("klfsvc_crypto_aead_seal")
+function kernelAeadSeal(
+    suite: Int,
+    key: RawPtr,
+    keyCount: Int,
+    nonce: RawPtr,
+    nonceCount: Int,
+    associated: RawPtr,
+    associatedCount: Int,
+    buffer: RawPtr,
+    count: Int,
+    capacity: Int
+) -> Int
+
+@Service("klfsvc_crypto_aead_open")
+function kernelAeadOpen(
+    suite: Int,
+    key: RawPtr,
+    keyCount: Int,
+    nonce: RawPtr,
+    nonceCount: Int,
+    associated: RawPtr,
+    associatedCount: Int,
+    buffer: RawPtr,
+    count: Int
+) -> Int
+
+@Service("klfsvc_crypto_header_mask")
+function kernelHeaderMask(
+    suite: Int,
+    key: RawPtr,
+    keyCount: Int,
+    sample: RawPtr,
+    sampleCount: Int,
+    destination: RawPtr,
+    capacity: Int
+) -> Int
+
+@Service("klfsvc_crypto_agreement_create")
+function kernelAgreementCreate(group: Int, public: RawPtr, capacity: Int) -> Int
+
+@Service("klfsvc_crypto_agreement_finish")
+function kernelAgreementFinish(
+    handle: Int,
+    peer: RawPtr,
+    peerCount: Int,
+    destination: RawPtr,
+    capacity: Int
+) -> Int
+
+@Service("klfsvc_crypto_verify")
+function kernelVerify(
+    scheme: Int,
+    certificate: RawPtr,
+    certificateCount: Int,
+    message: RawPtr,
+    messageCount: Int,
+    signature: RawPtr,
+    signatureCount: Int
+) -> Int
+
+@Service("klfsvc_crypto_key_load")
+function kernelKeyLoad(der: RawPtr, count: Int) -> Int
+
+@Service("klfsvc_crypto_sign")
+function kernelSign(
+    handle: Int,
+    scheme: Int,
+    message: RawPtr,
+    count: Int,
+    destination: RawPtr,
+    capacity: Int
+) -> Int
+
+@Service("klfsvc_crypto_certificate_verify")
+function kernelCertificateVerify(
+    chain: RawPtr,
+    chainCount: Int,
+    name: RawPtr,
+    nameCount: Int,
+    seconds: Int,
+    anchors: RawPtr,
+    anchorsCount: Int
+) -> Int
+
+@Service("klfsvc_crypto_release")
+function kernelCryptoRelease(handle: Int) -> Int
+
+@Service("klfsvc_crypto_digest_file")
+function kernelDigestFile(
+    hash: Int,
+    path: RawPtr,
+    pathCount: Int,
+    destination: RawPtr,
+    capacity: Int
+) -> Int
+
+@Service("klfsvc_crypto_key_generate")
+function kernelKeyGenerate(scheme: Int, destination: RawPtr, capacity: Int) -> Int
+
+@Service("klfsvc_crypto_key_public")
+function kernelKeyPublic(handle: Int, destination: RawPtr, capacity: Int) -> Int
+
+// Hash code points (RFC 5246 section 7.4.1.4.1), which HMAC and HKDF name.
+@Open
+enum HashAlgorithm: UN32 {
+    Sha256 = 4
+    Sha384 = 5
+}
+
+// TLS 1.3 cipher suites (RFC 8446 section B.4), which name an AEAD.
+@Open
+enum CipherSuite: UN32 {
+    Aes128GcmSha256 = 4865
+    Aes256GcmSha384 = 4866
+    ChaCha20Poly1305Sha256 = 4867
+}
+
+// Key-agreement groups (RFC 8446 section 4.2.7).
+@Open
+enum KeyGroup: UN32 {
+    Secp256r1 = 23
+    X25519 = 29
+}
+
+// Signature schemes (RFC 8446 section 4.2.3).
+@Open
+enum SignatureScheme: UN32 {
+    EcdsaSecp256r1Sha256 = 1027
+    EcdsaSecp384r1Sha384 = 1283
+    RsaPssRsaeSha256 = 2052
+    RsaPssRsaeSha384 = 2053
+    Ed25519 = 2055
+}
+
+// The failure words of `klf.crypto` (framework D-385), in their order.
+enum CryptoFailure {
+    Unsupported
+    Invalid
+    Rejected
+    InvalidHandle
+    TooSmall
+    UnknownIssuer
+    Expired
+    WrongName
+    BadCertificate
+}
+
+namespace CryptoService {
+    // The longest digest, HMAC tag or extracted key: SHA-384's.
+    let digestRoom: Number = 48
+    // The tag every TLS 1.3 AEAD appends (RFC 8446 section 5.2).
+    let tagBytes: Number = 16
+    // A QUIC header-protection mask (RFC 9001 section 5.4.1).
+    let maskBytes: Number = 5
+    // Public shares (RFC 8446 section 4.2.8.2): an X25519 coordinate and an
+    // uncompressed P-256 point, the longest.
+    let x25519Share: Number = 32
+    let secp256r1Share: Number = 65
+    let publicKeyRoom: Number = 65
+    // The longest shared secret.
+    let secretRoom: Number = 32
+    // The longest signature: RSA-PSS with a 4096-bit key.
+    let signatureRoom: Number = 512
+    // A generated key's PKCS#8 DER, and a raw public key: room for the
+    // schemes the kernel generates (framework D-386).
+    let generatedKeyRoom: Number = 512
+}
+
+// The kernel's word for a private key.
+distinct CryptoHandle = Number
+
+// `count` bytes from the operating system's generator.
+function randomBytes(count: UNumber) -> Result<[UN8], CryptoFailure> {
+    let room = Number(count)
+    let data = makeArrayData(max(room, 1))
+    let answer = kernelRandom(data, room)
+    return cryptoBytes(answer < 0 ? answer : room, data, room)
+}
+
+function digest(hash: HashAlgorithm, data: borrow [UN8]) -> Result<[UN8], CryptoFailure> {
+    let out = makeArrayData(CryptoService.digestRoom)
+    let answer = kernelDigest(code(hash), data.data, data.count, out, CryptoService.digestRoom)
+    return cryptoBytes(answer, out, CryptoService.digestRoom)
+}
+
+// The digest of the file at `path`, read by the kernel a piece at a time so
+// a file of any size is hashed without being held. A file that cannot be
+// read is `Invalid`.
+function digestFile(hash: HashAlgorithm, path: borrow String) -> Result<[UN8], CryptoFailure> {
+    let out = makeArrayData(CryptoService.digestRoom)
+    let answer = kernelDigestFile(code(hash), path.data, path.count, out, CryptoService.digestRoom)
+    return cryptoBytes(answer, out, CryptoService.digestRoom)
+}
+
+// A new private key for `scheme`, as PKCS#8 DER, which `loadSigningKey`
+// takes. Only `Ed25519` is generated.
+function generateSigningKey(scheme: SignatureScheme) -> Result<[UN8], CryptoFailure> {
+    let out = makeArrayData(CryptoService.generatedKeyRoom)
+    let answer = kernelKeyGenerate(code(scheme), out, CryptoService.generatedKeyRoom)
+    return cryptoBytes(answer, out, CryptoService.generatedKeyRoom)
+}
+
+function hmac(
+    hash: HashAlgorithm,
+    key: borrow [UN8],
+    data: borrow [UN8]
+) -> Result<[UN8], CryptoFailure> {
+    let out = makeArrayData(CryptoService.digestRoom)
+    let answer = kernelHmac(
+        code(hash),
+        key.data,
+        key.count,
+        data.data,
+        data.count,
+        out,
+        CryptoService.digestRoom
+    )
+    return cryptoBytes(answer, out, CryptoService.digestRoom)
+}
+
+// HKDF-Extract (RFC 5869 section 2.2): the pseudorandom key, as bytes, since
+// TLS 1.3's key schedule feeds it into the next extract.
+function hkdfExtract(
+    hash: HashAlgorithm,
+    salt: borrow [UN8],
+    keying: borrow [UN8]
+) -> Result<[UN8], CryptoFailure> {
+    let out = makeArrayData(CryptoService.digestRoom)
+    let answer = kernelHkdfExtract(
+        code(hash),
+        salt.data,
+        salt.count,
+        keying.data,
+        keying.count,
+        out,
+        CryptoService.digestRoom
+    )
+    return cryptoBytes(answer, out, CryptoService.digestRoom)
+}
+
+// HKDF-Expand (RFC 5869 section 2.3) to exactly `count` bytes.
+function hkdfExpand(
+    hash: HashAlgorithm,
+    pseudorandom: borrow [UN8],
+    info: borrow [UN8],
+    count: UNumber
+) -> Result<[UN8], CryptoFailure> {
+    let room = Number(count)
+    let out = makeArrayData(max(room, 1))
+    let answer = kernelHkdfExpand(
+        code(hash),
+        pseudorandom.data,
+        pseudorandom.count,
+        info.data,
+        info.count,
+        out,
+        room
+    )
+    return cryptoBytes(answer, out, room)
+}
+
+// A packet-protection key and the AEAD it is for, held across the packets it
+// seals; each call takes the nonce and the associated data the tag covers.
+struct AeadKey {
+    let suite: CipherSuite
+    let key: [UN8]
+}
+
+// `plain` sealed: its ciphertext, then the tag.
+function sealAead(
+    key: borrow AeadKey,
+    nonce: borrow [UN8],
+    associated: borrow [UN8],
+    plain: borrow [UN8]
+) -> Result<[UN8], CryptoFailure> {
+    let room = plain.count + CryptoService.tagBytes
+    let buffer = makeArrayData(room)
+    heapCopyBytes(buffer, plain.data, plain.count)
+    let answer = kernelAeadSeal(
+        code(key.suite),
+        key.key.data,
+        key.key.count,
+        nonce.data,
+        nonce.count,
+        associated.data,
+        associated.count,
+        buffer,
+        plain.count,
+        room
+    )
+    return cryptoBytes(answer, buffer, room)
+}
+
+// `sealed` opened, or `Rejected` when its tag does not verify: nothing of a
+// rejected message is ever read.
+function openAead(
+    key: borrow AeadKey,
+    nonce: borrow [UN8],
+    associated: borrow [UN8],
+    sealed: borrow [UN8]
+) -> Result<[UN8], CryptoFailure> {
+    let room = max(sealed.count, 1)
+    let buffer = makeArrayData(room)
+    heapCopyBytes(buffer, sealed.data, sealed.count)
+    let answer = kernelAeadOpen(
+        code(key.suite),
+        key.key.data,
+        key.key.count,
+        nonce.data,
+        nonce.count,
+        associated.data,
+        associated.count,
+        buffer,
+        sealed.count
+    )
+    return cryptoBytes(answer, buffer, room)
+}
+
+// The QUIC header-protection mask of `sample` (RFC 9001 section 5.4).
+function headerMask(
+    suite: CipherSuite,
+    key: borrow [UN8],
+    sample: borrow [UN8]
+) -> Result<[UN8], CryptoFailure> {
+    let out = makeArrayData(CryptoService.maskBytes)
+    let answer = kernelHeaderMask(
+        code(suite),
+        key.data,
+        key.count,
+        sample.data,
+        sample.count,
+        out,
+        CryptoService.maskBytes
+    )
+    return cryptoBytes(answer, out, CryptoService.maskBytes)
+}
+
+// An ephemeral key pair: the public share goes to the peer, and the private
+// key stays in the kernel until `finish` uses and releases it, or `release`
+// lets it go.
+struct KeyAgreement {
+    let handle: CryptoHandle
+    let share: [UN8]
+
+    function finish(borrow self, peer: borrow [UN8]) -> Result<[UN8], CryptoFailure> {
+        let out = makeArrayData(CryptoService.secretRoom)
+        let answer = kernelAgreementFinish(
+            handle.raw,
+            peer.data,
+            peer.count,
+            out,
+            CryptoService.secretRoom
+        )
+        return cryptoBytes(answer, out, CryptoService.secretRoom)
+    }
+
+    // Lets the private key go unused, as a share the peer never chose is.
+    function release(borrow self) -> Result<Void, CryptoFailure> {
+        return cryptoOutcome(kernelCryptoRelease(handle.raw))
+    }
+}
+
+function startKeyAgreement(group: KeyGroup) -> Result<KeyAgreement, CryptoFailure> {
+    let empty: [UN8] = []
+    let share = makeArrayData(CryptoService.publicKeyRoom)
+    let answer = kernelAgreementCreate(code(group), share, CryptoService.publicKeyRoom)
+    if answer < 0 {
+        releaseArrayData(share)
+        return .Error(cryptoFailure(answer))
+    }
+    let length = match group {
+        X25519 -> CryptoService.x25519Share
+        Secp256r1 -> CryptoService.secp256r1Share
+        else -> CryptoService.publicKeyRoom
+    }
+    return .Ok(
+        KeyAgreement {
+            handle: CryptoHandle(answer),
+                share: Array {
+                    data = share,
+                    count = length,
+                    capacity = CryptoService.publicKeyRoom,
+                    ops = empty.ops
+                }
+        }
+    )
+}
+
+// A long-term signing key, loaded from PKCS#8 DER; PEM is decoded above.
+struct SigningKey {
+    let handle: CryptoHandle
+
+    function sign(
+        borrow self,
+        scheme: SignatureScheme,
+        message: borrow [UN8]
+    ) -> Result<[UN8], CryptoFailure> {
+        let out = makeArrayData(CryptoService.signatureRoom)
+        let answer = kernelSign(
+            handle.raw,
+            code(scheme),
+            message.data,
+            message.count,
+            out,
+            CryptoService.signatureRoom
+        )
+        return cryptoBytes(answer, out, CryptoService.signatureRoom)
+    }
+
+    // The key's public half, raw: an Ed25519 key's 32 bytes.
+    function publicKey(borrow self) -> Result<[UN8], CryptoFailure> {
+        let out = makeArrayData(CryptoService.generatedKeyRoom)
+        let answer = kernelKeyPublic(handle.raw, out, CryptoService.generatedKeyRoom)
+        return cryptoBytes(answer, out, CryptoService.generatedKeyRoom)
+    }
+
+    function release(borrow self) -> Result<Void, CryptoFailure> {
+        return cryptoOutcome(kernelCryptoRelease(handle.raw))
+    }
+}
+
+function loadSigningKey(der: borrow [UN8]) -> Result<SigningKey, CryptoFailure> {
+    let answer = kernelKeyLoad(der.data, der.count)
+    if answer < 0 { return .Error(cryptoFailure(answer)) }
+    return .Ok(SigningKey { handle: CryptoHandle(answer) })
+}
+
+// Whether the key of `certificate`, DER, made `signature` over `message`.
+function verifySignature(
+    scheme: SignatureScheme,
+    certificate: borrow [UN8],
+    message: borrow [UN8],
+    signature: borrow [UN8]
+) -> Result<Void, CryptoFailure> {
+    return cryptoOutcome(
+        kernelVerify(
+            code(scheme),
+            certificate.data,
+            certificate.count,
+            message.data,
+            message.count,
+            signature.data,
+            signature.count
+        )
+    )
+}
+
+// What a certificate chain is checked against.
+struct ChainCheck {
+    // The server's name, or its address written as text.
+    let name: String
+    // The time it is checked at, in seconds since the Unix epoch.
+    let seconds: Number
+    // Trust anchors besides the bundled Mozilla roots.
+    let anchors: [UN8]
+}
+
+// Whether `chain`, end entity first, each DER certificate behind a 24-bit
+// length as a TLS Certificate message holds it, chains to a trusted root and
+// names the server.
+function verifyCertificates(
+    chain: borrow [UN8],
+    check: borrow ChainCheck
+) -> Result<Void, CryptoFailure> {
+    return cryptoOutcome(
+        kernelCertificateVerify(
+            chain.data,
+            chain.count,
+            check.name.data,
+            check.name.count,
+            Number(check.seconds),
+            check.anchors.data,
+            check.anchors.count
+        )
+    )
+}
+
+// The bytes a service wrote into `data`, which holds `capacity`, or its
+// failure, with `data` released.
+function cryptoBytes(
+    answer: Number,
+    data: RawPtr,
+    capacity: Number
+) -> Result<[UN8], CryptoFailure> {
+    if answer < 0 {
+        releaseArrayData(data)
+        return .Error(cryptoFailure(answer))
+    }
+    return .Ok(bytesWritten(data, answer, capacity))
+}
+
+function cryptoOutcome(answer: Number) -> Result<Void, CryptoFailure> {
+    if answer < 0 { return .Error(cryptoFailure(answer)) }
+    return .Ok
+}
+
+function cryptoFailure(word: Number) -> CryptoFailure {
+    return match word {
+            -1 -> .Unsupported
+            - 2 -> .Invalid
+            - 3 -> .Rejected
+            - 4 -> .InvalidHandle
+            - 5 -> .TooSmall
+            - 6 -> .UnknownIssuer
+            - 7 -> .Expired
+            - 8 -> .WrongName
+        else -> .BadCertificate
+    }
+}

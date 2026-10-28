@@ -1,0 +1,102 @@
+import Testing
+
+// The programs of `corpus/semantics.klfd` that compile without Foundation and
+// are rejected with the diagnostics the corpus named.
+
+@Test
+function rejectsAssignmentToImmutableBinding() {
+    expect!(!compiles("""
+        @Main
+        function main() -> Int {
+            let x = 1
+            x = 2
+            return x
+        }
+        """))
+    expect!(diagnosed(3025, 4, 0))
+}
+
+@Test
+function rejectsLiteralOutOfRange() {
+    expect!(!compiles("""
+        @Main
+        function main() -> Int {
+            let small: U8 = 300
+            return undefined(small)
+        }
+        """))
+    expect!(diagnosed(3350, 3, 0))
+    expect!(diagnosed(3061, 4, 0))
+}
+
+@Test
+function rejectsMixedWidths() {
+    expect!(!compiles("""
+        @Main
+        function main() -> Int {
+            let a: U8 = 1
+            let b: U16 = 2
+            return Int(a + b)
+        }
+        """))
+    expect!(diagnosed(3071, 5, 0))
+}
+
+@Test
+function rejectsMissingMain() {
+    expect!(!compiles("""
+        function helper() -> Int {
+            return 1
+        }
+        """))
+    expect!(diagnosed(3011, 1, 0))
+}
+
+@Test
+function rejectsNonBoolConditions() {
+    expect!(!compiles("""
+        @Main
+        function main() -> Int {
+            if 1 { return 1 }
+            return true
+        }
+        """))
+    expect!(diagnosed(3040, 3, 0))
+    expect!(diagnosed(3032, 4, 0))
+}
+
+@Test
+function rejectsNonExhaustiveMatch() {
+    expect!(!compiles("""
+        enum Color {
+            Red
+            Green
+        }
+
+        @Main
+        function main() -> Int {
+            let color: Color = .Red
+            match color {
+                Red -> return 1
+            }
+            return 0
+        }
+        """))
+    expect!(diagnosed(3129, 9, 0))
+}
+
+@Test
+function rejectsUnknownFields() {
+    expect!(!compiles("""
+        struct Point {
+            let x: Int
+        }
+
+        @Main
+        function main() -> Int {
+            let p = Point { x = 1 }
+            return p.z
+        }
+        """))
+    expect!(diagnosed(3091, 8, 0))
+}

@@ -1,0 +1,94 @@
+function materializeDistincts(move tree: SyntaxTree) -> SyntaxTree {
+    var prepared = move tree
+    for declared in prepared.distincts {
+        let representation = flattenDistinct(prepared, declared.representation, 0)
+        match builtinType(representation.name.text) {
+            Some(valueType) -> {
+                if valueType.equals(Type.void()) {
+                    report(.InvalidDistinctRepresentation, declared.name.span)
+                    continue
+                }
+            }
+            None -> {
+                report(.InvalidDistinctRepresentation, declared.name.span)
+                continue
+            }
+        }
+        prepared.structs.append(StructDeclaration {
+            name = declared.name, genericParameters = [], typeArguments = [], callableModes = [], ancestors = [],
+            genericBase = "Distinct", baseNameSpan = declared.name.span, specialized = false, typeSuffix = scopedTypeSuffix(declared.name.text),
+            fields = [FieldDeclaration {
+                name = Identifier { text = "raw", span = declared.name.span }, mutable = false,
+                annotation = representation, initial = .None, annotations = [], inferred = false,
+                span = declared.name.span
+            }],
+            methods = []
+        })
+    }
+    return prepared
+}
+
+function flattenDistinct(tree: SyntaxTree, reference: TypeReference, depth: Int) -> TypeReference {
+    if depth > tree.distincts.count {
+        report(.DistinctCycle, reference.name.span)
+        return reference
+    }
+    let canonical = canonicalAliasReference(tree.aliases, reference, 0)
+    for declared in tree.distincts {
+        if declared.name.text == canonical.name.text { return flattenDistinct(tree, declared.representation, depth + 1) }
+    }
+    return canonical
+}
+
+function isDistinctType(program: CheckedProgram, valueType: Type) -> Bool {
+    if valueType.kind != .Structure { return false }
+    return program.structs[valueType.declaration].genericBase == "Distinct"
+}
+
+// A distinct type's operators are its representation's. Between two values of
+// one distinct type, or one and a bare literal, arithmetic, bitwise and shift
+// operators yield the distinct type again and comparisons yield `Bool`; the
+// operation itself runs on the representation. A different distinct type or a
+// written representation value is refused as any other mismatch is.
+extend Checker {
+    // `value` as its representation when it is of a distinct type.
+    function rawOf(borrow mut self, value: Int) -> Int {
+        let valueType = typeOf(value)
+        if !isDistinctType(program, valueType) { return value }
+        return add(.Member(value, 0), program.structs[valueType.declaration].fields[0].valueType, program.expressions[value].span)
+    }
+
+    // An index of a distinct type over an integer, as an `Int`.
+    function integerIndex(borrow mut self, index: Int) -> Int {
+        let raw = rawOf(index)
+        if raw == index || !typeOf(raw).isInteger() || typeOf(raw).isInt() { return raw }
+        return add(.Convert(raw), Type.int(), program.expressions[raw].span)
+    }
+
+    // `value`, of the representation, as `nominal` when that is a distinct
+    // type.
+    function distinctResult(borrow mut self, value: Int, nominal: Type) -> Int {
+        if !isDistinctType(program, nominal) || typeOf(value).isInvalid() { return value }
+        return add(.Construct([value]), nominal, program.expressions[value].span)
+    }
+
+    // The operands beside `checked`, of a distinct type, with `right` still
+    // to check: a bare literal takes the representation, anything else must
+    // be the same distinct type.
+    function distinctOperands(borrow mut self, checked: Int, right: Int) -> Operands {
+        let nominal = typeOf(checked)
+        let representation = program.structs[nominal.declaration].fields[0].valueType
+        if tree.expressions[right].kind.takesOperandType() {
+            return Operands { left = rawOf(checked), right = coerce(expression(right, .Some(representation)), representation, .OperatorOperands) }
+        }
+        let other = coerce(expression(right, .Some(nominal)), nominal, .OperatorOperands)
+        return Operands { left = rawOf(checked), right = rawOf(other) }
+    }
+
+    // A bare literal on the left of `checked`, of a distinct type.
+    function literalBesideDistinct(borrow mut self, left: Int, checked: Int) -> Operands {
+        let representation = program.structs[typeOf(checked).declaration].fields[0].valueType
+        let first = coerce(expression(left, .Some(representation)), representation, .OperatorOperands)
+        return Operands { left = first, right = rawOf(checked) }
+    }
+}

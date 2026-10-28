@@ -1,0 +1,174 @@
+// `traceText(value)`: any value as a trail shows it. Lowering walks the
+// value's type and writes it through Foundation's trace functions: a struct
+// field by field, an array's first elements and its length, an enum's case
+// and payload, a string quoted and cut short, and nothing more than its type
+// for what has no readable contents, such as a pointer or a closure. A type
+// that conforms to Foundation's `Traced` is shown by its `traced()` instead,
+// so its author decides what a trail says about it.
+
+// What lowering calls in Foundation, in this order.
+function traceRuntimeNames() -> [String] {
+    return [
+        "traceMark", "traceTake", "traceBytes", "traceInteger", "traceUnsigned", "traceFloat",
+        "traceBoolean", "traceQuoted", "traceTraced", "traceElided", "traceNested", "traceNumber"
+    ]
+}
+
+extend Checker {
+    function checkTraceText(borrow mut self, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 1 {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let value = expression(arguments[0], .None)
+        return tracedText(value, span)
+    }
+
+    // `"\(value)"`: a string is written as itself, as `print` writes it, and
+    // any other value as a trail shows it.
+    function checkInterpolated(borrow mut self, arguments: [Int], span: Span) -> Int {
+        let value = expression(arguments[0], .None)
+        if isStringType(program, typeOf(value)) { return value }
+        return tracedText(value, span)
+    }
+
+    function tracedText(borrow mut self, value: Int, span: Span) -> Int {
+        let valueType = typeOf(value)
+        if valueType.isInvalid() { return add(.Integer(0), Type.invalid(), span) }
+        if valueType.equals(Type.void()) {
+            report(.BuiltinArgumentType, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        match declarations.typeNamed("String") {
+            Some(stringType) -> {
+                if !requireTraceRuntime(span) { return add(.Integer(0), Type.invalid(), span) }
+                updateTracedFunctions()
+                for target in traceTargets(program, valueType) { requireTraceRoot(target) }
+                return add(.TraceText(value), stringType, span)
+            }
+            None -> {
+                report(.MissingFoundation, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+
+    // Foundation's trace functions, found the first time a trace needs them.
+    function requireTraceRuntime(borrow mut self, span: Span) -> Bool {
+        if program.traceFunctions.count > 0 { return true }
+        var found: [Int] = []
+        for name in traceRuntimeNames() {
+            match declarations.findFunction(.None, name) {
+                Some(target) -> found.append(target)
+                None -> {
+                    report(.UndefinedFunction, span)
+                    return false
+                }
+            }
+        }
+        program.traceFunctions = found
+        return true
+    }
+
+    // A function a trace may run, checked and lowered whether or not
+    // anything else names it.
+    function requireTraceRoot(borrow mut self, target: Int) {
+        if contains(program.traceRoots, target) { return }
+        program.traceRoots.append(target)
+        pending.append(target)
+    }
+
+    // Each struct's and enum's `traced` function, or -1, for the types
+    // declared or minted since the last update.
+    function updateTracedFunctions(borrow mut self) {
+        for index in program.tracedStructs.count..program.structs.count {
+            program.tracedStructs.append(tracedFunctionOf(Type.structure(index), program.structs[index].name.text))
+        }
+        for index in program.tracedEnums.count..program.enums.count {
+            program.tracedEnums.append(tracedFunctionOf(Type.enumeration(index), program.enums[index].name.text))
+        }
+    }
+
+    function tracedFunctionOf(borrow self, owner: Type, name: String) -> Int {
+        for conformance in tree.conformances {
+            if conformance.traitName.name.text != "Traced" { continue }
+            if isTemplateReference(tree, conformance.owner) {
+                if instanceArguments(declarations, owner, conformance.owner.name.text).isNone() { continue }
+            } else if conformance.owner.instanceName != name {
+                continue
+            }
+            match declarations.findFunction(.Some(owner), "traced") {
+                Some(target) -> return target
+                None -> {}
+            }
+        }
+        return 0 - 1
+    }
+}
+
+// The `traced` function a value of `valueType` shows itself by, or -1.
+function tracedFunctionFor(program: CheckedProgram, valueType: Type) -> Int {
+    if valueType.kind == .Structure && valueType.declaration < program.tracedStructs.count { return program.tracedStructs[valueType.declaration] }
+    if valueType.kind == .Enumeration && valueType.declaration < program.tracedEnums.count { return program.tracedEnums[valueType.declaration] }
+    return 0 - 1
+}
+
+// The functions tracing a value of `valueType` runs: Foundation's trace
+// functions and the `traced` of every type the walk reaches.
+function traceTargets(program: CheckedProgram, valueType: Type) -> [Int] {
+    var targets: [Int] = []
+    for target in program.traceFunctions { targets.append(target) }
+    var visiting: [Int] = []
+    tracedReached(program, valueType, visiting, targets)
+    return targets
+}
+
+function tracedReached(program: CheckedProgram, valueType: Type, visiting: borrow mut [Int], targets: borrow mut [Int]) {
+    if valueType.kind != .Structure && valueType.kind != .Enumeration { return }
+    let key = valueType.kind == .Structure ? valueType.declaration : program.structs.count + valueType.declaration
+    if contains(visiting, key) { return }
+    visiting.append(key)
+    let traced = tracedFunctionFor(program, valueType)
+    if traced >= 0 {
+        targets.append(traced)
+        return
+    }
+    if valueType.kind == .Enumeration {
+        for variant in program.enums[valueType.declaration].variants {
+            match variant.payload {
+                Some(payload) -> tracedReached(program, payload, visiting, targets)
+                None -> {}
+            }
+        }
+        return
+    }
+    if !tracesFields(program, valueType) { return }
+    for field in program.structs[valueType.declaration].fields { tracedReached(program, field.valueType, visiting, targets) }
+}
+
+// Whether a struct is shown by its fields: not a string, an `Any`, a class,
+// a closure, a task, native state or C storage.
+function tracesFields(program: CheckedProgram, valueType: Type) -> Bool {
+    if isStringType(program, valueType) || isAnyType(program, valueType) || isClassType(program, valueType) { return false }
+    if isTaskType(program, valueType) || isClosureType(program, valueType) || isContextCallbackType(program, valueType) || isWitnessedType(program, valueType) { return false }
+    let declared = program.structs[valueType.declaration]
+    if declared.genericBase == "NativeState" { return false }
+    match declared.shape {
+        Plain -> return true
+        CPointer -> return false
+        Callback -> return false
+        CLayout -> return false
+        CUnion -> return false
+        CArray -> return false
+    }
+}
+
+// A type's name as a trail shows it: without its arguments or the module
+// suffix a clash gives it.
+function shownTypeName(name: String) -> String {
+    for index in 0..utf8Count(name) {
+        let byte = utf8Byte(name, index)
+        if byte == 60 || byte == 35 { return utf8Slice(name, 0, index) }
+    }
+    return name
+}

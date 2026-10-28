@@ -1,0 +1,443 @@
+import Foundation
+import Kten
+
+// The Kira rules (DESIGN.md section 5.5): the toolchain the project builds
+// with, found as the knvm launcher finds it, and the compiles that build a
+// package with it. A compile reads the package and the toolchain where they
+// are, keyed by their digests, and writes a depfile of whatever else it read,
+// so a path dependency, an embedded file or a contract it found rebuilds it
+// when it changes (section 5.3).
+
+/// The toolchain a project builds with.
+public struct KiraToolchain {
+    /// `<KLFD_HOME or ~/.klf>/toolchains/kira/<channel>/<version>`.
+    let root: String
+    /// The toolchain's compiler driver.
+    let driver: String
+    /// The toolchain's tree, whose digest keys every compile.
+    let tree: Artifact
+}
+
+/// What a compile is for.
+public struct KiraSettings {
+    /// The target triple; empty for the host.
+    let target: String = ""
+    /// Whether the compile is a release build.
+    let release: Bool = false
+    /// Whether the framework's KIR optimizer runs before the backend.
+    let optimize: Bool = false
+    /// An SDK tree (KLF-RIDL section 27.7) that imports resolve frameworks in.
+    let sdk: Artifact? = .None
+    /// The C library tree a cross build links against, as `KLF_SYSROOT`.
+    let sysroot: Artifact? = .None
+    /// Paths under the package directory its key leaves out, as build output kept beside the sources.
+    let excluding: [String] = []
+    /// The relocatable source hierarchy, relative to the build project.
+    let sourceRoot: String = ""
+}
+
+/// A library a compile made: its shared binary and its contract.
+public struct KiraLibrary {
+    /// The library's shared binary.
+    let binary: Artifact
+    /// The library's contract, which other packages compile against.
+    let contract: Artifact
+}
+
+/// A library as an SDK holds it: `<Module>.framework` under `System/Library/Frameworks`, or `PrivateFrameworks` when only the system itself uses it.
+public struct KiraFramework {
+    /// The framework's module name.
+    let module: String
+    /// The library the framework holds.
+    let library: KiraLibrary
+    /// Whether only the system itself uses the framework, which makes it a private framework.
+    let systemOnly: Bool = false
+}
+
+namespace KiraLayout {
+    // knvm's file pinning a directory tree's toolchain.
+    let pin: String = "kira-toolchain.toml"
+    // The variable relocating knvm's home.
+    let home: String = "KLFD_HOME"
+    // Where a compile writes what it read, in its working directory.
+    let depfile: String = "read.d"
+}
+
+extend Graph {
+    // The toolchain the project builds with: the one the nearest
+    // `kira-toolchain.toml` at or above the project root pins, else the one
+    // knvm selected. A toolchain that is not installed is a problem of the
+    // graph.
+    function kira(borrow mut self) -> KiraToolchain {
+        let found = match kiraToolchainRoot(root) {
+            Ok(path) -> path
+            Error(failure) -> {
+                problems.append(failureText(failure))
+                return KiraToolchain { root: "", driver: "", tree: Artifact { id: -1 } }
+            }
+        }
+        let none: [String] = []
+        let tree = sourceTree(found, none)
+        return KiraToolchain { root: found, driver: joinPath(found, "bin/kira"), tree: tree }
+    }
+}
+
+extend KiraToolchain {
+    // The executable the package at `package`, a path from the project root,
+    // builds.
+    function program(
+        borrow self,
+        graph: borrow mut Graph,
+        package: borrow String,
+        settings: borrow KiraSettings
+    ) -> Artifact {
+        let name = packageName(graph, package)
+        var arguments = compileArguments(graph, package, settings)
+        arguments.append(.Text("--emit"))
+        arguments.append(.Text("bin"))
+        arguments.append(.Text("-o"))
+        arguments.append(.Output(name))
+        return compile(graph, "compile", package, settings, move arguments, [name], "")[0]
+    }
+
+    // The shared binary of the library at `package` and its contract.
+    function library(
+        borrow self,
+        graph: borrow mut Graph,
+        package: borrow String,
+        settings: borrow KiraSettings
+    ) -> KiraLibrary {
+        let name = packageName(graph, package)
+        var shared = compileArguments(graph, package, settings)
+        shared.append(.Text("--emit"))
+        shared.append(.Text("shared"))
+        shared.append(.Text("-o"))
+        shared.append(.Output(name))
+        // The contract comes from the same compile: the driver writes it
+        // from the module it lowers for the binary, so an edit pays for one
+        // compile, not two.
+        let contractName = name + ".ridl"
+        shared.append(.Text("--contract"))
+        shared.append(.Output(contractName))
+        let built = compile(
+            graph,
+            "compile",
+            package,
+            settings,
+            move shared,
+            [name, contractName],
+            ""
+        )
+        let binary = built[0]
+        let contract = built[1]
+        return KiraLibrary { binary: binary, contract: contract }
+    }
+
+    // What the tests of the package at `package` printed. A test that fails
+    // fails the action; a run that passed is cached by what it read.
+    function tests(
+        borrow self,
+        graph: borrow mut Graph,
+        package: borrow String,
+        settings: borrow KiraSettings
+    ) -> Artifact {
+        var arguments = compileArguments(graph, package, settings)
+        arguments.append(.Text("--test"))
+        arguments.append(.Text("--emit"))
+        arguments.append(.Text("run"))
+        let results = "results.txt"
+        return compile(graph, "test", package, settings, move arguments, [copy results], results)[0]
+    }
+
+    // A compile of the package at `package` writing `outputs`.
+    function compile(
+        borrow self,
+        graph: borrow mut Graph,
+        verb: borrow String,
+        package: borrow String,
+        settings: borrow KiraSettings,
+        arguments: [Argument],
+        outputs: borrow [String],
+        standardOutput: borrow String
+    ) -> [Artifact] {
+        var detail = ""
+        if settings.target.count > 0 { detail += " for \(settings.target)" }
+        if settings.release { detail += ", release" }
+        if settings.optimize { detail += ", optimized" }
+        if settings.sdk.isSome() { detail += ", with an SDK" }
+        var reads = [tree]
+        match graph.packageTree(package, settings.excluding) {
+            Some(found) -> reads.append(found)
+            None -> {}
+        }
+        for artifact in [settings.sdk, settings.sysroot] {
+            match artifact {
+                Some(given) -> {
+                    if given.id >= 0 && given.id < graph.origins.count && graph.producer(
+                        given
+                    ).isNone() {
+                        reads.append(given)
+                    }
+                }
+                None -> {}
+            }
+        }
+        var variables: [CommandVariable] = []
+        match settings.sysroot {
+            Some(given) -> variables.append(
+                CommandVariable { name: "KLF_SYSROOT", value: .Input(given) }
+            )
+            None -> {}
+        }
+        var declared: [Output] = []
+        for output in outputs { declared.append(Output { name: copy output }) }
+        var all = move arguments
+        all.append(.Text("--depfile"))
+        all.append(.Text(KiraLayout.depfile))
+        return graph.command(
+            CommandAction {
+                label: "\(verb) \(package)\(detail)",
+                tool: copy driver,
+                arguments: all,
+                environment: compileEnvironment(),
+                // The C tools the driver runs are found there; the key holds
+                // the driver itself, not where the shell looks.
+                inherited: ["PATH"],
+                variables: variables,
+                outputs: declared,
+                reads: reads,
+                sourceRoot: copy settings.sourceRoot,
+                depfile: KiraLayout.depfile,
+                standardOutput: copy standardOutput
+            }
+        )
+    }
+
+    // `build <package>` and what `settings` asks of it.
+    function compileArguments(
+        borrow self,
+        graph: borrow mut Graph,
+        package: borrow String,
+        settings: borrow KiraSettings
+    ) -> [Argument] {
+        var arguments: [Argument] = [.Text("build")]
+        match graph.packageTree(package, settings.excluding) {
+            Some(found) -> arguments.append(.Input(found))
+            None -> {}
+        }
+        if settings.target.count > 0 {
+            arguments.append(.Text("--target"))
+            arguments.append(.Text(copy settings.target))
+        }
+        if settings.release { arguments.append(.Text("--release")) }
+        if settings.optimize { arguments.append(.Text("--optimize")) }
+        match settings.sdk {
+            Some(given) -> {
+                arguments.append(.Text("--sdk"))
+                arguments.append(.Input(given))
+            }
+            None -> {}
+        }
+        return arguments
+    }
+}
+
+extend Graph {
+    // The tree of the package at `package`, once however many compiles read
+    // it; none, and a problem, when no `package.kira` is there.
+    function packageTree(
+        borrow mut self,
+        package: borrow String,
+        excluding: borrow [String]
+    ) -> Artifact? {
+        let directory = joinPath(root, package)
+        for index in 0..origins.count {
+            match origins[index] {
+                SourceTree(tree) -> {
+                    if joinPath(root, tree.path) == directory && tree.excluding == excluding {
+                        return .Some(Artifact { id: index })
+                    }
+                }
+                Source(path) -> {}
+                Stored(reference) -> {}
+                Produced(made) -> {}
+            }
+        }
+        if !fileExists(joinPath(directory, "package.kira")) {
+            problems.append("\(package) holds no package.kira")
+            return .None
+        }
+        return .Some(sourceTree(package, excluding))
+    }
+
+    // An SDK tree (KLF-RIDL section 27.7) holding `frameworks`: each one's
+    // binary as `<Module>.framework/<Module>` and its contract under the
+    // framework's `Resources/`.
+    function sdk(
+        borrow mut self,
+        name: borrow String,
+        frameworks: borrow [KiraFramework]
+    ) -> Artifact {
+        var inputs: [Artifact] = []
+        var modules: [String] = []
+        var places: [String] = []
+        var described: [Kten] = []
+        for framework in frameworks {
+            inputs.append(framework.library.binary)
+            inputs.append(framework.library.contract)
+            modules.append(copy framework.module)
+            let place = framework.systemOnly ? "PrivateFrameworks" : "Frameworks"
+            places.append(place)
+            described.append(
+                ktenBare(
+                    [
+                        ktenField("module", .Text(copy framework.module)),
+                        ktenField("place", .Text(place))
+                    ]
+                )
+            )
+        }
+        return native(
+            NativeAction {
+                label: "sdk \(name)",
+                code: sourceDigest!("package"),
+                parameters: .List(described),
+                inputs: inputs,
+                outputs: [Output { name: copy name, kind: .Tree }],
+                work: { run in
+                    for index in 0..modules.count {
+                        let module = modules[index]
+                        let framework = joinPath(
+                            joinPath(run.outputs[0], "System/Library/" + places[index]),
+                            module + ".framework"
+                        )
+                        let resources = joinPath(framework, "Resources")
+                        match makePathTree(resources) {
+                            Ok -> {}
+                            Error(failure) -> return .Error(failure)
+                        }
+                        match placeCopy(run.inputs[index * 2], joinPath(framework, module), 493) {
+                            Ok -> {}
+                            Error(failure) -> return .Error(failure)
+                        }
+                        let contract = joinPath(resources, module + ".ridl")
+                        match placeCopy(run.inputs[index * 2 + 1], contract, 420) {
+                            Ok -> {}
+                            Error(failure) -> return .Error(failure)
+                        }
+                    }
+                    return .Ok
+                }
+            }
+        )[0]
+    }
+}
+
+// Copies the file at `from` to `to` with the permission bits `mode`.
+function placeCopy(
+    from: borrow String,
+    to: borrow String,
+    mode: UNumber
+) -> Result<Void, BuildFailure> {
+    match copyFile(from, to) {
+        Ok(size) -> {}
+        Error(failure) -> return .Error(
+            .Files("cannot copy \(from) to \(to): \(traceText(failure))")
+        )
+    }
+    return match setFileMode(to, mode) {
+        Ok -> .Ok
+        Error(failure) -> .Error(.Files("cannot set the mode of \(to): \(traceText(failure))"))
+    }
+}
+
+// The name of what the package at `package` builds: its directory's, or the
+// project's for the project root.
+function packageName(graph: borrow Graph, package: borrow String) -> String {
+    let name = lastName(package)
+    if name.count == 0 || name == "." { return pathSafe(graph.project) }
+    return pathSafe(name)
+}
+
+// What a compile's environment holds of the build's: where the toolchain and
+// its caches are.
+function compileEnvironment() -> [EnvironmentEntry] {
+    var entries: [EnvironmentEntry] = []
+    for name in ["HOME", "KLF_HOME", "KLF_CACHE", KiraLayout.home] {
+        let value = environmentValue(name)
+        if value.count > 0 { entries.append(EnvironmentEntry { name: name, value: value }) }
+    }
+    return entries
+}
+
+// The toolchain the knvm launcher runs for `directory`: the nearest pin at or
+// above it, else the selection.
+function kiraToolchainRoot(directory: borrow String) -> Result<String, BuildFailure> {
+    var home = environmentValue(KiraLayout.home)
+    if home.count == 0 {
+        let user = environmentValue("HOME")
+        if user.count == 0 { return .Error(.Description("neither KLFD_HOME nor HOME is set")) }
+        home = joinPath(user, ".klf")
+    }
+    let compilers = joinPath(home, "toolchains/kira")
+    var channel = ""
+    var version = ""
+    var named = ""
+    var current = copy directory
+    while true {
+        let pin = joinPath(current, KiraLayout.pin)
+        if fileExists(pin) {
+            named = pin
+            break
+        }
+        let parent = parentPath(current)
+        if parent == current || parent == "." { break }
+        current = parent
+    }
+    if named.count > 0 {
+        let text = match readFile(named) {
+            Ok(contents) -> contents.text
+            Error(failure) -> return .Error(
+                .Description("cannot read \(named): \(traceText(failure))")
+            )
+        }
+        channel = tomlText(text, "channel").or("release")
+        version = tomlText(text, "version").or("")
+    } else {
+        named = joinPath(compilers, "current.toml")
+        let text = match readFile(named) {
+            Ok(contents) -> contents.text
+            Error(failure) -> return .Error(
+                .Description(
+                    "no kira toolchain is selected; install one with `knvm install latest`"
+                )
+            )
+        }
+        channel = tomlText(text, "channel").or("")
+        version = tomlText(text, "version").or("")
+    }
+    let known = channel == "release" || channel == "dev"
+    if !known || version.count == 0 || version.contains("/") {
+        return .Error(.Description("\(named) names no toolchain"))
+    }
+    let root = joinPath(joinPath(compilers, channel), version)
+    if !isDirectory(root) {
+        return .Error(.Description("\(named) names \(channel)/\(version), which is not installed"))
+    }
+    return .Ok(root)
+}
+
+// The value of `key = "value"` in the flat TOML file `text`.
+function tomlText(text: borrow String, key: borrow String) -> String? {
+    for line in text.split("\n") {
+        let trimmed = line.trim()
+        if trimmed.startsWith("#") { continue }
+        let parts = trimmed.split("=")
+        if parts.count != 2 || parts[0].trim() != key { continue }
+        let value = parts[1].trim()
+        if value.count >= 2 && value.startsWith("\"") && value.endsWith("\"") {
+            return .Some(value.substring(1, value.count - 1))
+        }
+    }
+    return .None
+}

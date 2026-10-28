@@ -1,0 +1,30 @@
+import Foundation
+
+comptime function generatedFunction() -> String {
+    let name = Identifier { text = "answer" }
+    let value = 42
+    let syntax = quote {function #{name}() -> Int { return #{value} }}
+    return syntax.text
+}
+
+comptime function generatedString() -> String {
+    let value = "a\"b\\c\n"
+    let syntax = quote {return #{value}}
+    return syntax.text
+}
+
+comptime function generatedSequence() -> String {
+    let parts: [Syntax] = [quote {return 1}, quote {return 2}]
+    let syntax = quote {#{parts}}
+    return syntax.text
+}
+
+@Main
+function main() -> Int {
+    let functionSource = generatedFunction()
+    let stringSource = generatedString()
+    if functionSource != "function answer() -> Int { return 42 }" { return 1 }
+    if stringSource != "return \"a\\\"b\\\\c\\n\"" { return 2 }
+    if generatedSequence() != "return 1\nreturn 2" { return 3 }
+    return 42
+}

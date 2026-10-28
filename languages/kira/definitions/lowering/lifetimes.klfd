@@ -1,0 +1,171 @@
+struct TrackedValue {
+    let address: KirAddress
+    let valueType: Type
+    let initialized: KirAddress
+    // The index `trackedAt` gave the address before this value was tracked,
+    // put back when this value stops being tracked; -1 for none.
+    let shadowed: Int
+}
+
+function needsArrayCleanup(program: CheckedProgram, valueType: Type) -> Bool {
+    if isArrayType(program, valueType) || isStringType(program, valueType) || isAnyType(program, valueType) || isClosureType(program, valueType) || isContextCallbackType(program, valueType) || isClassType(program, valueType) || isWitnessedType(program, valueType) { return true }
+    match valueType.kind {
+        Structure -> {
+            if program.dropFunctions[valueType.declaration] >= 0 || pointerFree(program, valueType.declaration) >= 0 { return true }
+            for field in program.structs[valueType.declaration].fields {
+                if needsArrayCleanup(program, field.valueType) { return true }
+            }
+        }
+        Enumeration -> {
+            for recursive in program.recursiveCases[valueType.declaration] {
+                if recursive { return true }
+            }
+            for variant in program.enums[valueType.declaration].variants {
+                match variant.payload {
+                    Some(payload) -> {
+                        if needsArrayCleanup(program, payload) { return true }
+                    }
+                    None -> {}
+                }
+            }
+        }
+        Integer -> {}
+        Decimal -> {}
+        Floating -> {}
+        Boolean -> {}
+        Pointer -> {}
+        Void -> {}
+        Invalid -> {}
+    }
+    return false
+}
+
+extend FunctionLowering {
+    function trackValue(borrow mut self, address: KirAddress, valueType: Type) {
+        if !needsArrayCleanup(program, valueType) { return }
+        let flag = storageSlot(types.boolean)
+        if !framed() { kir.store(kir.integer(types.boolean, 0), flag) }
+        track(address, valueType, flag)
+    }
+
+    // Tracks `address` as the newest value, `trackedAt` naming it for the
+    // address until it stops being tracked.
+    function track(borrow mut self, address: KirAddress, valueType: Type, initialized: KirAddress) {
+        let slot = trackedSlot(address)
+        lifetimes.append(TrackedValue { address = address, valueType = valueType, initialized = initialized, shadowed = trackedAt[slot] })
+        trackedAt[slot] = lifetimes.count - 1
+    }
+
+    // The entry of `trackedAt` for `address`, the table grown to hold it.
+    function trackedSlot(borrow mut self, address: KirAddress) -> Int {
+        let wanted = address as Int
+        if trackedAt.count == 0 { trackedBase = wanted }
+        if wanted < trackedBase {
+            var rebased: [Int] = []
+            for below in wanted..trackedBase { rebased.append(-1) }
+            for entry in trackedAt { rebased.append(entry) }
+            trackedAt = rebased
+            trackedBase = wanted
+        }
+        let slot = wanted - trackedBase
+        for grown in trackedAt.count..(slot + 1) { trackedAt.append(-1) }
+        return slot
+    }
+
+    // The position of `address` among the tracked values, or -1: the newest
+    // value tracked at it. A recycled temporary rejoins at the end with the
+    // address it was first given, so the values are in the order they were
+    // tracked, not by address; `trackedAt` answers without looking at them.
+    function trackedIndex(borrow self, address: KirAddress) -> Int {
+        let slot = (address as Int) - trackedBase
+        if slot < 0 || slot >= trackedAt.count { return -1 }
+        return trackedAt[slot]
+    }
+
+    // Ends the tracked values from `mark` on, already destroyed on every path
+    // that leaves them: they are no longer tracked, and their slots and flags
+    // are kept for later temporaries of the same type, so that storage whose
+    // lifetimes never overlap, such as the arms of one `match`, shares one
+    // slot instead of each taking its own in the frame.
+    function retireTracked(borrow mut self, mark: Int) {
+        for offset in 0..(lifetimes.count - mark) {
+            let retired = lifetimes[lifetimes.count - 1 - offset]
+            trackedAt[(retired.address as Int) - trackedBase] = retired.shadowed
+        }
+        var kept: [TrackedValue] = []
+        for index in 0..lifetimes.count {
+            if index < mark { kept.append(lifetimes[index]) } else { spareTemporaries.append(lifetimes[index]) }
+        }
+        lifetimes = kept
+    }
+
+    // A retired slot for a temporary of `valueType`, tracked again with its
+    // own flag. The caller releases it before writing, as any temporary is.
+    function recycledTemporary(borrow mut self, valueType: Type) -> Optional<KirAddress> {
+        for offset in 0..spareTemporaries.count {
+            let index = spareTemporaries.count - 1 - offset
+            let spare = spareTemporaries[index]
+            if !spare.valueType.equals(valueType) { continue }
+            var remaining: [TrackedValue] = []
+            for other in 0..spareTemporaries.count {
+                if other != index { remaining.append(spareTemporaries[other]) }
+            }
+            spareTemporaries = remaining
+            track(spare.address, spare.valueType, spare.initialized)
+            return .Some(spare.address)
+        }
+        return .None
+    }
+
+    function forgetTracked(borrow mut self, address: KirAddress) {
+        let index = trackedIndex(address)
+        if index >= 0 { kir.store(kir.integer(types.boolean, 0), lifetimes[index].initialized) }
+    }
+
+    // Whether `address` is storage whose initialization is tracked, so what
+    // it holds may already have been moved out.
+    function isTracked(borrow self, address: KirAddress) -> Bool {
+        return trackedIndex(address) >= 0
+    }
+
+    function isTemporaryAddress(borrow self, address: KirAddress) -> Bool {
+        if trackedIndex(address) < 0 { return false }
+        for local in storage { if (local as Int) == (address as Int) { return false } }
+        return true
+    }
+
+    function markInitialized(borrow mut self, address: KirAddress) {
+        let index = trackedIndex(address)
+        if index >= 0 { kir.store(kir.integer(types.boolean, 1), lifetimes[index].initialized) }
+    }
+
+    function releaseTracked(borrow mut self, address: KirAddress) {
+        let index = trackedIndex(address)
+        if index >= 0 { destroyTracked(lifetimes[index]) }
+    }
+
+    function destroyTracked(borrow mut self, tracked: TrackedValue) {
+        let destroy = kir.block()
+        let done = kir.block()
+        kir.branchIf(kir.load(tracked.initialized), destroy, done)
+        enter(destroy)
+        destroyValue(tracked.address, tracked.valueType)
+        kir.store(kir.integer(types.boolean, 0), tracked.initialized)
+        flowInto(done)
+        enter(done)
+    }
+
+    function cleanupValues(borrow mut self) {
+        for offset in 0..lifetimes.count {
+            destroyTracked(lifetimes[lifetimes.count - 1 - offset])
+        }
+        cleanupCells()
+        cleanupGlobals()
+    }
+
+    function destroyValue(borrow mut self, address: KirAddress, valueType: Type) {
+        if !needsArrayCleanup(program, valueType) { return }
+        kir.argument(kir.pointer(address))
+        kir.callVoid(types.destructors[types.helperIndex(program, valueType)])
+    }
+}

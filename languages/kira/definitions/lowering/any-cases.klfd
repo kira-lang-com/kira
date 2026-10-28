@@ -1,0 +1,113 @@
+// The `Any`s of a program built as several units (`separate-packages.klfd`).
+// Each unit boxes the types it names, so each defines one function that
+// destroys and one that compares the values of its own types, under its
+// module's name. The program's unit defines `Any`'s destroy and equality
+// helpers, which try its own cases, then those of every package built apart
+// whose units box `Any`s; the other units only declare the helpers.
+
+extend KirTypes {
+    // This unit's cases first, then those of the packages built apart.
+    function declareAnyCases(borrow mut self, builder: KirModuleBuilder, program: CheckedProgram) {
+        match anyStructure(program) {
+            Some(any) -> {
+                let span = program.structs[any].baseNameSpan
+                anyDestroyCases.append(declareAnyDestroyCases(builder, program, span, program.moduleName))
+                anyEqualCases.append(declareAnyEqualCases(builder, program, span, program.moduleName))
+                for module in program.boxingModules {
+                    anyDestroyCases.append(declareAnyDestroyCases(builder, program, span, module))
+                    anyEqualCases.append(declareAnyEqualCases(builder, program, span, module))
+                }
+            }
+            None -> {}
+        }
+    }
+
+    // Destroys the value at its first parameter when its second numbers one
+    // of the unit's types, and answers whether it did.
+    function declareAnyDestroyCases(borrow self, builder: KirModuleBuilder, program: CheckedProgram, span: Span, module: String) -> KirFunctionBuilder {
+        let name = program.named(span)
+        let signature = kir_signature_new_named(builder, name.start, name.end, boolean, generatedSuffix(builder, "any destroy cases", module))
+        kir_signature_parameter(signature, pointer)
+        kir_signature_parameter(signature, integer64)
+        return kir_signature_declare(signature)
+    }
+
+    // Compares the values at its first two parameters when its third numbers
+    // one of the unit's types: 1 when equal, 0 when not, 2 when the type is
+    // not the unit's.
+    function declareAnyEqualCases(borrow self, builder: KirModuleBuilder, program: CheckedProgram, span: Span, module: String) -> KirFunctionBuilder {
+        let name = program.named(span)
+        let signature = kir_signature_new_named(builder, name.start, name.end, integer64, generatedSuffix(builder, "any equal cases", module))
+        kir_signature_parameter(signature, pointer)
+        kir_signature_parameter(signature, pointer)
+        kir_signature_parameter(signature, integer64)
+        return kir_signature_declare(signature)
+    }
+}
+
+// The struct `Any` is, when the program has one.
+function anyStructure(program: CheckedProgram) -> Optional<Int> {
+    for index in 0..program.structs.count {
+        if isAnyType(program, Type.structure(index)) { return .Some(index) }
+    }
+    return .None
+}
+
+function lowerAnyCases(program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder]) {
+    if types.anyDestroyCases.count == 0 { return }
+    let span = program.structs[anyStructure(program).unwrap()].baseNameSpan
+    var destroy = FunctionLowering.startChecked(program, types, functions, helperChecked(span, Type.boolean()), types.anyDestroyCases[0])
+    destroy.lowerAnyDestroyCases()
+    var equal = FunctionLowering.startChecked(program, types, functions, helperChecked(span, Type.int()), types.anyEqualCases[0])
+    equal.lowerAnyEqualCases()
+}
+
+extend FunctionLowering {
+    function lowerAnyDestroyCases(borrow mut self) {
+        let body = kir.block()
+        enter(body)
+        let data = kir.parameter(0)
+        let id = kir.parameter(1)
+        for index in 0..program.anyTypes.count {
+            let storedType = program.anyTypes[index]
+            if !needsArrayCleanup(program, storedType) { continue }
+            let matched = kir.block()
+            let next = kir.block()
+            kir.branchIf(kir.compare(kirPredicate(.Equal, false), id, kir.integer(types.integer64, program.anyTypeIds[index])), matched, next)
+            enter(matched)
+            destroyValue(kir.typedMemory(data, types.of(storedType)), storedType)
+            kir.returnValue(kir.integer(types.boolean, 1))
+            enter(next)
+        }
+        kir.returnValue(kir.integer(types.boolean, 0))
+        kir.switchTo(entry)
+        kir.branch(body)
+    }
+
+    function lowerAnyEqualCases(borrow mut self) {
+        let body = kir.block()
+        enter(body)
+        let left = kir.parameter(0)
+        let right = kir.parameter(1)
+        let id = kir.parameter(2)
+        for index in 0..program.anyTypes.count {
+            let storedType = program.anyTypes[index]
+            let matched = kir.block()
+            let next = kir.block()
+            kir.branchIf(kir.compare(kirPredicate(.Equal, false), id, kir.integer(types.integer64, program.anyTypeIds[index])), matched, next)
+            enter(matched)
+            let same = equalValues(kir.typedMemory(left, types.of(storedType)), kir.typedMemory(right, types.of(storedType)), storedType)
+            let equal = kir.block()
+            let different = kir.block()
+            kir.branchIf(same, equal, different)
+            enter(equal)
+            kir.returnValue(kir.integer(types.integer64, 1))
+            enter(different)
+            kir.returnValue(kir.integer(types.integer64, 0))
+            enter(next)
+        }
+        kir.returnValue(kir.integer(types.integer64, 2))
+        kir.switchTo(entry)
+        kir.branch(body)
+    }
+}

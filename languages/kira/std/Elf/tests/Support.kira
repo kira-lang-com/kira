@@ -1,0 +1,163 @@
+import Foundation
+
+// Builders for the small executable the Elf cases split. Not tests.
+// A header, one loaded segment over it and `.text`, then `.debug_info`,
+// `.symtab`, `.strtab` and `.shstrtab`.
+
+function sampleNames() -> [UN8] {
+    return "\0.text\0.debug_info\0.symtab\0.strtab\0.shstrtab\0".utf8()
+}
+
+// Appends a section header.
+function appendSection(
+    bytes: borrow mut [UN8],
+    name: Number,
+    kind: Number,
+    flags: Number,
+    offset: Number,
+    size: Number,
+    link: Number
+) {
+    appendSampleWord(bytes, name, 4)
+    appendSampleWord(bytes, kind, 4)
+    appendSampleWord(bytes, flags, 8)
+    appendSampleWord(bytes, flags == 0 ? 0 : 4194304 + offset, 8)
+    appendSampleWord(bytes, offset, 8)
+    appendSampleWord(bytes, size, 8)
+    appendSampleWord(bytes, link, 4)
+    appendSampleWord(bytes, 0, 4)
+    appendSampleWord(bytes, 1, 8)
+    appendSampleWord(bytes, kind == 2 ? 24 : 0, 8)
+}
+
+function appendSampleWord(bytes: borrow mut [UN8], value: Number, count: Number) {
+    for index in 0..count { bytes.append(UN8((value >> (index * 8)) & 255)) }
+}
+
+function sampleElf(type: Number) -> [UN8] {
+    var bytes: [UN8] = [127, 69, 76, 70, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    appendSampleWord(bytes, type, 2)
+    appendSampleWord(bytes, 62, 2)
+    appendSampleWord(bytes, 1, 4)
+    appendSampleWord(bytes, 4194424, 8)
+    appendSampleWord(bytes, 64, 8)
+    appendSampleWord(bytes, 208, 8)
+    appendSampleWord(bytes, 0, 4)
+    appendSampleWord(bytes, 64, 2)
+    appendSampleWord(bytes, 56, 2)
+    appendSampleWord(bytes, 1, 2)
+    appendSampleWord(bytes, 64, 2)
+    appendSampleWord(bytes, 6, 2)
+    appendSampleWord(bytes, 5, 2)
+    // The loaded segment: the headers and `.text`, 128 bytes.
+    appendSampleWord(bytes, 1, 4)
+    appendSampleWord(bytes, 5, 4)
+    appendSampleWord(bytes, 0, 8)
+    appendSampleWord(bytes, 4194304, 8)
+    appendSampleWord(bytes, 4194304, 8)
+    appendSampleWord(bytes, 128, 8)
+    appendSampleWord(bytes, 128, 8)
+    appendSampleWord(bytes, 4096, 8)
+    for index in 0..8 { bytes.append(144) }
+    bytes.appendAll("dbg!".utf8())
+    for index in 0..4 { bytes.append(0) }
+    for index in 0..24 { bytes.append(0) }
+    bytes.append(0)
+    bytes.appendAll(sampleNames())
+    for index in bytes.count..208 { bytes.append(0) }
+    appendSection(bytes, 0, 0, 0, 0, 0, 0)
+    appendSection(bytes, 1, 1, 6, 120, 8, 0)
+    appendSection(bytes, 7, 1, 0, 128, 4, 0)
+    appendSection(bytes, 19, 2, 0, 136, 24, 4)
+    appendSection(bytes, 27, 3, 0, 160, 1, 0)
+    appendSection(bytes, 35, 3, 0, 161, sampleNames().count, 0)
+    return bytes
+}
+
+// Each section of `bytes` as its name and type.
+function sectionListing(bytes: borrow [UN8]) -> String {
+    let image = match readElf(bytes) {
+        Ok(read) -> read
+        Error(failure) -> return elfFailureText(failure)
+    }
+    var parts: [String] = []
+    for section in image.sections { parts.append("\(section.name):\(section.kind)") }
+    return joined(parts, " ")
+}
+
+
+// --- Interface-stub sample ------------------------------------------------
+
+
+// The interface stub of a small shared library made here: `gone`, a local,
+// then `zeta`, a function, `alpha`, an undefined weak symbol, `value`, an
+// object given twice, `slot`, thread-local storage, and `hidden`, a hidden
+// function. A stub leaves out `gone` and `hidden`. It needs `libc.so.6` and is
+// named `libsample.so.1`.
+
+function sampleStrings() -> [UN8] {
+    return "\0libsample.so.1\0libc.so.6\0zeta\0alpha\0value\0slot\0gone\0hidden\0".utf8()
+}
+
+function appendSampleSymbol(
+    bytes: borrow mut [UN8],
+    name: Number,
+    info: Number,
+    other: Number,
+    section: Number,
+    size: Number
+) {
+    appendSampleWord(bytes, name, 4)
+    appendSampleWord(bytes, info, 1)
+    appendSampleWord(bytes, other, 1)
+    appendSampleWord(bytes, section, 2)
+    appendSampleWord(bytes, section == 0 ? 0 : 4096, 8)
+    appendSampleWord(bytes, size, 8)
+}
+
+function appendSampleHeader(bytes: borrow mut [UN8], fields: [Number]) {
+    let widths = [4, 4, 8, 8, 8, 8, 4, 4, 8, 8]
+    for (index, width) in widths.enumerated() { appendSampleWord(bytes, fields[index], width) }
+}
+
+// `.dynsym` at 64, `.dynstr` at 256, `.dynamic` at 320, `.shstrtab` at 416
+// and the section headers at 456.
+function sampleShared() -> [UN8] {
+    var bytes: [UN8] = [127, 69, 76, 70, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    appendSampleWord(bytes, 3, 2)
+    appendSampleWord(bytes, 62, 2)
+    appendSampleWord(bytes, 1, 4)
+    appendSampleWord(bytes, 0, 8)
+    appendSampleWord(bytes, 0, 8)
+    appendSampleWord(bytes, 456, 8)
+    appendSampleWord(bytes, 0, 4)
+    appendSampleWord(bytes, 64, 2)
+    appendSampleWord(bytes, 56, 2)
+    appendSampleWord(bytes, 0, 2)
+    appendSampleWord(bytes, 64, 2)
+    appendSampleWord(bytes, 5, 2)
+    appendSampleWord(bytes, 4, 2)
+    appendSampleSymbol(bytes, 0, 0, 0, 0, 0)
+    appendSampleSymbol(bytes, 48, 2, 0, 1, 16)
+    appendSampleSymbol(bytes, 26, 18, 0, 1, 32)
+    appendSampleSymbol(bytes, 31, 32, 0, 0, 0)
+    appendSampleSymbol(bytes, 37, 17, 0, 1, 8)
+    appendSampleSymbol(bytes, 43, 22, 0, 1, 4)
+    appendSampleSymbol(bytes, 53, 18, 2, 1, 16)
+    appendSampleSymbol(bytes, 37, 17, 0, 1, 8)
+    bytes.appendAll(sampleStrings())
+    for index in bytes.count..320 { bytes.append(0) }
+    for (tag, value) in [(6, 64), (5, 256), (10, 60), (1, 16), (14, 1), (0, 0)] {
+        appendSampleWord(bytes, tag, 8)
+        appendSampleWord(bytes, value, 8)
+    }
+    bytes.appendAll("\0.dynsym\0.dynstr\0.dynamic\0.shstrtab\0".utf8())
+    for index in bytes.count..456 { bytes.append(0) }
+    appendSampleHeader(bytes, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    appendSampleHeader(bytes, [1, 11, 2, 64, 64, 192, 2, 2, 8, 24])
+    appendSampleHeader(bytes, [9, 3, 2, 256, 256, 60, 0, 0, 1, 0])
+    appendSampleHeader(bytes, [17, 6, 2, 320, 320, 96, 2, 0, 8, 16])
+    appendSampleHeader(bytes, [26, 3, 0, 0, 416, 36, 0, 0, 1, 0])
+    return bytes
+}
+

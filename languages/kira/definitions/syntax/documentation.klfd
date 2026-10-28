@@ -1,0 +1,120 @@
+// Doc comments: `///` documents the declaration it directly precedes, `//!`
+// the file it is written in (docs/documentation.md). The lexer records them
+// (`lexer.klfd`); the parser claims each outer one for the next declaration
+// or member, and reports any it cannot claim.
+
+// The text of a doc comment: each line with its marker and one following
+// space removed, the lines joined by line breaks.
+function documentationText(source: String, span: Span) -> String {
+    var lines: [String] = []
+    var lineStart = span.start
+    for index in span.start..span.end {
+        if utf8Byte(source, index) == asciiNewline {
+            lines.append(documentationLine(source, lineStart, index))
+            lineStart = index + 1
+        }
+    }
+    lines.append(documentationLine(source, lineStart, span.end))
+    return joinedWith(lines, "\n")
+}
+
+// The pieces joined in order, `separator` between each pair.
+function joinedWith(pieces: [String], separator: String) -> String {
+    var parts: [String] = []
+    for index in 0..pieces.count {
+        if index > 0 { parts.append(separator) }
+        parts.append(pieces[index])
+    }
+    return joinText(parts)
+}
+
+// One line of a doc comment, from its indentation to `end`, without its
+// marker.
+function documentationLine(source: String, start: Int, end: Int) -> String {
+    var at = start
+    while at < end && isWhitespace(utf8Byte(source, at)) { at += 1 }
+    at += 3
+    if at < end && utf8Byte(source, at) == asciiSpace { at += 1 }
+    if at >= end { return "" }
+    return utf8Slice(source, at, end)
+}
+
+// A documented declaration, as the tree keeps it: what it is, the name it
+// is known by, the type it belongs to when it is a member, and its text.
+// A module's `//!` entry has kind `module` and an empty name.
+struct DocEntry {
+    let kind: String
+    let name: String
+    let owner: String
+    let span: Span
+    let text: String
+}
+
+extend Parser {
+    // The outer doc comments between the previous token and the current one,
+    // which the declaration starting at the current token documents. Each is
+    // taken once. A doc comment that ends before the previous token was not
+    // followed by a declaration: it sits in a body, or after one.
+    function claimDocs(borrow mut self) -> Result<[DocComment], Failure> {
+        let gapStart = position == 0 ? 0 : tokens[position - 1].span.end
+        let gapEnd = current().span.start
+        var claimed: [DocComment] = []
+        while docCursor < docs.count {
+            let doc = docs[docCursor]
+            if doc.inner {
+                docCursor += 1
+                continue
+            }
+            if doc.span.start >= gapEnd { break }
+            if doc.span.end <= gapStart {
+                return .Error(Failure { diagnostic = .DocWithoutDeclaration, span = doc.span })
+            }
+            claimed.append(doc)
+            docCursor += 1
+        }
+        return .Ok(claimed)
+    }
+
+    // Records the text of the doc comments `claimed` as the documentation of
+    // one declaration. Nothing is recorded when no doc comment was claimed.
+    function recordDocs(borrow mut self, claimed: [DocComment], kind: String, name: String, owner: String) {
+        if claimed.count == 0 { return }
+        var pieces: [String] = []
+        for doc in claimed { pieces.append(documentationText(source, doc.span)) }
+        let span = claimed[0].span.to(claimed[claimed.count - 1].span)
+        tree.documentation.append(DocEntry { kind = kind, name = name, owner = owner, span = span, text = joinedWith(pieces, "\n\n") })
+    }
+
+    // The module documentation of the file: its `//!` comments, which must
+    // precede its first token. Any other `//!` is an error.
+    function recordModuleDocs(borrow mut self) -> Result<Bool, Failure> {
+        let first = tokens[0].span.start
+        var pieces: [String] = []
+        var span = Span { file = tokens[0].span.file, start = first, end = first }
+        for doc in docs {
+            if !doc.inner { continue }
+            if doc.span.start >= first {
+                return .Error(Failure { diagnostic = .InnerDocNotFirst, span = doc.span })
+            }
+            pieces.append(documentationText(source, doc.span))
+            span = doc.span
+        }
+        if pieces.count > 0 {
+            tree.documentation.append(DocEntry { kind = "module", name = "", owner = "", span = span, text = joinedWith(pieces, "\n") })
+        }
+        return .Ok(true)
+    }
+
+    // Fails on the first outer doc comment left unclaimed at the end of the
+    // file: one written before a statement or after the last declaration.
+    function checkDocsClaimed(borrow self) -> Result<Bool, Failure> {
+        var index = docCursor
+        while index < docs.count {
+            if !docs[index].inner {
+                return .Error(Failure { diagnostic = .DocWithoutDeclaration, span = docs[index].span })
+            }
+            index += 1
+        }
+        return .Ok(true)
+    }
+}

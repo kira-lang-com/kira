@@ -1,0 +1,33 @@
+import Foundation
+
+// The xz reader against a stream made by the reference `xz`, and a stream
+// cut short, which is refused.
+
+// `printf 'hello hello hello xz\n' | xz -6`, with its CRC-64.
+function helloStreamBytes() -> [UN8] {
+    return [
+        253, 55, 122, 88, 90, 0, 0, 4, 230, 214, 180, 70, 4, 192, 23, 21, 33, 1, 22, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 137, 182, 11, 126, 224, 0, 20, 0, 15, 93, 0, 52, 25, 73, 238, 141, 233,
+        80, 150, 9, 37, 13, 165, 1, 0, 0, 0, 0, 58, 126, 147, 48, 158, 150, 102, 201, 0, 1, 51,
+        21, 240, 52, 48, 185, 31, 182, 243, 125, 1, 0, 0, 0, 0, 4, 89, 90
+    ]
+}
+
+@Test
+function helloStreamDecodes() {
+    let outcome = match decompressXz(helloStreamBytes()) {
+        Ok(bytes) -> textFromBytes(bytes).or("?")
+        Error(failure) -> archiveFailureText(failure)
+    }
+    expect!((outcome) == "hello hello hello xz\n")
+}
+
+@Test
+function helloStreamCutShortIsRefused() {
+    let cut = byteRun(helloStreamBytes(), 0, 40)
+    let outcome = match decompressXz(move cut) {
+        Ok(bytes) -> "read \(bytes.count)"
+        Error(failure) -> archiveFailureText(failure)
+    }
+    expect!((outcome) == "malformed: an LZMA2 chunk runs past the end")
+}

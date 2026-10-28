@@ -1,0 +1,381 @@
+// The parser: the preprocessed tokens of one translation unit to its tree.
+//
+// Every production returns its node or the failure that stops parsing,
+// which `try` hands up. This file holds the cursor and the declarations at
+// file and namespace scope; types, statements and expressions follow in
+// their own files. The parser knows which names are types (the built-in
+// spellings, structs, aliases and the template parameters in scope), as a
+// C++ parser must to tell `T(x)` from a call and `(T)x` from a product.
+
+function loadTranslationUnit(session: Session) -> Result<SyntaxTree, Failure> {
+    let path = sourceName()
+    let tokens = try preprocess(session, path, readFile(session, path))
+    var parser = Parser {
+        tokens = tokens, position = 0, tree = SyntaxTree.empty(tokens[tokens.count - 1].span.file), prefix = "", typeNames = [],
+        templateNames = []
+    }
+    while !parser.at(.End) {
+        try parser.declaration()
+    }
+    return .Ok(parser.tree)
+}
+
+struct Parser {
+    var tokens: [Token]
+    var position: Int
+    var tree: SyntaxTree
+    var prefix: String
+    var typeNames: [String]
+    var templateNames: [String]
+
+    function token(borrow self) -> Token {
+        return tokens[position]
+    }
+
+    function peek(borrow self, ahead: Int) -> Token {
+        let index = position + ahead
+        if index >= tokens.count { return tokens[tokens.count - 1] }
+        return tokens[index]
+    }
+
+    function at(borrow self, kind: TokenKind) -> Bool {
+        return token().kind == kind
+    }
+
+    function atWord(borrow self, word: String) -> Bool {
+        return at(.Word) && token().text == word
+    }
+
+    function advance(borrow mut self) -> Token {
+        let taken = token()
+        if taken.kind != .End { position += 1 }
+        return taken
+    }
+
+    function eat(borrow mut self, kind: TokenKind) -> Bool {
+        if !at(kind) { return false }
+        advance()
+        return true
+    }
+
+    function eatWord(borrow mut self, word: String) -> Bool {
+        if !atWord(word) { return false }
+        advance()
+        return true
+    }
+
+    function fail(borrow self, diagnostic: Diagnostic, span: Span) -> Failure {
+        return Failure { diagnostic = diagnostic, span = span }
+    }
+
+    function unexpected(borrow self) -> Failure {
+        return fail(.Unexpected, token().span)
+    }
+
+    function expect(borrow mut self, kind: TokenKind) -> Result<Token, Failure> {
+        if at(kind) { return .Ok(advance()) }
+        return .Error(unexpected())
+    }
+
+    function expectWord(borrow mut self, word: String) -> Result<Token, Failure> {
+        if atWord(word) { return .Ok(advance()) }
+        return .Error(unexpected())
+    }
+
+    // A declared name: a word no keyword claims.
+    function name(borrow mut self) -> Result<Token, Failure> {
+        if !at(.Word) || isReserved(token().text) { return .Error(unexpected()) }
+        return .Ok(advance())
+    }
+
+    // The span from `start` to the end of the last token taken.
+    function since(borrow self, start: Span) -> Span {
+        var end = start.end
+        if position > 0 { end = tokens[position - 1].span.end }
+        return Span { file = start.file, start = start.start, end = end }
+    }
+
+    function qualified(borrow self, written: String) -> String {
+        if utf8Count(prefix) == 0 { return written }
+        return joinText([prefix, "_", written])
+    }
+
+    function declaration(borrow mut self) -> Result<Bool, Failure> {
+        let start = token().span
+        if eat(.Semicolon) { return .Ok(true) }
+        if !at(.Word) && !at(.LeftBracket) { return .Error(fail(.NotADeclaration, start)) }
+        if atWord("using") { return usingDeclaration() }
+        if atWord("typedef") { return typedefDeclaration() }
+        if atWord("namespace") { return namespaceDeclaration() }
+        if atWord("enum") || atWord("union") { return .Error(fail(.UnsupportedConstruct, start)) }
+        if atWord("struct") || atWord("class") {
+            let index = try structDeclaration()
+            tree.items.append(Item { kind = .StructItem, index = index })
+            return .Ok(true)
+        }
+        var templateParameters: [String] = []
+        if atWord("template") { templateParameters = try templateHead() }
+        let attributes = try attributeList()
+        return functionOrGlobal(start, templateParameters, attributes)
+    }
+
+    // `using namespace N;` or `using Name = Type;`.
+    function usingDeclaration(borrow mut self) -> Result<Bool, Failure> {
+        let start = advance().span
+        if eatWord("namespace") {
+            let opened = try namePath()
+            try expect(.Semicolon)
+            if opened != "metal" && opened != "simd" { tree.usings.append(opened) }
+            return .Ok(true)
+        }
+        let declared = try name()
+        try expect(.Equals)
+        let typeSyntax = try typeName()
+        try expect(.Semicolon)
+        return .Ok(addAlias(declared.text, typeSyntax, since(start)))
+    }
+
+    function typedefDeclaration(borrow mut self) -> Result<Bool, Failure> {
+        let start = advance().span
+        let typeSyntax = try typeName()
+        let declared = try name()
+        try expect(.Semicolon)
+        return .Ok(addAlias(declared.text, typeSyntax, since(start)))
+    }
+
+    function addAlias(borrow mut self, written: String, typeSyntax: Int, span: Span) -> Bool {
+        let aliasName = qualified(written)
+        typeNames.append(aliasName)
+        tree.aliases.append(AliasDeclaration { name = aliasName, prefix = prefix, typeSyntax = typeSyntax, span = span })
+        tree.items.append(Item { kind = .AliasItem, index = tree.aliases.count - 1 })
+        return true
+    }
+
+    function namespaceDeclaration(borrow mut self) -> Result<Bool, Failure> {
+        advance()
+        let declared = try name()
+        let outer = prefix
+        prefix = qualified(declared.text)
+        tree.namespaces.append(NamespaceScope { prefix = prefix, parent = outer })
+        try expect(.LeftBrace)
+        while !at(.RightBrace) && !at(.End) {
+            try declaration()
+        }
+        try expect(.RightBrace)
+        prefix = outer
+        return .Ok(true)
+    }
+
+    // `template <typename T, class U>`; a value parameter, an empty list
+    // (a specialization) or a class template is refused.
+    function templateHead(borrow mut self) -> Result<[String], Failure> {
+        let start = advance().span
+        try expect(.Less)
+        var names: [String] = []
+        while !at(.Greater) && !at(.End) {
+            if !eatWord("typename") && !eatWord("class") { return .Error(fail(.ClassTemplate, since(start))) }
+            names.append((try name()).text)
+            if !eat(.Comma) { break }
+        }
+        try expect(.Greater)
+        if names.count == 0 || atWord("struct") || atWord("class") {
+            return .Error(fail(.ClassTemplate, since(start)))
+        }
+        return .Ok(names)
+    }
+
+    function structDeclaration(borrow mut self) -> Result<Int, Failure> {
+        let start = advance().span
+        let declared = try name()
+        let structName = qualified(declared.text)
+        if at(.Colon) || at(.Semicolon) { return .Error(fail(.UnsupportedStruct, since(start))) }
+        typeNames.append(structName)
+        try expect(.LeftBrace)
+        var members: [MemberDeclaration] = []
+        while !at(.RightBrace) && !at(.End) {
+            try memberDeclarations(members)
+        }
+        try expect(.RightBrace)
+        try expect(.Semicolon)
+        tree.structs.append(StructDeclaration {
+            name = structName, prefix = prefix, members = members, span = since(start)
+        })
+        return .Ok(tree.structs.count - 1)
+    }
+
+    // `Type a [[attr]], b[4];`. Anything a struct holds besides data
+    // members is refused.
+    function memberDeclarations(borrow mut self, members: borrow mut [MemberDeclaration]) -> Result<Bool, Failure> {
+        let start = token().span
+        let refused = atWord("public") || atWord("private") || atWord("protected") || atWord("static")
+            || atWord("struct") || atWord("using") || atWord("typedef") || atWord("template")
+            || atWord("virtual") || atWord("friend") || atWord("operator")
+        if refused { return .Error(fail(.UnsupportedStruct, start)) }
+        let base = try typeName()
+        while true {
+            let memberStart = token().span
+            let declared = try declarator(base)
+            if at(.LeftParen) || at(.Colon) || at(.Equals) || at(.LeftBrace) {
+                return .Error(fail(.UnsupportedStruct, since(start)))
+            }
+            let attributes = try attributeList()
+            members.append(MemberDeclaration {
+                name = declared.name, typeSyntax = declared.typeSyntax, attributes = attributes,
+                span = since(memberStart)
+            })
+            if !eat(.Comma) { break }
+        }
+        try expect(.Semicolon)
+        return .Ok(true)
+    }
+
+    // Zero or more `[[a, b(x)]]` groups.
+    function attributeList(borrow mut self) -> Result<[Attribute], Failure> {
+        var attributes: [Attribute] = []
+        while at(.LeftBracket) && peek(1).kind == .LeftBracket {
+            advance()
+            advance()
+            while !at(.RightBracket) && !at(.End) {
+                let start = token().span
+                let attributeName = try namePath()
+                var arguments: [Int] = []
+                if eat(.LeftParen) {
+                    while !at(.RightParen) && !at(.End) {
+                        arguments.append(try assignment())
+                        if !eat(.Comma) { break }
+                    }
+                    try expect(.RightParen)
+                }
+                attributes.append(Attribute { name = attributeName, arguments = arguments, span = since(start) })
+                if !eat(.Comma) { break }
+            }
+            try expect(.RightBracket)
+            try expect(.RightBracket)
+        }
+        return .Ok(attributes)
+    }
+
+    // A function, a prototype, or a program-scope constant, after any
+    // template head and leading attributes.
+    function functionOrGlobal(borrow mut self, start: Span, templateParameters: [String], leading: [Attribute]) -> Result<Bool, Failure> {
+        var stage: StageWord = .NoStage
+        var constexpr = false
+        var attributes = leading
+        while true {
+            if eatWord("static") || eatWord("inline") {
+                continue
+            }
+            if eatWord("constexpr") {
+                constexpr = true
+                continue
+            }
+            if atWord("extern") { return .Error(fail(.UnsupportedConstruct, token().span)) }
+            if eatWord("vertex") {
+                stage = .VertexStage
+            } else if eatWord("fragment") {
+                stage = .FragmentStage
+            } else if eatWord("kernel") {
+                stage = .KernelStage
+            } else if atWord("mesh") || atWord("object") {
+                return .Error(fail(.MeshShader, token().span))
+            } else if atWord("visible") || atWord("intersection") || atWord("stitchable") {
+                return .Error(fail(.FunctionTable, token().span))
+            } else {
+                break
+            }
+            let more = try attributeList()
+            for attribute in more {
+                attributes.append(attribute)
+            }
+        }
+        templateNames = templateParameters
+        let result = try typeName()
+        let declared = try name()
+        if at(.LeftParen) {
+            let made = try functionRest(declared, start, stage, result, templateParameters, attributes)
+            templateNames = []
+            tree.functions.append(made)
+            tree.items.append(Item { kind = .FunctionItem, index = tree.functions.count - 1 })
+            return .Ok(true)
+        }
+        templateNames = []
+        if templateParameters.count > 0 || stage != .NoStage { return .Error(unexpected()) }
+        let global = try globalRest(declared, start, result, constexpr)
+        tree.globals.append(global)
+        tree.items.append(Item { kind = .GlobalItem, index = tree.globals.count - 1 })
+        return .Ok(true)
+    }
+
+    function functionRest(borrow mut self, declared: Token, start: Span, stage: StageWord, result: Int, templateParameters: [String], leading: [Attribute]) -> Result<FunctionDeclaration, Failure> {
+        try expect(.LeftParen)
+        var parameters: [ParameterDeclaration] = []
+        if atWord("void") && peek(1).kind == .RightParen { advance() }
+        while !at(.RightParen) && !at(.End) {
+            let parameterStart = token().span
+            let base = try typeName()
+            var parameterName = ""
+            var typeSyntax = base
+            if !at(.Comma) && !at(.RightParen) && !(at(.LeftBracket) && peek(1).kind == .LeftBracket) {
+                let parameter = try declarator(base)
+                parameterName = parameter.name
+                typeSyntax = parameter.typeSyntax
+            }
+            let attributes = try attributeList()
+            if at(.Equals) { return .Error(fail(.UnsupportedConstruct, token().span)) }
+            parameters.append(ParameterDeclaration {
+                name = parameterName, typeSyntax = typeSyntax, attributes = attributes, span = since(parameterStart)
+            })
+            if !eat(.Comma) { break }
+        }
+        try expect(.RightParen)
+        var attributes = leading
+        let trailing = try attributeList()
+        for attribute in trailing {
+            attributes.append(attribute)
+        }
+        var body: [Int] = []
+        var defined = false
+        if !eat(.Semicolon) {
+            body = try block()
+            defined = true
+        }
+        return .Ok(FunctionDeclaration {
+            name = qualified(declared.text), prefix = prefix, stage = stage, result = result,
+            parameters = parameters, templateParameters = templateParameters, attributes = attributes,
+            body = body, defined = defined, span = since(start)
+        })
+    }
+
+    // `constant T name = value;`, `constexpr T name = value;` or
+    // `constant T name [[function_constant(n)]];`. A program-scope variable
+    // lives in the constant address space.
+    function globalRest(borrow mut self, declared: Token, start: Span, typeSyntax: Int, constexpr: Bool) -> Result<GlobalDeclaration, Failure> {
+        var written = tree.types[typeSyntax]
+        if written.name == "sampler" && constexpr { return .Error(fail(.ConstexprSampler, since(start))) }
+        if written.space != .ConstantSpace && !constexpr { return .Error(fail(.UnsupportedConstruct, since(start))) }
+        var extents: [Int] = []
+        while at(.LeftBracket) && peek(1).kind != .LeftBracket {
+            advance()
+            extents.append(try expression())
+            try expect(.RightBracket)
+        }
+        let attributes = try attributeList()
+        var value = -1
+        if eat(.Equals) {
+            value = try initializer()
+        } else if at(.LeftBrace) {
+            value = try initializer()
+        }
+        try expect(.Semicolon)
+        var typed = typeSyntax
+        if extents.count > 0 {
+            written.extents = extents
+            tree.types.append(written)
+            typed = tree.types.count - 1
+        }
+        return .Ok(GlobalDeclaration {
+            name = qualified(declared.text), prefix = prefix, typeSyntax = typed, value = value,
+            attributes = attributes, span = since(start)
+        })
+    }
+}

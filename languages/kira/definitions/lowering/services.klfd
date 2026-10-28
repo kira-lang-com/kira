@@ -1,0 +1,22 @@
+// Kernel services a lowered program calls. Each is a foreign declaration of
+// a `klfsvc_*` symbol that every platform's KLF runtime implements, so the
+// program names no platform library.
+
+extend KirTypes {
+    function declareOutputService(borrow mut self, builder: KirModuleBuilder, program: CheckedProgram) {
+        for expression in program.expressions {
+            if expression.operation.printed().isNone() { continue }
+            // KIR names the declaration after source text, so it borrows
+            // the `print` that starts the call.
+            let callee = expression.span
+            let name = program.named(Span { file = callee.file, start = callee.start, end = callee.start + utf8Count("print") })
+            let signature = kir_signature_new_named(builder, name.start, name.end, integer64, 0)
+            let symbol = "klfsvc_io_write"
+            for index in 0..utf8Count(symbol) { kir_signature_name_byte(signature, utf8Byte(symbol, index)) }
+            kir_signature_parameter(signature, pointer)
+            kir_signature_parameter(signature, integer64)
+            output = .Some(kir_signature_declare(signature))
+            return
+        }
+    }
+}

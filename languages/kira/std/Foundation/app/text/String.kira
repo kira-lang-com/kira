@@ -1,0 +1,422 @@
+import Heap
+
+// The layout of a string, as the heap and the compiler's string runtime read it:
+// `count` and `capacity` are stored as `Int`, which is the layout seam.
+struct String {
+    var data: RawPtr
+    var count: Int
+    var capacity: Int
+    var ops: RawPtr
+
+    function asSyntax(borrow self) -> Syntax { return Syntax { text = self } }
+
+    // The byte at `index`, as a number.
+    function charAt(borrow self, index: Number) -> Number {
+        return Number(byteAt(index))
+    }
+
+    // The byte at `index`.
+    function byteAt(borrow self, index: Number) -> UN8 {
+        return storedByte(self, index)
+    }
+
+    // The bytes from `start` up to, not including, `end`.
+    function substring(borrow self, start: Number, end: Number) -> String {
+        return slice(self, start, end)
+    }
+
+    function split(borrow self, separator: borrow String) -> [String] {
+        if separator.count == 0 { return [self] }
+        var parts: [String] = []
+        var start: Number = 0
+        var index: Number = 0
+        while index + separator.count <= count {
+            if bytesMatch(self, index, separator) {
+                parts.append(slice(self, start, index))
+                index = index + separator.count
+                start = index
+            } else {
+                index = index + 1
+            }
+        }
+        parts.append(slice(self, start, count))
+        return parts
+    }
+
+    function startsWith(borrow self, prefix: borrow String) -> Bool {
+        return prefix.count <= count && bytesMatch(self, 0, prefix)
+    }
+
+    function endsWith(borrow self, suffix: borrow String) -> Bool {
+        return suffix.count <= count && bytesMatch(self, count - suffix.count, suffix)
+    }
+
+    // Where `part` first starts, or nothing when the text does not hold it.
+    function indexOf(borrow self, part: borrow String) -> Number? {
+        if part.count > count { return .None }
+        for offset in 0..(count - part.count + 1) {
+            if bytesMatch(self, offset, part) { return .Some(offset) }
+        }
+        return .None
+    }
+
+    // Where `part` first appears at or after `from`.
+    function indexOf(borrow self, part: borrow String, from: Number) -> Number? {
+        if from < 0 || part.count > count { return .None }
+        for offset in from..(count - part.count + 1) {
+            if bytesMatch(self, offset, part) { return .Some(offset) }
+        }
+        return .None
+    }
+
+    // Where `part` last starts, or nothing when the text does not hold it.
+    function lastIndexOf(borrow self, part: borrow String) -> Number? {
+        if part.count > count { return .None }
+        var offset = count - part.count
+        while offset >= 0 {
+            if bytesMatch(self, offset, part) { return .Some(offset) }
+            offset -= 1
+        }
+        return .None
+    }
+
+    // The text before the first `part`, or all of it when `part` is absent.
+    function before(borrow self, part: borrow String) -> String {
+        match indexOf(part) {
+            Some(at) -> return substring(0, at)
+            None -> return self
+        }
+    }
+
+    function contains(borrow self, part: borrow String) -> Bool {
+        return indexOf(part).isSome()
+    }
+
+    // Without the white space at either end, as Unicode's White_Space
+    // property names it.
+    function trim(borrow self) -> String {
+        var start: Number = 0
+        while start < count {
+            let width = scalarWidthAt(self, start)
+            if !isWhiteSpaceScalar(scalarAt(self, start, width)) { break }
+            start = start + width
+        }
+        var end = count
+        while end > start {
+            let lead = scalarStartBefore(self, end)
+            if !isWhiteSpaceScalar(scalarAt(self, lead, end - lead)) { break }
+            end = lead
+        }
+        return slice(self, start, end)
+    }
+
+    // Without its last Unicode scalar; empty text stays empty.
+    function dropLastScalar(borrow self) -> String {
+        if count == 0 { return slice(self, 0, 0) }
+        return slice(self, 0, scalarStartBefore(self, count))
+    }
+
+    // The number the text spells, trimmed, as `Number(text)` reads one, or
+    // nothing when it spells none.
+    function toNumber(borrow self) -> Number? {
+        return parseNumber(trim())
+    }
+
+    function isEmpty(borrow self) -> Bool {
+        return count == 0
+    }
+
+    function append(borrow mut self, other: borrow String) {
+        self = concatStrings(self, other)
+    }
+}
+
+// The byte at `index`, for Foundation's own scans, which walk the stored
+// count and so skip the conversion a `Number` index takes.
+function storedByte(text: borrow String, index: Number) -> UN8 {
+    if index < 0 || index >= text.count { runtimeTrap() }
+    return UN8(heapReadByte(heapOffset(text.data, index)))
+}
+
+function slice(text: borrow String, start: Number, end: Number) -> String {
+    if start < 0 || end < start || end > text.count { runtimeTrap() }
+    return syntaxTextSlice(text, start, end)
+}
+
+// Whether `part`'s bytes stand in `text` from `offset` on.
+function bytesMatch(text: borrow String, offset: Number, part: borrow String) -> Bool {
+    if offset + part.count > text.count { return false }
+    for index in 0..part.count {
+        if storedByte(text, offset + index) != storedByte(part, index) { return false }
+    }
+    return true
+}
+
+// The byte length of the UTF-8 scalar starting at `index`, read from its
+// lead byte.
+function scalarWidthAt(text: borrow String, index: Number) -> Number {
+    let lead = storedByte(text, index)
+    if lead < 0x80 { return 1 }
+    if lead < 0xE0 { return 2 }
+    if lead < 0xF0 { return 3 }
+    return 4
+}
+
+// Where the scalar ending at `end` starts: back over its continuation bytes,
+// which are `10xxxxxx`.
+function scalarStartBefore(text: borrow String, end: Number) -> Number {
+    var start = end - 1
+    while start > 0 && (storedByte(text, start) & 0xC0) == 0x80 {
+        start = start - 1
+    }
+    return start
+}
+
+function scalarAt(text: borrow String, index: Number, width: Number) -> Number {
+    let lead = Number(storedByte(text, index))
+    if width == 1 { return lead }
+    var value = lead & (127 >> width)
+    for offset in 1..width {
+        value = (value << 6) | (Number(storedByte(text, index + offset)) & 63)
+    }
+    return value
+}
+
+// Unicode's White_Space property.
+function isWhiteSpaceScalar(scalar: Number) -> Bool {
+    match scalar {
+        0x09..0x0E -> return true
+        0x20, 0x85, 0xA0, 0x1680 -> return true
+        0x2000..0x200B -> return true
+        0x2028, 0x2029, 0x202F, 0x205F, 0x3000 -> return true
+        else -> return false
+    }
+}
+
+// The compiler's string runtime calls these by name, so they keep the
+// layout of the values it passes: `concatStrings`, `equalStrings`,
+// `stringFromInteger`, `stringFromBoolean`, `stringFromUnsigned`,
+// `stringFromFloat`, `orderStrings` and `hashStringBytes`.
+function concatStrings(left: borrow String, right: borrow String) -> String {
+    let count = left.count + right.count
+    let data = makeArrayData(count)
+    heapCopyBytes(data, left.data, left.count)
+    heapCopyBytes(heapOffset(data, left.count), right.data, right.count)
+    return String { data = data, count = count, capacity = count, ops = left.ops }
+}
+
+function equalStrings(left: borrow String, right: borrow String) -> Bool {
+    if left.count != right.count { return false }
+    for index in 0..left.count {
+        if heapReadByte(heapOffset(left.data, index)) != heapReadByte(
+            heapOffset(right.data, index)
+        ) {
+            return false
+        }
+    }
+    return true
+}
+
+// The byte order of two strings, as `<` and `compare` read it: -1, 0 or 1.
+function orderStrings(left: borrow String, right: borrow String) -> Int {
+    let shared = left.count < right.count ? left.count : right.count
+    for index in 0..shared {
+        let first = heapReadByte(heapOffset(left.data, index))
+        let second = heapReadByte(heapOffset(right.data, index))
+        if first < second { return -1 }
+        if first > second { return 1 }
+    }
+    if left.count < right.count { return -1 }
+    if left.count > right.count { return 1 }
+    return 0
+}
+
+// `accumulator` with the string's bytes folded in, as `hash` folds them:
+// FNV-1a, a byte at a time.
+function hashStringBytes(accumulator: Int, text: borrow String) -> Int {
+    var folded = accumulator
+    for index in 0..text.count {
+        folded = wrappingMul(
+            folded ^ Int(heapReadByte(heapOffset(text.data, index))),
+            1099511628211
+        )
+    }
+    return folded
+}
+
+function stringFromInteger(value: Int) -> String {
+    let empty: String = ""
+    var remaining = value
+    var digits: Int = 1
+    while remaining <= -10 || remaining >= 10 {
+        remaining = remaining / 10
+        digits = digits + 1
+    }
+    let negative = value < 0
+    let count = digits + (negative ? 1 : 0)
+    let data = makeArrayData(count)
+    remaining = value
+    for offset in 0..digits {
+        let digit = remaining % 10
+        let magnitude = digit < 0 ? -digit : digit
+        heapWriteByte(heapOffset(data, count - offset - 1), U8(48 + magnitude))
+        remaining = remaining / 10
+    }
+    if negative { heapWriteByte(data, U8(45)) }
+    return String { data = data, count = count, capacity = count, ops = empty.ops }
+}
+
+function stringFromUnsigned(value: U64) -> String {
+    let empty: String = ""
+    var remaining = value
+    var digits: Int = 1
+    while remaining >= U64(10) {
+        remaining = remaining / U64(10)
+        digits = digits + 1
+    }
+    let data = makeArrayData(digits)
+    remaining = value
+    for offset in 0..digits {
+        heapWriteByte(heapOffset(data, digits - offset - 1), U8(U64(48) + remaining % U64(10)))
+        remaining = remaining / U64(10)
+    }
+    return String { data = data, count = digits, capacity = digits, ops = empty.ops }
+}
+
+function stringFromBoolean(value: Bool) -> String {
+    if value { return "true" }
+    return "false"
+}
+
+namespace Unicode {
+    // The last code point.
+    let last: Number = 0x10FFFF
+    // UTF-16's surrogate halves, which name no scalar.
+    let surrogates: Number = 0xD800
+    let surrogatesEnd: Number = 0xE000
+    // Where the low halves start: below are the high ones.
+    let lowSurrogates: Number = 0xDC00
+    // The first scalar past UTF-16's single units, where a pair starts naming.
+    let supplementary: Number = 0x10000
+    // U+FFFD, what a decoder writes for bytes that spell no scalar.
+    let replacement: Number = 0xFFFD
+}
+
+// Whether `codepoint` is the first half of a UTF-16 surrogate pair.
+function isHighSurrogate(codepoint: Number) -> Bool {
+    return codepoint >= Unicode.surrogates && codepoint < Unicode.lowSurrogates
+}
+
+// Whether `codepoint` is the second half of a UTF-16 surrogate pair.
+function isLowSurrogate(codepoint: Number) -> Bool {
+    return codepoint >= Unicode.lowSurrogates && codepoint < Unicode.surrogatesEnd
+}
+
+// The scalar a high and a low surrogate spell together.
+function surrogatePair(high: Number, low: Number) -> Number {
+    return Unicode.supplementary + ((high - Unicode.surrogates) << 10) + (
+        low - Unicode.lowSurrogates
+    )
+}
+
+// Bytes the ASCII grammars Foundation reads are written in, as the numbers
+// they stand for.
+namespace Ascii {
+    let tab: Number = 0x09
+    let space: Number = 0x20
+    let quote: Number = 0x22
+    let plus: Number = 0x2B
+    let comma: Number = 0x2C
+    let minus: Number = 0x2D
+    let dot: Number = 0x2E
+    let slash: Number = 0x2F
+    let zero: Number = 0x30
+    let five: Number = 0x35
+    let nine: Number = 0x39
+    let colon: Number = 0x3A
+    let upperA: Number = 0x41
+    let upperE: Number = 0x45
+    let upperF: Number = 0x46
+    let openBracket: Number = 0x5B
+    let backslash: Number = 0x5C
+    let closeBracket: Number = 0x5D
+    let lowerA: Number = 0x61
+    let lowerE: Number = 0x65
+    let lowerF: Number = 0x66
+    let lowerU: Number = 0x75
+    let lowerX: Number = 0x78
+    let openBrace: Number = 0x7B
+    let closeBrace: Number = 0x7D
+}
+
+function isAsciiDigit(byte: Number) -> Bool {
+    return byte >= Ascii.zero && byte <= Ascii.nine
+}
+
+// The value of one hex digit, either case.
+function hexDigitValue(byte: Number) -> Number? {
+    match byte {
+        0x30..0x3A -> return .Some(byte - Ascii.zero)
+        0x41..0x47 -> return .Some(byte - Ascii.upperA + 10)
+        0x61..0x67 -> return .Some(byte - Ascii.lowerA + 10)
+        else -> return .None
+    }
+}
+
+// The text of one Unicode scalar, or nothing for a number that names none.
+function scalarText(codepoint: Number) -> String? {
+    if codepoint < 0 || codepoint > Unicode.last || (
+        codepoint >= Unicode.surrogates && codepoint < Unicode.surrogatesEnd
+    ) { return .None }
+    return .Some(encodedScalar(codepoint))
+}
+
+// A scalar's UTF-8 bytes: one below 0x80, else a lead byte holding the
+// count in its high bits and six bits in each continuation byte.
+function encodedScalar(codepoint: Number) -> String {
+    let empty: String = ""
+    let count: Number = codepoint < 0x80 ? 1 : (
+        codepoint < 0x800 ? 2 : (codepoint < 0x10000 ? 3 : 4)
+    )
+    let data = makeArrayData(count)
+    if count == 1 {
+        heapWriteByte(data, codepoint)
+    } else {
+        let lead = count == 2 ? 0xC0 : (count == 3 ? 0xE0 : 0xF0)
+        heapWriteByte(data, lead | (codepoint >> ((count - 1) * 6)))
+        for index in 1..count {
+            let shift = (count - index - 1) * 6
+            heapWriteByte(heapOffset(data, index), 0x80 | ((codepoint >> shift) & 0x3F))
+        }
+    }
+    return String { data = data, count = count, capacity = count, ops = empty.ops }
+}
+
+@Service("klfsvc_text_float")
+function kernelFloatText(bits: U64, destination: RawPtr, capacity: Int) -> Int
+
+// The shortest decimal that reads back as `value`, written without an
+// exponent: `2.0` is `2`, a third is `0.3333333333333333`.
+function stringFromFloat(value: Float) -> String {
+    let empty: String = ""
+    let bits = floatToBits(value)
+    var capacity: Int = 32
+    var data = makeArrayData(capacity)
+    var count = kernelFloatText(bits, data, capacity)
+    if count > capacity {
+        capacity = count
+        data = resizeArrayData(data, capacity)
+        count = kernelFloatText(bits, data, capacity)
+    }
+    return String { data = data, count = count, capacity = capacity, ops = empty.ops }
+}
+
+// `parts` one after another with `separator` between each two.
+function joined(parts: borrow [String], separator: borrow String) -> String {
+    var text = ""
+    for (index, part) in parts.enumerated() {
+        if index > 0 { text += separator }
+        text += part
+    }
+    return text
+}

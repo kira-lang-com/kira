@@ -1,0 +1,68 @@
+import Foundation
+
+/// A family of shapes, each reporting its area.
+construct Shape {
+    /// The area in square units.
+    @Required
+    function area(borrow self) -> Number
+}
+
+/// A square with the side it is built from.
+Shape Square {
+    /// The side in metres.
+    let side: Number
+
+    /// The area of the square.
+    function area(borrow self) -> Number {
+        return side * side
+    }
+}
+
+/// Something with a label for the user.
+trait Named {
+    /// The label shown to the user.
+    function label(borrow self) -> String
+}
+
+/// The limits every price respects.
+namespace Limits {
+    /// The largest amount.
+    let maximum = 1000
+}
+
+//// The rule below is a plain comment: it documents nothing.
+/// The currency every price is quoted in.
+let currency = "EUR"
+
+/// A price in whole units.
+struct Price: Named {
+    /// The amount in whole units.
+    let amount: Number
+
+    /// The label of a price.
+    function label(borrow self) -> String {
+        return "price"
+    }
+}
+
+/// Doubles the amount of a price.
+extend Price {
+    /// The amount, twice over.
+    function doubled(borrow self) -> Number {
+        return amount * 2
+    }
+}
+
+/// A size of text, written as its code.
+enum Size: UN8 {
+    /// Small text.
+    Small = 1
+    /// Large text.
+    Large = 2
+}
+
+@Main
+function main() {
+    let price = Price { amount = Limits.maximum }
+    print(price.doubled())
+}

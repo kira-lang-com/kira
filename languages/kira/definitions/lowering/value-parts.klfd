@@ -1,0 +1,233 @@
+// The arms of `value` and `address` that take more than a line: each runs one
+// operation and answers its value or its storage.
+
+extend FunctionLowering {
+    // What an operation run for its effect answers; nothing reads it.
+    function noValue(borrow self) -> KirValue {
+        return kir.integer(types.integer64, 0)
+    }
+
+    function sequenceValue(borrow mut self, body: [Int], result: Int) -> KirValue {
+        let unused = noValue()
+        blockStatements(body)
+        if !open { return unused }
+        return value(result)
+    }
+
+    function sequenceAddress(borrow mut self, body: [Int], result: Int, valueType: Type) -> KirAddress {
+        let unused = temporary(valueType)
+        blockStatements(body)
+        if !open { return unused }
+        return address(result)
+    }
+
+    function floatLiteralValue(borrow mut self, valueType: Type, written: Span) -> KirValue {
+        let span = program.named(written)
+        return kir_value_float_literal(kir, types.of(valueType), span.start, span.end)
+    }
+
+    function globalValue(borrow mut self, index: Int, global: Int) -> KirValue {
+        match program.constantGlobal(global) {
+            Some(constant) -> return value(constant)
+            None -> return kir.load(address(index))
+        }
+    }
+
+    function globalReadAddress(borrow mut self, global: Int) -> KirAddress {
+        match program.constantGlobal(global) {
+            Some(constant) -> return address(constant)
+            None -> return globalAddress(global)
+        }
+    }
+
+    function awaitedValue(borrow mut self, task: Int, typeId: Int, valueType: Type, span: Span) -> KirValue {
+        let payload = awaitTask(task, typeId, valueType, span)
+        let source = program.anyTypeOf(typeId)
+        let unboxed = kir.load(payload)
+        if source.equals(valueType) { return unboxed }
+        if source.kind == .Floating {
+            return kir.convert(9, unboxed, types.of(valueType))
+        }
+        if !source.fitsIn(valueType) {
+            trapUnlessReported(inRange(unboxed, source, valueType), span, narrowingReport(source, valueType), [wideOperand(unboxed, source)])
+        }
+        return resize(unboxed, source, valueType)
+    }
+
+    function taskEffect(borrow mut self, action: Int, task: Int) -> KirValue {
+        taskAction(action, task)
+        return noValue()
+    }
+
+    // `runtimeTrap()`, or a check the checker wrote as one, at `span`: a trap
+    // whose report says which.
+    function trapValue(borrow mut self, cause: TrapCause, span: Span) -> KirValue {
+        let unused = noValue()
+        trapReported(span, causeReport(cause), [])
+        open = false
+        return unused
+    }
+
+    function triedValue(borrow mut self, operand: Int, destination: Optional<Int>, valueType: Type) -> KirValue {
+        let place = tryAddress(operand, destination, valueType)
+        if valueType.kind == .Void { return noValue() }
+        return kir.load(place)
+    }
+
+    function sendEffect(borrow mut self, channel: Int, sent: Int) -> KirValue {
+        sendChannel(channel, sent)
+        return noValue()
+    }
+
+    function closeEffect(borrow mut self, channel: Int) -> KirValue {
+        closeChannel(channel)
+        return noValue()
+    }
+
+    function freeEffect(borrow mut self, pointer: Int) -> KirValue {
+        kir.freeRaw(value(pointer))
+        return noValue()
+    }
+
+    function printEffect(borrow mut self, text: Int) -> KirValue {
+        printString(address(text))
+        return noValue()
+    }
+
+    function heapReadValue(borrow mut self, index: Int, pointer: Int, valueType: Type, span: Span) -> KirValue {
+        if valueType.isAggregate() { return kir.load(address(index)) }
+        return heapRead(pointer, valueType, span)
+    }
+
+    function heapWriteEffect(borrow mut self, pointer: Int, stored: Int) -> KirValue {
+        heapWrite(pointer, stored)
+        return noValue()
+    }
+
+    function heapCopyEffect(borrow mut self, destination: Int, source: Int, count: Int, overlapping: Bool) -> KirValue {
+        if overlapping {
+            kir.moveRaw(value(source), value(destination), value(count))
+        } else {
+            kir.copyRaw(value(source), value(destination), value(count))
+        }
+        return noValue()
+    }
+
+    function heapFillEffect(borrow mut self, destination: Int, byte: Int, count: Int) -> KirValue {
+        kir.setBytes(value(destination), value(byte), value(count))
+        return noValue()
+    }
+
+    function appendEffect(borrow mut self, array: Int, element: Int) -> KirValue {
+        arrayAppend(array, element)
+        return noValue()
+    }
+
+    function wrappingValue(borrow mut self, operator: ArithmeticOperator, left: Int, right: Int, valueType: Type) -> KirValue {
+        let signed = valueType.signed
+        return kir.binary(kirOperator(operator, signed), false, signed, value(left), value(right))
+    }
+
+    function selectValue(borrow mut self, index: Int, condition: Int, whenTrue: Int, whenFalse: Int, valueType: Type) -> KirValue {
+        if valueType.isAggregate() { return kir.load(address(index)) }
+        return select(condition, whenTrue, whenFalse, valueType)
+    }
+
+    // A `Number` and its `NumberWords` are the same two words.
+    function bitcastValue(borrow mut self, operand: Int, valueType: Type) -> KirValue {
+        if valueType.isAggregate() { return kir.load(address(operand)) }
+        return kir.convert(convertBitcast, value(operand), types.of(valueType))
+    }
+
+    function classCallAddress(borrow mut self, index: Int, target: Int, arguments: [Int], valueType: Type) -> KirAddress {
+        if !valueType.isAggregate() { return spill(index) }
+        let destination = temporary(valueType)
+        classCall(target, arguments, valueType, .Some(destination))
+        markInitialized(destination)
+        return destination
+    }
+
+    function indirectCallAddress(borrow mut self, index: Int, target: Int, arguments: [Int], valueType: Type) -> KirAddress {
+        if !valueType.isAggregate() { return spill(index) }
+        let destination = temporary(valueType)
+        indirectCall(target, arguments, valueType, .Some(destination))
+        markInitialized(destination)
+        return destination
+    }
+
+    function traceTextAddress(borrow mut self, operand: Int, valueType: Type) -> KirAddress {
+        let operandType = program.typeOf(operand)
+        if operandType.isAggregate() { return traceText(address(operand), operandType, valueType) }
+        return traceText(spill(operand), operandType, valueType)
+    }
+
+    function memberAddress(borrow mut self, base: Int, field: Int) -> KirAddress {
+        let owner = program.typeOf(base)
+        if isClassType(program, owner) { return classField(base, field) }
+        let fieldType = program.structs[owner.declaration].fields[field].valueType
+        return kir.field(address(base), field, types.of(fieldType))
+    }
+
+    function callAddress(borrow mut self, target: Int, arguments: [Int], valueType: Type) -> KirAddress {
+        let destination = temporary(valueType)
+        callInto(target, arguments, destination)
+        markInitialized(destination)
+        return destination
+    }
+
+    function constructAddress(borrow mut self, fields: [Int], valueType: Type) -> KirAddress {
+        if isClassType(program, valueType) { return constructClass(fields, valueType) }
+        let destination = temporary(valueType)
+        let owner = program.structs[valueType.declaration]
+        for field in 0..fields.count {
+            let fieldType = owner.fields[field].valueType
+            write(fields[field], kir.field(destination, field, types.of(fieldType)))
+        }
+        markInitialized(destination)
+        return destination
+    }
+
+    function taggedAddress(borrow mut self, variant: Int, payload: Optional<Int>, valueType: Type) -> KirAddress {
+        let destination = temporary(valueType)
+        match payload {
+            Some(carried) -> write(carried, newPayloadPlace(destination, valueType, variant))
+            None -> {}
+        }
+        let enumType = program.enums[valueType.declaration]
+        if enumType.tags.count > 0 {
+            kir.store(kir.integer(types.integer32, enumType.tag(variant)), kir_address_cast(kir, destination, types.integer32))
+        } else {
+            kir.inject(destination, variant)
+        }
+        markInitialized(destination)
+        return destination
+    }
+}
+
+extend FunctionLowering {
+    function causeReport(borrow self, cause: TrapCause) -> TrapReport {
+        match cause {
+            Called -> return TrapReport {
+                code = checkTrap,
+                headline = "the program called `runtimeTrap()`",
+                label = "stopped here",
+                note = "`runtimeTrap()` stops the program on purpose, where its author ruled the state out; the condition around it says which state",
+                help = "the frames below show the caller that reached this state; fix that caller"
+            }
+            FamilyCast(target) -> return TrapReport {
+                code = checkTrap,
+                headline = joinText(["cast failed: the value is not a `", spelledType(program, target), "`"]),
+                label = joinText(["expects a `", spelledType(program, target), "`"]),
+                note = "`as` on a family value unwraps it only when it was made by exactly that declaration",
+                help = joinText(["test the value with `is ", spelledType(program, target), "` first, or `match` on it"])
+            }
+            TypeTableRow -> return TrapReport {
+                code = checkTrap,
+                headline = "a type table has no row for this type id",
+                label = "in this type table",
+                note = "every type a program's `Any` holds gets a row; a missing one means a unit built apart was not rebuilt with the program",
+                help = "rebuild every package of the program with the same compiler"
+            }
+        }
+    }
+}

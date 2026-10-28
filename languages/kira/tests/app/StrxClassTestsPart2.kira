@@ -1,0 +1,372 @@
+import Foundation
+
+// StrxClassTests.kira — deep class/inheritance coverage for `kira test`.
+// PREFIX: strx / Strx  (all top-level names use this prefix).
+//
+// PARITY RULE: no inherited base method ever calls self.<m>() where a
+// descendant overrides <m>. Super-calls use only parent-qualified
+// Parent.method() inside overrides. Inherited methods read only self fields
+// or call parent-qualified methods, which is consistent across all backends.
+
+// ---------------------------------------------------------------------------
+// H4 Tests
+// ---------------------------------------------------------------------------
+@Test
+function strxClsVehicleCost5() {
+    let v = StrxCVehicle()
+    // 5 + 5 = 10
+    expect!(v.cost(5) == 10)
+}
+
+@Test
+function strxClsCarCost5() {
+    let c = StrxCCar()
+    // 10 + 5*2 = 20
+    expect!(c.cost(5) == 20)
+}
+
+@Test
+function strxClsTruckCost5() {
+    let t = StrxCTruck()
+    // StrxCCar.cost(5) = 15+10 = 25; +3 = 28
+    expect!(t.cost(5) == 28)
+}
+
+@Test
+function strxClsVehicleLoop() {
+    let v = StrxCVehicle()
+    var acc = 0
+    for km in 0..5 {
+        acc = acc + v.cost(km)
+    }
+    // sum(5+km for km=0..4) = 5+6+7+8+9 = 35
+    expect!(acc == 35)
+}
+
+@Test
+function strxClsCarLoop() {
+    let c = StrxCCar()
+    var acc = 0
+    for km in 0..5 {
+        acc = acc + c.cost(km)
+    }
+    // sum(10+km*2 for km=0..4) = 10+12+14+16+18 = 70
+    expect!(acc == 70)
+}
+
+@Test
+function strxClsTruckLoop() {
+    let t = StrxCTruck()
+    var acc = 0
+    for km in 0..5 {
+        acc = acc + t.cost(km)
+    }
+    // StrxCCar.cost(km)=15+km*2 then +3; sum(18+km*2 for km=0..4) = 110
+    expect!(acc == 110)
+}
+
+@Test
+function strxClsVehicleBase() {
+    let v = StrxCVehicle()
+    expect!(v.base == 5)
+}
+
+@Test
+function strxClsCarBase() {
+    let c = StrxCCar()
+    expect!(c.base == 10)
+}
+
+@Test
+function strxClsTruckBase() {
+    let t = StrxCTruck()
+    expect!(t.base == 15)
+}
+
+@Test
+function strxClsVehicleCost10() {
+    let v = StrxCVehicle()
+    // 5+10 = 15
+    expect!(v.cost(10) == 15)
+}
+
+@Test
+function strxClsCarCost10() {
+    let c = StrxCCar()
+    // 10+10*2 = 30
+    expect!(c.cost(10) == 30)
+}
+
+@Test
+function strxClsTruckCost10() {
+    let t = StrxCTruck()
+    // StrxCCar.cost(10)=15+20=35; +3=38
+    expect!(t.cost(10) == 38)
+}
+
+@Test
+function strxClsBaseFieldSum() {
+    let v = StrxCVehicle()
+    let c = StrxCCar()
+    let t = StrxCTruck()
+    // 5 + 10 + 15 = 30
+    expect!(v.base + c.base + t.base == 30)
+}
+
+// ---------------------------------------------------------------------------
+// H5 Tests
+// ---------------------------------------------------------------------------
+
+@Test
+function strxClsCounterInc() {
+    var c = StrxCCounter()
+    let _ = c.increment()
+    expect!(c.getCount() == 1)
+}
+
+@Test
+function strxClsCounterLoop() {
+    var c = StrxCCounter()
+    for i in 0..10 {
+        let _ = c.increment()
+    }
+    expect!(c.getCount() == 10)
+}
+
+@Test
+function strxClsCounterReset() {
+    var c = StrxCCounter()
+    for i in 0..5 {
+        let _ = c.increment()
+    }
+    let _ = c.reset()
+    expect!(c.getCount() == 0)
+}
+
+@Test
+function strxClsSmartInc() {
+    var sc = StrxCSmartCounter()
+    let _ = sc.incrementBy(7)
+    expect!(sc.getCount() == 7)
+}
+
+@Test
+function strxClsSmartStep() {
+    var sc = StrxCSmartCounter()
+    let _ = sc.addStep()
+    // step=2, count=0+2=2
+    expect!(sc.getCount() == 2)
+}
+
+@Test
+function strxClsSmartLoop5() {
+    var sc = StrxCSmartCounter()
+    for i in 0..5 {
+        let _ = sc.addStep()
+    }
+    // 5 * 2 = 10
+    expect!(sc.getCount() == 10)
+}
+
+@Test
+function strxClsSmartCustomStep() {
+    var sc = StrxCSmartCounter()
+    sc.step = 5
+    for i in 0..3 {
+        let _ = sc.addStep()
+    }
+    // 3 * 5 = 15
+    expect!(sc.getCount() == 15)
+}
+
+@Test
+function strxClsSmartMixedOps() {
+    var sc = StrxCSmartCounter()
+    let _ = sc.increment()
+    let _ = sc.increment()
+    let _ = sc.addStep()
+    let _ = sc.incrementBy(3)
+    // 1+1+2+3 = 7
+    expect!(sc.getCount() == 7)
+}
+
+@Test
+function strxClsCounterMultiple() {
+    var total = 0
+    for k in 0..5 {
+        var c = StrxCCounter()
+        let _ = c.increment()
+        let _ = c.increment()
+        let _ = c.increment()
+        total = total + c.getCount()
+    }
+    // 5 * 3 = 15
+    expect!(total == 15)
+}
+
+@Test
+function strxClsCounterResetLoop() {
+    var c = StrxCCounter()
+    for i in 0..20 {
+        let _ = c.increment()
+    }
+    let _ = c.reset()
+    let _ = c.increment()
+    let _ = c.increment()
+    // reset then +1+1 = 2
+    expect!(c.getCount() == 2)
+}
+
+// ---------------------------------------------------------------------------
+// H6 Tests
+// ---------------------------------------------------------------------------
+
+@Test
+function strxClsNodeDesc() {
+    var n = StrxCNode()
+    n.value = 5
+    // 5 + 1 = 6
+    expect!(n.describe() == 6)
+}
+
+@Test
+function strxClsLeafDesc() {
+    var l = StrxCLeaf()
+    l.value = 5
+    // 5 * 10 = 50
+    expect!(l.describe() == 50)
+}
+
+@Test
+function strxClsDeepLeafDesc() {
+    var d = StrxCDeepLeaf()
+    d.value = 5
+    // StrxCLeaf.describe() = 5*100=500; + label=100 -> 600
+    expect!(d.describe() == 600)
+}
+
+@Test
+function strxClsLeafArr() {
+    var leaves: [StrxCLeaf] = []
+    for i in 0..4 {
+        var l = StrxCLeaf()
+        l.value = i
+        leaves.append(move l)
+    }
+    var total = 0
+    for j in 0..leaves.count {
+        total = total + leaves[j].describe()
+    }
+    // value=0..3: 0+10+20+30 = 60
+    expect!(total == 60)
+}
+
+@Test
+function strxClsLabelNode() {
+    let n = StrxCNode()
+    expect!(n.label == 1)
+}
+
+@Test
+function strxClsLabelLeaf() {
+    let l = StrxCLeaf()
+    expect!(l.label == 10)
+}
+
+@Test
+function strxClsLabelDeep() {
+    let d = StrxCDeepLeaf()
+    expect!(d.label == 100)
+}
+
+@Test
+function strxClsDeepArr() {
+    var ds: [StrxCDeepLeaf] = []
+    for i in 0..3 {
+        var d = StrxCDeepLeaf()
+        d.value = i + 1
+        ds.append(move d)
+    }
+    var total = 0
+    for j in 0..ds.count {
+        total = total + ds[j].describe()
+    }
+    // value=1: 200; value=2: 300; value=3: 400 -> 900
+    expect!(total == 900)
+}
+
+@Test
+function strxClsLabelSum() {
+    let n = StrxCNode()
+    let l = StrxCLeaf()
+    let d = StrxCDeepLeaf()
+    // 1 + 10 + 100 = 111
+    expect!(n.label + l.label + d.label == 111)
+}
+
+@Test
+function strxClsLeafMutDesc() {
+    var l = StrxCLeaf()
+    l.value = 7
+    // 7 * 10 = 70
+    expect!(l.describe() == 70)
+}
+
+@Test
+function strxClsDeepMutDesc() {
+    var d = StrxCDeepLeaf()
+    d.value = 3
+    // StrxCLeaf.describe()=3*100=300; +100=400
+    expect!(d.describe() == 400)
+}
+
+@Test
+function strxClsNodeDescLoop() {
+    var total = 0
+    for i in 0..5 {
+        var n = StrxCNode()
+        n.value = i
+        total = total + n.describe()
+    }
+    // (0+1)+(1+1)+(2+1)+(3+1)+(4+1) = 15
+    expect!(total == 15)
+}
+
+// ---------------------------------------------------------------------------
+// Trap tests
+// ---------------------------------------------------------------------------
+
+@Test
+function strxClsTrapArrOob() {
+    expectTrap!("")
+    var tris: [StrxCTriangle] = []
+    tris.append(StrxCTriangle())
+    tris.append(StrxCTriangle())
+    let _ = tris[99].sides
+}
+
+@Test
+function strxClsTrapDivZero() {
+    expectTrap!("")
+        let a = 5
+        let b = 0
+        let _ = a / b
+}
+
+@Test
+function strxClsTrapModZero() {
+    expectTrap!("")
+        let a = 10
+        let b = 0
+        let _ = a % b
+}
+
+@Test
+function strxClsTrapLeafArrOob() {
+    expectTrap!("")
+    var leaves: [StrxCLeaf] = []
+    for i in 0..3 {
+        leaves.append(StrxCLeaf())
+    }
+    let _ = leaves[10].label
+}

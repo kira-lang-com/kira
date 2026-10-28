@@ -1,0 +1,298 @@
+import Foundation
+import Kten
+
+// Action keys (DESIGN.md section 6.1): the SHA-256 of an action's canonical
+// Kten encoding with every input replaced by what it is: a file's digest and
+// permission bits, a tree's listing digest. A label names an action in
+// reports and is not part of its key.
+
+namespace KeySchema {
+    // Changes whenever the encoding below does, so no older record matches.
+    let version: String = "kira-build 2"
+}
+
+// Where an action is in a run.
+enum ActionPhase {
+    // No requested step needs it.
+    Unneeded
+    Waiting
+    Running
+    // It ran and produced its outputs.
+    Ran
+    // Its record was in the cache.
+    Cached
+    Failed
+    // An input of it failed.
+    Blocked
+    // `-dry-run`: it would run.
+    WouldRun
+}
+
+// Everything a run of the graph knows besides the graph.
+struct Engine {
+    let root: String
+    // `<root>/.kira-build`.
+    let state: String
+    let store: ContentStore
+    let request: BuildRequest
+    var cache: StatCache
+    // Per artifact, once it exists.
+    var made: [Made?] = []
+    // Per action.
+    var phases: [ActionPhase] = []
+    var keys: [String] = []
+    // Per action, the program a command runs, found once.
+    var tools: [String] = []
+    // Per action, the program each of a command's later stages runs.
+    var stageTools: [[String]] = []
+
+    function phase(borrow self, action: Number) -> ActionPhase {
+        return phases[action]
+    }
+
+    // The artifact as its key sees it.
+    function artifactKten(borrow self, artifact: borrow Artifact) -> Kten {
+        match made[artifact.id] {
+            Some(known) -> {
+                if known.tree {
+                    return ktenCase("Tree", [.Text(copy known.digest)])
+                }
+                return ktenCase("File", [.Text(copy known.digest), .Number(known.mode)])
+            }
+            None -> return .Null
+        }
+    }
+
+    function argumentKten(borrow self, argument: borrow Argument) -> Kten {
+        match argument {
+            Text(text) -> return ktenCase("Text", [.Text(copy text)])
+            Input(artifact) -> return ktenCase("Input", [artifactKten(artifact)])
+            Output(name) -> return ktenCase("Output", [.Text(copy name)])
+            Workspace -> return ktenCase("Workspace", [])
+            Joined(parts) -> {
+                var items: [Kten] = []
+                for part in parts { items.append(argumentKten(part)) }
+                return ktenCase("Joined", move items)
+            }
+        }
+    }
+
+    // The key of `action`, whose inputs all exist. A command's tool is found
+    // and hashed here.
+    function actionKey(
+        borrow mut self,
+        graph: borrow Graph,
+        action: Number
+    ) -> Result<String, BuildFailure> {
+        var fields = [ktenField("schema", .Text(KeySchema.version))]
+        match graph.actions[action] {
+            Run(command) -> {
+                let tool = match findTool(graph.root, command.tool) {
+                    Ok(path) -> path
+                    Error(failure) -> return .Error(failure)
+                }
+                let toolDigest = match cache.fileHex(tool) {
+                    Ok(hex) -> hex
+                    Error(failure) -> return .Error(failure)
+                }
+                tools[action] = tool
+                var arguments: [Kten] = []
+                for argument in command.arguments { arguments.append(argumentKten(argument)) }
+                var environment: [Kten] = []
+                for entry in command.environment {
+                    environment.append(
+                        ktenBare(
+                            [
+                                ktenField("name", .Text(copy entry.name)),
+                                ktenField("value", .Text(copy entry.value))
+                            ]
+                        )
+                    )
+                }
+                for variable in command.variables {
+                    environment.append(
+                        ktenBare(
+                            [
+                                ktenField("name", .Text(copy variable.name)),
+                                ktenField("argument", argumentKten(variable.value))
+                            ]
+                        )
+                    )
+                }
+                var placed: [Kten] = []
+                for input in command.inputs {
+                    placed.append(
+                        ktenBare(
+                            [
+                                ktenField("path", .Text(copy input.path)),
+                                ktenField("input", artifactKten(input.artifact))
+                            ]
+                        )
+                    )
+                }
+                var reads: [Kten] = []
+                for read in command.reads {
+                    let sourceIdentity = try commandSourcePath(graph, command, graph.sourcePath(read))
+                    reads.append(
+                        ktenBare(
+                            [
+                                ktenField("path", .Text(sourceIdentity)),
+                                ktenField("input", artifactKten(read))
+                            ]
+                        )
+                    )
+                }
+                var stages: [Kten] = []
+                var found: [String] = []
+                for stage in command.followedBy {
+                    let path = match findTool(graph.root, stage.tool) {
+                        Ok(located) -> located
+                        Error(failure) -> return .Error(failure)
+                    }
+                    let digest = match cache.fileHex(path) {
+                        Ok(hex) -> hex
+                        Error(failure) -> return .Error(failure)
+                    }
+                    found.append(move path)
+                    var given: [Kten] = []
+                    for argument in stage.arguments { given.append(argumentKten(argument)) }
+                    stages.append(
+                        ktenBare(
+                            [
+                                ktenField("tool", .Text(digest)),
+                                ktenField("arguments", .List(given)),
+                                ktenField("directory", argumentKten(stage.directory))
+                            ]
+                        )
+                    )
+                }
+                stageTools[action] = found
+                fields.append(ktenField("tool", .Text(toolDigest)))
+                fields.append(ktenField("arguments", .List(arguments)))
+                fields.append(ktenField("environment", .List(environment)))
+                fields.append(ktenField("placed", .List(placed)))
+                fields.append(ktenField("reads", .List(reads)))
+                if command.sourceRoot.count > 0 {
+                    fields.append(ktenField("sourceRoot", .Text(plainPath(command.sourceRoot))))
+                    fields.append(ktenField("sourceScope", .Text("physical-v1")))
+                }
+                fields.append(ktenField("depfile", .Text(copy command.depfile)))
+                fields.append(ktenField("standardOutput", .Text(copy command.standardOutput)))
+                if command.workspace.count > 0 {
+                    fields.append(ktenField("workspace", .Text(copy command.workspace)))
+                }
+                // Only when given, so the keys of commands without them stay
+                // what they were.
+                if !isPlainDirectory(command.directory) {
+                    fields.append(ktenField("directory", argumentKten(command.directory)))
+                }
+                if stages.count > 0 { fields.append(ktenField("followedBy", .List(stages))) }
+                fields.append(ktenField("outputs", outputsKten(command.outputs)))
+                return sha256Hex(ktenObject("Command", move fields).encoded())
+            }
+            Native(native) -> {
+                if native.produces.count > 0 {
+                    fields.append(ktenField("produces", .Text(copy native.produces)))
+                    fields.append(ktenField("outputs", outputsKten(native.outputs)))
+                    return sha256Hex(ktenObject("Fetch", move fields).encoded())
+                }
+                var inputs: [Kten] = []
+                for input in native.inputs { inputs.append(artifactKten(input)) }
+                fields.append(ktenField("code", .Text(copy native.code)))
+                fields.append(ktenField("parameters", copy native.parameters))
+                fields.append(ktenField("inputs", .List(inputs)))
+                fields.append(ktenField("outputs", outputsKten(native.outputs)))
+                return sha256Hex(ktenObject("Native", move fields).encoded())
+            }
+        }
+    }
+
+    // Makes every source artifact exist in the store: a file under its
+    // digest, a tree under its listing's.
+    function prepareSource(
+        borrow mut self,
+        graph: borrow Graph,
+        artifact: borrow Artifact
+    ) -> Result<Void, BuildFailure> {
+        match graph.origins[artifact.id] {
+            Source(path) -> {
+                let full = joinPath(root, path)
+                let digest = match cache.fileHex(full) {
+                    Ok(hex) -> hex
+                    Error(failure) -> return .Error(failure)
+                }
+                let status = match fileStatus(full) {
+                    Ok(found) -> found
+                    Error(failure) -> return .Error(
+                        .Files("cannot read \(full): \(traceText(failure))")
+                    )
+                }
+                match store.keepFile(full, digest, false) {
+                    Ok -> {}
+                    Error(failure) -> return .Error(failure)
+                }
+                made[artifact.id] = .Some(Made { digest: digest, tree: false, mode: status.mode })
+            }
+            SourceTree(tree) -> {
+                let full = joinPath(root, tree.path)
+                let entries = match walkTree(cache, full, tree.excluding) {
+                    Ok(found) -> found
+                    Error(failure) -> return .Error(failure)
+                }
+                let digest = match store.keepTree(full, entries, false) {
+                    Ok(hex) -> hex
+                    Error(failure) -> return .Error(failure)
+                }
+                made[artifact.id] = .Some(Made { digest: digest, tree: true, mode: 0 })
+            }
+            Stored(reference) -> {
+                let known = referenceMade(reference)
+                if !store.holds(known) {
+                    return .Error(.Files("snapshot artifact \(reference.name) is missing from the store"))
+                }
+                made[artifact.id] = .Some(known)
+            }
+            Produced(produced) -> {}
+        }
+        return .Ok
+    }
+}
+
+function outputsKten(outputs: borrow [Output]) -> Kten {
+    var items: [Kten] = []
+    for output in outputs {
+        let kind = match output.kind {
+            File -> "file"
+            Tree -> "tree"
+        }
+        items.append(
+            ktenBare([ktenField("name", .Text(copy output.name)), ktenField("kind", .Text(kind))])
+        )
+    }
+    return .List(items)
+}
+
+// The program `tool` names: a path from the project root when it holds a
+// `/`, else the first runnable file of that name on the build's `PATH`.
+function findTool(root: borrow String, tool: borrow String) -> Result<String, BuildFailure> {
+    if tool.contains("/") {
+        let path = joinPath(root, tool)
+        if fileExists(path) { return .Ok(path) }
+        return .Error(.Failed("there is no program \(path)"))
+    }
+    for directory in environmentValue("PATH").split(":") {
+        if directory.count == 0 { continue }
+        let path = joinPath(directory, tool)
+        // Most directories on PATH hold no such file; asking only of one
+        // that does keeps those absences out of the trail.
+        if !fileExists(path) { continue }
+        match fileStatus(path) {
+            Ok(status) -> {
+                let runnable = (status.mode & StoreMode.runnable) != 0
+                if status.kind == .File && runnable { return .Ok(path) }
+            }
+            Error(failure) -> absorb failure
+        }
+    }
+    return .Error(.Failed("no program \(tool) is on PATH"))
+}

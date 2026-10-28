@@ -1,0 +1,120 @@
+import Heap
+
+struct Array<Element> {
+    var data: RawPtr
+    var count: Int
+    var capacity: Int
+    var ops: RawPtr
+
+    // Append every element of `other`, in order.
+    function appendAll(borrow mut self, other: borrow [Element]) {
+        for element in other { self.append(element) }
+    }
+
+    // The first `length` elements, or all of them when there are fewer.
+    function prefix(borrow self, length: Number) -> [Element] {
+        var out: [Element] = []
+        for index in 0..min(length, count) { out.append(self[index]) }
+        return out
+    }
+
+    // Removes the last element and answers it, or nothing when there is none,
+    // as Swift's popLast.
+    function popLast(borrow mut self) -> Element? {
+        if count == 0 {
+            return .None
+        }
+        let last = self[count - 1]
+        self = self.prefix(count - 1)
+        return .Some(last)
+    }
+
+    // The elements in reverse order.
+    function reversed(borrow self) -> [Element] {
+        var out: [Element] = []
+        for index in 0..count { out.append(self[count - 1 - index]) }
+        return out
+    }
+
+    // The elements sorted so `before(a, b)` holds for each neighbour pair
+    // it orders, stable for equal elements: a merge sort.
+    function sorted(borrow self, before: (Element, Element) -> Bool) -> [Element] {
+        var sorted: [Element] = []
+        for element in self { sorted.append(element) }
+        var width: Number = 1
+        while width < count {
+            var merged: [Element] = []
+            var start: Number = 0
+            while start < count {
+                let middle = start + width < count ? start + width : count
+                let end = start + 2 * width < count ? start + 2 * width : count
+                var left = start
+                var right = middle
+                while left < middle || right < end {
+                    if right >= end || (left < middle && !before(sorted[right], sorted[left])) {
+                        merged.append(sorted[left])
+                        left = left + 1
+                    } else {
+                        merged.append(sorted[right])
+                        right = right + 1
+                    }
+                }
+                start = end
+            }
+            sorted = merged
+            width = width * 2
+        }
+        return sorted
+    }
+
+    // The elements ordered by `using`, as Foundation's `sorted(using:)`
+    // orders them: by the first comparator, then by the next among elements
+    // standing the same by those before it. Stable.
+    function sorted<Comparator: SortComparator>(borrow self, using: [Comparator]) -> [Element] {
+        return sorted(before: { lhs, rhs in
+            for comparator in using {
+                match comparator.comparison(lhs, rhs) {
+                    OrderedAscending -> return true
+                    OrderedDescending -> return false
+                    OrderedSame -> {}
+                }
+            }
+            return false
+        })
+    }
+
+    // Orders the elements by `using`, as `sorted(using:)` does.
+    function sort<Comparator: SortComparator>(borrow mut self, using: [Comparator]) {
+        self = self.sorted(using: using)
+    }
+}
+
+// Whether some element of `items` equals `value`: `items.contains(value)`. A
+// free function, so it is made only for element types a program asks it of;
+// as a method it would be made for every array, closures and native state
+// included, which have no `==`.
+function arrayContains<Element>(items: borrow [Element], value: borrow Element) -> Bool {
+    for element in items {
+        if element == value { return true }
+    }
+    return false
+}
+
+// Where the first element equal to `value` sits in `items`, when one does.
+// A free function for the reason `arrayContains` is one.
+function arrayIndex<Element>(items: borrow [Element], value: borrow Element) -> Number? {
+    for (index, element) in items.enumerated() {
+        if element == value { return .Some(index) }
+    }
+    return .None
+}
+
+// The element of `cases` whose code is `raw`, when one is: decodes a raw
+// value from outside the program, which may name no case, for an enum that
+// is not `@Open`; `fromCode` traps on such a value.
+function caseWithCode<Case>(cases: borrow [Case], raw: Number) -> Case? {
+    for each in cases {
+        if code(each) == raw { return .Some(each) }
+    }
+    return .None
+}

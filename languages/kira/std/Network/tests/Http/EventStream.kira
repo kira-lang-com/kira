@@ -1,0 +1,42 @@
+import Foundation
+
+// Each event the stream yields, as `name [data] id=.. retry=..`, in order.
+function describeServerEvents(stream: borrow mut EventStream) -> [String] {
+    var parts: [String] = []
+    while true {
+        let next = stream.event()
+        let event = match next {
+            Some(value) -> value
+            None -> return parts
+        }
+        parts.append("\(event.name) [\(event.data)] id=\(event.id) retry=\(traceText(event.retry))")
+    }
+    return parts
+}
+
+// The events the stream yields for a transcript fed three bytes at a time,
+// after a byte order mark; `["refused"]` when the stream refuses a chunk.
+function eventStreamDecodesSplitChunksOutcome() -> [String] {
+    let text = ": keep-alive\r\nevent: message_start\r\ndata: {\"a\":1}\r\n\r\nid: 7\nretry: 3000\ndata: first\ndata:second\n\nevent: ignored\n\ndata\rdata: é\r\rdata: unfinished"
+    let bytes = joinedBytes(EventStreamLimit.byteOrderMark, text.utf8())
+    var stream = EventStream {}
+    var at = 0
+    while at < bytes.count {
+        let end = min(at + 3, bytes.count)
+        if !stream.feed(byteRun(bytes, at, end)) { return ["refused"] }
+        at = end
+    }
+    return describeServerEvents(stream)
+}
+
+// A transcript with a comment, a named event, a multi-line event, an event
+// with no name and a trailing unfinished event: the three complete events
+// decode, and the unfinished one does not.
+@Test
+function eventStreamDecodesSplitChunks() {
+    let events = eventStreamDecodesSplitChunksOutcome()
+    expect!((events.count) == (3))
+    expect!((events[0]) == ("message_start [{\"a\":1}] id= retry=None"))
+    expect!((events[1]) == ("message [first\nsecond] id=7 retry=Some(3000)"))
+    expect!((events[2]) == ("message [\né] id=7 retry=Some(3000)"))
+}

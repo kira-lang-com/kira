@@ -1,0 +1,211 @@
+// HLSL spellings of types. A KSIR `matCxR` is spelled `floatCxR`, the
+// transpose of HLSL's row-by-column reading, and stored `row_major`, so
+// each KSIR column is one contiguous HLSL row.
+
+function hlslScalar(scalar: String) -> String {
+    match scalar {
+        "bool" -> return "bool"
+        "i32" -> return "int"
+        "u32" -> return "uint"
+        "f32" -> return "float"
+        "f16" -> return "half"
+        "f64" -> return "double"
+        "i64" -> return "int64_t"
+        "u64" -> return "uint64_t"
+        else -> return typeFailure(joinText(["HLSL has no ", scalar]))
+    }
+}
+
+function hlslTexel(scalar: String) -> String {
+    let shape = scalarKind(scalar)
+    if shape == "float" { return "float4" }
+    if shape == "sint" { return "int4" }
+    if shape == "uint" { return "uint4" }
+    return typeFailure("a texture of bool")
+}
+
+extend TextOut {
+    function hlslImage(borrow self, typeIndex: Int) -> String {
+        let dimension = typeText(typeIndex, "dimension")
+        var dim = "Cube"
+        if dimension == "1d" {
+            dim = "1D"
+        } else if dimension == "2d" {
+            dim = "2D"
+        } else if dimension == "3d" {
+            dim = "3D"
+        }
+        var array = ""
+        if flag("types", -1, typeIndex, "arrayed") { array = "Array" }
+        let imageClass = typeText(typeIndex, "class")
+        var ms = ""
+        if flag("types", -1, typeIndex, "multisampled") { ms = "MS" }
+        if imageClass == "depth" { return joinText(["Texture", dim, ms, array, "<float>"]) }
+        let texel = hlslTexel(typeText(typeIndex, "scalar"))
+        if failedText(texel) { return texel }
+        if imageClass == "storage" { return joinText(["RWTexture", dim, array, "<", texel, ">"]) }
+        return joinText(["Texture", dim, ms, array, "<", texel, ">"])
+    }
+
+    // A type's text, or a failure.
+    function hlslType(borrow self, typeIndex: Int) -> String {
+        let shape = typeKind(typeIndex)
+        let scalar = typeText(typeIndex, "scalar")
+        match shape {
+            "struct" -> return structName(typeIndex)
+            "scalar" -> return hlslScalar(scalar)
+            "atomic" -> return hlslScalar(scalar)
+            "vector" -> {
+                let base = hlslScalar(scalar)
+                if failedText(base) { return base }
+                return joinText([base, decimalText(typeField(typeIndex, "lanes"))])
+            }
+            "matrix" -> {
+                let base = hlslScalar(scalar)
+                if failedText(base) { return base }
+                return joinText([base, decimalText(typeField(typeIndex, "columns")), "x",
+                    decimalText(typeField(typeIndex, "rows"))])
+            }
+            "pointer" -> return hlslType(typeField(typeIndex, "base"))
+            "array" -> {
+                let base = hlslType(typeField(typeIndex, "base"))
+                if failedText(base) { return base }
+                let length = typeField(typeIndex, "length")
+                if length >= 0 { return joinText([base, "[", decimalText(length), "]"]) }
+                if typeField(typeIndex, "length_override") >= 0 {
+                    return typeFailure("an array sized by a kept override")
+                }
+                return joinText([base, "[]"])
+            }
+            "image" -> return hlslImage(typeIndex)
+            "sampler" -> {
+                if flag("types", -1, typeIndex, "comparison") { return "SamplerComparisonState" }
+                return "SamplerState"
+            }
+            else -> return typeFailure(joinText(["a ", shape]))
+        }
+    }
+
+    // A type's text where the module declares something of it; a type HLSL
+    // cannot spell is refused at the type.
+    function typeName(borrow self, typeIndex: Int) -> String {
+        let written = hlslType(typeIndex)
+        if failedText(written) {
+            refuseAt(failureText(written), "types", -1, typeIndex)
+            return ""
+        }
+        return written
+    }
+
+    // The type of an expression's result, in a body.
+    function resultType(borrow self, expression: Int) -> String {
+        return commentedText(hlslType(typeOf(expression)))
+    }
+
+    // `T name` with array extents after the name, as HLSL declares them, or
+    // a failure.
+    function declaredText(borrow self, typeIndex: Int, name: String) -> String {
+        var extents: [String] = []
+        var at = typeIndex
+        while typeKind(at) == "array" {
+            let length = typeField(at, "length")
+            if length < 0 { return typeFailure("an array without a constant size outside a buffer") }
+            extents.append(joinText(["[", decimalText(length), "]"]))
+            at = typeField(at, "base")
+        }
+        var major = ""
+        if typeKind(at) == "matrix" { major = "row_major " }
+        let written = hlslType(at)
+        if failedText(written) { return written }
+        return joinText([major, written, " ", name, joinText(extents)])
+    }
+
+    // A declaration the module writes; a type HLSL cannot spell is refused
+    // at the type.
+    function declare(borrow self, typeIndex: Int, name: String) -> String {
+        let written = declaredText(typeIndex, name)
+        if failedText(written) {
+            refuseAt(failureText(written), "types", -1, typeIndex)
+            return ""
+        }
+        return written
+    }
+
+    // The zero value of a type: a cast of `0`, or an initializer list for
+    // an array, which HLSL cannot cast to.
+    function zeroText(borrow self, typeIndex: Int) -> String {
+        let length = typeField(typeIndex, "length")
+        if typeKind(typeIndex) == "array" && length >= 0 {
+            let zero = zeroText(typeField(typeIndex, "base"))
+            if failedText(zero) { return zero }
+            var parts: [String] = []
+            for at in 0..length {
+                parts.append(zero)
+            }
+            return joinText(["{ ", joinWith(parts, ", "), " }"])
+        }
+        let written = hlslType(typeIndex)
+        if failedText(written) { return written }
+        return joinText(["(", written, ")0"])
+    }
+
+    // An initializer list for a struct from its members' values, with zero
+    // for each padding scalar.
+    function structValue(borrow self, typeIndex: Int, parts: [String]) -> String {
+        if !dialect.padded[typeIndex] { return joinText(["{ ", joinWith(parts, ", "), " }"]) }
+        var texts: [String] = []
+        for slot in dialect.slots[typeIndex] {
+            if slot < 0 {
+                for pad in 0..(0 - slot) {
+                    texts.append("0u")
+                }
+            } else if slot < parts.count {
+                texts.append(parts[slot])
+            } else {
+                texts.append("")
+            }
+        }
+        return joinText(["{ ", joinWith(texts, ", "), " }"])
+    }
+
+    // The size HLSL gives a member: buffers place members on four-byte
+    // boundaries, so only padding is needed to reach a recorded offset.
+    function std430Size(borrow self, typeIndex: Int) -> Int {
+        let shape = typeKind(typeIndex)
+        if shape == "struct" { return typeField(typeIndex, "size") }
+        if shape == "array" {
+            var length = typeField(typeIndex, "length")
+            if length < 0 { length = 1 }
+            return length * typeField(typeIndex, "stride")
+        }
+        if shape == "pointer" || shape == "image" || shape == "sampler" { return 0 }
+        return typeField(typeIndex, "size_std430")
+    }
+
+    // Pads every host-shared struct to its recorded layout.
+    function prepareSlots(borrow mut self) {
+        let types = count("types", -1)
+        for typeIndex in 0..types {
+            var slots: [Int] = []
+            var padded = false
+            if typeKind(typeIndex) == "struct" && flag("types", -1, typeIndex, "host_shared") {
+                let members = count("members", typeIndex)
+                var sizes: [Int] = []
+                var aligns: [Int] = []
+                for member in 0..members {
+                    sizes.append(std430Size(field("members", typeIndex, member, "type")))
+                    aligns.append(4)
+                }
+                let padding = paddedSlots(typeIndex, typeField(typeIndex, "size"), sizes, aligns)
+                if utf8Count(padding.problem) > 0 {
+                    refuseAt(padding.problem, "types", -1, typeIndex)
+                } else {
+                    slots = padding.slots
+                    padded = true
+                }
+            }
+            dialect.padded.append(padded)
+            dialect.slots.append(slots)
+        }
+    }
+}

@@ -1,0 +1,120 @@
+// The `format` hook's layout (framework KLF-FORMAT.md section 7): Kira's
+// tokens laid out by the layout the framework's languages share, which the
+// package's `include` file brings in. Tokens the lexer splits but the source
+// writes as one piece, such as `+=` and the `#{...}` holes of a quote, are
+// passed as one token, so their spacing stays as written.
+
+struct FormatTokens {
+    var starts: [Int]
+    var ends: [Int]
+}
+
+function formatSource(session: Session) -> Bool {
+    let file = readFile(session, sourceName())
+    let source = fileText(session, file as SourceFile)
+    match lex(source, file) {
+        Ok(tokens) -> {
+            let merged = formatTokens(tokens)
+            return layoutTokens(source, merged.starts, merged.ends, kiraLayout())
+        }
+        Error(failure) -> return false
+    }
+}
+
+function kiraLayout() -> LayoutRules {
+    return LayoutRules {
+        spacedCalls = [],
+        keywords = ["return", "if", "else", "while", "for", "in", "match", "attempt", "try", "let", "var",
+            "as", "is", "break", "continue", "borrow", "mut", "move", "copy", "handle"],
+        ambiguous = ["<", ">", ">>"],
+        spacedArrow = true,
+        labels = [],
+        semicolons = false,
+        literals = true,
+        headers = ["if", "else", "while", "for", "match", "attempt", "function", "struct", "enum", "class",
+            "construct", "trait", "extend"],
+        inlineBlocks = true
+    }
+}
+
+function formatTokens(tokens: [Token]) -> FormatTokens {
+    var merged = FormatTokens { starts = [], ends = [] }
+    var index = 0
+    while index < tokens.count && tokens[index].kind != .End {
+        let token = tokens[index]
+        if token.kind == .Hash && tokens[index + 1].kind == .LeftBrace && tokens[index + 1].span.start == token.span.end {
+            let close = holeEnd(tokens, index + 1)
+            let glued = index > 0 && (tokens[index - 1].kind == .Identifier || tokens[index - 1].kind == .Dot)
+            merged.add(token.span.start, tokens[close].span.end, glued)
+            index = close + 1
+            while tokens[index].kind == .Identifier && tokens[index].span.start == merged.lastEnd() {
+                merged.add(tokens[index].span.start, tokens[index].span.end, true)
+                index += 1
+            }
+        } else if token.kind == .Equals && index > 0 && compound(tokens[index - 1].kind)
+            && tokens[index - 1].span.end == token.span.start {
+            merged.add(token.span.start, token.span.end, true)
+            index += 1
+        } else if steps(tokens, index) {
+            // After a closing `]` or `)` the step stays its own token: glued on,
+            // the closer would not be seen closing its bracket.
+            let closer = tokens[index - 1].kind == .RightBracket || tokens[index - 1].kind == .RightParen
+            merged.add(token.span.start, tokens[index + 1].span.end, !closer)
+            index += 2
+        } else {
+            merged.add(token.span.start, token.span.end, false)
+            index += 1
+        }
+    }
+    return merged
+}
+
+// The `}` closing the hole whose `{` is at `open`.
+function holeEnd(tokens: [Token], open: Int) -> Int {
+    var depth = 0
+    for at in open..tokens.count {
+        let kind = tokens[at].kind
+        if kind == .End { return at - 1 }
+        if kind == .LeftBrace { depth += 1 }
+        if kind == .RightBrace {
+            depth -= 1
+            if depth == 0 { return at }
+        }
+    }
+    return tokens.count - 1
+}
+
+// Whether the tokens at `index` spell the `++` or `--` of an `i++` or `i--`,
+// which stays glued to its target. A `--` written against what follows it is
+// a subtraction of a negation.
+function steps(tokens: [Token], index: Int) -> Bool {
+    let kind = tokens[index].kind
+    if (kind != .Plus && kind != .Minus) || index == 0 || index + 2 >= tokens.count { return false }
+    if tokens[index + 1].kind != kind || tokens[index].span.end != tokens[index + 1].span.start { return false }
+    if tokens[index - 1].span.end != tokens[index].span.start { return false }
+    return kind == .Plus || tokens[index + 2].span.start != tokens[index + 1].span.end
+}
+
+// Whether `kind` followed by `=` spells a compound assignment.
+function compound(kind: TokenKind) -> Bool {
+    return kind == .Plus || kind == .Minus || kind == .Star || kind == .Slash || kind == .Percent
+        || kind == .Ampersand || kind == .Pipe || kind == .Caret || kind == .LessLess || kind == .GreaterGreater
+}
+
+extend FormatTokens {
+    function lastEnd(borrow self) -> Int {
+        if ends.count == 0 { return -1 }
+        return ends[ends.count - 1]
+    }
+
+    // Adds `start..end` as a token, joined to the previous one when `glued`
+    // and they touch.
+    function add(borrow mut self, start: Int, end: Int, glued: Bool) {
+        if glued && lastEnd() == start {
+            ends[ends.count - 1] = end
+        } else {
+            starts.append(start)
+            ends.append(end)
+        }
+    }
+}

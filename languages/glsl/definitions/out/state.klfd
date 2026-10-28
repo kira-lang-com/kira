@@ -1,0 +1,38 @@
+// The GLSL 4.30 out (KLF-KSL section 19.6): one unit per entry point with a
+// `main` wrapper, std140 and std430 blocks padded to the recorded offsets,
+// and textures combined with the sampler pairing gives.
+
+// What the GLSL out keeps beside the shared text writer.
+struct Dialect {
+    // Per type: whether a host-shared struct was padded, and its slots.
+    var padded: [Bool]
+    var slots: [[Int]]
+    // Per type: the rule a host-shared struct follows, `std140` when a
+    // uniform reaches it and `std430` otherwise, or empty.
+    var rules: [String]
+    // Whether bodies carry `#line` directives.
+    var debug: Bool
+}
+
+function writeGlsl(unit: ShaderUnit) -> Bool {
+    var out = textOut(unit, Dialect { padded = [], slots = [], rules = [], debug = false })
+    out.writeGlslModule()
+    return true
+}
+
+function glslReserved() -> [String] {
+    return [
+        "main", "attribute", "const", "uniform", "varying", "buffer", "shared", "coherent", "volatile", "restrict",
+        "readonly", "writeonly", "atomic_uint", "layout", "centroid", "flat", "smooth", "noperspective", "patch",
+        "sample", "break", "continue", "do", "for", "while", "switch", "case", "default", "if", "else",
+        "subroutine", "in", "out", "inout", "float", "double", "int", "void", "bool", "true", "false", "invariant",
+        "precise", "discard", "return", "lowp", "mediump", "highp", "precision", "struct", "common", "partition",
+        "active", "asm", "class", "union", "enum", "typedef", "template", "this", "resource", "goto", "inline",
+        "noinline", "public", "static", "extern", "external", "interface", "long", "short", "half", "fixed",
+        "unsigned", "superp", "input", "output", "filter", "sizeof", "cast", "namespace", "using", "texture",
+        "sampler", "image", "mix", "min", "max", "clamp", "abs", "sign", "floor", "ceil", "fract", "mod", "step",
+        "smoothstep", "length", "distance", "dot", "cross", "normalize", "reflect", "refract", "pow", "exp", "log",
+        "exp2", "log2", "sqrt", "inversesqrt", "sin", "cos", "tan", "asin", "acos", "atan", "radians", "degrees",
+        "all", "any", "not", "equal", "lessThan", "greaterThan", "barrier", "round", "trunc"
+    ]
+}

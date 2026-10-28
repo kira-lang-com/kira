@@ -1,0 +1,75 @@
+import Foundation
+
+// Structs: nested fields, methods with `self`, `borrow mut` writeback, value
+// copy semantics, and deep nesting churned in a loop.
+
+struct StVec {
+    var x: Number
+    var y: Number
+    var z: Number
+
+    function sum() -> Number {
+        return self.x + self.y + self.z
+    }
+
+    function scaled(k: Number) -> StVec {
+        return StVec { x: self.x * k, y: self.y * k, z: self.z * k }
+    }
+}
+
+struct StBox {
+    var origin: StVec
+    var size: StVec
+    var label: Number
+}
+
+function stcBumpZ(v: borrow mut StVec) {
+    v.z = v.z + 100
+}
+
+function stcBumpBox(b: borrow mut StBox) {
+    b.label = b.label + 1
+    b.size.x = b.size.x + 10
+}
+
+@Test
+function methodsSumAndScaleEachValue() {
+    var total: Number = 0
+    for i in 0..100 {
+        let v = StVec { x: i, y: i + 1, z: i + 2 }
+        total = total + v.sum()
+        let w = v.scaled(3)
+        total = total + w.sum()
+    }
+    expect!((total) == (60600))
+}
+
+@Test
+function borrowMutWritesBackToTheLocal() {
+    var v = StVec { x: 1, y: 2, z: 3 }
+    for j in 0..25 {
+        stcBumpZ(v)
+    }
+    expect!((v.z) == (2503))
+    expect!((v.x) == (1))
+}
+
+@Test
+function nestedStructMutationThroughBorrowMut() {
+    var b = StBox { origin: StVec { x: 0, y: 0, z: 0 }, size: StVec { x: 1, y: 1, z: 1 }, label: 0 }
+    for k in 0..30 {
+        stcBumpBox(b)
+    }
+    expect!((b.label) == (30))
+    expect!((b.size.x) == (301))
+    expect!((b.origin.x) == (0))
+}
+
+@Test
+function copyOfAStructDoesNotAlias() {
+    let a1 = StVec { x: 5, y: 5, z: 5 }
+    var a2 = a1
+    a2.x = 999
+    expect!((a1.x) == (5))
+    expect!((a2.x) == (999))
+}

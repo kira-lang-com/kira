@@ -1,0 +1,97 @@
+function closureTemplate(structures: [StructDeclaration]) -> Optional<StructDeclaration> {
+    for declared in structures {
+        if declared.name.text == "Closure" { return .Some(declared) }
+    }
+    return .None
+}
+
+function specializeClosure(template: StructDeclaration, reference: TypeReference, suffix: Int) -> StructDeclaration {
+    return StructDeclaration {
+        name = Identifier { text = reference.instanceName, span = template.name.span },
+        genericParameters = [], typeArguments = reference.arguments, callableModes = reference.modes, ancestors = [],
+        genericBase = "Closure", baseNameSpan = template.baseNameSpan,
+        specialized = true, typeSuffix = suffix,
+        fields = template.fields, methods = []
+    }
+}
+
+// A value a call names as its callee: a closure, a C function pointer, or a
+// key path, which reads its members from the root it is applied to.
+function isCallableType(program: CheckedProgram, valueType: Type) -> Bool {
+    return isClosureType(program, valueType) || isCallbackType(program, valueType) || isKeyPathType(program, valueType)
+}
+
+// A crossing family's trait object, `Any Family` (`declareWitnessedFamily`).
+function isWitnessedType(program: CheckedProgram, valueType: Type) -> Bool {
+    if valueType.kind != .Structure { return false }
+    return program.structs[valueType.declaration].genericBase == "Witnessed"
+}
+
+extend Checker {
+    // The function boxing a value of `actual` as the trait object `target`,
+    // when `actual` is a declaration seen through that crossing family.
+    function witnessBoxOf(borrow self, actual: Type, target: Type) -> Optional<Int> {
+        if actual.kind != .Structure || !isWitnessedType(program, target) { return .None }
+        let family = program.structs[target.declaration].name.text
+        if !hasBoundName(program.structs[actual.declaration].ancestors, family) { return .None }
+        return declarations.findFunction(.Some(actual), witnessBoxName(utf8Slice(family, 4, utf8Count(family))))
+    }
+}
+
+function isClosureType(program: CheckedProgram, valueType: Type) -> Bool {
+    if valueType.kind != .Structure { return false }
+    return program.structs[valueType.declaration].genericBase == "Closure"
+}
+
+// Whether `valueType` is an instance of Foundation's `KeyPath`.
+function isKeyPathType(program: CheckedProgram, valueType: Type) -> Bool {
+    if valueType.kind != .Structure { return false }
+    return program.structs[valueType.declaration].genericBase == "KeyPath"
+}
+
+extend Checker {
+    function checkIndirectArguments(borrow mut self, target: Int, arguments: [Int], span: Span) -> Int {
+        let valueType = typeOf(target)
+        if valueType.isInvalid() { return target }
+        if isCallbackType(program, valueType) { return checkPointerCall(target, valueType.declaration, arguments, span) }
+        // A key path applied to a root reads its members there.
+        if isKeyPathType(program, valueType) {
+            match program.structs[valueType.declaration].field("read") {
+                Some(field) -> {
+                    let read = add(.Member(target, field), program.structs[valueType.declaration].fields[field].valueType, span)
+                    return checkIndirectArguments(read, arguments, span)
+                }
+                None -> {}
+            }
+        }
+        if !isClosureType(program, valueType) {
+            report(.UndefinedFunction, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let callable = program.structs[valueType.declaration]
+        let count = callable.typeArguments.count - 1
+        if arguments.count != count {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        var values: [Int] = []
+        var before: [Int] = []
+        var after: [Int] = []
+        for index in 0..count {
+            let parameter = callable.typeArguments[index]
+            let mode = callable.callableModes[index]
+            var value = expression(arguments[index], .Some(parameter))
+            checkNamedArgument(arguments[index], value, parameter, mode, false)
+            if mode == .MutablyBorrowed {
+                value = writable(value, mode, before, after)
+                if !typeOf(value).equals(parameter) && !typeOf(value).isInvalid() {
+                    report(.ArgumentTypeMismatch, program.expressions[value].span)
+                }
+            } else {
+                value = coerce(value, parameter, .ArgumentTypeMismatch)
+            }
+            values.append(value)
+        }
+        return writtenBack(add(.IndirectCall(target, values), callable.typeArguments[count], span), before, after, span)
+    }
+}

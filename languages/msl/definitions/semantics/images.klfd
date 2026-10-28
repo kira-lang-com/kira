@@ -1,0 +1,429 @@
+// Texture methods, atomics, barriers and `discard_fragment`.
+//
+// A texture method becomes one KSIR image operation whose operands are in
+// KSIR's order, -1 where one is absent: a sample's image, sampler,
+// coordinate, array index, offset, two level operands, depth reference and
+// gather component; a load's image, coordinate, array index, sample and
+// level; a store's image, coordinate, array index and value. A `half`
+// texture is read as `float` and converted.
+
+function sizeLanes(dimension: Dimension) -> Int {
+    match dimension {
+        Line -> return 1
+        Plane -> return 2
+        Volume -> return 3
+        Cube -> return 2
+    }
+}
+
+// KSIR's atomic function for a Metal atomic, or "".
+function atomicFunction(name: String) -> String {
+    match name {
+        "atomic_fetch_add_explicit" -> return "add"
+        "atomic_fetch_sub_explicit" -> return "subtract"
+        "atomic_fetch_and_explicit" -> return "and"
+        "atomic_fetch_or_explicit" -> return "or"
+        "atomic_fetch_xor_explicit" -> return "xor"
+        "atomic_fetch_min_explicit" -> return "min"
+        "atomic_fetch_max_explicit" -> return "max"
+        "atomic_exchange_explicit" -> return "exchange"
+        "atomic_load_explicit" -> return "load"
+        "atomic_store_explicit" -> return "store"
+        "atomic_compare_exchange_weak_explicit" -> return "compare_exchange"
+        else -> return ""
+    }
+}
+
+// A sample's level option: `level(x)`, `bias(x)` or `gradient2d(x, y)`.
+struct LevelOption {
+    var kind: String
+    var first: Int
+    var second: Int
+}
+
+extend Checker {
+    function imageCall(borrow mut self, name: String, resultType: Int, operands: [Int], span: Span) -> Int {
+        var made = expressionOf(.ImageCall, resultType, span)
+        made.name = name
+        made.arguments = operands
+        return add(made)
+    }
+
+    // A texel as the texture's own scalar: KSIR reads a `half` texture as
+    // `float`.
+    function texel(borrow mut self, read: Int, scalar: Scalar) -> Int {
+        if scalar != .Half { return read }
+        return convertTo(read, withScalar(typeOf(read), .Half))
+    }
+
+    function specialCall(borrow mut self, name: String, arguments: [Int], span: Span) -> Int {
+        if name == "discard_fragment" {
+            if arguments.count != 0 { return refuse(.ArgumentCount, span) }
+            if stage == .VertexStage || stage == .KernelStage { return refuse(.WrongStage, span) }
+            return add(expressionOf(.Discard, voidType(), span))
+        }
+        if name == "threadgroup_barrier" { return barrierCall(arguments, span) }
+        if name == "is_function_constant_defined" { return refuse(.GatedParameter, span) }
+        let atomic = atomicFunction(name)
+        if utf8Count(atomic) > 0 { return atomicCall(atomic, arguments, span) }
+        let option = name == "level" || name == "bias" || name == "gradient2d" || name == "gradient3d"
+            || name == "gradientcube" || name == "min_lod_clamp"
+        if option { return refuse(.UnsupportedConstruct, span) }
+        return -1
+    }
+
+    // `threadgroup_barrier(mem_flags::...)`: a control barrier over the
+    // memory its flags name.
+    function barrierCall(borrow mut self, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 1 { return refuse(.ArgumentCount, span) }
+        if stage == .VertexStage || stage == .FragmentStage { return refuse(.WrongStage, span) }
+        var flags: [String] = []
+        if !barrierFlags(arguments[0], flags) { return refuse(.UnsupportedFunction, span) }
+        var made = expressionOf(.Barrier, voidType(), span)
+        made.name = joinText(flags)
+        return add(made)
+    }
+
+    function barrierFlags(borrow self, index: Int, flags: borrow mut [String]) -> Bool {
+        let syntax = tree.expressions[index]
+        if syntax.kind == .Binary && syntax.operator == .BitOr {
+            return barrierFlags(syntax.left, flags) && barrierFlags(syntax.right, flags)
+        }
+        if syntax.kind != .Name { return false }
+        var word = ""
+        match syntax.text {
+            "mem_flags_mem_none" -> return true
+            "mem_flags_mem_device" -> word = "storage"
+            "mem_flags_mem_threadgroup" -> word = "workgroup"
+            "mem_flags_mem_texture" -> word = "image"
+            else -> return false
+        }
+        if flags.count > 0 { flags.append(" ") }
+        flags.append(word)
+        return true
+    }
+
+    // Whether the last argument is `memory_order_relaxed`.
+    function relaxed(borrow self, index: Int) -> Bool {
+        let syntax = tree.expressions[index]
+        return syntax.kind == .Name && syntax.text == "memory_order_relaxed"
+    }
+
+    // `&place` of an atomic in device or threadgroup memory.
+    function atomicPlace(borrow mut self, index: Int, span: Span) -> Int {
+        let syntax = tree.expressions[index]
+        if syntax.kind != .Unary || syntax.operator != .AddressOf { return refuse(.TypeMismatch, span) }
+        let target = checkExpression(syntax.left)
+        if broken(target) { return target }
+        if typeAt(typeOf(target)).shape != .Atomic || !writable(target) { return refuse(.TypeMismatch, span) }
+        var root = target
+        while program.expressions[root].kind == .Member || program.expressions[root].kind == .Index {
+            root = program.expressions[root].left
+        }
+        let rooted = program.expressions[root]
+        if rooted.kind == .Local && !locals[rooted.target].shared { return refuse(.TypeMismatch, span) }
+        return target
+    }
+
+    function atomicCall(borrow mut self, operation: String, arguments: [Int], span: Span) -> Int {
+        var count = 3
+        if operation == "load" { count = 2 }
+        if operation == "compare_exchange" { count = 5 }
+        if arguments.count != count { return refuse(.ArgumentCount, span) }
+        if !relaxed(arguments[count - 1]) || (count == 5 && !relaxed(arguments[3])) {
+            return refuse(.MemoryOrder, span)
+        }
+        let target = atomicPlace(arguments[0], span)
+        if broken(target) { return target }
+        let scalar = scalarType(typeAt(typeOf(target)).scalar)
+        var made = expressionOf(.Atomic, scalar, span)
+        made.name = operation
+        made.left = target
+        if operation == "load" {
+            made.name = "or"
+            made.right = literal(typeAt(scalar).scalar, "0", span)
+            return add(made)
+        }
+        if operation == "compare_exchange" {
+            let expected = checkExpression(arguments[1])
+            let syntax = tree.expressions[arguments[1]]
+            if syntax.kind != .Unary || syntax.operator != .AddressOf { return refuse(.TypeMismatch, span) }
+            let place = checkExpression(syntax.left)
+            if broken(place) || broken(expected) { return invalid(span) }
+            if typeOf(place) != scalar || !writable(place) { return refuse(.TypeMismatch, span) }
+            made.third = place
+            made.right = convertImplicitly(checkExpression(arguments[2]), scalar, span)
+            made.expressionType = scalarType(.Bool)
+            return add(made)
+        }
+        made.right = convertImplicitly(checkExpression(arguments[1]), scalar, span)
+        if operation == "store" {
+            made.name = "exchange"
+            made.expressionType = voidType()
+        }
+        return add(made)
+    }
+
+    function checkMethod(borrow mut self, callee: Expression, arguments: [Int], span: Span) -> Int {
+        let image = checkExpression(callee.left)
+        if broken(image) { return image }
+        if typeAt(typeOf(image)).shape != .Image { return refuse(.NoSuchMember, span) }
+        match callee.text {
+            "sample" -> return sampleCall(image, arguments, false, span)
+            "sample_compare" -> return sampleCall(image, arguments, true, span)
+            "gather" -> return gatherCall(image, arguments, false, span)
+            "gather_compare" -> return gatherCall(image, arguments, true, span)
+            "read" -> return readCall(image, arguments, span)
+            "write" -> return writeCall(image, arguments, span)
+            "get_width" -> return sizeCall(image, arguments, 0, span)
+            "get_height" -> return sizeCall(image, arguments, 1, span)
+            "get_depth" -> return sizeCall(image, arguments, 2, span)
+            "get_num_mip_levels" -> return countCall(image, arguments, "levels", span)
+            "get_array_size" -> return countCall(image, arguments, "layers", span)
+            "get_num_samples" -> return countCall(image, arguments, "samples", span)
+            else -> return refuse(.UnsupportedFunction, span)
+        }
+    }
+
+    // The sampler argument, marked with how it samples.
+    function samplerArgument(borrow mut self, index: Int, comparison: Bool, span: Span) -> Int {
+        let sampler = checkExpression(index)
+        if broken(sampler) { return sampler }
+        if typeAt(typeOf(sampler)).shape != .Sampler { return refuse(.TypeMismatch, span) }
+        markSampler(sampler, !comparison, comparison, current)
+        return sampler
+    }
+
+    // A coordinate of `count` lanes: integers when `integral`, else
+    // floats, to which integers convert.
+    function coordinate(borrow mut self, index: Int, count: Int, integral: Bool, span: Span) -> Int {
+        let value = checkExpression(index)
+        if broken(value) { return value }
+        if integral {
+            if !isIntegral(typeOf(value)) || lanes(typeOf(value)) != count { return refuse(.TypeMismatch, span) }
+            return value
+        }
+        return convertImplicitly(value, vectorType(.Float, count), span)
+    }
+
+    function integralArgument(borrow mut self, index: Int, span: Span) -> Int {
+        let value = checkExpression(index)
+        if broken(value) { return value }
+        if !isScalar(typeOf(value)) || !isIntegral(typeOf(value)) { return refuse(.TypeMismatch, span) }
+        return value
+    }
+
+    // A written level option, or none when `index` is no option call.
+    function levelOption(borrow mut self, index: Int, span: Span) -> Optional<LevelOption> {
+        let none: Optional<LevelOption> = .None
+        let syntax = tree.expressions[index]
+        if syntax.kind != .Call || tree.expressions[syntax.left].kind != .Name { return none }
+        let name = tree.expressions[syntax.left].text
+        var option = LevelOption { kind = "", first = -1, second = -1 }
+        if name == "level" || name == "bias" {
+            if syntax.arguments.count != 1 { return none }
+            option.kind = "exact"
+            if name == "bias" { option.kind = "bias" }
+            option.first = convertImplicitly(checkExpression(syntax.arguments[0]), scalarType(.Float), span)
+            return .Some(option)
+        }
+        if startsWith(name, "gradient") && syntax.arguments.count == 2 {
+            option.kind = "gradient"
+            var width = 2
+            if name == "gradient3d" || name == "gradientcube" { width = 3 }
+            option.first = convertImplicitly(checkExpression(syntax.arguments[0]), vectorType(.Float, width), span)
+            option.second = convertImplicitly(checkExpression(syntax.arguments[1]), vectorType(.Float, width), span)
+            return .Some(option)
+        }
+        if name == "min_lod_clamp" { option.kind = "refused" }
+        if utf8Count(option.kind) > 0 { return .Some(option) }
+        return none
+    }
+
+    // `t.sample(s, coord[, array][, level][, offset])` and
+    // `t.sample_compare(s, coord[, array], reference[, level][, offset])`.
+    function sampleCall(borrow mut self, image: Int, arguments: [Int], compare: Bool, span: Span) -> Int {
+        let found = typeAt(typeOf(image))
+        if found.multisampled || found.access != .Sample || (compare && !found.depth) { return refuse(.NoMatch, span) }
+        if arguments.count < 2 { return refuse(.ArgumentCount, span) }
+        var operands = [image, samplerArgument(arguments[0], compare, span), -1, -1, -1, -1, -1, -1, -1]
+        operands[2] = coordinate(arguments[1], found.dimension.lanes(), false, span)
+        var next = 2
+        if found.arrayed {
+            if next >= arguments.count { return refuse(.ArgumentCount, span) }
+            operands[3] = integralArgument(arguments[next], span)
+            next += 1
+        }
+        if compare {
+            if next >= arguments.count { return refuse(.ArgumentCount, span) }
+            operands[7] = convertImplicitly(checkExpression(arguments[next]), scalarType(.Float), span)
+            next += 1
+        }
+        var level = "auto"
+        while next < arguments.count {
+            match levelOption(arguments[next], span) {
+                Some(option) -> {
+                    if option.kind == "refused" { return refuse(.UnsupportedFunction, span) }
+                    level = option.kind
+                    operands[5] = option.first
+                    operands[6] = option.second
+                }
+                None -> operands[4] = offsetArgument(arguments[next], sizeLanes(found.dimension), span)
+            }
+            next += 1
+        }
+        if compare && level == "exact" {
+            if !zeroLiteral(operands[5]) { return refuse(.UnsupportedFunction, span) }
+            level = "zero"
+            operands[5] = -1
+        }
+        if compare && level != "zero" && level != "auto" { return refuse(.UnsupportedFunction, span) }
+        if level == "auto" && (stage == .VertexStage || stage == .KernelStage) { return refuse(.WrongStage, span) }
+        var resultType = vectorType(.Float, 4)
+        if found.depth { resultType = scalarType(.Float) }
+        if !found.depth && found.scalar.isInteger() { resultType = vectorType(found.scalar, 4) }
+        var made = expressionOf(.ImageCall, resultType, span)
+        made.name = "sample"
+        made.detail = level
+        made.arguments = operands
+        return texel(add(made), found.scalar)
+    }
+
+    function zeroLiteral(borrow self, expression: Int) -> Bool {
+        let checked = program.expressions[expression]
+        return checked.kind == .Literal && (checked.value.text == "0" || checked.value.text == "0.0")
+    }
+
+    // A texel offset: a constant integer vector.
+    function offsetArgument(borrow mut self, index: Int, count: Int, span: Span) -> Int {
+        let offset = checkExpression(index)
+        if broken(offset) { return offset }
+        let offsetType = typeOf(offset)
+        if !isIntegral(offsetType) || lanes(offsetType) != count || !isConstantExpression(offset) {
+            return refuse(.TypeMismatch, span)
+        }
+        return convertTo(offset, vectorType(.Int, count))
+    }
+
+    // `t.gather(s, coord[, array][, offset][, component])` and
+    // `t.gather_compare(s, coord[, array], reference[, offset])`.
+    function gatherCall(borrow mut self, image: Int, arguments: [Int], compare: Bool, span: Span) -> Int {
+        let found = typeAt(typeOf(image))
+        let shaped = found.dimension == .Plane || found.dimension == .Cube
+        if !shaped || found.multisampled || found.access != .Sample || (compare && !found.depth) {
+            return refuse(.NoMatch, span)
+        }
+        if arguments.count < 2 { return refuse(.ArgumentCount, span) }
+        var operands = [image, samplerArgument(arguments[0], compare, span), -1, -1, -1, -1, -1, -1, -1]
+        operands[2] = coordinate(arguments[1], found.dimension.lanes(), false, span)
+        var next = 2
+        if found.arrayed && next < arguments.count {
+            operands[3] = integralArgument(arguments[next], span)
+            next += 1
+        }
+        if compare && next < arguments.count {
+            operands[7] = convertImplicitly(checkExpression(arguments[next]), scalarType(.Float), span)
+            next += 1
+        }
+        var component = 0
+        while next < arguments.count {
+            let syntax = tree.expressions[arguments[next]]
+            if syntax.kind == .Name && startsWith(syntax.text, "component_") && !compare {
+                let lanes = swizzleLanes(utf8Slice(syntax.text, 10, utf8Count(syntax.text)))
+                if lanes.count != 1 { return refuse(.TypeMismatch, span) }
+                component = lanes[0]
+            } else {
+                operands[4] = offsetArgument(arguments[next], 2, span)
+            }
+            next += 1
+        }
+        var resultType = vectorType(.Float, 4)
+        if found.scalar.isInteger() { resultType = vectorType(found.scalar, 4) }
+        var made = expressionOf(.ImageCall, resultType, span)
+        made.name = "sample"
+        made.detail = "zero"
+        made.arguments = operands
+        made.components = [component]
+        return texel(add(made), found.scalar)
+    }
+
+    // `t.read(coord[, array][, lod or sample])`.
+    function readCall(borrow mut self, image: Int, arguments: [Int], span: Span) -> Int {
+        let found = typeAt(typeOf(image))
+        if found.access == .Write || found.dimension == .Cube { return refuse(.NoMatch, span) }
+        if arguments.count < 1 { return refuse(.ArgumentCount, span) }
+        var operands = [image, coordinate(arguments[0], sizeLanes(found.dimension), true, span), -1, -1, -1]
+        var next = 1
+        if found.arrayed {
+            if next >= arguments.count { return refuse(.ArgumentCount, span) }
+            operands[2] = integralArgument(arguments[next], span)
+            next += 1
+        }
+        if found.multisampled {
+            if next >= arguments.count { return refuse(.ArgumentCount, span) }
+            operands[3] = integralArgument(arguments[next], span)
+            next += 1
+        } else if found.access == .Sample {
+            operands[4] = literal(.Int, "0", span)
+            if next < arguments.count {
+                operands[4] = integralArgument(arguments[next], span)
+                next += 1
+            }
+        }
+        if next != arguments.count { return refuse(.ArgumentCount, span) }
+        var resultType = vectorType(.Float, 4)
+        if found.depth { resultType = scalarType(.Float) }
+        if !found.depth && found.scalar.isInteger() { resultType = vectorType(found.scalar, 4) }
+        return texel(imageCall("read", resultType, operands, span), found.scalar)
+    }
+
+    // `t.write(value, coord[, array][, 0])`.
+    function writeCall(borrow mut self, image: Int, arguments: [Int], span: Span) -> Int {
+        let found = typeAt(typeOf(image))
+        if found.access != .Write && found.access != .ReadWrite { return refuse(.NoMatch, span) }
+        if arguments.count < 2 { return refuse(.ArgumentCount, span) }
+        var stored: Scalar = .Float
+        if found.scalar.isInteger() { stored = found.scalar }
+        let value = convertImplicitly(checkExpression(arguments[0]), vectorType(stored, 4), span)
+        var operands = [image, coordinate(arguments[1], sizeLanes(found.dimension), true, span), -1, value]
+        var next = 2
+        if found.arrayed {
+            if next >= arguments.count { return refuse(.ArgumentCount, span) }
+            operands[2] = integralArgument(arguments[next], span)
+            next += 1
+        }
+        if next < arguments.count {
+            let level = checkExpression(arguments[next])
+            if !zeroLiteral(level) { return refuse(.UnsupportedFunction, span) }
+            next += 1
+        }
+        if next != arguments.count { return refuse(.ArgumentCount, span) }
+        return imageCall("write", voidType(), operands, span)
+    }
+
+    // `get_width`, `get_height` and `get_depth`: one lane of the size.
+    function sizeCall(borrow mut self, image: Int, arguments: [Int], lane: Int, span: Span) -> Int {
+        let found = typeAt(typeOf(image))
+        let lanes = sizeLanes(found.dimension)
+        if lane >= lanes { return refuse(.NoSuchMember, span) }
+        let levelled = found.access == .Sample && !found.multisampled
+        var level = -1
+        if arguments.count > 1 || (arguments.count == 1 && !levelled) { return refuse(.ArgumentCount, span) }
+        if levelled {
+            level = literal(.Int, "0", span)
+            if arguments.count == 1 { level = integralArgument(arguments[0], span) }
+        }
+        let size = imageCall("size", vectorType(.UInt, lanes), [image, level], span)
+        if lanes == 1 { return size }
+        return indexOf(size, literal(.Int, decimalText(lane), span), span)
+    }
+
+    function countCall(borrow mut self, image: Int, arguments: [Int], query: String, span: Span) -> Int {
+        let found = typeAt(typeOf(image))
+        if arguments.count != 0 { return refuse(.ArgumentCount, span) }
+        let fits = (query == "levels" && found.access == .Sample && !found.multisampled)
+            || (query == "layers" && found.arrayed) || (query == "samples" && found.multisampled)
+        if !fits { return refuse(.NoMatch, span) }
+        return imageCall(query, scalarType(.UInt), [image, -1], span)
+    }
+}

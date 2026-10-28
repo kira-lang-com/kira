@@ -1,0 +1,250 @@
+// The syntax tree of one translation unit.
+//
+// Expressions, statements and written types live in arenas and name each
+// other by index. Top-level declarations are kept per kind, with `items`
+// recording the order the file writes them in: C++ names a declaration
+// only after it, so that order is what the checker resolves names by.
+// A name declared in `namespace a { }` is `a_name`; `prefix` records
+// the prefix a declaration was written under, empty at file scope.
+
+struct SyntaxTree {
+    var expressions: [Expression]
+    var statements: [Statement]
+    var types: [TypeSyntax]
+    var items: [Item]
+    var structs: [StructDeclaration]
+    var functions: [FunctionDeclaration]
+    var globals: [GlobalDeclaration]
+    var aliases: [AliasDeclaration]
+    // Namespaces a `using namespace` opened, `metal` aside, and each
+    // namespace with the one it is written in.
+    var usings: [String]
+    var namespaces: [NamespaceScope]
+    // The translation unit's own file.
+    var file: Int
+
+    function empty(file: Int) -> SyntaxTree {
+        return SyntaxTree {
+            expressions = [], statements = [], types = [], items = [], structs = [], functions = [],
+            globals = [], aliases = [], usings = [], namespaces = [], file = file
+        }
+    }
+}
+
+struct NamespaceScope {
+    let prefix: String
+    let parent: String
+}
+
+enum ItemKind {
+    StructItem
+    FunctionItem
+    GlobalItem
+    AliasItem
+}
+
+struct Item {
+    let kind: ItemKind
+    let index: Int
+}
+
+// `[[name(arguments)]]`; each argument is an expression, a bare word being
+// a `Name`.
+struct Attribute {
+    let name: String
+    let arguments: [Int]
+    let span: Span
+}
+
+enum SpaceWord {
+    NoSpace
+    ConstantSpace
+    DeviceSpace
+    ThreadSpace
+    ThreadgroupSpace
+}
+
+// A written type: a name with its template arguments, its qualifiers, and
+// what the declarator adds: a pointer or reference, and array extents,
+// outermost first. A template argument is a type (`types`) or an integer
+// expression (`expressions`), -1 in the other list.
+struct TypeSyntax {
+    let name: String
+    let typeArguments: [Int]
+    let valueArguments: [Int]
+    var space: SpaceWord
+    var constant: Bool
+    var pointer: Bool
+    var reference: Bool
+    var extents: [Int]
+    let span: Span
+}
+
+struct StructDeclaration {
+    let name: String
+    let prefix: String
+    let members: [MemberDeclaration]
+    let span: Span
+}
+
+struct MemberDeclaration {
+    let name: String
+    let typeSyntax: Int
+    let attributes: [Attribute]
+    let span: Span
+}
+
+enum StageWord {
+    NoStage
+    VertexStage
+    FragmentStage
+    KernelStage
+}
+
+struct ParameterDeclaration {
+    let name: String
+    let typeSyntax: Int
+    let attributes: [Attribute]
+    let span: Span
+}
+
+// A function, a template of one (`templateParameters` not empty) or a
+// prototype (`defined` false).
+struct FunctionDeclaration {
+    let name: String
+    let prefix: String
+    let stage: StageWord
+    let result: Int
+    let parameters: [ParameterDeclaration]
+    let templateParameters: [String]
+    let attributes: [Attribute]
+    let body: [Int]
+    let defined: Bool
+    let span: Span
+}
+
+// A program-scope `constant` or `constexpr` variable; `value` is -1 for a
+// function constant, which `[[function_constant(n)]]` marks.
+struct GlobalDeclaration {
+    let name: String
+    let prefix: String
+    let typeSyntax: Int
+    let value: Int
+    let attributes: [Attribute]
+    let span: Span
+}
+
+struct AliasDeclaration {
+    let name: String
+    let prefix: String
+    let typeSyntax: Int
+    let span: Span
+}
+
+enum StatementKind {
+    Declare
+    Evaluate
+    If
+    Switch
+    Case
+    For
+    While
+    Do
+    Break
+    Continue
+    Return
+    Block
+    Group
+    Empty
+}
+
+// One statement. `Declare` declares `name` of `typeSyntax` with `value`
+// (-1 without an initializer); `Evaluate` and `Return` read `value`; `If`
+// tests `value` and runs `body[0]`, then `otherwise`; `Switch` selects on
+// `value` over `body`, whose `Case` statements hold their label in `value`
+// (-1 for `default`); `For` runs `initial`, tests `value`, steps `step`;
+// `While` and `Do` test `value` around `body[0]`; `Block` scopes `body`
+// and `Group` does not, as `int a, b;` declares both in the enclosing scope.
+struct Statement {
+    let kind: StatementKind
+    let name: String
+    let typeSyntax: Int
+    let value: Int
+    let initial: Int
+    let step: Int
+    let body: [Int]
+    let otherwise: Int
+    let span: Span
+}
+
+enum ExpressionKind {
+    IntegerLiteral
+    FloatLiteral
+    BooleanLiteral
+    Name
+    Member
+    Index
+    Call
+    Construct
+    InitializerList
+    Unary
+    Postfix
+    Binary
+    Assign
+    Conditional
+    Cast
+    Bitcast
+}
+
+enum Operator {
+    Add
+    Subtract
+    Multiply
+    Divide
+    Remainder
+    Equal
+    NotEqual
+    Less
+    LessEqual
+    Greater
+    GreaterEqual
+    LogicalAnd
+    LogicalOr
+    BitAnd
+    BitOr
+    BitXor
+    ShiftLeft
+    ShiftRight
+    Negate
+    Plus
+    Not
+    BitNot
+    Dereference
+    AddressOf
+    Increment
+    Decrement
+    Comma
+    Plain
+}
+
+// One expression. A literal or name keeps its `text`, a name its namespace
+// path joined with `_`; `Member` reads `left` and `text`, `Index` `left`
+// and `right`; `Call` calls `left` with `arguments`; `Construct` builds
+// `typeSyntax` from `arguments`, braced or not; `InitializerList` is a
+// bare `{...}`; `Unary`, `Postfix` and `Binary` apply `operator`; `Assign`
+// stores `right` into `left`, combined by `operator` unless `Plain`;
+// `Conditional` picks `right` or `third` by `left`; `Cast` and `Bitcast`
+// convert `left` to `typeSyntax`. `arrow` marks `->`, `braced` `T{...}`.
+struct Expression {
+    let kind: ExpressionKind
+    let text: String
+    let operator: Operator
+    let left: Int
+    let right: Int
+    let third: Int
+    let arguments: [Int]
+    let typeSyntax: Int
+    let arrow: Bool
+    let braced: Bool
+    let span: Span
+}

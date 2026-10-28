@@ -1,0 +1,218 @@
+// Statements. A statement that starts with a type and goes on with a name
+// declares; anything else that is not a keyword statement is an
+// expression. `case` and `default` labels are statements of a switch's
+// body, so a label's place among its statements is kept.
+
+extend Parser {
+    function block(borrow mut self) -> Result<[Int], Failure> {
+        try expect(.LeftBrace)
+        var statements: [Int] = []
+        while !at(.RightBrace) && !at(.End) {
+            statements.append(try statement())
+        }
+        try expect(.RightBrace)
+        return .Ok(statements)
+    }
+
+    function addStatement(borrow mut self, statement: Statement) -> Int {
+        tree.statements.append(statement)
+        return tree.statements.count - 1
+    }
+
+    function simple(borrow mut self, kind: StatementKind, value: Int, body: [Int], start: Span) -> Int {
+        return addStatement(Statement {
+            kind = kind, name = "", typeSyntax = -1, value = value, initial = -1, step = -1, body = body,
+            otherwise = -1, span = since(start)
+        })
+    }
+
+    function statement(borrow mut self) -> Result<Int, Failure> {
+        let start = token().span
+        if at(.LeftBracket) && peek(1).kind == .LeftBracket {
+            return .Error(fail(.UnsupportedAttribute, start))
+        }
+        if at(.LeftBrace) { return .Ok(simple(.Block, -1, try block(), start)) }
+        if eat(.Semicolon) { return .Ok(simple(.Empty, -1, [], start)) }
+        if at(.Word) {
+            match token().text {
+                "if" -> return ifStatement()
+                "switch" -> return switchStatement()
+                "case" -> {
+                    advance()
+                    let label = try binary(0)
+                    try expect(.Colon)
+                    return .Ok(simple(.Case, label, [], start))
+                }
+                "default" -> {
+                    advance()
+                    try expect(.Colon)
+                    return .Ok(simple(.Case, -1, [], start))
+                }
+                "for" -> return forStatement()
+                "while" -> {
+                    advance()
+                    let condition = try parenthesized()
+                    let body = try statement()
+                    return .Ok(simple(.While, condition, [body], start))
+                }
+                "do" -> {
+                    advance()
+                    let body = try statement()
+                    try expectWord("while")
+                    let condition = try parenthesized()
+                    try expect(.Semicolon)
+                    return .Ok(simple(.Do, condition, [body], start))
+                }
+                "break" -> {
+                    advance()
+                    try expect(.Semicolon)
+                    return .Ok(simple(.Break, -1, [], start))
+                }
+                "continue" -> {
+                    advance()
+                    try expect(.Semicolon)
+                    return .Ok(simple(.Continue, -1, [], start))
+                }
+                "return" -> {
+                    advance()
+                    var value = -1
+                    if !at(.Semicolon) { value = try initializer() }
+                    try expect(.Semicolon)
+                    return .Ok(simple(.Return, value, [], start))
+                }
+                "goto" -> return .Error(fail(.UnsupportedStatement, start))
+                "try" -> return .Error(fail(.UnsupportedStatement, start))
+                "asm" -> return .Error(fail(.UnsupportedStatement, start))
+                "static" -> return .Error(fail(.UnsupportedStatement, start))
+                else -> {}
+            }
+            if peek(1).kind == .Colon { return .Error(fail(.UnsupportedStatement, start)) }
+        }
+        if atDeclaration() {
+            let declared = try declarationStatement()
+            try expect(.Semicolon)
+            return .Ok(declared)
+        }
+        let value = try commaExpression()
+        try expect(.Semicolon)
+        return .Ok(simple(.Evaluate, value, [], start))
+    }
+
+    function parenthesized(borrow mut self) -> Result<Int, Failure> {
+        try expect(.LeftParen)
+        if atDeclaration() { return .Error(fail(.UnsupportedStatement, token().span)) }
+        let value = try commaExpression()
+        try expect(.RightParen)
+        return .Ok(value)
+    }
+
+    // Whether the cursor starts a declaration: `constexpr`, or a type
+    // followed by a name. The type is read and the cursor put back.
+    function atDeclaration(borrow mut self) -> Bool {
+        if atWord("constexpr") { return true }
+        if !atType() { return false }
+        let saved = position
+        var declares = false
+        match typeName() {
+            Ok(written) -> declares = at(.Word) && !isReserved(token().text)
+            Error(failure) -> declares = false
+        }
+        position = saved
+        return declares
+    }
+
+    // `[constexpr] Type a = x, b[2], c{...}` as one `Declare`, or a `Group`
+    // of them.
+    function declarationStatement(borrow mut self) -> Result<Int, Failure> {
+        let start = token().span
+        eatWord("constexpr")
+        let base = try typeName()
+        var declared: [Int] = []
+        while true {
+            let declaredStart = token().span
+            let named = try declarator(base)
+            var value = -1
+            if eat(.Equals) {
+                value = try initializer()
+            } else if at(.LeftBrace) {
+                value = try bracedConstruct(named.typeSyntax, declaredStart)
+            } else if at(.LeftParen) {
+                return .Error(fail(.UnsupportedConstruct, token().span))
+            }
+            declared.append(addStatement(Statement {
+                kind = .Declare, name = named.name, typeSyntax = named.typeSyntax, value = value, initial = -1,
+                step = -1, body = [], otherwise = -1, span = since(declaredStart)
+            }))
+            if !eat(.Comma) { break }
+        }
+        if declared.count == 1 { return .Ok(declared[0]) }
+        return .Ok(simple(.Group, -1, declared, start))
+    }
+
+    // An initializer: a braced list or an assignment expression.
+    function initializer(borrow mut self) -> Result<Int, Failure> {
+        if !at(.LeftBrace) { return assignment() }
+        let start = advance().span
+        let arguments = try initializerItems()
+        return .Ok(addExpression(Expression {
+            kind = .InitializerList, text = "", operator = .Plain, left = -1, right = -1, third = -1,
+            arguments = arguments, typeSyntax = -1, arrow = false, braced = true, span = since(start)
+        }))
+    }
+
+    // The items of a braced list up to its `}`, after the `{`.
+    function initializerItems(borrow mut self) -> Result<[Int], Failure> {
+        var arguments: [Int] = []
+        while !at(.RightBrace) && !at(.End) {
+            arguments.append(try initializer())
+            if !eat(.Comma) { break }
+        }
+        try expect(.RightBrace)
+        return .Ok(arguments)
+    }
+
+    function ifStatement(borrow mut self) -> Result<Int, Failure> {
+        let start = advance().span
+        if atWord("constexpr") { return .Error(fail(.UnsupportedStatement, token().span)) }
+        let condition = try parenthesized()
+        let body = try statement()
+        var otherwise = -1
+        if eatWord("else") { otherwise = try statement() }
+        return .Ok(addStatement(Statement {
+            kind = .If, name = "", typeSyntax = -1, value = condition, initial = -1, step = -1, body = [body],
+            otherwise = otherwise, span = since(start)
+        }))
+    }
+
+    function switchStatement(borrow mut self) -> Result<Int, Failure> {
+        let start = advance().span
+        let selector = try parenthesized()
+        let body = try block()
+        return .Ok(simple(.Switch, selector, body, start))
+    }
+
+    // `for (initial; condition; step) body`; each part may be empty.
+    function forStatement(borrow mut self) -> Result<Int, Failure> {
+        let start = advance().span
+        try expect(.LeftParen)
+        var initial = -1
+        let initialStart = token().span
+        if atDeclaration() {
+            initial = try declarationStatement()
+        } else if !at(.Semicolon) {
+            initial = simple(.Evaluate, try commaExpression(), [], initialStart)
+        }
+        try expect(.Semicolon)
+        var condition = -1
+        if !at(.Semicolon) { condition = try commaExpression() }
+        try expect(.Semicolon)
+        var step = -1
+        if !at(.RightParen) { step = try commaExpression() }
+        try expect(.RightParen)
+        let body = try statement()
+        return .Ok(addStatement(Statement {
+            kind = .For, name = "", typeSyntax = -1, value = condition, initial = initial, step = step,
+            body = [body], otherwise = -1, span = since(start)
+        }))
+    }
+}

@@ -1,0 +1,199 @@
+// Kira's types, as analysis reasons about them.
+//
+// Every integer spelling is its own type: `U8` and `U32` do not mix. Bare
+// `Int` is the exception, pairing with any width, which is what lets a
+// literal be written at every width and a width flow into an `Int`. Values
+// cross between `Int` and a width through a conversion the analysis makes
+// explicit, checked when the destination cannot hold every source value.
+
+enum TypeKind {
+    Integer
+    Floating
+    Decimal
+    Boolean
+    Pointer
+    Void
+    Structure
+    Enumeration
+    Invalid
+}
+
+// A type is a kind plus the fields that kind reads: the width and signedness
+// of an integer, and the declaration a struct or enum type names. Only a
+// struct or enum reads `declaration`; every other kind leaves it 0. `Invalid`
+// is the type of an expression that already failed, so one mistake is
+// reported once rather than at every use.
+struct Type {
+    let kind: TypeKind
+    let bits: Int
+    let signed: Bool
+    let declaration: Int
+
+    function integer(bits: Int, signed: Bool) -> Type {
+        return Type { kind = .Integer, bits = bits, signed = signed, declaration = 0 }
+    }
+
+    function int() -> Type {
+        return Type.integer(64, true)
+    }
+
+    function floating(bits: Int) -> Type {
+        return Type { kind = .Floating, bits = bits, signed = true, declaration = 0 }
+    }
+
+    // `Number`, the exact decimal: two words, a mantissa and a scale, which
+    // Foundation does arithmetic on. Lowering sees Foundation's `NumberWords`.
+    function number() -> Type {
+        return Type { kind = .Decimal, bits = 64, signed = true, declaration = 0 }
+    }
+
+    // `N8` to `N32` and `UN8` to `UN32`: a `Number` whose values fit that
+    // many bits, signed or not, stored as the integer of that width
+    // (KLF-RIDL section 21.1). It widens into any number that holds all its
+    // values, and narrowing into it is a conversion asked for, since that
+    // loses range.
+    function sizedNumber(bits: Int, signed: Bool) -> Type {
+        return Type { kind = .Decimal, bits = bits, signed = signed, declaration = 0 }
+    }
+
+    function boolean() -> Type {
+        return Type { kind = .Boolean, bits = 1, signed = false, declaration = 0 }
+    }
+
+    function pointer() -> Type {
+        return Type { kind = .Pointer, bits = 0, signed = false, declaration = 0 }
+    }
+
+    function void() -> Type {
+        return Type { kind = .Void, bits = 0, signed = false, declaration = 0 }
+    }
+
+    function structure(declaration: Int) -> Type {
+        return Type { kind = .Structure, bits = 0, signed = false, declaration = declaration }
+    }
+
+    function enumeration(declaration: Int) -> Type {
+        return Type { kind = .Enumeration, bits = 0, signed = false, declaration = declaration }
+    }
+
+    function invalid() -> Type {
+        return Type { kind = .Invalid, bits = 0, signed = false, declaration = 0 }
+    }
+
+    function equals(borrow self, other: Type) -> Bool {
+        return kind == other.kind && bits == other.bits && signed == other.signed
+            && declaration == other.declaration
+    }
+
+    function isInteger(borrow self) -> Bool {
+        return kind == .Integer
+    }
+
+    // Bare `Int`, the width that pairs with every other.
+    function isInt(borrow self) -> Bool {
+        return kind == .Integer && bits == 64 && signed
+    }
+
+    // `Number` itself rather than a sized one.
+    function isNumber(borrow self) -> Bool {
+        return kind == .Decimal && bits == 64
+    }
+
+    function isSizedNumber(borrow self) -> Bool {
+        return kind == .Decimal && bits != 64
+    }
+
+    // The integer a sized number is stored as.
+    function storage(borrow self) -> Type {
+        return Type.integer(bits, signed)
+    }
+
+    // Whether every value of this number or integer type is a value of the
+    // number type `other`. `Number` holds every one.
+    function widensToNumber(borrow self, other: Type) -> Bool {
+        if other.isNumber() { return true }
+        if kind == .Decimal && bits == 64 { return false }
+        return fitsIn(other)
+    }
+
+    // How Kira spells a number type.
+    function numberName(borrow self) -> String {
+        if bits == 64 { return "Number" }
+        if signed { return joinText(["N", decimalText(bits)]) }
+        return joinText(["UN", decimalText(bits)])
+    }
+
+    function isInvalid(borrow self) -> Bool {
+        return kind == .Invalid
+    }
+
+    // Structs and enums live in memory and are handled by address.
+    function isAggregate(borrow self) -> Bool {
+        return kind == .Structure || kind == .Enumeration
+    }
+
+    // Whether a literal is a value of this integer type. A hexadecimal
+    // literal names bits, so any one fits a `U64`: that is how a `U64` above
+    // the signed range is written.
+    function holdsLiteral(borrow self, value: Int, hexadecimal: Bool) -> Bool {
+        if bits == 64 {
+            return signed || value >= 0 || hexadecimal
+        }
+        if signed {
+            let limit = 1 << (bits - 1)
+            return value >= 0 - limit && value < limit
+        }
+        return value >= 0 && value < (1 << bits)
+    }
+
+    // The bounds of an integer type, which a checked conversion tests against.
+    // `U64`'s maximum is no `Int`, but no conversion needs it: nothing is wider.
+    function minimum(borrow self) -> Int {
+        if !signed { return 0 }
+        if bits == 64 { return 0 - 9223372036854775807 - 1 }
+        return 0 - (1 << (bits - 1))
+    }
+
+    function maximum(borrow self) -> Int {
+        if bits == 64 { return 9223372036854775807 }
+        if signed { return (1 << (bits - 1)) - 1 }
+        return (1 << bits) - 1
+    }
+
+    // Whether every value of this integer type is a value of `other`.
+    function fitsIn(borrow self, other: Type) -> Bool {
+        if signed == other.signed { return bits <= other.bits }
+        if signed { return false }
+        return bits < other.bits
+    }
+}
+
+// The builtin type a name spells, if it spells one. There is no `I64`: `Int`
+// is the signed 64-bit integer.
+function builtinType(name: String) -> Optional<Type> {
+    match name {
+        "Int" -> return .Some(Type.int())
+        "I8" -> return .Some(Type.integer(8, true))
+        "I16" -> return .Some(Type.integer(16, true))
+        "I32", "Int32" -> return .Some(Type.integer(32, true))
+        "U8" -> return .Some(Type.integer(8, false))
+        "U16" -> return .Some(Type.integer(16, false))
+        "U32" -> return .Some(Type.integer(32, false))
+        "U64" -> return .Some(Type.integer(64, false))
+        "Bool" -> return .Some(Type.boolean())
+        "Float", "F64" -> return .Some(Type.floating(64))
+        "F32" -> return .Some(Type.floating(32))
+        // A conversion is read as a callee, which the alias table above does
+        // not rewrite, so the aliases a conversion answers to are named here.
+        "Number", "UNumber" -> return .Some(Type.number())
+        "N8" -> return .Some(Type.sizedNumber(8, true))
+        "N16" -> return .Some(Type.sizedNumber(16, true))
+        "N32" -> return .Some(Type.sizedNumber(32, true))
+        "UN8" -> return .Some(Type.sizedNumber(8, false))
+        "UN16" -> return .Some(Type.sizedNumber(16, false))
+        "UN32" -> return .Some(Type.sizedNumber(32, false))
+        "RawPtr" -> return .Some(Type.pointer())
+        "Void" -> return .Some(Type.void())
+        else -> return .None
+    }
+}

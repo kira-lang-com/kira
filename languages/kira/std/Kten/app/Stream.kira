@@ -1,0 +1,35 @@
+import Foundation
+
+/// Values one after another, arriving in pieces, as an HTTP body streams them. Each value's binary form delimits itself, so the stream is the values back to back with nothing around them; a value split across pieces waits for the rest.
+public struct KtenStream {
+    /// The bytes received that do not yet make a whole value.
+    var pending: [UN8] = []
+
+    /// Adds `bytes` that arrived to the stream.
+    function feed(borrow mut self, bytes: borrow [UN8]) {
+        pending.appendAll(bytes)
+    }
+
+    /// The next whole value, or none until more bytes arrive. Fails when the bytes are not a value.
+    function next(borrow mut self) -> Result<Kten?, KtenDecodeFailure> {
+        if pending.count == 0 { return .Ok(.None) }
+        var reader = KtenReader { bytes: copy pending }
+        let failure = match reader.value() {
+            Ok(value) -> {
+                pending = byteRun(pending, reader.at, pending.count)
+                return .Ok(.Some(value))
+            }
+            Error(problem) -> problem
+        }
+        return match failure {
+            // The value is not all here yet.
+            Truncated, LengthPastEnd -> .Ok(.None)
+            Overlong, UnknownKind, TooDeep, NotText, NotADecimal -> .Error(failure)
+        }
+    }
+
+    /// Whether part of a value is held. Once the stream has ended, those bytes are a value cut short.
+    function holdsPart(borrow self) -> Bool {
+        return pending.count > 0
+    }
+}

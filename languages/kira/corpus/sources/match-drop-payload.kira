@@ -1,0 +1,75 @@
+// A payload that runs `drop`, bound by a `match` arm, is dropped once: the
+// binding takes it over from a temporary or a `move`, and the matched value
+// does not drop it again. Each `Counted` adds one to the counter when it is
+// dropped; five are made, so the counter ends at 5.
+
+import Foundation
+
+struct Counted: Drop {
+    let counter: RawPtr
+    function drop(borrow mut self) {
+        heapWriteInt(counter, heapReadInt(counter) + 1)
+    }
+}
+
+enum Problem {
+    Missing
+}
+
+function made(counter: RawPtr, fails: Bool) -> Result<Counted, Problem> {
+    if fails { return .Error(.Missing) }
+    return .Ok(Counted(counter: counter))
+}
+
+function fromTemporary(counter: RawPtr) {
+    match made(counter, false) {
+        Ok(held) -> { let _ = held.counter }
+        Error(failed) -> { let _ = failed }
+    }
+}
+
+function fromMove(counter: RawPtr) {
+    let named = made(counter, false)
+    match move named {
+        Ok(held) -> { let _ = held.counter }
+        Error(failed) -> { let _ = failed }
+    }
+}
+
+function asValue(counter: RawPtr) -> Int {
+    let size = match made(counter, false) {
+        Ok(held) -> 1
+        Error(failed) -> 0
+    }
+    return size
+}
+
+function unbound(counter: RawPtr) {
+    match made(counter, false) {
+        Ok -> {}
+        Error(failed) -> { let _ = failed }
+    }
+}
+
+function failing(counter: RawPtr) {
+    match made(counter, true) {
+        Ok(held) -> { let _ = held.counter }
+        Error(failed) -> { let _ = failed }
+    }
+}
+
+@Main
+function main() -> Int {
+    let counter = heapAllocateRaw(8, 8)
+    heapWriteInt(counter, 0)
+    fromTemporary(counter)
+    fromMove(counter)
+    let _ = asValue(counter)
+    unbound(counter)
+    failing(counter)
+    // A copy dropped twice would have counted more; one leaked, fewer.
+    fromTemporary(counter)
+    let result = heapReadInt(counter)
+    heapFreeRaw(counter)
+    return result
+}

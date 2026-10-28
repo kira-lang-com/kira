@@ -1,0 +1,279 @@
+// A Kira function or lambda where an `@FFI.Callback` value is expected (KLF
+// section 26.4): C calls it through a function pointer with the platform
+// convention, so the value is the address of an adapter the lowering emits,
+// which takes the callback's C parameters and calls the function. The
+// function takes what C passes: a scalar as itself, a `CString` as a
+// `String`, and a C struct by value either as itself or as an
+// `@FFI.Pointer` to it. A callback with a `context:` also holds the
+// lambda's captures, as a closure does; its `context` member is what the
+// program hands C to pass back, and the adapter calls the lambda with it.
+
+extend Checker {
+    // A name: a function given where a callback is expected becomes one.
+    function checkNameExpecting(borrow mut self, name: Identifier, expected: Optional<Type>) -> Int {
+        match expected {
+            Some(target) -> {
+                if isCallbackType(program, target) && lookup(name.text).isNone() && declarations.globalNamed(name.text).isNone() {
+                    match declarations.findFunction(.None, name.text) {
+                        Some(callee) -> return foreignCallback(callee, target.declaration, name.span)
+                        None -> {}
+                    }
+                }
+            }
+            None -> {}
+        }
+        return checkName(name)
+    }
+
+    function foreignCallback(borrow mut self, callee: Int, callback: Int, span: Span) -> Int {
+        let signature = declarations.signatures[callee]
+        declarations.requireVisible(file(), signature.name.span.file, span)
+        let callbackType = Type.structure(callback)
+        match callbackMark(callback) {
+            Some(mark) -> {
+                let parameters = callbackParameters(mark)
+                let result = callbackResult(mark)
+                let context = program.callbackContexts[callback]
+                var taken: [Type] = []
+                for parameter in signature.parameters { taken.append(parameter.valueType) }
+                if signature.owner.isSome() || signature.declaration.typeParameters.count > 0
+                    || !signature.result.equals(result) || !callbackTakesAll(parameters, context, taken) {
+                    report(.ForeignCallbackShape, span)
+                    return add(.Integer(0), Type.invalid(), span)
+                }
+                let entry = callbackEntry(ForeignCallback {
+                    callee = callee, callback = callback, parameters = parameters, result = result, context = context, closure = false
+                })
+                let none: Optional<Int> = .None
+                return add(.ForeignCallback(entry, callee, none), callbackType, span)
+            }
+            None -> {
+                report(.ForeignCallbackShape, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+
+    // A lambda where a callback is expected: it takes the callback's
+    // parameters but the context, which carries its captures, so one that
+    // captures needs a callback with a `context:`.
+    function checkLambdaExpecting(borrow mut self, declared: LambdaDeclaration, expected: Optional<Type>) -> Int {
+        match expected {
+            Some(target) -> {
+                if isCallbackType(program, target) { return foreignLambda(declared, target.declaration) }
+            }
+            None -> {}
+        }
+        return checkLambda(declared, expected)
+    }
+
+    function foreignLambda(borrow mut self, declared: LambdaDeclaration, callback: Int) -> Int {
+        let callbackType = Type.structure(callback)
+        match callbackMark(callback) {
+            Some(mark) -> {
+                let context = program.callbackContexts[callback]
+                let closureType = resolveType(callbackClosureReference(mark, context, declared.span))
+                let closure = checkLambda(declared, .Some(closureType))
+                if typeOf(closure).isInvalid() { return closure }
+                match program.expressions[closure].operation.namedFunction() {
+                    Some(lambda) -> {
+                        if context < 0 && program.functions[lambda].captures.count > 0 {
+                            report(.ForeignCallbackCaptures, declared.span)
+                            return add(.Integer(0), Type.invalid(), declared.span)
+                        }
+                        let entry = callbackEntry(ForeignCallback {
+                            callee = lambda, callback = callback, parameters = callbackParameters(mark),
+                            result = callbackResult(mark), context = context, closure = true
+                        })
+                        return add(.ForeignCallback(entry, lambda, .Some(closure)), callbackType, declared.span)
+                    }
+                    None -> {
+                        report(.ForeignCallbackShape, declared.span)
+                        return add(.Integer(0), Type.invalid(), declared.span)
+                    }
+                }
+            }
+            None -> {
+                report(.ForeignCallbackShape, declared.span)
+                return add(.Integer(0), Type.invalid(), declared.span)
+            }
+        }
+    }
+
+    // The function type a lambda for `mark` has: its parameters but the
+    // context, to its result.
+    function callbackClosureReference(borrow self, mark: ForeignMark, context: Int, span: Span) -> TypeReference {
+        var arguments: [TypeReference] = []
+        var modes: [PassingMode] = []
+        match markField(mark, "params") {
+            Some(field) -> {
+                match field.value {
+                    Listed(listed) -> {
+                        for index in 0..listed.count {
+                            if index == context { continue }
+                            arguments.append(listed[index])
+                            modes.append(.Owned)
+                        }
+                    }
+                    Word -> {}
+                    Count -> {}
+                    Named -> {}
+                }
+            }
+            None -> {}
+        }
+        var result = TypeReference { qualifier = .None, name = Identifier { text = "Void", span = span }, arguments = [], modes = [], instanceName = "Void" }
+        match markField(mark, "result") {
+            Some(field) -> {
+                match field.value {
+                    Named(reference) -> result = reference
+                    Word -> {}
+                    Count -> {}
+                    Listed -> {}
+                }
+            }
+            None -> {}
+        }
+        arguments.append(result)
+        return TypeReference {
+            qualifier = .None, name = Identifier { text = "Closure", span = span },
+            arguments = arguments, modes = modes, instanceName = referenceInstanceName("Closure", arguments, modes)
+        }
+    }
+
+    function callbackEntry(borrow mut self, entry: ForeignCallback) -> Int {
+        for index in 0..program.foreignCallbacks.count {
+            let earlier = program.foreignCallbacks[index]
+            if earlier.callee == entry.callee && earlier.callback == entry.callback { return index }
+        }
+        program.foreignCallbacks.append(entry)
+        return program.foreignCallbacks.count - 1
+    }
+
+    // Whether a function taking `taken` takes what C passes, the context
+    // aside.
+    function callbackTakesAll(borrow self, parameters: [Type], context: Int, taken: [Type]) -> Bool {
+        var at = 0
+        for index in 0..parameters.count {
+            if index == context { continue }
+            if at >= taken.count || !callbackTakes(parameters[index], taken[at]) { return false }
+            at += 1
+        }
+        return at == taken.count
+    }
+
+    // Whether a Kira parameter of type `taken` takes the C argument `given`.
+    function callbackTakes(borrow self, given: Type, taken: Type) -> Bool {
+        if given.equals(taken) { return true }
+        if isCStringType(program, given) { return isStringType(program, taken) }
+        if given.kind != .Structure || taken.kind != .Structure { return false }
+        match program.structs[taken.declaration].shape {
+            CPointer(pointee) -> {
+                match pointee {
+                    Some(pointed) -> return pointed == given.declaration
+                    None -> return false
+                }
+            }
+            Plain -> return false
+            CLayout -> return false
+            CUnion -> return false
+            CArray -> return false
+            Callback -> return false
+        }
+    }
+
+    function callbackMark(borrow self, callback: Int) -> Optional<ForeignMark> {
+        for marked in tree.foreignTypes {
+            if program.structs[callback].name.span.same(marked.name.span) { return .Some(tree.foreignMarks[marked.mark]) }
+        }
+        return .None
+    }
+
+    // The C parameter types an `@FFI.Callback` lists.
+    function callbackParameters(borrow mut self, mark: ForeignMark) -> [Type] {
+        var parameters: [Type] = []
+        match markField(mark, "params") {
+            Some(field) -> {
+                match field.value {
+                    Listed(listed) -> {
+                        for reference in listed { parameters.append(resolveType(reference)) }
+                    }
+                    Word -> {}
+                    Count -> {}
+                    Named -> {}
+                }
+            }
+            None -> {}
+        }
+        return parameters
+    }
+
+    function callbackResult(borrow mut self, mark: ForeignMark) -> Type {
+        match markField(mark, "result") {
+            Some(field) -> {
+                match field.value {
+                    Named(reference) -> return resolveType(reference)
+                    Word -> return Type.invalid()
+                    Count -> return Type.invalid()
+                    Listed -> return Type.invalid()
+                }
+            }
+            None -> return Type.void()
+        }
+    }
+}
+
+function isCallbackType(program: CheckedProgram, valueType: Type) -> Bool {
+    if valueType.kind != .Structure { return false }
+    return isCallbackShape(program.structs[valueType.declaration].shape)
+}
+
+// A callback holding a lambda's captures, which it copies and drops as a
+// closure does.
+function isContextCallbackType(program: CheckedProgram, valueType: Type) -> Bool {
+    return isCallbackType(program, valueType) && program.callbackContexts[valueType.declaration] >= 0
+}
+
+function isCallbackShape(shape: ForeignShape) -> Bool {
+    match shape {
+        Callback -> return true
+        Plain -> return false
+        CLayout -> return false
+        CUnion -> return false
+        CArray -> return false
+        CPointer -> return false
+    }
+}
+
+// The index of the parameter an `@FFI.Callback`'s `context:` names, a
+// `RawPtr` C passes back as it was given, or -1.
+function callbackContext(mark: ForeignMark) -> Int {
+    match markField(mark, "context") {
+        Some(context) -> {
+            match context.value {
+                Word(word) -> {
+                    match markField(mark, "params") {
+                        Some(field) -> {
+                            match field.value {
+                                Listed(listed) -> {
+                                    for index in 0..field.names.count {
+                                        if field.names[index].text == word.text && listed[index].instanceName == "RawPtr" { return index }
+                                    }
+                                }
+                                Word -> {}
+                                Count -> {}
+                                Named -> {}
+                            }
+                        }
+                        None -> {}
+                    }
+                }
+                Count -> {}
+                Named -> {}
+                Listed -> {}
+            }
+        }
+        None -> {}
+    }
+    return 0 - 1
+}

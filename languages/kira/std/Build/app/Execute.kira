@@ -1,0 +1,499 @@
+import Foundation
+
+// Running one action (DESIGN.md section 5.2): a fresh working directory
+// under `.kira-build/work/`, named by what the action is, holding each input under `inputs/`, each
+// output under `outputs/` and room of its own under `scratch/`.
+
+// Where an action's files are while it runs.
+// An output file a native action copied whole from the stored file
+// `digest`.
+struct CopiedFile {
+    let path: String
+    let digest: String
+}
+
+struct WorkPlace {
+    let directory: String
+    // Each input placed, by artifact, and its path.
+    let placedIds: [Number]
+    let placedPaths: [String]
+    // The path of each output, in the order the action declares them.
+    let outputs: [String]
+    let scratch: String
+    // The command's workspace, or nothing.
+    let workspace: String = ""
+
+    function pathOf(borrow self, artifact: borrow Artifact) -> String {
+        for index in 0..placedIds.count {
+            if placedIds[index] == artifact.id { return copy placedPaths[index] }
+        }
+        return ""
+    }
+}
+
+// What names the working directory of `action`: its label and outputs.
+function workIdentity(action: borrow Action) -> String {
+    var identity = actionLabel(action)
+    for output in actionOutputs(action) {
+        identity += "\n" + output.name
+    }
+    return identity
+}
+
+// A command that is running, and what reports name it by.
+struct RunningCommand {
+    let action: Number
+    // Which of the command's programs runs: 0 is its tool, then each of
+    // `followedBy`.
+    let stage: Number
+    let child: ChildProcess
+    let place: WorkPlace
+    let line: String
+}
+
+extend Engine {
+    // Where `action` runs: a directory named by what the action is, its
+    // label and outputs, and not by its key, so a compile run again over an
+    // edited input reads its inputs at the same paths as before. The
+    // compiler's own cache then finds the paths it read where they were and
+    // answers for what is unchanged (KLF-RIDL section 8.9). Actions alike in
+    // label and outputs are told apart by their order in the graph.
+    function workDirectory(
+        borrow self,
+        graph: borrow Graph,
+        action: Number
+    ) -> Result<String, BuildFailure> {
+        let identity = workIdentity(graph.actions[action])
+        var alike = 0
+        for earlier in 0..action {
+            if workIdentity(graph.actions[earlier]) == identity { alike += 1 }
+        }
+        return match sha256Hex("\(identity)\n\(alike)".utf8()) {
+            Ok(named) -> .Ok(joinPath(joinPath(state, "work"), named))
+            Error(failure) -> .Error(failure)
+        }
+    }
+
+    // Where the workspace `name` is kept: under the project's state, never
+    // cleared by a run.
+    function workspacePath(borrow self, name: borrow String) -> String {
+        return joinPath(joinPath(state, "workspaces"), name)
+    }
+
+    // The files `.out` and `.err` that keep what the action wrote.
+    function logPath(borrow self, label: borrow String, stream: borrow String) -> String {
+        return joinPath(joinPath(state, "logs"), pathSafe(label) + stream)
+    }
+
+    // Makes the working directory of `action` and places its inputs there;
+    // linked inputs share the store's files.
+    function prepareWork(
+        borrow self,
+        graph: borrow Graph,
+        action: Number,
+        linked: Bool
+    ) -> Result<WorkPlace, BuildFailure> {
+        let directory = match workDirectory(graph, action) {
+            Ok(named) -> named
+            Error(failure) -> return .Error(failure)
+        }
+        // Most actions have no earlier working directory; asking only when
+        // there is one keeps an expected absence out of the trail.
+        if pathExists(directory) {
+            match clearPath(directory) {
+                Ok -> {}
+                Error(failure) -> return .Error(failure)
+            }
+        }
+        var placedIds: [Number] = []
+        var placedPaths: [String] = []
+        // A source a command reads where it is stays there. An input it
+        // places at a path of its own is there only, and an argument naming
+        // it reads that path.
+        match graph.actions[action] {
+            Run(command) -> {
+                for read in command.reads {
+                    placedIds.append(read.id)
+                    placedPaths.append(graph.sourcePath(read))
+                }
+                for placed in command.inputs {
+                    let path = joinPath(directory, placed.path)
+                    match placeArtifact(placed.artifact, path, linked) {
+                        Ok -> {}
+                        Error(failure) -> return .Error(failure)
+                    }
+                    placedIds.append(placed.artifact.id)
+                    placedPaths.append(path)
+                }
+            }
+            Native(native) -> {}
+        }
+        let inputs = graph.inputsOf(action)
+        for index in 0..inputs.count {
+            let input = inputs[index]
+            if placedIds.contains(input.id) { continue }
+            let path = joinPath(directory, "inputs/\(index)/\(inputName(graph, input))")
+            match placeArtifact(input, path, linked) {
+                Ok -> {}
+                Error(failure) -> return .Error(failure)
+            }
+            placedIds.append(input.id)
+            placedPaths.append(path)
+        }
+        var outputs: [String] = []
+        for output in actionOutputs(graph.actions[action]) {
+            let path = joinPath(directory, "outputs/" + output.name)
+            let made = match output.kind {
+                File -> makePathTree(parentPath(path))
+                Tree -> makePathTree(path)
+            }
+            match made {
+                Ok -> {}
+                Error(failure) -> return .Error(failure)
+            }
+            outputs.append(path)
+        }
+        let scratch = joinPath(directory, "scratch")
+        match makePathTree(scratch) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        let workspace = match graph.actions[action] {
+            Run(command) -> command.workspace.count > 0 ? workspacePath(command.workspace) : ""
+            Native(native) -> ""
+        }
+        if workspace.count > 0 {
+            match makePathTree(workspace) {
+                Ok -> {}
+                Error(failure) -> return .Error(failure)
+            }
+        }
+        return .Ok(
+            WorkPlace {
+                directory: directory,
+                placedIds: placedIds,
+                placedPaths: placedPaths,
+                outputs: outputs,
+                scratch: scratch,
+                workspace: workspace
+            }
+        )
+    }
+
+    function placeArtifact(
+        borrow self,
+        artifact: borrow Artifact,
+        path: borrow String,
+        linked: Bool
+    ) -> Result<Void, BuildFailure> {
+        match makePathTree(parentPath(path)) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        return match made[artifact.id] {
+            Some(known) -> store.place(known, path, linked)
+            None -> .Error(.Failed("an input of an action does not exist yet"))
+        }
+    }
+
+    // Starts program `stage` of the command `action`, answering it running
+    // and its command line.
+    function startCommand(
+        borrow self,
+        graph: borrow Graph,
+        action: Number,
+        place: WorkPlace,
+        stage: Number
+    ) -> Result<RunningCommand, BuildFailure> {
+        match graph.actions[action] {
+            Run(command) -> {
+                let program = stage == 0 ? copy tools[action] : copy stageTools[action][stage - 1]
+                let given = stage == 0 ? copy command.arguments : copy command.followedBy[stage - 1].arguments
+                let within = stage == 0 ? copy command.directory : copy command.followedBy[stage - 1].directory
+                let directory = isPlainDirectory(within) ? copy place.directory : argumentText(
+                    command,
+                    place,
+                    within
+                )
+                if !isPlainDirectory(within) {
+                    match makePathTree(directory) {
+                        Ok -> {}
+                        Error(failure) -> return .Error(failure)
+                    }
+                }
+                var arguments: [String] = []
+                var line = copy program
+                for argument in given {
+                    let text = argumentText(command, place, argument)
+                    line += " " + shownArgument(text)
+                    arguments.append(text)
+                }
+                match makePathTree(joinPath(state, "logs")) {
+                    Ok -> {}
+                    Error(failure) -> return .Error(failure)
+                }
+                var environment = copy command.environment
+                for name in command.inherited {
+                    let value = environmentValue(name)
+                    if value.count > 0 {
+                        environment.append(EnvironmentEntry { name: copy name, value: value })
+                    }
+                }
+                for variable in command.variables {
+                    environment.append(
+                        EnvironmentEntry {
+                            name: copy variable.name,
+                            value: argumentText(command, place, variable.value)
+                        }
+                    )
+                }
+                let started = ProcessCommand {
+                    program: program,
+                    arguments: arguments,
+                    environment: environment,
+                    clearEnvironment: true,
+                    directory: directory,
+                    input: .Null,
+                    output: .File(standardOutputPath(command, place)),
+                    errors: .File(logPath(command.label, ".err"))
+                }
+                return match started.start() {
+                    Ok(child) -> .Ok(
+                        RunningCommand {
+                            action: action,
+                            stage: stage,
+                            child: child,
+                            place: place,
+                            line: line
+                        }
+                    )
+                    Error(failure) -> .Error(
+                        .Failed("\(line) did not start: \(traceText(failure))")
+                    )
+                }
+            }
+            Native(native) -> return .Error(.Failed("\(native.label) is not a command"))
+        }
+    }
+
+    // Runs the native action `action` to its end, answering the output
+    // files it copied whole from the store.
+    function runNative(
+        borrow self,
+        graph: borrow Graph,
+        action: Number,
+        place: borrow WorkPlace
+    ) -> Result<[CopiedFile], BuildFailure> {
+        match graph.actions[action] {
+            Native(native) -> {
+                var inputs: [String] = []
+                var trees: [[TreeEntry]] = []
+                var modes: [UNumber] = []
+                var digests: [String] = []
+                for input in native.inputs {
+                    inputs.append(place.pathOf(input))
+                    var entries: [TreeEntry] = []
+                    var mode: UNumber = 0
+                    var digest = ""
+                    match made[input.id] {
+                        Some(known) -> {
+                            mode = known.mode
+                            digest = copy known.digest
+                            if known.tree {
+                                match store.treeEntries(known.digest) {
+                                    Ok(found) -> entries = found
+                                    Error(failure) -> return .Error(failure)
+                                }
+                            }
+                        }
+                        None -> {}
+                    }
+                    trees.append(entries)
+                    modes.append(mode)
+                    digests.append(digest)
+                }
+                var copied: [CopiedFile] = []
+                let run = NativeRun {
+                    inputs: inputs,
+                    trees: trees,
+                    modes: modes,
+                    outputs: copy place.outputs,
+                    scratch: copy place.scratch,
+                    digests: digests,
+                    copied: { path, digest in
+                        copied.append(CopiedFile { path: path, digest: digest })
+                    }
+                }
+                return match native.work(move run) {
+                    Ok -> .Ok(copied)
+                    Error(failure) -> .Error(failure)
+                }
+            }
+            Run(command) -> return .Error(.Failed("\(command.label) is not a native action"))
+        }
+    }
+
+    // Where the command's standard output goes: the output it names, or the
+    // logs.
+    function standardOutputPath(
+        borrow self,
+        command: borrow CommandAction,
+        place: borrow WorkPlace
+    ) -> String {
+        for index in 0..command.outputs.count {
+            if command.outputs[index].name == command.standardOutput {
+                return copy place.outputs[index]
+            }
+        }
+        return logPath(command.label, ".out")
+    }
+
+    // Keeps what `action` produced in the store, answering its record. An
+    // output missing, or of the wrong kind, fails the action.
+    function collectOutputs(
+        borrow self,
+        graph: borrow Graph,
+        action: Number,
+        place: borrow WorkPlace,
+        copied: borrow [CopiedFile]
+    ) -> Result<ActionRecord, BuildFailure> {
+        // Outputs are hashed once, so they stay out of the project's stat
+        // cache; a file the action copied whole takes its source's digest.
+        var once = StatCache {}
+        for file in copied {
+            once.remember(file.path, store.blobPath(file.digest), file.digest)
+        }
+        let label = actionLabel(graph.actions[action])
+        let declared = actionOutputs(graph.actions[action])
+        let produces = actionProduces(graph.actions[action])
+        var outputs: [Made] = []
+        for index in 0..declared.count {
+            let output = declared[index]
+            let path = place.outputs[index]
+            let status = match linkStatus(path) {
+                Ok(found) -> found
+                Error(failure) -> {
+                    absorb failure
+                    return .Error(.Failed("\(label) did not produce \(output.name)"))
+                }
+            }
+            match output.kind {
+                File -> {
+                    if status.kind != .File {
+                        return .Error(
+                            .Failed(
+                                "\(label) produced \(output.name) as something else than a file"
+                            )
+                        )
+                    }
+                    let digest = match once.fileHex(path) {
+                        Ok(hex) -> hex
+                        Error(failure) -> return .Error(failure)
+                    }
+                    if produces.count > 0 && digest != produces {
+                        return .Error(
+                            .Failed(
+                                "\(label) produced \(output.name) with the SHA-256 \(digest), not \(produces)"
+                            )
+                        )
+                    }
+                    match store.keepFile(path, digest, true) {
+                        Ok -> {}
+                        Error(failure) -> return .Error(failure)
+                    }
+                    outputs.append(Made { digest: digest, tree: false, mode: status.mode })
+                }
+                Tree -> {
+                    if status.kind != .Directory {
+                        return .Error(
+                            .Failed(
+                                "\(label) produced \(output.name) as something else than a directory"
+                            )
+                        )
+                    }
+                    let none: [String] = []
+                    let entries = match walkTree(once, path, none) {
+                        Ok(found) -> found
+                        Error(failure) -> return .Error(failure)
+                    }
+                    let digest = match store.keepTree(path, entries, true) {
+                        Ok(hex) -> hex
+                        Error(failure) -> return .Error(failure)
+                    }
+                    outputs.append(Made { digest: digest, tree: true, mode: 0 })
+                }
+            }
+        }
+        return .Ok(ActionRecord { outputs: outputs })
+    }
+
+    // Records that `action` produced `record`: its outputs exist from now.
+    function produced(
+        borrow mut self,
+        graph: borrow Graph,
+        action: Number,
+        record: borrow ActionRecord
+    ) {
+        let artifacts = graph.produced[action]
+        for index in 0..artifacts.count {
+            made[artifacts[index].id] = .Some(copy record.outputs[index])
+        }
+    }
+}
+
+// The name an input is placed under: its file's or directory's own name, or
+// the output's.
+function inputName(graph: borrow Graph, artifact: borrow Artifact) -> String {
+    match graph.origins[artifact.id] {
+        Stored(reference) -> return copy reference.name
+        Source(path) -> return lastName(path)
+        SourceTree(tree) -> {
+            let name = lastName(tree.path)
+            if name.count == 0 || name == "." { return "tree" }
+            return name
+        }
+        Produced(made) -> return copy actionOutputs(graph.actions[made.action])[made.output].name
+    }
+}
+
+function argumentText(
+    command: borrow CommandAction,
+    place: borrow WorkPlace,
+    argument: borrow Argument
+) -> String {
+    match argument {
+        Text(text) -> return copy text
+        Input(artifact) -> return place.pathOf(artifact)
+        Output(name) -> {
+            for index in 0..command.outputs.count {
+                if command.outputs[index].name == name { return copy place.outputs[index] }
+            }
+            return ""
+        }
+        Joined(parts) -> {
+            var text = ""
+            for part in parts { text += argumentText(command, place, part) }
+            return text
+        }
+        Workspace -> return copy place.workspace
+    }
+}
+
+// `text` as a report shows it in a command line: in single quotes when a
+// shell would read it as more than one word or as anything but itself.
+function shownArgument(text: borrow String) -> String {
+    if text.count == 0 { return "''" }
+    var plain = true
+    for index in 0..text.count {
+        let byte = UN8(text.byteAt(index))
+        let digit = byte >= UN8(48) && byte <= UN8(57)
+        let letter = (byte >= UN8(65) && byte <= UN8(90)) || (byte >= UN8(97) && byte <= UN8(122))
+        // `+`, `,`, `-`, `.`, `/`, `:`, `=`, `@` and `_`.
+        let mark = byte == UN8(43) || byte == UN8(44) || byte == UN8(45) || byte == UN8(46)
+            || byte == UN8(47) || byte == UN8(58) || byte == UN8(61) || byte == UN8(64)
+            || byte == UN8(95)
+        if !(digit || letter || mark) { plain = false }
+    }
+    if plain { return copy text }
+    return "'" + joined(text.split("'"), "'\\''") + "'"
+}

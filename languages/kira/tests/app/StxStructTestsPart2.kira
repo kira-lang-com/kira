@@ -1,0 +1,406 @@
+import Foundation
+
+// StxStructTests: deep struct tests — construction, field access, methods,
+// borrow-mut writeback, value-copy independence, arrays of structs, and traps.
+//
+// All top-level names use the Stx/stx prefix to avoid harness namespace collisions.
+// This file imports Foundation explicitly because imports are file-scoped.
+
+// ---------------------------------------------------------------------------
+// Group 4: Value-copy independence
+// ---------------------------------------------------------------------------
+@Test
+function stxCopyXIndep() {
+    // copy struct, mutate copy.x, original.x unchanged
+    let p = StxPoint { x: 5, y: 3 }
+    var q = p
+    q.x = 99
+    expect!(p.x == 5)
+}
+
+@Test
+function stxCopyYIndep() {
+    let p = StxPoint { x: 5, y: 3 }
+    var q = p
+    q.y = 77
+    expect!(p.y == 3)
+}
+
+@Test
+function stxCopyBothUnchanged() {
+    // copy, mutate both fields of copy, original sum unchanged
+    let p = StxPoint { x: 5, y: 3 }
+    var q = p
+    q.x = 1
+    q.y = 1
+    expect!(p.x + p.y == 8)
+}
+
+@Test
+function stxCopyNestedOriginX() {
+    let r = StxRect { origin: StxPoint { x: 10, y: 20 }, size: StxPoint { x: 5, y: 5 }, label: 0 }
+    var r2 = r
+    r2.origin.x = 999
+    expect!(r.origin.x == 10)
+}
+
+@Test
+function stxCopyNestedSizeY() {
+    let r = StxRect { origin: StxPoint { x: 10, y: 20 }, size: StxPoint { x: 5, y: 5 }, label: 0 }
+    var r2 = r
+    r2.size.y = 888
+    expect!(r.size.y == 5)
+}
+
+@Test
+function stxCopyMutateCopy() {
+    // original 5, copy gets 100; copy.x + original.x = 105
+    let p = StxPoint { x: 5, y: 5 }
+    var q = p
+    q.x = 100
+    expect!(q.x + p.x == 105)
+}
+
+@Test
+function stxCopyBorrowMutNoEffect() {
+    // borrow mut on copy; original.x unchanged
+    let p = StxPoint { x: 3, y: 4 }
+    var q = p
+    stxBumpX(q)
+    expect!(p.x == 3)
+}
+
+@Test
+function stxCopyLoopIndependence() {
+    // i=0..4: copy p={i,i}, zero copy.x, acc += p.x = i; sum=10
+    var acc = 0
+    for i in 0..5 {
+        let p = StxPoint { x: i, y: i }
+        var q = p
+        q.x = 0
+        acc = acc + p.x
+    }
+    expect!(acc == 10)
+}
+
+@Test
+function stxCopyScaleOriginalUnchanged() {
+    // scale returns new struct; original p.x unchanged
+    let p = StxPoint { x: 3, y: 5 }
+    let q = p.scale(10)
+    expect!(p.x == 3)
+}
+
+@Test
+function stxCopyCubeDepth() {
+    let c = StxCube { lo: StxPoint { x: 1, y: 2 }, hi: StxPoint { x: 5, y: 6 }, depth: 7 }
+    var c2 = c
+    c2.depth = 999
+    expect!(c.depth == 7)
+}
+
+// ---------------------------------------------------------------------------
+// Group 5: Arrays of structs
+// ---------------------------------------------------------------------------
+
+@Test
+function stxArrRead1X() {
+    // pts[1].x=3
+    var pts: [StxPoint] = []
+    pts.append(StxPoint { x: 1, y: 2 })
+    pts.append(StxPoint { x: 3, y: 4 })
+    pts.append(StxPoint { x: 5, y: 6 })
+    expect!(pts[1].x == 3)
+}
+
+@Test
+function stxArrRead2Y() {
+    // pts[2].y=6
+    var pts: [StxPoint] = []
+    pts.append(StxPoint { x: 1, y: 2 })
+    pts.append(StxPoint { x: 3, y: 4 })
+    pts.append(StxPoint { x: 5, y: 6 })
+    expect!(pts[2].y == 6)
+}
+
+@Test
+function stxArrSumX() {
+    // sum pts[i].x for i=0..2 = 1+3+5=9
+    var pts: [StxPoint] = []
+    pts.append(StxPoint { x: 1, y: 2 })
+    pts.append(StxPoint { x: 3, y: 4 })
+    pts.append(StxPoint { x: 5, y: 6 })
+    var s = 0
+    for i in 0..pts.count {
+        s = s + pts[i].x
+    }
+    expect!(s == 9)
+}
+
+@Test
+function stxArrForInSumY() {
+    // for-in: sum pts[i].y for i=0..2 = 2+4+6=12
+    var pts: [StxPoint] = []
+    pts.append(StxPoint { x: 1, y: 2 })
+    pts.append(StxPoint { x: 3, y: 4 })
+    pts.append(StxPoint { x: 5, y: 6 })
+    var s = 0
+    for p in pts {
+        s = s + p.y
+    }
+    expect!(s == 12)
+}
+
+@Test
+function stxArrWriteX() {
+    var pts: [StxPoint] = []
+    pts.append(StxPoint { x: 10, y: 20 })
+    pts[0].x = 77
+    expect!(pts[0].x == 77)
+}
+
+@Test
+function stxArrWriteY() {
+    var pts: [StxPoint] = []
+    pts.append(StxPoint { x: 10, y: 20 })
+    pts[0].y = 88
+    expect!(pts[0].y == 88)
+}
+
+@Test
+function stxArrDeepWriteRectOriginX() {
+    var rects: [StxRect] = []
+    rects.append(
+        StxRect { origin: StxPoint { x: 10, y: 20 }, size: StxPoint { x: 5, y: 5 }, label: 0 }
+    )
+    rects[0].origin.x = 77
+    expect!(rects[0].origin.x == 77)
+}
+
+@Test
+function stxArrDeepWriteRectSizeY() {
+    var rects: [StxRect] = []
+    rects.append(
+        StxRect { origin: StxPoint { x: 0, y: 0 }, size: StxPoint { x: 5, y: 5 }, label: 0 }
+    )
+    rects.append(
+        StxRect { origin: StxPoint { x: 1, y: 1 }, size: StxPoint { x: 3, y: 3 }, label: 1 }
+    )
+    rects[1].size.y = 44
+    expect!(rects[1].size.y == 44)
+}
+
+@Test
+function stxArrMixedWrites() {
+    // 4 pts, write to specific fields, sum=10+20+30+40=100
+    var pts: [StxPoint] = []
+    pts.append(StxPoint { x: 0, y: 0 })
+    pts.append(StxPoint { x: 0, y: 0 })
+    pts.append(StxPoint { x: 0, y: 0 })
+    pts.append(StxPoint { x: 0, y: 0 })
+    pts[0].x = 10
+    pts[1].y = 20
+    pts[2].x = 30
+    pts[3].y = 40
+    expect!(pts[0].x + pts[1].y + pts[2].x + pts[3].y == 100)
+}
+
+@Test
+function stxArrLoop100() {
+    // 100 pts where x=i, y=100-i; sum of p.sum()=100 each; total=10000
+    var pts: [StxPoint] = []
+    for i in 0..100 {
+        pts.append(StxPoint { x: i, y: 100 - i })
+    }
+    var acc = 0
+    for j in 0..pts.count {
+        acc = acc + pts[j].sum()
+    }
+    expect!(acc == 10000)
+}
+
+@Test
+function stxArrCount() {
+    // append 7 pts, count=7
+    var pts: [StxPoint] = []
+    for i in 0..7 {
+        pts.append(StxPoint { x: i, y: 0 })
+    }
+    expect!(pts.count == 7)
+}
+
+@Test
+function stxArrForInMethodSum() {
+    // i=0..4: p={x:i, y:i*2}, p.sum()=3i; total=0+3+6+9+12=30
+    var pts: [StxPoint] = []
+    for i in 0..5 {
+        pts.append(StxPoint { x: i, y: i * 2 })
+    }
+    var acc = 0
+    for p in pts {
+        acc = acc + p.sum()
+    }
+    expect!(acc == 30)
+}
+
+@Test
+function stxArrAfterDeepWrite() {
+    // pts=[{x:1},{x:2},{x:3}], set pts[1].x=50, sum x = 1+50+3=54
+    var pts: [StxPoint] = []
+    pts.append(StxPoint { x: 1, y: 0 })
+    pts.append(StxPoint { x: 2, y: 0 })
+    pts.append(StxPoint { x: 3, y: 0 })
+    pts[1].x = 50
+    var s = 0
+    for i in 0..pts.count {
+        s = s + pts[i].x
+    }
+    expect!(s == 54)
+}
+
+@Test
+function stxArrTrapEmpty() {
+    expectTrap!("")
+        var pts: [StxPoint] = []
+        let _ = pts[0].x
+}
+
+@Test
+function stxArrTrapOOB() {
+    expectTrap!("")
+        var pts: [StxPoint] = []
+        pts.append(StxPoint { x: 1, y: 2 })
+        let _ = pts[99].x
+}
+
+// ---------------------------------------------------------------------------
+// Group 6: StxBag (struct with array field)
+// ---------------------------------------------------------------------------
+
+@Test
+function stxBagTotal5() {
+    // stxMakeBag(5): tag=5, items=[1,2,3,4,5], total=5+15=20
+    var b = stxMakeBag(5)
+    expect!(b.total() == 20)
+}
+
+@Test
+function stxBagTotal0() {
+    // stxMakeBag(0): tag=0, items=[], total=0
+    var b = stxMakeBag(0)
+    expect!(b.total() == 0)
+}
+
+@Test
+function stxBagCount10() {
+    var b = stxMakeBag(10)
+    expect!(b.count() == 10)
+}
+
+@Test
+function stxBagItems2() {
+    // stxMakeBag(5).items=[1,2,3,4,5], items[2]=3
+    var b = stxMakeBag(5)
+    expect!(b.items[2] == 3)
+}
+
+@Test
+function stxBagTag() {
+    var b = stxMakeBag(5)
+    expect!(b.tag == 5)
+}
+
+@Test
+function stxBagTotal1() {
+    // stxMakeBag(1): tag=1, items=[1], total=2
+    var b = stxMakeBag(1)
+    expect!(b.total() == 2)
+}
+
+@Test
+function stxBagTotal3() {
+    // stxMakeBag(3): tag=3, items=[1,2,3], total=9
+    var b = stxMakeBag(3)
+    expect!(b.total() == 9)
+}
+
+@Test
+function stxBagLoopTotal() {
+    // n=1..5: total(n)=n+n*(n+1)/2 → 2+5+9+14+20=50
+    var acc = 0
+    for n in 1..6 {
+        var b = stxMakeBag(n)
+        acc = acc + b.total()
+    }
+    expect!(acc == 50)
+}
+
+@Test
+function stxBagItems0() {
+    // stxMakeBag(3).items[0]=1
+    var b = stxMakeBag(3)
+    expect!(b.items[0] == 1)
+}
+
+@Test
+function stxBagItems1() {
+    // stxMakeBag(3).items[1]=2
+    var b = stxMakeBag(3)
+    expect!(b.items[1] == 2)
+}
+
+// ---------------------------------------------------------------------------
+// Group 7: Trap tests
+// ---------------------------------------------------------------------------
+
+@Test
+function stxTrapDivZeroField() {
+    expectTrap!("")
+        let p = StxPoint { x: 5, y: 0 }
+        let _ = p.x / p.y
+}
+
+@Test
+function stxTrapModZero() {
+    expectTrap!("")
+    let _ = 7 % 0
+}
+
+@Test
+function stxTrapDivZeroConst() {
+    expectTrap!("")
+    let _ = 1 / 0
+}
+
+@Test
+function stxTrapArrLargeIndex() {
+    expectTrap!("")
+        var pts: [StxPoint] = []
+        pts.append(StxPoint { x: 1, y: 2 })
+        pts.append(StxPoint { x: 3, y: 4 })
+        let _ = pts[99].x
+}
+
+@Test
+function stxTrapDeepWriteOOB() {
+    expectTrap!("")
+        var rects: [StxRect] = []
+        rects.append(
+            StxRect { origin: StxPoint { x: 0, y: 0 }, size: StxPoint { x: 5, y: 5 }, label: 1 }
+        )
+        let _ = rects[5].label
+}
+
+@Test
+function stxTrapBagOOB() {
+    expectTrap!("")
+        var b = stxMakeBag(3)
+        let _ = b.items[99]
+}
+
+@Test
+function stxTrapModZeroField() {
+    expectTrap!("")
+        let p = StxPoint { x: 5, y: 0 }
+        let _ = p.x % p.y
+}

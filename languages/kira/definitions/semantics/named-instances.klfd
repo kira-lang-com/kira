@@ -1,0 +1,30 @@
+// Named instances (KLF-RIDL sections 20.7 and 23.5). `@Instance(Number)` on
+// a generic declaration of the module being built mints `Holder<Number>`
+// with the program's own instances, and its methods are exports of their
+// own, which a caller in another module reaches by the instance's symbols.
+
+// Whether `file` is one of the program's own sources, not a library's.
+function ownSourceFile(tree: borrow SyntaxTree, file: Int) -> Bool {
+    for source in tree.sources {
+        if source.file == file { return source.module == 0 }
+    }
+    return false
+}
+
+// The named instances the program's own declarations ask for.
+function ownNamedInstances(tree: borrow SyntaxTree) -> [TypeReference] {
+    var references: [TypeReference] = []
+    for reference in tree.namedInstances {
+        if ownSourceFile(tree, reference.name.span.file) { references.append(reference) }
+    }
+    return references
+}
+
+// Whether `name`, an instance's, is one its declaration names with
+// `@Instance`.
+function isNamedInstance(tree: borrow SyntaxTree, name: String) -> Bool {
+    for reference in tree.namedInstances {
+        if reference.instanceName == name { return true }
+    }
+    return false
+}

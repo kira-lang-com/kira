@@ -1,0 +1,76 @@
+// Methods a family's extension declares under one name are overloads: a
+// call on a member of the family takes the one its arguments fit, labels and
+// defaults included, as a type's own methods are chosen.
+
+import Foundation
+
+struct Row {
+    let name: String
+    let size: Int
+}
+
+construct Column {
+    @Required function read(row: borrow Any) -> Int
+}
+
+construct Field<RowValue>(measure: (borrow RowValue) -> Int) extends Column<RowValue> {
+    init(title: String, value: KeyPath<RowValue, String>) {
+        let read = copy value
+        return Field<RowValue>(measure: { row in return read(row).count })
+    }
+
+    init<Value>(title: String, value: KeyPath<RowValue, Value>, content: (borrow RowValue) -> Int) {
+        return Field<RowValue>(measure: content)
+    }
+
+    function read(row: borrow Any) -> Int {
+        if row is RowValue {
+            let value = row as RowValue
+            return measure(value)
+        }
+        return 0
+    }
+}
+
+construct Report {
+    @Required function total() -> Int
+}
+
+construct Sheet<Value>(rows: [Value]) extends Report {
+    let columns: [some Column<Value>]
+
+    function total() -> Int {
+        var sum = 0
+        for row in rows {
+            for column in columns { sum = sum + column.read(row) }
+        }
+        return sum
+    }
+}
+
+construct Narrowed(base: Any Column, cap: Int) extends Column {
+    function read(row: borrow Any) -> Int {
+        let value = base.read(row)
+        return value > cap ? cap : value
+    }
+}
+
+extend Column {
+    function limit(cap: Int) -> Any Column {
+        return Narrowed(base: self, cap: cap)
+    }
+
+    function limit(low: Int = 0, high: Int = 1000) -> Any Column {
+        return Narrowed(base: self, cap: high)
+    }
+}
+
+@Main
+function main() -> Int {
+    let sheet = Sheet(rows: [Row { name: "abc", size: 4 }]) {
+        Field("Name", value: \.name)
+        Field("Size", value: \.size) { row in row.size * 10 }
+        .limit(low: 0, high: 30)
+    }
+    return sheet.total()
+}

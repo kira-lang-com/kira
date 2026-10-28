@@ -1,0 +1,29 @@
+import Foundation
+
+enum Failure {
+    Bad
+}
+
+struct Box<Element> {
+    let value: Element
+}
+
+function fetch(value: Int) -> Result<Int, Failure> {
+    if value < 0 { return .Error(.Bad) }
+    return .Ok(value)
+}
+
+function caught(value: Int) -> Int {
+    attempt {
+        let found = try fetch(value)
+        return found
+    } handle {
+        Bad { return 99 }
+    }
+}
+
+@Main
+function main() -> Int {
+    let box = Box<Int>(value: caught(42))
+    return box.value + caught(-1)
+}

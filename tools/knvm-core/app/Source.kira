@@ -1,0 +1,636 @@
+import Foundation
+
+// Where a toolchain archive comes from.
+//
+// Everything downstream of this — extract, validate, move into place, write
+// `current.toml` — is one code path, so driving the directory source end to end
+// exercises the shipped install with only the transport substituted.
+
+// How long a single transfer may take, in seconds.
+public let transferTimeoutSeconds: String = "120"
+
+// One published release, reduced to what an install needs.
+public struct ReleaseEntry {
+    var version: String = ""
+    var channel: Channel = .Release
+    var assets: [AssetLink] = []
+}
+
+// Where releases are listed and fetched from.
+public enum ReleaseSource {
+    // `<root>/<channel>/<version>/<compiler>-<version>-<host-key>.tar.gz`, laid out
+    // exactly as a published feed is.
+    Directory(String)
+    // The GitHub releases of a repository.
+    GitHub(String)
+    // A Cairn release feed for one compiler: the address answering its
+    // releases in GitHub's shape (`/api/vcs/repos/<repo>/releases/feed/<binary>`).
+    Cairn(String)
+    // Nothing publishes them and no local feed was named: the variable that
+    // would have named one, so the refusal can say what to set.
+    Unpublished(String)
+}
+
+// Why a release could not be listed or fetched.
+public enum SourceFailure {
+    ChannelEmpty(String)
+    VersionNotFound(String)
+    MissingHostArtifact(String)
+    UnsupportedHost
+    TransportFailed(String)
+    ToolUnavailable(String)
+    MalformedFeed(String)
+    // Nothing publishes this compiler's releases, and no local feed was named to
+    // stand in for one.
+    NoFeed(String)
+}
+
+// The source releases are fetched from for this host.
+//
+// A named directory first, then the compiler's own repository, then the Cairn
+// feed every toolchain is published on, so a machine with nothing built can
+// install one. `KNVM_FEED` names another Cairn feed, and `none` turns it off.
+public function defaultSource(compiler: borrow Compiler) -> ReleaseSource {
+    let directory = environmentValue(compiler.feedVariable)
+    if directory.isEmpty() && compiler.repository.isEmpty() {
+        let feed = cairnFeed()
+        if !feed.isEmpty() { return .Cairn(feed + "/" + compiler.binary) }
+    }
+    return releaseSourceFor(compiler, directory)
+}
+
+// The Cairn feed releases come from when nothing else names a source.
+public let defaultCairnFeed: String = "https://cairn.sunday-cloud.com/api/vcs/repos/tessera/releases/feed"
+
+public function cairnFeed() -> String {
+    let named = environmentValue("KNVM_FEED").trim()
+    if named == "none" { return "" }
+    if !named.isEmpty() { return named }
+    return defaultCairnFeed
+}
+
+// The source a compiler's release-directory variable names: that directory when
+// it names one, the compiler's repository when it publishes releases, and
+// nothing at all when neither is there. The last is not the same as GitHub —
+// pointing a compiler that publishes nothing at a repository it has no releases
+// in is a request that can only fail confusingly.
+public function releaseSourceFor(compiler: borrow Compiler, directory: borrow String) -> ReleaseSource {
+    if !directory.isEmpty() { return .Directory(directory) }
+    if compiler.repository.isEmpty() { return .Unpublished(compiler.feedVariable) }
+    return .GitHub(compiler.repository)
+}
+
+// The artifact file name a release publishes for one host.
+//
+// The stem is the compiler's own binary name, which is what a release of it
+// publishes the archive under: `kira-1.7.3-x86_64-linux-gnu.tar.gz` next to
+// `klf-1.7.3-x86_64-linux-gnu.tar.gz`.
+public function archiveFileName(
+    compiler: borrow Compiler,
+    version: borrow String,
+    hostKey: borrow String
+) -> String {
+    return compiler.binary + "-" + version + "-" + hostKey + ".tar.gz"
+}
+
+// Every version published on `channel`, newest first, or why there are none.
+public function availableVersions(
+    source: borrow ReleaseSource,
+    channel: borrow Channel
+) -> VersionsResult {
+    match source {
+        Directory(root) -> { return directoryVersions(root, channel) }
+        GitHub(repository) -> { return feedVersions(githubFeedUrl(repository), channel) }
+        Cairn(url) -> { return feedVersions(url, channel) }
+        Unpublished(variable) -> { return .Failed(.NoFeed(variable)) }
+    }
+    return .Failed(.ChannelEmpty(channelName(channel)))
+}
+
+public enum VersionsResult {
+    Found([String])
+    Failed(SourceFailure)
+}
+
+// The archive for `version`, written into `destinationDirectory` and named by
+// its path, or why it could not be had.
+public function fetchArchive(
+    source: borrow ReleaseSource,
+    compiler: borrow Compiler,
+    channel: borrow Channel,
+    version: borrow String,
+    destinationDirectory: borrow String
+) -> FetchResult {
+    match source {
+        Directory(root) -> {
+            return fetchFromDirectory(compiler, root, channel, version, destinationDirectory)
+        }
+        GitHub(repository) -> {
+            return fetchFromFeed(githubFeedUrl(repository), compiler, version, destinationDirectory)
+        }
+        Cairn(url) -> { return fetchFromFeed(url, compiler, version, destinationDirectory) }
+        Unpublished(variable) -> { return .Failed(.NoFeed(variable)) }
+    }
+    return .Failed(.VersionNotFound(version))
+}
+
+public enum FetchResult {
+    Fetched(String)
+    Failed(SourceFailure)
+}
+
+// The digest this source publishes for `version`'s host artifact, nothing
+// when it publishes none — which installs as unverified, and is reported as
+// such rather than passed over — or why a sidecar it does publish could not be
+// read. An unreadable sidecar is not an absent one: treating it so would let
+// anyone who can break the transfer skip the verification.
+public function publishedChecksum(
+    source: borrow ReleaseSource,
+    compiler: borrow Compiler,
+    channel: borrow Channel,
+    version: borrow String
+) -> Result<Digest?, SourceFailure> {
+    let artifact = archiveFileName(compiler, version, currentHostKey())
+    match source {
+        Directory(root) -> return publishedChecksumIn(
+            versionDirectory(root, channel, version),
+            artifact
+        )
+        Unpublished(variable) -> return .Ok(.None)
+        Cairn(url) -> return publishedChecksumAt(url, version, artifact)
+        GitHub(repository) -> return publishedChecksumAt(githubFeedUrl(repository), version, artifact)
+    }
+}
+
+// The digest a release feed publishes beside `artifact`, nothing when it
+// publishes none, or why its sidecar could not be read.
+public function publishedChecksumAt(
+    feed: borrow String,
+    version: borrow String,
+    artifact: borrow String
+) -> Result<Digest?, SourceFailure> {
+    match findRelease(feed, version) {
+        Ok(release) -> {
+            match release {
+                Some(entry) -> {
+                    let sidecar = checksumFileName(artifact)
+                    match assetUrl(entry, sidecar) {
+                        Some(url) -> {
+                            match getText(url) {
+                                Fetched(text) -> return checksumIn(text, sidecar)
+                                Failed(failure) -> return .Error(failure)
+                            }
+                        }
+                        None -> return .Ok(.None)
+                    }
+                }
+                None -> return .Ok(.None)
+            }
+        }
+        Error(failure) -> return .Error(failure)
+    }
+}
+
+public function versionDirectory(
+    root: borrow String,
+    channel: borrow Channel,
+    version: borrow String
+) -> String {
+    return joinPath(joinPath(root, channelName(channel)), version)
+}
+
+// A source rooted at a local directory.
+public function directoryVersions(root: borrow String, channel: borrow Channel) -> VersionsResult {
+    let directory = joinPath(root, channelName(channel))
+    // A feed that publishes nothing on a channel has no directory for it, which
+    // is an empty channel rather than a broken feed.
+    let none: [String] = []
+    if !isDirectory(directory) { return .Found(none) }
+    var versions: [String] = []
+    for name in entriesOf(directory) {
+        if name.startsWith(".") { continue }
+        if !isDirectory(joinPath(directory, name)) { continue }
+        versions.append(name)
+    }
+    return .Found(sortNewestFirst(versions))
+}
+
+public function fetchFromDirectory(
+    compiler: borrow Compiler,
+    root: borrow String,
+    channel: borrow Channel,
+    version: borrow String,
+    destinationDirectory: borrow String
+) -> FetchResult {
+    let directory = versionDirectory(root, channel, version)
+    if !isDirectory(directory) { return .Failed(.VersionNotFound(version)) }
+    let artifact = archiveFileName(compiler, version, currentHostKey())
+    let archive = joinPath(directory, artifact)
+    if !fileExists(archive) { return .Failed(.MissingHostArtifact(artifact)) }
+    if !makeDirectoryTree(destinationDirectory) {
+        return .Failed(.TransportFailed(destinationDirectory))
+    }
+    let destination = joinPath(destinationDirectory, artifact)
+    if !copyTree(archive, destination) { return .Failed(.TransportFailed(archive)) }
+    return .Fetched(destination)
+}
+
+// The address of a GitHub repository's release list.
+public function githubFeedUrl(repository: borrow String) -> String {
+    return "https://api.github.com/repos/" + repository + "/releases?per_page=100"
+}
+
+// The releases a feed lists, newest first per channel.
+public function feedVersions(url: borrow String, channel: borrow Channel) -> VersionsResult {
+    let feed = getText(url)
+    match feed {
+        Failed(failure) -> { return .Failed(failure) }
+        Fetched(text) -> {
+            match parseReleaseFeed(text) {
+                Ok(entries) -> {
+                    var versions: [String] = []
+                    for entry in entries {
+                        if entry.channel == channel { versions.append(entry.version) }
+                    }
+                    return .Found(sortNewestFirst(versions))
+                }
+                Error(failure) -> return .Failed(failure)
+            }
+        }
+    }
+}
+
+public function fetchFromFeed(
+    feed: borrow String,
+    compiler: borrow Compiler,
+    version: borrow String,
+    destinationDirectory: borrow String
+) -> FetchResult {
+    match findRelease(feed, version) {
+        Ok(release) -> {
+            match release {
+                Some(entry) -> {
+                    let artifact = archiveFileName(compiler, version, currentHostKey())
+                    match assetUrl(entry, artifact) {
+                        Some(address) -> {
+                            if !makeDirectoryTree(destinationDirectory) {
+                                return .Failed(.TransportFailed(destinationDirectory))
+                            }
+                            let destination = joinPath(destinationDirectory, artifact)
+                            if download(address, destination) == 0 { return .Fetched(destination) }
+                            return .Failed(.TransportFailed(address))
+                        }
+                        None -> return .Failed(.MissingHostArtifact(artifact))
+                    }
+                }
+                None -> return .Failed(.VersionNotFound(version))
+            }
+        }
+        Error(failure) -> return .Failed(failure)
+    }
+}
+
+// One release of a feed by version, nothing when it publishes none, or why
+// its releases could not be listed.
+public function findRelease(
+    url: borrow String,
+    version: borrow String
+) -> Result<ReleaseEntry?, SourceFailure> {
+    let feed = getText(url)
+    match feed {
+        Failed(failure) -> return .Error(failure)
+        Fetched(text) -> {
+            match parseReleaseFeed(text) {
+                Ok(entries) -> {
+                    for entry in entries {
+                        if entry.version == version { return .Ok(.Some(entry)) }
+                    }
+                    return .Ok(.None)
+                }
+                Error(failure) -> return .Error(failure)
+            }
+        }
+    }
+}
+
+// The download URL of the asset with exactly this name.
+public function assetUrl(release: borrow ReleaseEntry, name: borrow String) -> String? {
+    for asset in release.assets {
+        if asset.name == name { return .Some(copy asset.url) }
+    }
+    return .None
+}
+
+// Parses a GitHub `/releases` response into release entries.
+//
+// Draft releases are skipped: they are not visible to users. A response that
+// is not JSON, or a release whose tag or asset list is not the documented
+// shape, fails the whole parse rather than being silently dropped — a feed
+// that changed shape must not look like a feed with fewer releases.
+public function parseReleaseFeed(text: borrow String) -> Result<[ReleaseEntry], SourceFailure> {
+    match parseJson(text) {
+        Ok(value) -> {
+            match value.items() {
+                Some(releases) -> {
+                    var entries: [ReleaseEntry] = []
+                    for release in releases {
+                        match releaseEntry(release) {
+                            Ok(entry) -> {
+                                match entry {
+                                    Some(listed) -> entries.append(listed)
+                                    // A draft, or a tag that is not a release.
+                                    None -> {}
+                                }
+                            }
+                            Error(failure) -> return .Error(failure)
+                        }
+                    }
+                    return .Ok(entries)
+                }
+                None -> return .Error(.MalformedFeed("the release list is not an array"))
+            }
+        }
+        Error(failure) -> return .Error(.MalformedFeed("not JSON at byte " + String(failure.at)))
+    }
+}
+
+// One release's entry, nothing for a draft or for a tag that names something
+// other than a compiler release, or the failure of a release not shaped as
+// documented.
+public function releaseEntry(release: borrow JsonValue) -> Result<ReleaseEntry?, SourceFailure> {
+    match release.field("tag_name") {
+        Some(field) -> {
+            match field.text() {
+                Some(tag) -> {
+                    if !namesARelease(tag) { return .Ok(.None) }
+                    if isSet(release, "draft") { return .Ok(.None) }
+                    match assetLinks(release) {
+                        Some(links) -> {
+                            let entry = ReleaseEntry {
+                                version: stripTagPrefix(tag),
+                                channel: releaseChannel(release),
+                                assets: move links
+                            }
+                            return .Ok(.Some(entry))
+                        }
+                        None -> return .Error(
+                            .MalformedFeed(tag + " has an asset list not shaped as documented")
+                        )
+                    }
+                }
+                None -> return .Error(.MalformedFeed("a release tag is not text"))
+            }
+        }
+        None -> return .Error(.MalformedFeed("a release has no tag"))
+    }
+}
+
+// An asset's name and download address.
+public struct AssetLink {
+    let name: String
+    let url: String
+}
+
+// Every asset of a release, or nothing when the list or one of its assets is
+// not the documented shape.
+public function assetLinks(release: borrow JsonValue) -> [AssetLink]? {
+    match release.field("assets") {
+        Some(list) -> {
+            match list.items() {
+                Some(assets) -> {
+                    var links: [AssetLink] = []
+                    for asset in assets {
+                        match assetLink(asset) {
+                            Some(link) -> links.append(link)
+                            None -> return .None
+                        }
+                    }
+                    return .Some(links)
+                }
+                None -> return .None
+            }
+        }
+        None -> return .None
+    }
+}
+
+public function assetLink(asset: borrow JsonValue) -> AssetLink? {
+    match fieldText(asset, "name") {
+        Some(name) -> {
+            match fieldText(asset, "browser_download_url") {
+                Some(url) -> {
+                    if name.isEmpty() || url.isEmpty() { return .None }
+                    return .Some(AssetLink { name: name, url: url })
+                }
+                None -> return .None
+            }
+        }
+        None -> return .None
+    }
+}
+
+// The text of an object's member, nothing when absent or not text.
+public function fieldText(object: borrow JsonValue, name: borrow String) -> String? {
+    match object.field(name) {
+        Some(value) -> return value.text()
+        None -> return .None
+    }
+}
+
+// Whether an object's flag is present and `true`. GitHub leaves a flag out
+// rather than writing it `false` for some of these.
+public function isSet(object: borrow JsonValue, name: borrow String) -> Bool {
+    match object.field(name) {
+        Some(value) -> {
+            match value.boolean() {
+                Some(flag) -> return flag
+                None -> return false
+            }
+        }
+        None -> return false
+    }
+}
+
+// Prereleases are the `dev` channel; everything else is `release`.
+public function releaseChannel(release: borrow JsonValue) -> Channel {
+    if isSet(release, "prerelease") { return .Dev }
+    return .Release
+}
+
+// The version a release tag names: `v1.7.3` and `1.7.3` both mean `1.7.3`.
+public function stripTagPrefix(tag: borrow String) -> String {
+    if tag.startsWith("v") { return tag.substring(1, tag.count) }
+    return tag
+}
+
+// Whether a tag names a release of the compiler being listed.
+//
+// A release tag is a dotted number, with the optional leading `v` and an optional
+// prerelease suffix: `v1.8.3`, `1.8.3`, `v1.8.0.1`, `1.8.0-dev5`. Anything whose
+// leading component is not a number is something else the repository publishes —
+// the managed LLVM bundles are tagged `llvm-v<version>-kira.<n>` — and reading one
+// as a version made `install latest` resolve a version and then ask for an
+// archive it does not carry.
+public function namesARelease(tag: borrow String) -> Bool {
+    let version = stripTagPrefix(tag)
+    if version.isEmpty() { return false }
+    let number = version.before("-")
+    if number.isEmpty() { return false }
+    let parts = number.split(".")
+    for index in 0..parts.count {
+        if !isDigits(parts[index]) { return false }
+    }
+    return true
+}
+
+public function isDigits(text: borrow String) -> Bool {
+    if text.isEmpty() { return false }
+    for byte in text.utf8() {
+        if !isAsciiDigit(byte) { return false }
+    }
+    return true
+}
+
+// What one transfer answered.
+public enum TransferResult {
+    Fetched(String)
+    Failed(SourceFailure)
+}
+
+// The only code here that talks to a network.
+//
+// Isolated so that replacing `curl` with a native client is a change to this
+// one place, and so that everything above it stays reachable by the directory
+// source. `curl` rather than an HTTP client because it ships with every host
+// this runs on and pulls no TLS stack into a program that has one job.
+public function getText(url: borrow String) -> TransferResult {
+    var arguments: [String] = []
+    arguments.append("-fsSL")
+    arguments.append("--max-time")
+    arguments.append(transferTimeoutSeconds)
+    arguments.append("-H")
+    arguments.append("User-Agent: " + toolName)
+    arguments.append("-H")
+    arguments.append("Accept: application/vnd.github+json")
+    let token = authorizationHeader(url)
+    if !token.isEmpty() {
+        arguments.append("-H")
+        arguments.append(token)
+    }
+    arguments.append(url)
+    let result = captureTool("curl", arguments)
+    if result.status == toolNotRunnable { return .Failed(.ToolUnavailable("curl")) }
+    if result.status != 0 {
+        return .Failed(.TransportFailed("curl exited with " + String(result.status)))
+    }
+    return .Fetched(result.output)
+}
+
+// A download may be large (a klf toolchain is over a hundred megabytes), so
+// it is not given a total time: it fails when it cannot connect, or when it
+// stalls below a kilobyte a second for a minute, and is retried a few times.
+public function download(url: borrow String, destination: borrow String) -> Number {
+    var arguments: [String] = []
+    arguments.append("-fsSL")
+    arguments.append("--connect-timeout")
+    arguments.append("30")
+    arguments.append("--speed-limit")
+    arguments.append("1024")
+    arguments.append("--speed-time")
+    arguments.append("60")
+    arguments.append("--retry")
+    arguments.append("3")
+    arguments.append("-H")
+    arguments.append("User-Agent: " + toolName)
+    arguments.append("-o")
+    arguments.append(destination)
+    let token = authorizationHeader(url)
+    if !token.isEmpty() {
+        arguments.append("-H")
+        arguments.append(token)
+    }
+    arguments.append(url)
+    let result = runTool("curl", arguments)
+    return result
+}
+
+// The `Authorization` header this request carries, when it carries one.
+//
+// A token raises GitHub's unauthenticated limit, and every environment that has
+// one already exports it under one of these names. It is only ever sent to
+// GitHub itself: a credential is scoped to a host, and a source pointed
+// elsewhere must not be handed this one. The same holds for Cairn: its token
+// (`CAIRN_TOKEN`, or the one `cairn login` saved) goes to the Cairn feed's
+// host and nowhere else.
+public function authorizationHeader(url: borrow String) -> String {
+    let feed = cairnFeed()
+    if !feed.isEmpty() && hostOf(url) == hostOf(feed) && !hostOf(url).isEmpty() {
+        let token = cairnToken()
+        if !token.isEmpty() { return "Authorization: Bearer " + token }
+        return ""
+    }
+    if !isGitHubHost(url) { return "" }
+    let token = environmentValue("GH_TOKEN")
+    if !token.trim().isEmpty() { return "Authorization: Bearer " + token }
+    let fallback = environmentValue("GITHUB_TOKEN")
+    if !fallback.trim().isEmpty() { return "Authorization: Bearer " + fallback }
+    return ""
+}
+
+// The host a `https://` URL addresses, "" for any other: the part after the
+// scheme up to the first `/`, past any `user@`, without the port.
+public function hostOf(url: borrow String) -> String {
+    let prefix = "https://"
+    if !url.startsWith(prefix) { return "" }
+    let rest = url.substring(prefix.count, url.count)
+    var authority = rest.before("/")
+    match authority.indexOf("@") {
+        Some(at) -> authority = authority.substring(at + 1, authority.count)
+        None -> {}
+    }
+    return authority.before(":")
+}
+
+// The Cairn token: `CAIRN_TOKEN`, else the one `cairn login` saved in
+// `~/.cairn/config.json` (or `$CAIRN_HOME/config.json`).
+public function cairnToken() -> String {
+    let named = environmentValue("CAIRN_TOKEN").trim()
+    if !named.isEmpty() { return named }
+    var home = environmentValue("CAIRN_HOME")
+    if home.isEmpty() {
+        match userHomeDirectory() {
+            Some(user) -> home = joinPath(user, ".cairn")
+            None -> return ""
+        }
+    }
+    match textOf(joinPath(home, "config.json")) {
+        Some(text) -> {
+            match parseJson(text) {
+                Ok(value) -> {
+                    match fieldText(value, "token") {
+                        Some(token) -> return token
+                        None -> return ""
+                    }
+                }
+                Error(failure) -> return ""
+            }
+        }
+        None -> return ""
+    }
+}
+
+// Whether a URL addresses GitHub itself. The host is what a credential is
+// scoped to: `https://api.github.com@example.com/` addresses `example.com`.
+public function isGitHubHost(url: borrow String) -> Bool {
+    let prefix = "https://"
+    if !url.startsWith(prefix) { return false }
+    let rest = url.substring(prefix.count, url.count)
+    var authority = rest.before("/")
+    match authority.indexOf("@") {
+        Some(at) -> authority = authority.substring(at + 1, authority.count)
+        None -> {}
+    }
+    authority = authority.before(":")
+    if authority == "github.com" { return true }
+    return authority.endsWith(".github.com")
+}

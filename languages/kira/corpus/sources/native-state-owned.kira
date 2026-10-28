@@ -1,0 +1,25 @@
+import Foundation
+
+struct Payload {
+    var text: String
+    var value: Any
+}
+
+struct Container {
+    var child: NativeState<Payload>
+}
+
+@Main
+function main() -> Int {
+    let child = nativeState(Payload { text = "kept", value = Int(42) })
+    let parent = nativeState(Container { child = move child })
+    let erased: NativeState<Any> = move parent
+    var container = nativeRecover<Container>(erased)
+    var payload = nativeRecover<Payload>(container.child)
+    payload.text = "changed"
+    let token = nativeUserDataBorrow(erased)
+    let again = nativeRecover<Container>(token)
+    let observed = nativeRecover<Payload>(again.child)
+    if observed.text != "changed" { return 1 }
+    return observed.value as Int
+}

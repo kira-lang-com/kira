@@ -1,0 +1,90 @@
+import Foundation
+
+@FFI.Extern { library: kira_runtime, symbol: kira_dynamic_alloc, abi: c }
+function allocate(size: U64): RawPtr
+@FFI.Extern { library: kira_runtime, symbol: kira_dynamic_free, abi: c }
+function release(ptr: RawPtr): Void
+@FFI.Extern { library: kira_runtime, symbol: kira_dynamic_write_u32_at, abi: c }
+function writeU32(ptr: RawPtr, offset: U64, value: U32): Void
+@FFI.Extern { library: kira_runtime, symbol: kira_dynamic_read_u32_at, abi: c }
+function readU32(ptr: RawPtr, offset: U64): U32
+@FFI.Extern { library: kira_runtime, symbol: kira_dynamic_write_f32_at, abi: c }
+function writeF32(ptr: RawPtr, offset: U64, value: F32): Void
+@FFI.Extern { library: kira_runtime, symbol: kira_dynamic_read_f32_at, abi: c }
+function readF32(ptr: RawPtr, offset: U64): F32
+
+function require(ok: Bool) -> Int {
+    if ok { return 0 }
+    var zero = 0
+    return 1 / zero
+}
+
+function copyU32(data: borrow [U32]) -> RawPtr {
+    let count = data.count
+    let bytes = allocate(count * 4)
+    var i = 0
+    while i < count {
+        writeU32(bytes, i * 4, data[i])
+        i = i + 1
+    }
+    require(i == count)
+    return bytes
+}
+
+function copyF32(data: borrow [F32]) -> RawPtr {
+    let count = data.count
+    let bytes = allocate(count * 4)
+    var i = 0
+    while i < count {
+        writeF32(bytes, i * 4, data[i])
+        i += 1
+    }
+    return bytes
+}
+
+function stepped(data: borrow [U32]) -> RawPtr {
+    let count = data.count
+    let bytes = allocate(count * 4)
+    var i = 0
+    while i < count {
+        writeU32(bytes, i * 4, data[i])
+        i += 2
+    }
+    return bytes
+}
+
+function changed(data: borrow [U32]) -> RawPtr {
+    let count = data.count
+    let bytes = allocate(count * 4)
+    var i = 0
+    while i < count {
+        writeU32(bytes, i * 4, data[i] + U32(1))
+        i += 1
+    }
+    return bytes
+}
+
+@Main
+function main() -> Int {
+    for count in [0, 1, 17, 4096] {
+        var data: [U32] = []
+        for i in 0..count { data.append(U32(i * 7)) }
+        let shared = copy data
+        let bytes = copyU32(data)
+        for i in 0..count { require(readU32(bytes, i * 4) == data[i]) }
+        require(shared.count == count && data.count == count)
+        release(bytes)
+    }
+    let floats: [F32] = [F32(-0.0), F32(1.25), F32(-2.5)]
+    let bytes = copyF32(floats)
+    require(readF32(bytes, 0) == F32(-0.0) && readF32(bytes, 4) == F32(1.25) && readF32(bytes, 8) == F32(-2.5))
+    release(bytes)
+    let values: [U32] = [U32(11), U32(22), U32(33)]
+    let sparse = stepped(values)
+    require(readU32(sparse, 0) == U32(11) && readU32(sparse, 4) == U32(0) && readU32(sparse, 8) == U32(33))
+    release(sparse)
+    let incremented = changed(values)
+    require(readU32(incremented, 0) == U32(12) && readU32(incremented, 8) == U32(34))
+    release(incremented)
+    return 0
+}

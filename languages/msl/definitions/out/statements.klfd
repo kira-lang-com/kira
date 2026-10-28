@@ -1,0 +1,175 @@
+// Math functions, and the statements MSL spells its own way.
+
+function mslMathName(fun: String) -> String {
+    match fun {
+        "round" -> return "rint"
+        "inverse_sqrt" -> return "rsqrt"
+        "face_forward" -> return "faceforward"
+        "count_one_bits" -> return "popcount"
+        "count_leading_zeros" -> return "clz"
+        "count_trailing_zeros" -> return "ctz"
+        "pack4x8snorm" -> return "pack_float_to_snorm4x8"
+        "pack4x8unorm" -> return "pack_float_to_unorm4x8"
+        "pack2x16snorm" -> return "pack_float_to_snorm2x16"
+        "pack2x16unorm" -> return "pack_float_to_unorm2x16"
+        "unpack4x8snorm" -> return "unpack_snorm4x8_to_float"
+        "unpack4x8unorm" -> return "unpack_unorm4x8_to_float"
+        "unpack2x16snorm" -> return "unpack_snorm2x16_to_float"
+        "unpack2x16unorm" -> return "unpack_unorm2x16_to_float"
+        "sign" -> return ""
+        "radians" -> return ""
+        "degrees" -> return ""
+        "first_leading_bit" -> return ""
+        "first_trailing_bit" -> return ""
+        "pack2x16float" -> return ""
+        "unpack2x16float" -> return ""
+        else -> return fun
+    }
+}
+
+function mslAtomicFunction(fun: String) -> String {
+    match fun {
+        "add" -> return "atomic_fetch_add_explicit"
+        "subtract" -> return "atomic_fetch_sub_explicit"
+        "and" -> return "atomic_fetch_and_explicit"
+        "or" -> return "atomic_fetch_or_explicit"
+        "xor" -> return "atomic_fetch_xor_explicit"
+        "min" -> return "atomic_fetch_min_explicit"
+        "max" -> return "atomic_fetch_max_explicit"
+        else -> return "atomic_exchange_explicit"
+    }
+}
+
+extend TextOut {
+    function mslMath(borrow self, expression: Int) -> String {
+        var parts: [String] = []
+        let items = fieldCount("expressions", current, expression, "items")
+        for at in 0..items {
+            parts.append(operand(fieldItem("expressions", current, expression, "items", at)))
+        }
+        let fun = text("expressions", current, expression, "fun")
+        let ty = resultType(expression)
+        let x = parts[0]
+        let unsigned = scalarKind(scalarOf(fieldItem("expressions", current, expression, "items", 0))) == "uint"
+        if fun == "sign" && unsigned { return joinText(["min(", x, ", ", ty, "(1u))"]) }
+        if fun == "sign" { return joinText([ty, "(sign(", x, "))"]) }
+        if fun == "radians" { return joinText(["(", x, " * 0.017453292519943295)"]) }
+        if fun == "degrees" { return joinText(["(", x, " * 57.29577951308232)"]) }
+        if fun == "extract_bits" || fun == "insert_bits" {
+            let last = parts.count - 1
+            parts[last] = joinText(["uint(", parts[last], ")"])
+            parts[last - 1] = joinText(["uint(", parts[last - 1], ")"])
+            return joinText([fun, "(", joinWith(parts, ", "), ")"])
+        }
+        if fun == "first_leading_bit" && unsigned {
+            return joinText(["select(", ty, "(31) - clz(", x, "), ", ty, "(-1), ", x, " == ", ty, "(0))"])
+        }
+        if fun == "first_leading_bit" {
+            return joinText(["select(", ty, "(31) - clz(select(", x, ", ~", x, ", ", x, " < ", ty, "(0))), ", ty,
+                "(-1), ", x, " == ", ty, "(0) || ", x, " == ", ty, "(-1))"])
+        }
+        if fun == "first_trailing_bit" {
+            return joinText(["select(ctz(", x, "), ", ty, "(-1), ", x, " == ", ty, "(0))"])
+        }
+        if fun == "pack2x16float" { return joinText(["as_type<uint>(half2(", x, "))"]) }
+        if fun == "unpack2x16float" { return joinText(["float2(as_type<half2>(", x, "))"]) }
+        var name = mslMathName(fun)
+        if utf8Count(name) == 0 { name = "/* unknown */" }
+        return joinText([name, "(", joinWith(parts, ", "), ")"])
+    }
+
+    function writeAtomic(borrow mut self, block: Int, position: Int, depth: Int) {
+        let target = operand(statementField(block, position, "pointer"))
+        let value = operand(statementField(block, position, "value"))
+        let fun = text("statements", block, position, "fun")
+        let compare = statementField(block, position, "compare")
+        let result = statementField(block, position, "result")
+        if fun == "compare_exchange" && compare >= 0 {
+            var expected = ""
+            if result >= 0 {
+                expected = scopeName(joinText(["_e", decimalText(result)]))
+                baked[result] = expected
+            } else {
+                expected = scopeFresh("expected")
+            }
+            var expectedType = "uint"
+            if result >= 0 { expectedType = resultType(result) }
+            let compareText = operand(compare)
+            line(depth, joinText([expectedType, " ", expected, " = ", compareText, ";"]))
+            line(depth, joinText(["atomic_compare_exchange_weak_explicit(&", target, ", &", expected, ", ", value,
+                ", memory_order_relaxed, memory_order_relaxed);"]))
+            return
+        }
+        let call = joinText([mslAtomicFunction(fun), "(&", target, ", ", value, ", memory_order_relaxed)"])
+        if result >= 0 {
+            bake(result, call, depth)
+        } else {
+            line(depth, joinText([call, ";"]))
+        }
+    }
+
+    function dialectStatement(borrow mut self, block: Int, position: Int, which: String, depth: Int) -> Bool {
+        if which == "kill" {
+            line(depth, "discard_fragment();")
+            return true
+        }
+        if which == "image_store" {
+            let image = operand(statementField(block, position, "image"))
+            let coordinate = statementField(block, position, "coordinate")
+            var size = "uint"
+            if typeKindOf(coordinate) == "vector" {
+                size = joinText(["uint", decimalText(typeField(typeOf(coordinate), "lanes"))])
+            }
+            var arguments: [String] = [operand(statementField(block, position, "value")),
+                joinText([size, "(", operand(coordinate), ")"])]
+            let arrayIndex = statementField(block, position, "array_index")
+            if arrayIndex >= 0 { arguments.append(joinText(["uint(", operand(arrayIndex), ")"])) }
+            line(depth, joinText([image, ".write(", joinWith(arguments, ", "), ");"]))
+            return true
+        }
+        if which == "atomic" {
+            writeAtomic(block, position, depth)
+            return true
+        }
+        if which == "store" && pointeeIsAtomic(statementField(block, position, "pointer")) {
+            let target = operand(statementField(block, position, "pointer"))
+            let value = operand(statementField(block, position, "value"))
+            line(depth, joinText(["atomic_store_explicit(&", target, ", ", value, ", memory_order_relaxed);"]))
+            return true
+        }
+        if which == "control_barrier" || which == "memory_barrier" {
+            let flags = text("statements", block, position, "flags")
+            var memory: [String] = []
+            if containsWord(flags, "workgroup") { memory.append("mem_flags::mem_threadgroup") }
+            if containsWord(flags, "storage") { memory.append("mem_flags::mem_device") }
+            if containsWord(flags, "image") { memory.append("mem_flags::mem_texture") }
+            if memory.count == 0 { memory.append("mem_flags::mem_none") }
+            line(depth, joinText(["threadgroup_barrier(", joinWith(memory, " | "), ");"]))
+            return true
+        }
+        if which == "workgroup_uniform_load" {
+            let value = operand(statementField(block, position, "pointer"))
+            line(depth, "threadgroup_barrier(mem_flags::mem_threadgroup);")
+            bake(statementField(block, position, "result"), value, depth)
+            line(depth, "threadgroup_barrier(mem_flags::mem_threadgroup);")
+            return true
+        }
+        if which == "call" { refusePointerArguments(block, position) }
+        return false
+    }
+
+    // A pointer argument must point to function or private memory, which
+    // is all a Metal function can take by reference here.
+    function refusePointerArguments(borrow self, block: Int, position: Int) {
+        let arguments = fieldCount("statements", block, position, "arguments")
+        for at in 0..arguments {
+            let argumentType = typeOf(fieldItem("statements", block, position, "arguments", at))
+            if typeKind(argumentType) == "pointer" {
+                let space = typeText(argumentType, "space")
+                if space != "function" && space != "private" {
+                    refuseAt("a pointer argument outside function or private memory", "statements", block, position)
+                }
+            }
+        }
+    }
+}

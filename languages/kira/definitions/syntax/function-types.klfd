@@ -1,0 +1,82 @@
+extend Parser {
+    function callableTypeReference(borrow mut self) -> Result<TypeReference, Failure> {
+        let start = try expect(.LeftParen)
+        var arguments: [TypeReference] = []
+        var modes: [PassingMode] = []
+        while !at(.RightParen) {
+            var mode: PassingMode = .Owned
+            if atWord("borrow") {
+                advance()
+                mode = .Borrowed
+                if atWord("mut") { advance() mode = .MutablyBorrowed }
+            }
+            arguments.append(try typeReference())
+            modes.append(mode)
+            if !eat(.Comma) { break }
+        }
+        try expect(.RightParen)
+        // `(A)` is A and `(A, B)` is a tuple, `Tuple2<A, B>`, when no arrow follows.
+        if !at(.Arrow) && arguments.count == 1 { return .Ok(arguments[0]) }
+        if !at(.Arrow) && arguments.count >= 2 && arguments.count <= 4 {
+            let name = joinText(["Tuple", decimalText(arguments.count)])
+            return .Ok(TypeReference {
+                qualifier = .None,
+                name = Identifier { text = name, span = spanFrom(start.span) },
+                arguments = arguments,
+                modes = [],
+                instanceName = genericInstanceName(name, arguments)
+            })
+        }
+        try expect(.Arrow)
+        arguments.append(try typeReference())
+        return .Ok(TypeReference {
+            qualifier = .None,
+            name = Identifier { text = "Closure", span = spanFrom(start.span) },
+            arguments = arguments,
+            modes = modes,
+            instanceName = referenceInstanceName("Closure", arguments, modes)
+        })
+    }
+}
+
+function referenceInstanceName(name: String, arguments: [TypeReference], modes: [PassingMode]) -> String {
+    if name != "Closure" || arguments.count == 0 { return genericInstanceName(name, arguments) }
+    var parts: [String] = ["("]
+    for index in 0..arguments.count - 1 {
+        if index > 0 { parts.append(",") }
+        if index < modes.count {
+            match modes[index] {
+                Owned -> {}
+                Borrowed -> parts.append("borrow ")
+                MutablyBorrowed -> parts.append("borrow mut ")
+            }
+        }
+        parts.append(arguments[index].instanceName)
+    }
+    parts.append(")->")
+    parts.append(arguments[arguments.count - 1].instanceName)
+    return joinText(parts)
+}
+
+function functionReferenceType(declared: FunctionDeclaration) -> TypeReference {
+    var arguments: [TypeReference] = []
+    var modes: [PassingMode] = []
+    for parameter in declared.parameters {
+        arguments.append(parameter.annotation)
+        modes.append(parameter.mode)
+    }
+    match declared.result {
+        Some(result) -> arguments.append(result)
+        None -> arguments.append(TypeReference {
+            qualifier = .None,
+            name = Identifier { text = "Void", span = declared.name.span },
+            arguments = [], modes = [], instanceName = "Void"
+        })
+    }
+    return TypeReference {
+        qualifier = .None,
+        name = Identifier { text = "Closure", span = declared.name.span },
+        arguments = arguments, modes = modes,
+        instanceName = referenceInstanceName("Closure", arguments, modes)
+    }
+}

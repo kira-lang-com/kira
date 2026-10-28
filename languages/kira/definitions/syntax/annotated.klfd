@@ -1,0 +1,437 @@
+// Type declarations a procedural macro reads: those written under an
+// annotation, and those carrying an annotated field, which may summon a
+// wrapper or a field-triggered macro over the whole declaration. Each is
+// recorded with the `Declaration` value a macro body is handed, written as
+// Kira source, because the macro runs as a program of its own.
+
+// A top-level declaration as a collector macro reads it: its name, the word
+// for its kind (`struct`, `class`, `enum`, `construct`, `form`, `distinct`,
+// `function` or `other`), the span of its text, and for a form the family it
+// extends.
+struct DeclarationSite {
+    let name: Identifier
+    let kind: String
+    let span: Span
+    let family: String
+}
+
+struct AnnotatedDeclaration {
+    // What is written before the declaration that names macros: `@Derive(A,
+    // B)` and the names no built-in attribute has.
+    let annotations: [Annotation]
+    let name: Identifier
+    // The word an `appliesTo` list names this kind of declaration with.
+    let kind: String
+    let span: Span
+    let reflection: String
+    let fieldAnnotations: [Annotation]
+}
+
+// The annotations that name a built-in attribute, and those that name a
+// macro.
+function builtInAnnotations(annotations: [Annotation]) -> [Annotation] {
+    var builtIn: [Annotation] = []
+    for annotation in annotations {
+        if annotation.attribute.isSome() { builtIn.append(annotation) }
+    }
+    return builtIn
+}
+
+function macroAnnotations(annotations: [Annotation]) -> [Annotation] {
+    var macros: [Annotation] = []
+    for annotation in annotations {
+        if annotation.attribute.isNone() { macros.append(annotation) }
+    }
+    return macros
+}
+
+// The macros `@Derive(A, B)` names.
+function derivedMacros(tree: SyntaxTree, annotation: Annotation) -> [Identifier] {
+    var macros: [Identifier] = []
+    for argument in annotation.arguments {
+        match tree.expressions[argument].kind.name() {
+            Some(name) -> macros.append(name)
+            None -> {}
+        }
+    }
+    return macros
+}
+
+extend Parser {
+    function atTypeDeclaration(borrow self) -> Bool {
+        if at(.Struct) || at(.Enum) || at(.Construct) || at(.Class) || at(.Distinct) { return true }
+        // `namespace Name { ... }` has the same shape as a construct form.
+        if atWord("namespace") { return false }
+        return at(.Identifier) && peek(1).kind == .Identifier && peek(2).kind == .LeftBrace
+    }
+
+    function typeDeclaration(borrow mut self, annotations: [Annotation]) -> Result<Span, Failure> {
+        let earlier = FieldSources.of(tree)
+        let bare = at(.Identifier)
+        var kind = text(current().span)
+        let nameToken = peek(1)
+        let name = nameOf(nameToken)
+        var span = current().span
+        if bare {
+            kind = "form"
+            span = try bareConstructHead()
+        } else if at(.Struct) {
+            span = try structDeclaration(foreignMarkIndex(tree, annotations))
+        } else if at(.Enum) {
+            span = try enumDeclaration(annotations)
+        } else if at(.Construct) {
+            span = try constructDeclaration()
+        } else if at(.Class) {
+            span = try classDeclaration()
+        } else {
+            span = try distinctDeclaration()
+        }
+        let kept = keptKind(tree, name, kind)
+        let family = constructFamily(tree, name, kind)
+        tree.declarationSites.append(DeclarationSite { name = name, kind = kept, span = span, family = family })
+        var fieldAnnotations: [Annotation] = []
+        for field in declaredFieldsSince(tree, name, earlier) {
+            for annotation in field.annotations {
+                if annotation.attribute.isNone() { fieldAnnotations.append(annotation) }
+            }
+        }
+        var macros: [Annotation] = []
+        for annotation in annotations {
+            if isAttribute(annotation, .Instance) && (kind == "struct" || kind == "construct" || kind == "enum") {
+                tree.namedInstances.append(namedInstanceReference(tree, name, annotation))
+            } else if isAttribute(annotation, .Open) && kind == "enum" {
+                tree.openEnums.append(name)
+            } else if isAttribute(annotation, .Main) && (kept == "form" || kind == "struct" || kind == "construct") {
+                tree.functions.append(typeEntry(tree, name, kept == "form", annotation.name.span))
+            } else if isAttribute(annotation, .Foreign) {
+                match foreignMarkOf(tree, annotation) {
+                    Some(mark) -> tree.foreignTypes.append(ForeignTypeMark { name = name, mark = mark })
+                    None -> {}
+                }
+            } else if isAttribute(annotation, .Derive) || annotation.attribute.isNone() {
+                macros.append(annotation)
+            } else {
+                return .Error(Failure { diagnostic = .AnnotationNotApplicable, span = annotation.name.span })
+            }
+        }
+        if macros.count == 0 && fieldAnnotations.count == 0 { return .Ok(span) }
+        tree.annotated.append(AnnotatedDeclaration {
+            annotations = macros, name = name, kind = kept, span = span,
+            reflection = reflectedDeclaration(tree, source, DeclarationSite { name = name, kind = kept, span = span, family = family }),
+            fieldAnnotations = fieldAnnotations
+        })
+        return .Ok(span)
+    }
+
+    // A top-level function's annotations that name macros: they are
+    // expanded as a type declaration's are, so the function keeps only its
+    // built-in attributes.
+    function annotatedFunction(borrow mut self, annotations: [Annotation], site: DeclarationSite) {
+        let macros = macroAnnotations(annotations)
+        if macros.count == 0 { return }
+        tree.annotated.append(AnnotatedDeclaration {
+            annotations = macros, name = site.name, kind = site.kind, span = site.span,
+            reflection = reflectedDeclaration(tree, source, site), fieldAnnotations = []
+        })
+    }
+
+    function distinctDeclaration(borrow mut self) -> Result<Span, Failure> {
+        let start = advance()
+        let name = try identifier(.ExpectedDistinctName)
+        try expectAs(.Equals, .ExpectedDistinctRepresentation)
+        let representation = try typeReference()
+        tree.distincts.append(DistinctDeclaration { name = name, representation = representation })
+        return .Ok(spanFrom(start.span))
+    }
+}
+
+// The program's entry when `@Main` is on a type, as Swift's `@main` is: it
+// makes the type's value, `Name()` for a form and `Name {}` otherwise, and
+// calls its `main()`.
+function typeEntry(tree: borrow mut SyntaxTree, name: Identifier, form: Bool, span: Span) -> FunctionDeclaration {
+    let fields: [FieldValue] = []
+    let types: [TypeReference] = []
+    var value = tree.addExpression(.StructLiteral(name, types, fields), span)
+    if form { value = tree.addExpression(.Call(name, []), span) }
+    let run = tree.addExpression(.MethodCall(value, Identifier { text = "main", span = span }, []), span)
+    return FunctionDeclaration {
+        name = Identifier { text = "main", span = span }, annotations = [implicitAnnotation(.Main, span)],
+        receiver = .Free, parameters = [], result = .None, body = [tree.addStatement(.Evaluation(run), span)],
+        span = span, typeParameters = [], scope = GenericScope.none()
+    }
+}
+
+// A field as the macro reads it: its text rebuilt from its parts, what it
+// is set to taken as written in `source`, the text of its file, and where its
+// bytes sit in the text of the declaration at `site`, so a macro can replace
+// it there. A field the declaration takes from elsewhere has no bytes in it.
+function reflectedField(tree: SyntaxTree, source: String, site: Span, field: FieldDeclaration) -> String {
+    let typeText = reflectedTypeText(field.annotation)
+    var parts: [String] = []
+    var annotations: [String] = []
+    for annotation in field.annotations {
+        let written = writtenAnnotation(tree, source, annotation)
+        parts.append(joinText([written, " "]))
+        annotations.append(encodedAnnotation(tree, source, annotation))
+    }
+    let hidden = isPrivateMember(tree, field.name.span)
+    if hidden { parts.append("private ") }
+    if field.mutable { parts.append("var ") } else { parts.append("let ") }
+    parts.append(field.name.text)
+    if !isInferredReference(field.annotation) { parts.append(joinText([": ", typeText])) }
+    var initializer = ""
+    match field.initial {
+        Some(value) -> {
+            let written = tree.expressions[value].span
+            initializer = utf8Slice(source, written.start, written.end)
+            parts.append(joinText([" = ", initializer]))
+        }
+        None -> {}
+    }
+    var start = 0
+    var end = 0
+    if field.span.start >= site.start && field.span.end <= site.end {
+        start = field.span.start - site.start
+        end = field.span.end - site.start
+    }
+    return encodedField(field.name, typeText, joinText(parts), initializer, annotations, start, end, hidden)
+}
+
+function isPrivateMember(tree: SyntaxTree, name: Span) -> Bool {
+    for member in tree.privateMembers {
+        if member.span.same(name) { return true }
+    }
+    return false
+}
+
+// An annotation as `source` writes it, `@` through its arguments.
+function writtenAnnotation(tree: SyntaxTree, source: String, annotation: Annotation) -> String {
+    if annotation.arguments.count == 0 { return joinText(["@", annotation.name.text]) }
+    var parts: [String] = ["@", annotation.name.text, "("]
+    for index in 0..annotation.arguments.count {
+        if index > 0 { parts.append(", ") }
+        let written = tree.expressions[annotation.arguments[index]].span
+        parts.append(utf8Slice(source, written.start, written.end))
+    }
+    parts.append(")")
+    return joinText(parts)
+}
+
+// An annotation in the reflection text: its name and argument count, then
+// each argument's label, empty for none, and its value as written.
+function encodedAnnotation(tree: SyntaxTree, source: String, annotation: Annotation) -> String {
+    var parts: [String] = [encodedItem(annotation.name.text), encodedItem(decimalText(annotation.arguments.count))]
+    for argument in annotation.arguments {
+        var label = ""
+        var value = argument
+        match tree.expressions[argument].kind.labelled() {
+            Some(field) -> {
+                label = field.name.text
+                value = field.value
+            }
+            None -> {}
+        }
+        let written = tree.expressions[value].span
+        parts.append(encodedItem(label))
+        parts.append(encodedItem(utf8Slice(source, written.start, written.end)))
+    }
+    return joinText(parts)
+}
+
+// The `Declaration` value a macro is handed for `site`, written as Kira
+// source; `source` is the text of the site's file.
+function reflectedDeclaration(tree: SyntaxTree, source: String, site: DeclarationSite) -> String {
+    return joinText(["reflectedDeclaration(", escapedSourceString(encodedDeclaration(tree, source, site)), ")"])
+}
+
+// The declaration at `site` in the text the Foundation's `ReflectionReader`
+// reads.
+function encodedDeclaration(tree: SyntaxTree, source: String, site: DeclarationSite) -> String {
+    var reflected: [String] = []
+    match site.kind {
+        "enum" -> {
+            for variant in declaredCases(tree, site.name) {
+                var typeText = ""
+                match variant.payload { Some(payload) -> typeText = reflectedTypeText(payload) None -> {} }
+                reflected.append(encodedField(variant.name, typeText, variant.name.text, "", [], 0, 0, false))
+            }
+        }
+        "distinct" -> {
+            for declared in tree.distincts {
+                if declared.name.span.same(site.name.span) {
+                    let raw = Identifier { text = "raw", span = site.name.span }
+                    reflected.append(encodedField(raw, reflectedTypeText(flattenDistinct(tree, declared.representation, 0)), "raw", "", [], 0, 0, false))
+                }
+            }
+        }
+        "function", "other" -> {}
+        else -> {
+            for field in declaredFields(tree, site.name) { reflected.append(reflectedField(tree, source, site.span, field)) }
+        }
+    }
+    return encodedDeclarationText(site.name, site.kind, utf8Slice(source, site.span.start, site.span.end), reflected, site.family, declaredTypeParameters(tree, site.name))
+}
+
+// The type parameters a generic struct is written with, `<Value>`.
+function declaredTypeParameters(tree: SyntaxTree, name: Identifier) -> [Identifier] {
+    for declared in tree.genericStructs {
+        if declared.name.span.same(name.span) { return declared.genericParameters }
+    }
+    return []
+}
+
+// The word a declaration's kind is read as: a construct written with
+// parameters is a form of the family it extends.
+function keptKind(tree: SyntaxTree, name: Identifier, kind: String) -> String {
+    match latestConstruct(tree, name) {
+        Some(declared) -> { if declared.parameters.isSome() { return "form" } }
+        None -> {}
+    }
+    return kind
+}
+
+// The family a form is written against: the first type its `extends`
+// clause names.
+function constructFamily(tree: SyntaxTree, name: Identifier, kind: String) -> String {
+    match latestConstruct(tree, name) {
+        Some(declared) -> {
+            if keptKind(tree, name, kind) == "form" && declared.parents.count > 0 { return declared.parents[0].name.text }
+        }
+        None -> {}
+    }
+    return ""
+}
+
+// The construct named at this span, looked for from the newest, since the
+// parser asks about the one it has just read.
+function latestConstruct(tree: SyntaxTree, name: Identifier) -> Optional<ConstructDeclaration> {
+    for offset in 0..tree.constructs.count {
+        let index = tree.constructs.count - 1 - offset
+        if tree.constructs[index].name.span.same(name.span) { return .Some(tree.constructs[index]) }
+    }
+    return .None
+}
+
+// The stored members a declaration named at this span writes: a struct's or
+// class's fields, a construct body's fields and requirements.
+// How many declarations each list a type's fields come from held: a type
+// read after them is declared past them.
+struct FieldSources {
+    let structs: Int
+    let genericStructs: Int
+    let classes: Int
+    let constructs: Int
+
+    function of(tree: borrow SyntaxTree) -> FieldSources {
+        return FieldSources {
+            structs = tree.structs.count, genericStructs = tree.genericStructs.count,
+            classes = tree.classes.count, constructs = tree.constructs.count
+        }
+    }
+}
+
+function declaredFields(tree: SyntaxTree, name: Identifier) -> [FieldDeclaration] {
+    return declaredFieldsSince(tree, name, FieldSources { structs = 0, genericStructs = 0, classes = 0, constructs = 0 })
+}
+
+// The fields of the type `name` declares among the declarations past
+// `earlier`.
+function declaredFieldsSince(tree: SyntaxTree, name: Identifier, earlier: FieldSources) -> [FieldDeclaration] {
+    var fields: [FieldDeclaration] = []
+    for index in earlier.structs..tree.structs.count {
+        if tree.structs[index].name.span.same(name.span) { for field in tree.structs[index].fields { fields.append(field) } }
+    }
+    for index in earlier.genericStructs..tree.genericStructs.count {
+        if tree.genericStructs[index].name.span.same(name.span) { for field in tree.genericStructs[index].fields { fields.append(field) } }
+    }
+    for index in earlier.classes..tree.classes.count {
+        if tree.classes[index].name.span.same(name.span) { for field in tree.classes[index].fields { fields.append(field) } }
+    }
+    for index in earlier.constructs..tree.constructs.count {
+        let declared = tree.constructs[index]
+        if declared.name.span.same(name.span) {
+            for field in declared.fields { fields.append(field) }
+            for field in declared.requirements { fields.append(field) }
+        }
+    }
+    return fields
+}
+
+function declaredCases(tree: SyntaxTree, name: Identifier) -> [CaseDeclaration] {
+    for declared in tree.enums {
+        if declared.name.span.same(name.span) { return declared.cases }
+    }
+    for declared in tree.genericEnums {
+        if declared.name.span.same(name.span) { return declared.cases }
+    }
+    return []
+}
+
+function reflectedTypeText(reference: TypeReference) -> String {
+    if reference.name.text == "Array" && reference.arguments.count == 1 {
+        return joinText(["[", reflectedTypeText(reference.arguments[0]), "]"])
+    }
+    var text = reference.name.text
+    match reference.qualifier { Some(qualifier) -> text = joinText([qualifier.text, ".", text]) None -> {} }
+    if reference.arguments.count == 0 { return text }
+    var parts: [String] = [text, "<"]
+    for index in 0..reference.arguments.count {
+        if index > 0 { parts.append(",") }
+        parts.append(reflectedTypeText(reference.arguments[index]))
+    }
+    parts.append(">")
+    return joinText(parts)
+}
+
+// One item of the reflection text: its byte count, a `:` and its bytes.
+function encodedItem(text: String) -> String {
+    return joinText([decimalText(utf8Count(text)), ":", text])
+}
+
+function encodedField(name: Identifier, typeText: String, syntax: String, initializer: String, annotations: [String], start: Int, end: Int, hidden: Bool) -> String {
+    var parts: [String] = [
+        encodedItem(name.text), encodedItem(typeText), encodedItem(syntax), encodedItem(initializer),
+        encodedItem(decimalText(start)), encodedItem(decimalText(end)), encodedItem(hidden ? "1" : "0"),
+        encodedItem(decimalText(annotations.count))
+    ]
+    for annotation in annotations { parts.append(annotation) }
+    return joinText(parts)
+}
+
+function declarationFormCase(kind: String) -> String {
+    match kind {
+        "struct" -> return "Struct"
+        "enum" -> return "Enum"
+        "class" -> return "Class"
+        "construct" -> return "Construct"
+        "form" -> return "Form"
+        "function" -> return "Function"
+        "distinct" -> return "Distinct"
+        else -> return "Other"
+    }
+}
+
+function encodedDeclarationText(name: Identifier, kind: String, syntax: String, fields: [String], family: String, typeParameters: [Identifier]) -> String {
+    var parts: [String] = [
+        encodedItem(name.text), encodedItem(declarationFormCase(kind)), encodedItem(syntax), encodedItem(family),
+        encodedItem(decimalText(typeParameters.count))
+    ]
+    for parameter in typeParameters { parts.append(encodedItem(parameter.text)) }
+    parts.append(encodedItem(decimalText(fields.count)))
+    for field in fields { parts.append(field) }
+    return joinText(parts)
+}
+
+// The instance `@Instance(A, B)` on the declaration `name` names: `name<A, B>`.
+function namedInstanceReference(tree: borrow SyntaxTree, name: Identifier, annotation: Annotation) -> TypeReference {
+    var arguments: [TypeReference] = []
+    for argument in annotation.arguments {
+        match tree.expressions[argument].kind.name() {
+            Some(written) -> arguments.append(namedReference(written))
+            None -> {}
+        }
+    }
+    return TypeReference {
+        qualifier = .None, name = name, arguments = arguments, modes = [], instanceName = genericInstanceName(name.text, arguments)
+    }
+}

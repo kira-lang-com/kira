@@ -1,0 +1,110 @@
+// A window onto `count` bytes from `start` that it does not own: reads and
+// writes through it are checked against its bounds and trap outside them.
+// Values are read and written in the machine's own byte order and need no
+// alignment. A view lives no longer than the memory it names; the block
+// that owns that memory, a `ByteBlock` or an `Arena`, frees it.
+struct MemoryView {
+    let start: RawPtr
+    let count: Int
+
+    function readU8(borrow self, at: Int) -> U8 { return viewLoad<U8>(self, at) }
+    function readU16(borrow self, at: Int) -> U16 { return viewLoad<U16>(self, at) }
+    function readU32(borrow self, at: Int) -> U32 { return viewLoad<U32>(self, at) }
+    function readU64(borrow self, at: Int) -> U64 { return viewLoad<U64>(self, at) }
+    function readI8(borrow self, at: Int) -> I8 { return viewLoad<I8>(self, at) }
+    function readI16(borrow self, at: Int) -> I16 { return viewLoad<I16>(self, at) }
+    function readI32(borrow self, at: Int) -> I32 { return viewLoad<I32>(self, at) }
+    function readI64(borrow self, at: Int) -> Int { return viewLoad<Int>(self, at) }
+    function readF32(borrow self, at: Int) -> F32 { return viewLoad<F32>(self, at) }
+    function readF64(borrow self, at: Int) -> Float { return viewLoad<Float>(self, at) }
+    function readBool(borrow self, at: Int) -> Bool { return viewLoad<Bool>(self, at) }
+    function readPointer(borrow self, at: Int) -> RawPtr { return viewLoad<RawPtr>(self, at) }
+
+    function writeU8(borrow self, at: Int, value: U8) { viewStore<U8>(self, at, value) }
+    function writeU16(borrow self, at: Int, value: U16) { viewStore<U16>(self, at, value) }
+    function writeU32(borrow self, at: Int, value: U32) { viewStore<U32>(self, at, value) }
+    function writeU64(borrow self, at: Int, value: U64) { viewStore<U64>(self, at, value) }
+    function writeI8(borrow self, at: Int, value: I8) { viewStore<I8>(self, at, value) }
+    function writeI16(borrow self, at: Int, value: I16) { viewStore<I16>(self, at, value) }
+    function writeI32(borrow self, at: Int, value: I32) { viewStore<I32>(self, at, value) }
+    function writeI64(borrow self, at: Int, value: Int) { viewStore<Int>(self, at, value) }
+    function writeF32(borrow self, at: Int, value: F32) { viewStore<F32>(self, at, value) }
+    function writeF64(borrow self, at: Int, value: Float) { viewStore<Float>(self, at, value) }
+    function writeBool(borrow self, at: Int, value: Bool) { viewStore<Bool>(self, at, value) }
+    function writePointer(borrow self, at: Int, value: RawPtr) {
+        viewStore<RawPtr>(self, at, value)
+    }
+
+    // The address of the byte at `at`, which may be one past the last.
+    function pointer(borrow self, at: Int) -> RawPtr {
+        if at < 0 || at > self.count { runtimeTrap() }
+        return heapOffset(self.start, at)
+    }
+
+    // The `count` bytes from `from`, as a view of their own.
+    function slice(borrow self, from: Int, count: Int) -> MemoryView {
+        requireWithin(self.count, from, count)
+        return MemoryView { start = heapOffset(self.start, from), count = count }
+    }
+
+    function fill(borrow self, byte: U8) {
+        heapFillBytes(self.start, byte, self.count)
+    }
+
+    function zero(borrow self) {
+        heapFillBytes(self.start, U8(0), self.count)
+    }
+
+    // The other view's bytes copied over this one's first; the two may
+    // overlap. A source longer than this view traps.
+    function copyFrom(borrow self, source: borrow MemoryView) {
+        if source.count > self.count { runtimeTrap() }
+        heapMoveBytes(self.start, source.start, source.count)
+    }
+
+    function equals(borrow self, other: borrow MemoryView) -> Bool {
+        return self.count == other.count && compareBytes(self.start, other.start, self.count) == 0
+    }
+
+    // The order of the two views' bytes, a shorter view that is a prefix of
+    // the other sorting first.
+    function order(borrow self, other: borrow MemoryView) -> Int {
+        let shared = self.count < other.count ? self.count : other.count
+        let order = compareBytes(self.start, other.start, shared)
+        if order != 0 { return order }
+        if self.count == other.count { return 0 }
+        return self.count < other.count ? -1 : 1
+    }
+}
+
+function memoryView(start: RawPtr, count: Int) -> MemoryView {
+    requireRange(start, count)
+    return MemoryView { start = start, count = count }
+}
+
+// The value of `T` at byte `at`, checked against the view's bounds.
+function viewLoad<T>(view: borrow MemoryView, at: Int) -> T {
+    requireWithin(view.count, at, sizeOf<T>())
+    return heapLoad<T>(view.start, at)
+}
+
+function viewStore<T>(view: borrow MemoryView, at: Int, value: T) {
+    requireWithin(view.count, at, sizeOf<T>())
+    heapStore<T>(view.start, at, value)
+}
+
+// The `index`th value of `T` in a view holding them end to end.
+function viewElement<T>(view: borrow MemoryView, index: Int) -> T {
+    if index < 0 || index > view.count / sizeOf<T>() { runtimeTrap() }
+    return viewLoad<T>(view, index * sizeOf<T>())
+}
+
+function setViewElement<T>(view: borrow MemoryView, index: Int, value: T) {
+    if index < 0 || index > view.count / sizeOf<T>() { runtimeTrap() }
+    viewStore<T>(view, index * sizeOf<T>(), value)
+}
+
+// `width` bytes from `at` lie within `count`, checked without overflow.
+function requireWithin(count: Int, at: Int, width: Int) {
+    if at < 0 || width < 0 || at > count || width > count - at { runtimeTrap() }
+}

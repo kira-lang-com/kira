@@ -1,0 +1,102 @@
+// The interface values of an entry point: each argument or result with a
+// binding, or each member with one of an argument or result struct.
+
+struct Leaf {
+    // Where the binding is read: a record of `arguments` or `members`, or a
+    // function's result, whose fields start with `result_`.
+    let table: String
+    let owner: Int
+    let index: Int
+    let prefix: String
+    let typeIndex: Int
+    // The argument the value belongs to, and its member, or -1 for the
+    // whole argument or result.
+    let argument: Int
+    let member: Int
+}
+
+extend TextOut {
+    function bound(borrow self, table: String, owner: Int, index: Int, prefix: String) -> Bool {
+        return utf8Count(text(table, owner, index, joinText([prefix, "builtin"]))) > 0
+            || field(table, owner, index, joinText([prefix, "location"])) >= 0
+    }
+
+    function leafText(borrow self, leaf: Leaf, name: String) -> String {
+        return text(leaf.table, leaf.owner, leaf.index, joinText([leaf.prefix, name]))
+    }
+
+    function leafField(borrow self, leaf: Leaf, name: String) -> Int {
+        return field(leaf.table, leaf.owner, leaf.index, joinText([leaf.prefix, name]))
+    }
+
+    function leafBuiltin(borrow self, leaf: Leaf) -> String {
+        return leafText(leaf, "builtin")
+    }
+
+    // A leaf's location, 0 when its binding names none.
+    function leafLocation(borrow self, leaf: Leaf) -> Int {
+        let location = leafField(leaf, "location")
+        if location < 0 { return 0 }
+        return location
+    }
+
+    // The members of struct `typeIndex` that carry a binding.
+    function memberLeaves(borrow self, typeIndex: Int, argument: Int) -> [Leaf] {
+        var found: [Leaf] = []
+        if typeKind(typeIndex) != "struct" { return found }
+        let members = count("members", typeIndex)
+        for member in 0..members {
+            if bound("members", typeIndex, member, "") {
+                found.append(Leaf {
+                    table = "members", owner = typeIndex, index = member, prefix = "",
+                    typeIndex = field("members", typeIndex, member, "type"), argument = argument, member = member
+                })
+            }
+        }
+        return found
+    }
+
+    function argumentLeaves(borrow self, which: Int, argument: Int) -> [Leaf] {
+        let argumentType = field("arguments", which, argument, "type")
+        if bound("arguments", which, argument, "") {
+            return [Leaf {
+                table = "arguments", owner = which, index = argument, prefix = "",
+                typeIndex = argumentType, argument = argument, member = -1
+            }]
+        }
+        return memberLeaves(argumentType, argument)
+    }
+
+    function inputLeaves(borrow self, which: Int) -> [Leaf] {
+        var found: [Leaf] = []
+        let arguments = count("arguments", which)
+        for argument in 0..arguments {
+            for leaf in argumentLeaves(which, argument) {
+                found.append(leaf)
+            }
+        }
+        return found
+    }
+
+    function resultLeaves(borrow self, which: Int) -> [Leaf] {
+        let result = field("functions", -1, which, "result")
+        if result < 0 { return [] }
+        if bound("functions", -1, which, "result_") {
+            return [Leaf {
+                table = "functions", owner = -1, index = which, prefix = "result_",
+                typeIndex = result, argument = 0, member = -1
+            }]
+        }
+        return memberLeaves(result, 0)
+    }
+
+    // The globals function `which` reaches, through every function it calls.
+    function reachedGlobals(borrow self, which: Int) -> [Int] {
+        var globals: [Int] = []
+        let uses = fieldCount("functions", -1, which, "uses")
+        for at in 0..uses {
+            globals.append(fieldItem("functions", -1, which, "uses", at))
+        }
+        return globals
+    }
+}

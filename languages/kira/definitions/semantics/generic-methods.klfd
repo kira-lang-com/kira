@@ -1,0 +1,101 @@
+// A generic method template and the existential type declaring it.
+struct GenericMethodTarget {
+    let template: FunctionDeclaration
+    let owner: Type
+}
+
+extend Checker {
+    function genericMethod(borrow self, owner: Type, name: String) -> Optional<FunctionDeclaration> {
+        var methods: [FunctionDeclaration] = []
+        if owner.kind == .Structure { methods = tree.structs[owner.declaration].methods }
+        if owner.kind == .Enumeration { methods = tree.enums[owner.declaration].methods }
+        for extension in tree.extensions {
+            if extension.owner.instanceName == declarations.typeName(owner) {
+                for method in extension.methods { methods.append(method) }
+            }
+        }
+        for method in methods {
+            if method.name.text == name && method.typeParameters.count > 0 { return .Some(method) }
+        }
+        return .None
+    }
+
+    // A generic method of a family existential that carries `receiverType`,
+    // the generic counterpart of `existentialMethod`: a value of that type
+    // reaches it by becoming the existential, and a method that mutates its
+    // receiver is left out, since it would change the copy.
+    function existentialGenericMethod(borrow self, receiverType: Type, name: String) -> Optional<GenericMethodTarget> {
+        for index in 0..program.enums.count {
+            let owner = Type.enumeration(index)
+            if existentialCase(program, receiverType, owner).isNone() { continue }
+            match genericMethod(owner, name) {
+                Some(template) -> {
+                    if template.receiver != .MutablyBorrowed { return .Some(GenericMethodTarget { template = template, owner = owner }) }
+                }
+                None -> {}
+            }
+        }
+        for index in 0..program.structs.count {
+            let owner = Type.structure(index)
+            if witnessBoxOf(receiverType, owner).isNone() { continue }
+            match genericMethod(owner, name) {
+                Some(template) -> {
+                    if template.receiver != .MutablyBorrowed { return .Some(GenericMethodTarget { template = template, owner = owner }) }
+                }
+                None -> {}
+            }
+        }
+        return .None
+    }
+
+    function callGenericMethod(borrow mut self, receiver: Int, template: FunctionDeclaration, arguments: [Int], span: Span) -> Int {
+        let owner = typeOf(receiver)
+        if arguments.count != template.parameters.count {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        var bound: [Optional<Type>] = []
+        for parameter in template.typeParameters {
+            let unknown: Optional<Type> = .None
+            bound.append(unknown)
+        }
+        var values: [Int] = []
+        for index in 0..arguments.count {
+            let annotation = template.parameters[index].annotation
+            inferLambdaParameters(arguments[index], annotation, template.typeParameters, bound)
+            let value = boundExpression(arguments[index], boundType(annotation, template.typeParameters, bound), annotation, template.typeParameters, bound)
+            infer(annotation, typeOf(value), template.typeParameters, bound)
+            values.append(value)
+        }
+        match inferredReferences(declarations, bound, span) {
+            Some(references) -> {
+                match mintMethod(owner, template, references, span) {
+                    Some(target) -> return callChecked(target, .Some(receiver), values, span)
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+        return add(.Integer(0), Type.invalid(), span)
+    }
+
+    function mintMethod(borrow mut self, owner: Type, template: FunctionDeclaration, arguments: [TypeReference], span: Span) -> Optional<Int> {
+        let name = referenceInstanceName(template.name.text, arguments, [])
+        match declarations.findFunction(.Some(owner), name) {
+            Some(existing) -> return .Some(existing)
+            None -> {}
+        }
+        checkBounds(declarations, tree, template.name.text, template.typeParameters, arguments)
+        let specialized = specializeMethods([template], template.typeParameters, arguments)[0]
+        let instance = FunctionDeclaration {
+            name = Identifier { text = name, span = template.name.span }, annotations = specialized.annotations,
+            receiver = specialized.receiver, parameters = specialized.parameters, result = specialized.result,
+            body = specialized.body, span = specialized.span, typeParameters = [], scope = specialized.scope
+        }
+        mintSignatureInstances(instance)
+        let target = declarations.signatures.count
+        declareFunction(declarations, tree, instance, .Some(owner))
+        registerSignatures()
+        return .Some(target)
+    }
+}

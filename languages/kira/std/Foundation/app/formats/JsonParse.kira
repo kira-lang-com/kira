@@ -1,0 +1,558 @@
+// Reading JSON text into a `JsonValue`.
+//
+// Strict about the grammar RFC 8259 defines, because the text usually comes
+// from somewhere else and a parser that accepted more than the format would let
+// a document mean one thing here and another wherever it goes next: no trailing
+// commas, no comments, no unquoted names, no single quotes, no leading `+`, no
+// bare `.5`, and no control character inside a string that the format requires
+// escaped.
+//
+// Every refusal carries the byte offset it happened at. A parser that answered
+// only "malformed" would leave a caller holding a 700 KB response with nothing
+// to look at, which is the moment the offset is worth having.
+
+// Why a document could not be read.
+enum JsonFailure {
+    // The text ended in the middle of a value.
+    UnexpectedEnd
+    // A byte the grammar does not allow where it appeared.
+    UnexpectedCharacter
+    // Digits that do not spell a number: `01`, `1.`, `1e`, a lone `-`.
+    InvalidNumber
+    // A number past the largest `Number` in either direction.
+    NumberOutOfRange
+    // A `\` followed by something that is not an escape.
+    InvalidEscape
+    // A string containing a raw control character, or a `\u` escape naming half
+    // a surrogate pair with no other half.
+    InvalidText
+    // A string with no closing quote.
+    UnterminatedText
+    // Nesting deeper than `Json.maxDepth`.
+    DepthExceeded
+    // A complete value followed by something other than whitespace.
+    TrailingText
+}
+
+// A refusal, and the byte offset in the text it happened at.
+struct JsonError {
+    let reason: JsonFailure
+    let at: UNumber
+}
+
+namespace Json {
+    // How deep arrays and objects may nest. The reader recurses, so depth is
+    // stack: without a limit a document nested deeply enough would exhaust
+    // it, and a program reading text off a network would have a crash its
+    // caller chose the input for. Well past what a document written to be
+    // read ever reaches.
+    let maxDepth: Number = 128
+    // The digits a `Number`, a `Number`'s largest mantissa, has.
+    let mantissaDigits: Number = 20
+    // The largest mantissa, a `Number`'s largest.
+    let largestMantissa: String = "18446744073709551615"
+    // More exponent digits than this move the point past every `Number`.
+    let exponentDigits: Number = 4
+}
+
+// Reads one document, or names where it stopped being one.
+function parseJson(text: borrow String) -> Result<JsonValue, JsonError> {
+    var reader = JsonReader { data = copy text }
+    return reader.document()
+}
+
+// What a byte opens where a value is expected.
+enum JsonStart {
+    Object
+    Array
+    Text
+    True
+    False
+    Null
+    Number
+}
+
+// The grammar's bytes, as a value's first byte reads.
+function jsonStart(byte: Number) -> JsonStart? {
+    match Number(byte) {
+        0x7B -> return .Some(.Object)
+        0x5B -> return .Some(.Array)
+        0x22 -> return .Some(.Text)
+        0x74 -> return .Some(.True)
+        0x66 -> return .Some(.False)
+        0x6E -> return .Some(.Null)
+        0x2D, 0x30..0x3A -> return .Some(.Number)
+        else -> return .None
+    }
+}
+
+// Space, tab, newline and carriage return: the four the format allows
+// between tokens, and nothing else.
+function isJsonWhitespace(byte: Number) -> Bool {
+    match Number(byte) {
+        0x20, 0x09, 0x0A, 0x0D -> return true
+        else -> return false
+    }
+}
+
+// A cursor over the text.
+struct JsonReader {
+    let data: String
+    var at: Number = 0
+    var depth: Number = 0
+
+    function failure(borrow self, reason: JsonFailure, offset: Number) -> JsonError {
+        return JsonError { reason = reason, at = offset }
+    }
+
+    // The byte at the cursor, or nothing at the end of the text.
+    function peek(borrow self) -> Number? {
+        if at >= data.count { return .None }
+        return .Some(storedByte(data, at))
+    }
+
+    function sees(borrow self, byte: Number) -> Bool {
+        return at < data.count && storedByte(data, at) == byte
+    }
+
+    function skipWhitespace(borrow mut self) {
+        while at < data.count && isJsonWhitespace(storedByte(data, at)) {
+            at++
+        }
+    }
+
+    // A refusal at the cursor: the end, or the byte that does not belong.
+    function unexpected(borrow self) -> JsonError {
+        if at >= data.count { return failure(.UnexpectedEnd, at) }
+        return failure(.UnexpectedCharacter, at)
+    }
+
+    function document(borrow mut self) -> Result<JsonValue, JsonError> {
+        skipWhitespace()
+        match value() {
+            Ok(value) -> {
+                skipWhitespace()
+                if at < data.count { return .Error(failure(.TrailingText, at)) }
+                return .Ok(value)
+            }
+            Error(error) -> return .Error(error)
+        }
+    }
+
+    function value(borrow mut self) -> Result<JsonValue, JsonError> {
+        match peek() {
+            Some(byte) -> {
+                match jsonStart(byte) {
+                    Some(start) -> return valueFrom(move start)
+                    None -> return .Error(failure(.UnexpectedCharacter, at))
+                }
+            }
+            None -> return .Error(failure(.UnexpectedEnd, at))
+        }
+    }
+
+    function valueFrom(borrow mut self, start: JsonStart) -> Result<JsonValue, JsonError> {
+        match start {
+            Object -> return object()
+            Array -> return array()
+            Text -> {
+                match text() {
+                    Ok(text) -> return .Ok(.Text(text))
+                    Error(error) -> return .Error(error)
+                }
+            }
+            True -> return keyword("true", .Boolean(true))
+            False -> return keyword("false", .Boolean(false))
+            Null -> return keyword("null", .Null)
+            Number -> return number()
+        }
+    }
+
+    // `word` whole, or a refusal at the byte that broke it: comparing byte
+    // by byte points at the `x` of `trxe` rather than at its `t`.
+    function keyword(
+        borrow mut self,
+        word: borrow String,
+        value: JsonValue
+    ) -> Result<JsonValue, JsonError> {
+        if at + word.count > data.count { return .Error(failure(.UnexpectedEnd, data.count)) }
+        for index in 0..word.count {
+            if storedByte(data, at + index) != storedByte(word, index) {
+                return .Error(failure(.UnexpectedCharacter, at + index))
+            }
+        }
+        at = at + word.count
+        return .Ok(value)
+    }
+
+    function enter(borrow mut self) -> Result<Void, JsonError> {
+        depth++
+        if depth > Json.maxDepth { return .Error(failure(.DepthExceeded, at)) }
+        // Past the opening bracket or brace.
+        at++
+        skipWhitespace()
+        return .Ok
+    }
+
+    // After an element: a comma before the next, or `close` ending the list,
+    // answering whether the list ended.
+    function separator(borrow mut self, close: Number) -> Result<Bool, JsonError> {
+        skipWhitespace()
+        if sees(Ascii.comma) {
+            at++
+            skipWhitespace()
+            return .Ok(false)
+        }
+        if sees(close) {
+            at++
+            depth--
+            return .Ok(true)
+        }
+        return .Error(unexpected())
+    }
+
+    function array(borrow mut self) -> Result<JsonValue, JsonError> {
+        match enter() {
+            Ok -> {}
+            Error(error) -> return .Error(error)
+        }
+        var items: [JsonValue] = []
+        if sees(Ascii.closeBracket) {
+            at++
+            depth--
+            return .Ok(.Array(move items))
+        }
+        while true {
+            match value() {
+                Ok(item) -> items.append(item)
+                Error(error) -> return .Error(error)
+            }
+            match separator(Ascii.closeBracket) {
+                Ok(ended) -> {
+                    if ended { return .Ok(.Array(move items)) }
+                }
+                Error(error) -> return .Error(error)
+            }
+        }
+        return .Ok(.Array(move items))
+    }
+
+    function object(borrow mut self) -> Result<JsonValue, JsonError> {
+        match enter() {
+            Ok -> {}
+            Error(error) -> return .Error(error)
+        }
+        var members: [JsonMember] = []
+        if sees(Ascii.closeBrace) {
+            at++
+            depth--
+            return .Ok(.Object(move members))
+        }
+        while true {
+            match member() {
+                Ok(member) -> members.append(member)
+                Error(error) -> return .Error(error)
+            }
+            match separator(Ascii.closeBrace) {
+                Ok(ended) -> {
+                    if ended { return .Ok(.Object(move members)) }
+                }
+                Error(error) -> return .Error(error)
+            }
+        }
+        return .Ok(.Object(move members))
+    }
+
+    // `"name": value`, with the cursor on the name's quote.
+    function member(borrow mut self) -> Result<JsonMember, JsonError> {
+        if !sees(Ascii.quote) { return .Error(unexpected()) }
+        match text() {
+            Ok(name) -> {
+                skipWhitespace()
+                if !sees(Ascii.colon) { return .Error(unexpected()) }
+                at++
+                skipWhitespace()
+                match value() {
+                    Ok(value) -> return .Ok(JsonMember { name = name, value = value })
+                    Error(error) -> return .Error(error)
+                }
+            }
+            Error(error) -> return .Error(error)
+        }
+    }
+
+    // A quoted string, starting at its opening quote.
+    //
+    // Bytes between escapes are copied as a run rather than one at a time, so
+    // text that carries no escape — which is most of it — costs one copy per
+    // string, and multi-byte UTF-8 crosses untouched because nothing here
+    // looks inside it.
+    function text(borrow mut self) -> Result<String, JsonError> {
+        // Past the opening quote.
+        at++
+        var out = ""
+        var runStart = at
+        while at < data.count {
+            let byte = storedByte(data, at)
+            if byte == Ascii.quote {
+                out = out + slice(data, runStart, at)
+                at++
+                return .Ok(out)
+            }
+            if byte == Ascii.backslash {
+                out = out + slice(data, runStart, at)
+                at++
+                match escape() {
+                    Ok(escaped) -> out = out + escaped
+                    Error(error) -> return .Error(error)
+                }
+                runStart = at
+            } else if byte < Ascii.space {
+                return .Error(failure(.InvalidText, at))
+            } else {
+                at++
+            }
+        }
+        return .Error(failure(.UnterminatedText, data.count))
+    }
+
+    // What follows a `\`, with the cursor on it.
+    function escape(borrow mut self) -> Result<String, JsonError> {
+        let escapeAt = at
+        match peek() {
+            Some(byte) -> {
+                at++
+                match Number(byte) {
+                    0x22 -> return .Ok("\"")
+                    0x5C -> return .Ok("\\")
+                    0x2F -> return .Ok("/")
+                    0x62 -> return .Ok(encodedScalar(0x08))
+                    0x66 -> return .Ok(encodedScalar(0x0C))
+                    0x6E -> return .Ok("\n")
+                    0x72 -> return .Ok("\r")
+                    0x74 -> return .Ok("\t")
+                    0x75 -> return unicodeEscape(escapeAt)
+                    else -> return .Error(failure(.InvalidEscape, escapeAt))
+                }
+            }
+            None -> return .Error(failure(.InvalidEscape, data.count))
+        }
+    }
+
+    // The four hex digits of a `\u`, and the second escape when the first
+    // named the high half of a surrogate pair.
+    //
+    // A pair is how the format spells a scalar above U+FFFF, so the two halves
+    // are one character and are read together. Half a pair on its own is not a
+    // character at all, and passing it through would build a `String` that is
+    // not UTF-8.
+    function unicodeEscape(borrow mut self, escapeAt: Number) -> Result<String, JsonError> {
+        match hexQuad(escapeAt) {
+            Ok(first) -> {
+                if isLowSurrogate(first) { return .Error(failure(.InvalidText, escapeAt)) }
+                if !isHighSurrogate(first) { return .Ok(encodedScalar(first)) }
+                if !(
+                    sees(Ascii.backslash) && at + 1 < data.count && storedByte(
+                        data,
+                        at + 1
+                    ) == Ascii.lowerU
+                ) {
+                    return .Error(failure(.InvalidText, escapeAt))
+                }
+                at = at + 2
+                match hexQuad(escapeAt) {
+                    Ok(second) -> {
+                        if !isLowSurrogate(second) {
+                            return .Error(failure(.InvalidText, escapeAt))
+                        }
+                        return .Ok(encodedScalar(surrogatePair(first, second)))
+                    }
+                    Error(error) -> return .Error(error)
+                }
+            }
+            Error(error) -> return .Error(error)
+        }
+    }
+
+    // Four hex digits, with the cursor on the first.
+    function hexQuad(borrow mut self, escapeAt: Number) -> Result<Number, JsonError> {
+        if at + 4 > data.count { return .Error(failure(.InvalidEscape, escapeAt)) }
+        var value: Number = 0
+        for index in 0..4 {
+            match hexDigitValue(storedByte(data, at + index)) {
+                Some(digit) -> value = value * 16 + digit
+                None -> return .Error(failure(.InvalidEscape, at + index))
+            }
+        }
+        at = at + 4
+        return .Ok(value)
+    }
+
+    // A number literal, with the cursor on its first byte.
+    function number(borrow mut self) -> Result<JsonValue, JsonError> {
+        let start = at
+        var literal = JsonNumberLiteral {}
+        if sees(Ascii.minus) {
+            literal.negative = true
+            at++
+        }
+        let integerStart = at
+        literal.digits = digits()
+        if literal.digits.count == 0 { return .Error(failure(.InvalidNumber, start)) }
+        // A leading zero may not be followed by another digit: `01` is two
+        // tokens in the format, not the number one.
+        if literal.digits.count > 1 && storedByte(data, integerStart) == Ascii.zero {
+            return .Error(failure(.InvalidNumber, integerStart))
+        }
+        if sees(Ascii.dot) {
+            at++
+            let fraction = digits()
+            if fraction.count == 0 { return .Error(failure(.InvalidNumber, start)) }
+            literal.digits = literal.digits + fraction
+            literal.scale = fraction.count
+        }
+        if sees(Ascii.lowerE) || sees(Ascii.upperE) {
+            at++
+            var negative = false
+            if sees(Ascii.minus) {
+                negative = true
+                at++
+            } else if sees(Ascii.plus) {
+                at++
+            }
+            let exponent = digits()
+            if exponent.count == 0 { return .Error(failure(.InvalidNumber, start)) }
+            literal.exponent = exponent
+            literal.exponentNegative = negative
+        }
+        match literal.value() {
+            Some(value) -> return .Ok(.Number(value))
+            None -> return .Error(failure(.NumberOutOfRange, start))
+        }
+    }
+
+    // The run of digits at the cursor, moving past it.
+    function digits(borrow mut self) -> String {
+        let first = at
+        while at < data.count && isAsciiDigit(storedByte(data, at)) {
+            at++
+        }
+        return slice(data, first, at)
+    }
+}
+
+// A number literal's parts: its digits with the point taken out, how many of
+// them were after the point, and its exponent's digits.
+//
+// A `Number` keeps eighteen fractional digits and a mantissa up to a `Number`'s
+// largest, so a literal with more precision than that reads as the nearest
+// `Number` to it, as a literal with more than a `Float` holds reads as the
+// nearest `Float` in any other reader. Only a value past the largest `Number`
+// is refused: there is no nearest one to give.
+struct JsonNumberLiteral {
+    var negative: Bool = false
+    var digits: String = ""
+    var scale: Number = 0
+    var exponent: String = ""
+    var exponentNegative: Bool = false
+
+    function value(borrow self) -> Number? {
+        let mantissa = withoutLeadingZeros(digits)
+        if mantissa.isEmpty() { return .Some(0) }
+        match exponentValue() {
+            Some(exponent) -> return rounded(mantissa, scale - exponent)
+            None -> {
+                // An exponent too long to read moves the point so far that
+                // the value is zero, or past every `Number`.
+                if exponentNegative { return .Some(0) }
+                return .None
+            }
+        }
+    }
+
+    // `mantissa * 10^-scale` as the nearest `Number`, rounding half away
+    // from zero.
+    function rounded(borrow self, mantissa: borrow String, scale: Number) -> Number? {
+        if scale < 0 {
+            if mantissa.count - scale > Json.mantissaDigits { return .None }
+            var whole = mantissa
+            for index in 0..0 - scale { whole = whole + "0" }
+            return signed(whole, 0)
+        }
+        // The fewest trailing digits to drop for the rest to fit.
+        var dropped = scale > NumberWord.scale ? scale - NumberWord.scale : 0
+        while dropped < mantissa.count && !fitsMantissa(
+            slice(mantissa, 0, mantissa.count - dropped)
+        ) {
+            dropped++
+        }
+        if dropped > scale { return .None }
+        if dropped >= mantissa.count {
+            // Every digit is past the eighteenth place. Only the first
+            // dropped digit decides, and it is the mantissa's first only when
+            // nothing sits between it and the kept places.
+            if dropped == mantissa.count && storedByte(mantissa, 0) >= Ascii.five {
+                return signed("1", scale - dropped)
+            }
+            return .Some(0)
+        }
+        var kept = slice(mantissa, 0, mantissa.count - dropped)
+        if dropped > 0 && storedByte(mantissa, mantissa.count - dropped) >= Ascii.five {
+            kept = incremented(kept)
+            if !fitsMantissa(kept) { return .None }
+        }
+        return signed(kept, scale - dropped)
+    }
+
+    // The digits with the point `scale` places from their end, and the sign.
+    function signed(borrow self, mantissa: borrow String, scale: Number) -> Number? {
+        var text = mantissa
+        if scale > 0 {
+            while text.count <= scale { text = "0" + text }
+            text = slice(text, 0, text.count - scale) + "." + slice(
+                text,
+                text.count - scale,
+                text.count
+            )
+        }
+        return parseNumber(negative ? "-" + text : text)
+    }
+
+    // The exponent, or nothing for one so long that no `Number` is near it.
+    function exponentValue(borrow self) -> Number? {
+        let written = withoutLeadingZeros(exponent)
+        if written.count > Json.exponentDigits { return .None }
+        var value: Number = 0
+        for index in 0..written.count {
+            value = value * 10 + Number(storedByte(written, index) - Ascii.zero)
+        }
+        return .Some(exponentNegative ? 0 - value : value)
+    }
+}
+
+// Whether a run of digits with no leading zero is at most a `Number`'s largest,
+// the most a `Number`'s mantissa holds.
+function fitsMantissa(digits: borrow String) -> Bool {
+    if digits.count != Json.mantissaDigits { return digits.count < Json.mantissaDigits }
+    return compare(digits, Json.largestMantissa) != .Greater
+}
+
+function withoutLeadingZeros(digits: borrow String) -> String {
+    for index in 0..digits.count {
+        if storedByte(digits, index) != Ascii.zero { return slice(digits, index, digits.count) }
+    }
+    return ""
+}
+
+// A run of digits plus one.
+function incremented(digits: borrow String) -> String {
+    var index = digits.count
+    while index > 0 && storedByte(digits, index - 1) == Ascii.nine {
+        index--
+    }
+    var out = index == 0 ? "1" : slice(digits, 0, index - 1) + encodedScalar(
+        Number(storedByte(digits, index - 1)) + 1
+    )
+    for place in index..digits.count { out = out + "0" }
+    return out
+}

@@ -1,0 +1,224 @@
+struct BuilderAffine {
+    let local: Int
+    let coefficient: Int
+    let offset: Int
+    let limit: Int
+}
+
+function builderMinimum(left: Int, right: Int) -> Int {
+    return left < right ? left : right
+}
+
+function boundedBuilderAffine(coefficient: Int, offset: Int, limit: Int) -> Optional<BuilderAffine> {
+    if coefficient < 0 || coefficient > 4294967295 || offset < 0 || offset > 4294967295 { return .None }
+    var bound = limit
+    if coefficient != 0 { bound = builderMinimum(bound, (4294967295 - offset) / coefficient + 1) }
+    return .Some(BuilderAffine { local = -1, coefficient = coefficient, offset = offset, limit = bound })
+}
+
+extend FunctionLowering {
+    function builderAffineValue(borrow self, index: Int, locals: [BuilderAffine]) -> Optional<BuilderAffine> {
+        let valueType = program.typeOf(index)
+        if !valueType.equals(Type.int()) && !valueType.equals(Type.integer(32, false)) { return .None }
+        match program.expressions[index].operation {
+            Integer(value) -> return boundedBuilderAffine(0, value, 4294967295)
+            Read(local) -> {
+                for affine in locals { if affine.local == local { return .Some(affine) } }
+                return .None
+            }
+            Convert(operand) -> return builderAffineValue(operand, locals)
+            Arithmetic(operator, left, right) -> {
+                var lhs = BuilderAffine { local = -1, coefficient = 0, offset = 0, limit = 0 }
+                var rhs = lhs
+                match builderAffineValue(left, locals) { Some(value) -> lhs = value None -> return .None }
+                match builderAffineValue(right, locals) { Some(value) -> rhs = value None -> return .None }
+                let limit = builderMinimum(lhs.limit, rhs.limit)
+                if operator == .Add { return boundedBuilderAffine(lhs.coefficient + rhs.coefficient, lhs.offset + rhs.offset, limit) }
+                if operator != .Multiply { return .None }
+                if lhs.coefficient != 0 && rhs.coefficient != 0 { return .None }
+                if lhs.coefficient == 0 {
+                    if lhs.offset != 0 && (rhs.coefficient > 4294967295 / lhs.offset || rhs.offset > 4294967295 / lhs.offset) { return .None }
+                    return boundedBuilderAffine(rhs.coefficient * lhs.offset, rhs.offset * lhs.offset, limit)
+                }
+                if rhs.offset != 0 && (lhs.coefficient > 4294967295 / rhs.offset || lhs.offset > 4294967295 / rhs.offset) { return .None }
+                return boundedBuilderAffine(lhs.coefficient * rhs.offset, lhs.offset * rhs.offset, limit)
+            }
+            StringText -> return .None
+            Sequence -> return .None
+            FloatLiteral -> return .None
+            BoxAny -> return .None
+            TypeIs -> return .None
+            UnboxAny -> return .None
+            FunctionReference -> return .None
+            IndirectCall -> return .None
+            MakeClosure -> return .None
+            GlobalRead -> return .None
+            TaskSpawn -> return .None
+            TaskReady -> return .None
+            TaskAwait -> return .None
+            TaskCancel -> return .None
+            TaskDetach -> return .None
+            Async -> return .None
+            RuntimeTrap -> return .None
+            Try -> return .None
+            ChannelCreate -> return .None
+            ChannelReceiver -> return .None
+            ChannelSend -> return .None
+            ChannelClose -> return .None
+            ClassView -> return .None
+            ClassCall -> return .None
+            Boolean -> return .None
+            StringLiteral -> return .None
+            StringConcat -> return .None
+            TraceText -> return .None
+            HeapAllocateRaw -> return .None
+            HeapFreeRaw -> return .None
+            Print -> return .None
+            HeapRead -> return .None
+            HeapWrite -> return .None
+            Atomic -> return .None
+            HeapCopy -> return .None
+            HeapFill -> return .None
+            HeapOffset -> return .None
+            HeapLayout -> return .None
+            ArrayLiteral -> return .None
+            ArrayIndex -> return .None
+            ArrayAppend -> return .None
+            Transfer -> return .None
+            Member -> return .None
+            Call -> return .None
+            Construct -> return .None
+            Tagged -> return .None
+            Unary -> return .None
+            Wrapping -> return .None
+            Compare -> return .None
+            Logical -> return .None
+            Select -> return .None
+            Choice -> return .None
+            Bitcast -> return .None
+            ForeignImage -> return .None
+            ForeignElements -> return .None
+            ForeignCallback -> return .None
+            ForeignRead -> return .None
+            ForeignUnion -> return .None
+            EnumCode -> return .None
+            EnumFromCode -> return .None
+            Order -> return .None
+            Hash -> return .None
+        }
+    }
+
+    function builderFastLimit(borrow self, body: [Int], counter: Int, array: Int) -> Int {
+        var locals = [BuilderAffine { local = counter, coefficient = 1, offset = 0, limit = 4294967295 }]
+        var limit = 4294967295
+        for index in 0..(body.count - 1) {
+            match program.statements[body[index]] {
+                Declare(local, expression) -> {
+                    match builderAffineValue(expression, locals) {
+                        Some(value) -> {
+                            limit = builderMinimum(limit, value.limit)
+                            locals.append(BuilderAffine { local = local, coefficient = value.coefficient, offset = value.offset, limit = value.limit })
+                        }
+                        None -> return 0
+                    }
+                }
+                Evaluate(expression) -> {
+                    match program.expressions[expression].operation.arrayAppendOperands() {
+                        Some(append) -> {
+                            if !arrayFillRead(append.array, array) { return 0 }
+                            match builderAffineValue(append.element, locals) {
+                                Some(value) -> limit = builderMinimum(limit, value.limit)
+                                None -> return 0
+                            }
+                        }
+                        None -> return 0
+                    }
+                }
+                InitializeGlobal -> return 0
+                Assign -> return 0
+                Branch -> return 0
+                Loop -> return 0
+                Count -> return 0
+                Iterate -> return 0
+                Dispatch -> return 0
+                Attempt -> return 0
+                Return -> return 0
+                Break -> return 0
+                Continue -> return 0
+            }
+        }
+        return limit
+    }
+
+    function fastBuilderValue(borrow mut self, index: Int) -> KirValue {
+        let valueType = program.typeOf(index)
+        match program.expressions[index].operation {
+            Integer -> return value(index)
+            Read(local) -> return kir.load(storage[local])
+            Convert(operand) -> return resize(fastBuilderValue(operand), program.typeOf(operand), valueType)
+            Arithmetic(operator, left, right) -> return kir.binary(kirOperator(operator, valueType.signed), false, valueType.signed, fastBuilderValue(left), fastBuilderValue(right))
+            StringText -> return value(index)
+            Sequence -> return value(index)
+            FloatLiteral -> return value(index)
+            BoxAny -> return value(index)
+            TypeIs -> return value(index)
+            UnboxAny -> return value(index)
+            FunctionReference -> return value(index)
+            IndirectCall -> return value(index)
+            MakeClosure -> return value(index)
+            GlobalRead -> return value(index)
+            TaskSpawn -> return value(index)
+            TaskReady -> return value(index)
+            TaskAwait -> return value(index)
+            TaskCancel -> return value(index)
+            TaskDetach -> return value(index)
+            Async -> return value(index)
+            RuntimeTrap -> return value(index)
+            Try -> return value(index)
+            ChannelCreate -> return value(index)
+            ChannelReceiver -> return value(index)
+            ChannelSend -> return value(index)
+            ChannelClose -> return value(index)
+            ClassView -> return value(index)
+            ClassCall -> return value(index)
+            Boolean -> return value(index)
+            StringLiteral -> return value(index)
+            StringConcat -> return value(index)
+            TraceText -> return value(index)
+            HeapAllocateRaw -> return value(index)
+            HeapFreeRaw -> return value(index)
+            Print -> return value(index)
+            HeapRead -> return value(index)
+            HeapWrite -> return value(index)
+            Atomic -> return value(index)
+            HeapCopy -> return value(index)
+            HeapFill -> return value(index)
+            HeapOffset -> return value(index)
+            HeapLayout -> return value(index)
+            ArrayLiteral -> return value(index)
+            ArrayIndex -> return value(index)
+            ArrayAppend -> return value(index)
+            Transfer -> return value(index)
+            Member -> return value(index)
+            Call -> return value(index)
+            Construct -> return value(index)
+            Tagged -> return value(index)
+            Unary -> return value(index)
+            Wrapping -> return value(index)
+            Compare -> return value(index)
+            Logical -> return value(index)
+            Select -> return value(index)
+            Choice -> return value(index)
+            Bitcast -> return value(index)
+            ForeignImage -> return value(index)
+            ForeignElements -> return value(index)
+            ForeignCallback -> return value(index)
+            ForeignRead -> return value(index)
+            ForeignUnion -> return value(index)
+            EnumCode -> return value(index)
+            EnumFromCode -> return value(index)
+            Order -> return value(index)
+            Hash -> return value(index)
+        }
+    }
+}

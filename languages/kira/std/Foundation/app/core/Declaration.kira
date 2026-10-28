@@ -1,0 +1,221 @@
+// Which form a declaration wears, as the case a macro body matches; its
+// lowercase spelling is the word an `appliesTo` list is written with.
+enum DeclarationForm {
+    Struct
+    Class
+    Enum
+    Construct
+    Form
+    Function
+    Distinct
+    Other
+}
+
+// An annotation written on a field: its name, without the `@`, and the
+// arguments it is written with.
+struct DeclarationAnnotation {
+    let name: String
+    let arguments: [DeclarationArgument] = []
+}
+
+// An argument as written: its label, empty when it has none, and its value.
+struct DeclarationArgument {
+    let label: String
+    let value: Syntax
+}
+
+struct DeclarationField {
+    let name: Identifier
+    let type: String
+    let syntax: Syntax
+    // What the field is set to when the declaration writes `= value`, and
+    // nothing otherwise.
+    let initializer: Syntax = Syntax { text = "" }
+    let annotations: [DeclarationAnnotation] = []
+    // Where the field's bytes, annotations included, start and end in the
+    // syntax of the declaration it belongs to. A field the declaration takes
+    // from elsewhere has none there.
+    let start: Number = 0
+    let end: Number = 0
+    // Whether the field is written `private`, kept to its declaration.
+    let isPrivate: Bool = false
+
+    function hasAnnotation(borrow self, name: borrow String) -> Bool {
+        for annotation in annotations {
+            if annotation.name == name { return true }
+        }
+        return false
+    }
+
+    // The field's annotation by `name`.
+    function annotation(borrow self, name: borrow String) -> Optional<DeclarationAnnotation> {
+        for annotation in annotations {
+            if annotation.name == name { return .Some(copy annotation) }
+        }
+        return .None
+    }
+}
+
+struct Declaration {
+    let name: Identifier
+    let kind: DeclarationForm
+    let syntax: Syntax
+    let fields: [DeclarationField]
+    let family: String
+    // The type parameters a generic struct is written with, `<Value>`.
+    let typeParameters: [Identifier] = []
+
+    // The declaration with its field `name`, annotations included, written
+    // as `replacement` instead.
+    function replaceField(
+        borrow self,
+        name: borrow Identifier,
+        replacement: borrow Syntax
+    ) -> Declaration {
+        return replacedField(self, name.text, replacement.text)
+    }
+
+    // The declaration without its field `name`, annotations included.
+    function dropField(borrow self, name: borrow Identifier) -> Declaration {
+        return replacedField(self, name.text, "")
+    }
+}
+
+// The declarations the compiler hands a collector, decoded from the text it
+// writes them as: a count, then each declaration.
+function reflectedDeclarations(encoded: String) -> [Declaration] {
+    var reader = ReflectionReader { text = encoded, position = 0 }
+    var declarations: [Declaration] = []
+    let count = reader.count()
+    for index in 0..count { declarations.append(reader.declaration()) }
+    return declarations
+}
+
+// The declaration the compiler hands a macro applied to it, decoded from the
+// text it writes it as.
+function reflectedDeclaration(encoded: String) -> Declaration {
+    var reader = ReflectionReader { text = encoded, position = 0 }
+    return reader.declaration()
+}
+
+// Reads the compiler's reflection text, where every item is its byte count
+// in decimal, a `:` and that many bytes. A declaration is its name, kind,
+// syntax, family, type parameter count and each type parameter, and field
+// count, then each field: its name, type, syntax,
+// initializer, where its bytes start and end in the declaration's syntax,
+// `1` when it is written `private` and `0` otherwise, and annotation count,
+// then each annotation: its name and argument count, then
+// each argument's label and value. A field with no bytes there is one the
+// declaration takes from elsewhere.
+function reflectionByte(text: borrow String, at: UN32) -> UN8 {
+    if at >= UN32(text.count) { runtimeTrap() }
+    return UN8(heapReadByte(heapOffset(text.data, at)))
+}
+
+namespace ReflectionText {
+    // `:`, which ends an item's byte count, and `0`.
+    let separator: UN8 = 58
+    let zero: UN8 = 48
+}
+
+struct ReflectionReader {
+    let text: String
+    var position: UN32
+
+    // The bytes are read straight from the text's storage, at a sized
+    // position: a collector macro reads every byte of every declaration in
+    // its package, and a `Number` position would cost a conversion at each.
+    function item(borrow mut self) -> String {
+        var length: UN32 = 0
+        var byte = reflectionByte(text, position)
+        while byte != ReflectionText.separator {
+            length = length * 10 + UN32(byte - ReflectionText.zero)
+            position = position + 1
+            byte = reflectionByte(text, position)
+        }
+        let start = position + 1
+        position = start + length
+        if position > UN32(text.count) { runtimeTrap() }
+        return syntaxTextSlice(text, start, position)
+    }
+
+    // The checker writes every count, so one that does not read is the
+    // checker's fault and stops the expansion.
+    function count(borrow mut self) -> Number {
+        match item().toNumber() {
+            Some(value) -> return Number(value)
+            None -> {
+                runtimeTrap()
+                return 0
+            }
+        }
+    }
+
+    function declaration(borrow mut self) -> Declaration {
+        let name = Identifier { text = item() }
+        let kind = declarationForm(item())
+        let text = item()
+        let family = item()
+        var typeParameters: [Identifier] = []
+        let parameterCount = count()
+        for index in 0..parameterCount { typeParameters.append(Identifier { text = item() }) }
+        var fields: [DeclarationField] = []
+        let fieldCount = count()
+        for index in 0..fieldCount { fields.append(field()) }
+        return Declaration {
+            name = name,
+            kind = kind,
+            syntax = Syntax { text = text },
+            fields = fields,
+            family = family,
+            typeParameters = typeParameters
+        }
+    }
+
+    function field(borrow mut self) -> DeclarationField {
+        let name = Identifier { text = item() }
+        let typeText = item()
+        let syntax = Syntax { text = item() }
+        let initializer = Syntax { text = item() }
+        let start = count()
+        let end = count()
+        let isPrivate = item() == "1"
+        var annotations: [DeclarationAnnotation] = []
+        let annotationCount = count()
+        for index in 0..annotationCount { annotations.append(annotation()) }
+        return DeclarationField {
+            name = name,
+            type = typeText,
+            syntax = syntax,
+            initializer = initializer,
+            annotations = annotations,
+            start = start,
+            end = end,
+            isPrivate = isPrivate
+        }
+    }
+
+    function annotation(borrow mut self) -> DeclarationAnnotation {
+        let name = item()
+        var arguments: [DeclarationArgument] = []
+        let argumentCount = count()
+        for index in 0..argumentCount {
+            let label = item()
+            arguments.append(
+                DeclarationArgument { label = label, value = Syntax { text = item() } }
+            )
+        }
+        return DeclarationAnnotation { name = name, arguments = arguments }
+    }
+}
+
+function declarationForm(word: String) -> DeclarationForm {
+    if word == "Struct" { return .Struct }
+    if word == "Class" { return .Class }
+    if word == "Enum" { return .Enum }
+    if word == "Construct" { return .Construct }
+    if word == "Form" { return .Form }
+    if word == "Function" { return .Function }
+    if word == "Distinct" { return .Distinct }
+    return .Other
+}

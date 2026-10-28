@@ -1,0 +1,23 @@
+construct NativeAutobind extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    // The declarations come from the header, and only `cos` of its
+    // functions: `autobind_missing` is in no library and would not link.
+    let nativeLibraries: [NativeLibrary] = [
+        NativeLibrary {
+            name: "m",
+            linkMode: LinkMode.Dynamic,
+            headers: Headers { entrypoint: "autobind.h", includeDirs: ["include"] },
+            autobind: Autobind {
+                module: "autobind",
+                headers: ["autobind.h"],
+                functions: ["cos"],
+                mode: AutobindMode.Selected
+            },
+            nativeTargets: [
+                NativeTarget { triple: "x86_64-linux-gnu", systemLibs: ["m"] },
+                NativeTarget { triple: "aarch64-linux-gnu", systemLibs: ["m"] }
+            ]
+        }
+    ]
+}

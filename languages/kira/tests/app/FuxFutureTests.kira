@@ -1,0 +1,94 @@
+import Foundation
+
+// Foundation's poll-based futures: `Poll`, `Waker`, `Context`, the `Future`
+// trait, and `blockOn` driving hand-written futures to their end.
+
+// Counts down, pending (and self-woken) until it reaches zero.
+struct FuxCountdown: Future<Int> {
+    var remaining: Int
+    var polls: Int = 0
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Int> {
+        self.polls += 1
+        if self.remaining == 0 { return .Ready(self.polls) }
+        self.remaining -= 1
+        context.waker.wakeUp()
+        return .Pending
+    }
+}
+
+// Pending without waking anyone: nothing will ever poll it again.
+struct FuxStuck: Future<Int> {
+    function poll(borrow mut self, context: borrow Context) -> Poll<Int> {
+        return .Pending
+    }
+}
+
+// Polls an inner future to its end, then adds to its value: a hand-written
+// `.await` inside a future.
+struct FuxThen: Future<Int> {
+    var inner: FuxCountdown
+    let add: Int
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Int> {
+        return match self.inner.poll(context) {
+            Ready(value) -> .Ready(value + self.add)
+            Pending -> .Pending
+        }
+    }
+}
+
+function fuxRecordWake(target: RawPtr, slot: Number) {
+    heapStore<Int>(target, heapLoad<Int>(target) + slot)
+}
+
+@Test
+function fuxReadyFutureIsReadyAtOnce() {
+    expect!(blockOn(ready(42)) == 42)
+}
+
+@Test
+function fuxBlockOnDrivesUntilReady() {
+    // Three pending polls, then the fourth is ready.
+    expect!(blockOn(FuxCountdown { remaining = 3 }) == 4)
+}
+
+@Test
+function fuxNestedPollForwardsTheContext() {
+    expect!(blockOn(FuxThen { inner = FuxCountdown { remaining = 2 }, add = 100 }) == 103)
+}
+
+@Test
+function fuxYieldNowIsPendingOnce() {
+    expect!(blockOn(yieldNow()) == 0)
+}
+
+@Test
+function fuxWakerCallsItsFunction() {
+    let cell = allocateBytes(8)
+    heapStore<Int>(cell, 0)
+    let waker = Waker { wake = fuxRecordWake, target = cell, slot = 5 }
+    waker.wakeUp()
+    waker.wakeUp()
+    let total = heapLoad<Int>(cell)
+    let other = Waker { wake = fuxRecordWake, target = cell, slot = 5 }
+    let elsewhere = Waker { wake = fuxRecordWake, target = cell, slot = 6 }
+    expect!(total == 10)
+    expect!(waker.willWakeSame(other))
+    expect!(!waker.willWakeSame(elsewhere))
+    freeBytes(cell)
+}
+
+@Test
+function fuxPollReportsItsState() {
+    let done: Poll<Int> = .Ready(1)
+    let waiting: Poll<Int> = .Pending
+    expect!(done.isReady())
+    expect!(waiting.isPending())
+}
+
+@Test
+function fuxBlockOnStuckFutureTraps() {
+    expectTrap!("")
+    let _ = blockOn(FuxStuck {})
+}

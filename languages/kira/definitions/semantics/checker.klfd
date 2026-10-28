@@ -1,0 +1,540 @@
+// Semantic analysis: the syntax tree to a checked program.
+//
+// Declarations are collected first, then the function bodies the program
+// reaches are checked: all of its own, and of its libraries' only those it
+// calls, so a program costs what it uses rather than what it imports. A
+// compile-time evaluation names the one function it runs. A mistake is reported where it is found and the expression takes the
+// `Invalid` type, which every later check accepts silently, so analysis
+// reports every independent mistake once and never stops early. The kernel
+// discards the program when anything was reported.
+
+function check(tree: SyntaxTree, evaluated: Optional<[String]>) -> CheckedProgram {
+    if evaluated.isNone() { checkAnnotations(tree) }
+    var prepared = instantiateGenericEnums(materializeExtensions(materializeTraits(materializeClasses(materializeDistincts(materializeConstructs(coalesceForeignPointers(scopeTypeNames(tree))))))))
+    let declarations = declare(prepared)
+    checkClassOverrideTypes(declarations, prepared.classes)
+    checkInits(declarations, prepared)
+    // What the program reads from the tree, taken before the checker takes
+    // the tree over, so it holds the only copy and grows it in place.
+    let drops = dropFunctions(prepared, declarations)
+    // A dependency unit builds its package into the program, not a library
+    // of its own.
+    let library = prepared.modules[0].library && !prepared.dependencyUnit
+    let nativeLibraries = prepared.nativeLibraries
+    let resources = prepared.resources
+    let constructIndices = constructStructs(prepared)
+    var checker = Checker {
+        tree = move prepared,
+        declarations = declarations,
+        program = CheckedProgram {
+            structs = declarations.structs,
+            enums = declarations.enums,
+            functions = [], comptimeFunctions = [], dropFunctions = drops, recursiveCases = [],
+            expressions = [],
+            statements = [],
+            arrayFunctions = arrayRuntimeFunctions(declarations),
+            stringFunctions = stringRuntimeFunctions(declarations),
+            numberFunctions = numberRuntimeFunctions(declarations),
+            numberWords = numberWordsDeclaration(declarations),
+            taskFunctions = taskRuntimeFunctions(declarations),
+            channelFunctions = channelRuntimeFunctions(declarations),
+            anyTypes = [],
+            globals = [], globalInitOrder = [], globalInitializer = .None, exitFunctions = [], traceFunctions = [], tracedStructs = [], tracedEnums = [], traceRoots = [],
+            library = library,
+            sources = tree.sources, firstSources = firstSourcePositions(tree.sources),
+            foreignFunctions = [], foreignCallbacks = [], foreignHelpers = [], variadicShapes = [], pointerFrees = noPointerFrees(declarations), callbackContexts = noPointerFrees(declarations), fieldBits = noFieldBits(declarations), nativeLibraries = nativeLibraries, resources = resources
+        },
+        current = 0, macroDepth = 0,
+        locals = [],
+        visible = [],
+        scopes = [],
+        loops = 0,
+        bareMembers = true,
+        globalStates = [], importedGlobalModules = [], checkingInitializer = false, sourceOverride = .None, handlers = [], propagated = [], tryAllowed = false,
+        pending = [], mainThreadCall = .None, loopMoves = [], wholeLiterals = [], constructIndices = constructIndices, members = emptyMemberIndex(), rechecks = []
+    }
+    let sourceCount = declarations.signatures.count
+    for signature in declarations.signatures {
+        checker.program.functions.append(CheckedFunction {
+            symbol = signature.symbol, name = signature.name.span, result = signature.result,
+            parameterCount = signature.parameters.count, locals = [], body = [], entry = signature.entry,
+            lambda = false, captures = [], globalInitializer = false, service = false, foreign = .None, memberName = signature.member
+        })
+    }
+    for index in 0..declarations.signatures.count {
+        if hasAttribute(declarations.signatures[index].declaration.annotations, .Comptime) {
+            checker.program.comptimeFunctions.append(index)
+        }
+        if hasAttribute(declarations.signatures[index].declaration.annotations, .AtExit) {
+            checker.checkExitFunction(index)
+        }
+    }
+    // A macro's evaluator runs what it is built from, so it builds all of it.
+    var dispatchers: [Bool] = []
+    if evaluated.isNone() {
+        checker.program.apart = apartFunctions(declarations)
+        checker.program.boxingModules = boxingModules(checker.tree, declarations)
+        checker.program.dependencyUnit = checker.tree.dependencyUnit
+        checker.program.dispatchedFamilies = dispatchedFamilies(checker.tree, declarations)
+        dispatchers = familyDispatchers(checker.tree, declarations, checker.program.dispatchedFamilies)
+        checker.program.elsewhere = elsewhereFunctions(declarations, checker.program.apart, dispatchers, checker.tree.dependencyUnit)
+        checker.program.classFallbacks = classFallbackFunctions(checker.tree, declarations)
+        if !checker.tree.dependencyUnit {
+            checker.program.familyDispatches = familyDispatches(checker.tree, declarations, checker.program.dispatchedFamilies, dispatchers)
+        }
+    }
+    checker.checkInstanceBounds()
+    checker.joinNamedInstances()
+    checker.checkForeignTypeForms()
+    checkCopyAssertions(declarations, checker.tree)
+    checker.checkFieldBits()
+    checker.checkForeignFunctions()
+    checker.inferFieldTypes()
+    checker.checkGlobals()
+    // A dependency's style is its own package's business, not this build's.
+    if evaluated.isNone() && !checker.tree.dependencyUnit { checker.checkStyle() }
+    checker.checkReached(checkRoots(checker.program, declarations, evaluated), sourceCount)
+    // The instances minted meanwhile are told apart too; their methods are
+    // checked as each is minted.
+    if dispatchers.count > 0 && !checker.tree.dependencyUnit {
+        checker.program.familyDispatches = familyDispatches(checker.tree, checker.declarations, checker.program.dispatchedFamilies, dispatchers)
+    }
+    // A dependency unit's package crosses into the program that merges it,
+    // not into a RIDL surface of its own.
+    if !checker.tree.dependencyUnit {
+        checker.program.surfaceTypes = publicTypes(checker.tree, declarations)
+        checker.program.surfaceGlobals = publicGlobals(checker.tree, declarations)
+        for alias in declarations.aliases {
+            if alias.genericParameters.count == 0 && ownDeclaration(declarations, alias.name.span.file) && isExportedName(checker.tree, alias.name.span) {
+                checker.program.surfaceAliasNames.append(alias.name.text)
+                checker.program.surfaceAliasTypes.append(declarations.resolve(alias.target))
+            }
+        }
+    }
+    checker.program.moduleName = checker.tree.modules[0].name
+    for module in checker.tree.modules { checker.program.moduleNames.append(module.name) }
+    checker.orderGlobalInitialization(evaluationRoots(checker.program, evaluated))
+    checker.program.contractDefaults = checker.contractDefaults(declarations)
+    checker.program.parameterDefaults = checker.parameterDefaults(declarations)
+    checker.program.contractConstants = checker.contractConstants(declarations)
+    checker.program.ridlTemplates = checker.ridlTemplates(declarations)
+    checker.writeTypeTable()
+    checker.program.recursiveCases = recursiveCases(checker.program)
+    checker.program.lowerNumberTypes()
+    return checker.program
+}
+
+// A family a slot being filled names with type arguments, those arguments
+// as types: what a generic construct written there without its own takes
+// them from (instances.klfd).
+struct FamilyHint {
+    let family: String
+    let arguments: [Type]
+}
+
+struct Checker {
+    // The slots being filled, innermost last.
+    var familyHints: [FamilyHint] = []
+    var tree: SyntaxTree
+    var declarations: Declarations
+    var program: CheckedProgram
+    // The function being checked, as an index into the signatures.
+    var current: Int
+    var macroDepth: Int
+    var locals: [Local]
+    // The locals in scope, innermost last, and where each open scope starts.
+    var visible: [Int]
+    var scopes: [Int]
+    var loops: Int
+    // Off while a field default is checked: a default sees no local and no
+    // receiver, whichever literal it fills in.
+    var bareMembers: Bool
+    var globalStates: [GlobalInitState]
+    // The modules whose imported libraries' globals are already checked.
+    var importedGlobalModules: [Int]
+    var checkingInitializer: Bool
+    var sourceOverride: Optional<Int>
+    var handlers: [ErrorHandlerSpec]
+    // A function's `try`s may fail with other enums than the first one tried.
+    // Each other enum has its own local here, converted on the way out.
+    var propagated: [ErrorHandlerSpec]
+    var tryAllowed: Bool
+    // Instance functions minted during analysis whose bodies are still to be
+    // checked.
+    var pending: [Int]
+    // Functions whose bodies changed after they may have been checked: the
+    // dispatchers of a family a generic declaration's instance joined.
+    var rechecks: [Int]
+    // Fields moved out and not yet refilled (semantics/field-moves.klfd).
+    var movedFields: [MovedField] = []
+    // Minted methods left to be checked when named (check-reach.klfd).
+    var deferredMinted: [Int] = []
+    // The functions a class call may run, by member name.
+    var members: MemberIndex
+    // The span of the call a `MainThread` request makes, the one place a
+    // `@MainThread` function may be called.
+    var mainThreadCall: Optional<Span>
+    // Per enclosing loop, the moves that may have happened on the ways out.
+    var loopMoves: [[Bool]]
+    // Every decimal a whole integer literal became, in the order they were
+    // added, so `whole` finds the literal behind a decimal by its index.
+    var wholeLiterals: [WholeLiteral]
+    // Where the structs construct declarations became sit in the tree.
+    var constructIndices: [Int]
+    // While an `async function`'s body is checked (async.klfd).
+    var asyncBody: Optional<AsyncBody> = .None
+
+    function checkFunction(borrow mut self, index: Int) {
+        if isAsyncSignature(declarations.signatures[index]) {
+            checkAsyncFunction(index)
+            return
+        }
+        checkPlainFunction(index)
+    }
+
+    function checkPlainFunction(borrow mut self, index: Int) {
+        let signature = declarations.signatures[index]
+        current = index
+        locals = []
+        visible = []
+        scopes = []
+        loops = 0
+        checkingInitializer = false
+        sourceOverride = .None
+        handlers = []
+        propagated = []
+        tryAllowed = false
+        for parameter in signature.parameters {
+            let reference = parameter.mode == .MutablyBorrowed
+            let local = declareLocal(parameter.name.text, parameter.valueType, reference, reference)
+            locals[local].passingMode = parameter.mode
+        }
+        let propagating = resultTypes(program, signature.result).isSome()
+        if propagating {
+            let error = declareLocal("__propagated_error", Type.invalid(), false, false)
+            handlers.append(ErrorHandlerSpec { local = error, errorType = Type.invalid(), depth = -1 })
+        }
+        let foreign = program.functions[index].foreign
+        let marked = hasAttribute(signature.declaration.annotations, .Foreign)
+        let imported = ridlImportModule(tree, signature.declaration.annotations)
+        let service = hasAttribute(signature.declaration.annotations, .Service) || marked || imported.isSome()
+        if service && !marked && imported.isNone() { checkService(signature) }
+        var ridlImport = ""
+        match imported {
+            Some(module) -> {
+                ridlImport = module
+                if signature.declaration.body.count > 0 { report(.ServiceBody, signature.name.span) }
+            }
+            None -> {}
+        }
+        let firstExpression = program.expressions.count
+        let firstStatement = program.statements.count
+        var body = block(signature.declaration.body)
+        if propagating && handlers[0].errorType.kind == .Enumeration {
+            body = [program.addStatement(propagatedBody(body, handlers[0], signature.result, signature.name.span))]
+            for handler in propagated {
+                body = [program.addStatement(propagatedBody(body, handler, signature.result, signature.name.span))]
+            }
+        }
+        checkOwnedPointerCopies(firstExpression, firstStatement)
+        let written = hasAttribute(signature.declaration.annotations, .TypeTable)
+        let witness = witnessRole(tree, signature.declaration.annotations)
+        if !service && !written && !boxesWitness(witness) && !unboxesWitness(witness) && !signature.result.equals(Type.void()) && !alwaysReturns(body) {
+            report(.MissingReturn, signature.name.span)
+        }
+        // A public function is an export, except the entry, which is the
+        // program's own `main`, and a foreign declaration, whose body is the
+        // C library's: the C boundary is `.klffi` (KLF-RIDL section 26), not
+        // a RIDL entry the module defines.
+        program.functions[index] = CheckedFunction {
+            symbol = signature.symbol,
+            name = signature.name.span,
+            result = signature.result,
+            parameterCount = signature.parameters.count,
+            locals = locals,
+            body = body,
+            entry = signature.entry,
+            lambda = false,
+            captures = [], globalInitializer = false, service = service, foreign = foreign, memberName = signature.member,
+            exported = isPublic(signature) && imported.isNone() && !marked && !signature.entry && !generatedName(signature.name.text), owner = signature.owner,
+            ridlImport = ridlImport, ridlName = signature.name.text, witness = witness
+        }
+    }
+
+    // A function another unit defines, as this one calls it: its parameters,
+    // which its signature in this unit's module spells, and no body.
+    function declareParameters(borrow mut self, index: Int) {
+        let signature = declarations.signatures[index]
+        current = index
+        locals = []
+        visible = []
+        scopes = []
+        for parameter in signature.parameters {
+            let reference = parameter.mode == .MutablyBorrowed
+            let local = declareLocal(parameter.name.text, parameter.valueType, reference, reference)
+            locals[local].passingMode = parameter.mode
+        }
+        program.functions[index].locals = locals
+    }
+
+    // Whether the declaration is in the module's surface: a top-level function
+    // of the package being built whose name is among the tree's exports, or a
+    // method of a struct or enum that is. A name is matched by span, so an
+    // overload or a same-named declaration in another file is not swept in. A
+    // package this one imports exports its own surface.
+    function isPublic(borrow self, signature: Signature) -> Bool {
+        // The program calls a dependency's functions as its own, which it
+        // does not export, so the unit that defines them exports none.
+        if program.dependencyUnit { return false }
+        var name = signature.name.span
+        // A method written `private` stays inside its file, whatever its
+        // type exports.
+        if isPrivateMember(tree, signature.name.span) { return false }
+        match signature.owner {
+            Some(owner) -> {
+                if owner.kind == .Structure && !declarations.structs[owner.declaration].specialized {
+                    name = declarations.structs[owner.declaration].name.span
+                } else if owner.kind == .Structure && isNamedInstance(tree, declarations.structs[owner.declaration].name.text) {
+                    // A named instance's methods are exported when its
+                    // template is (KLF-RIDL section 23.5).
+                    name = declarations.structs[owner.declaration].baseNameSpan
+                } else if owner.kind == .Enumeration && !declarations.enums[owner.declaration].specialized {
+                    name = declarations.enums[owner.declaration].name.span
+                } else {
+                    return false
+                }
+            }
+            None -> {}
+        }
+        if !ownDeclaration(declarations, name.file) { return false }
+        return isExportedName(tree, name)
+    }
+
+    function signature(borrow self) -> Signature {
+        return declarations.signatures[current]
+    }
+
+    // The file of the function being checked.
+    function file(borrow self) -> Int {
+        match sourceOverride {
+            Some(file) -> return file
+            None -> {}
+        }
+        return signature().name.span.file
+    }
+
+    function declareLocal(borrow mut self, name: String, valueType: Type, mutable: Bool, byReference: Bool) -> Int {
+        locals.append(Local {
+            name = name, valueType = valueType, mutable = mutable, byReference = byReference,
+            moved = false, cell = false, captured = false, passingMode = .Owned
+        })
+        visible.append(locals.count - 1)
+        return locals.count - 1
+    }
+
+    function lookup(borrow self, name: String) -> Optional<Int> {
+        var position = visible.count - 1
+        while position >= 0 {
+            if locals[visible[position]].name == name { return .Some(visible[position]) }
+            position -= 1
+        }
+        return .None
+    }
+
+    function openScope(borrow mut self) {
+        scopes.append(visible.count)
+    }
+
+    function closeScope(borrow mut self) {
+        let start = scopes[scopes.count - 1]
+        scopes = truncated(scopes, scopes.count - 1)
+        visible = truncated(visible, start)
+    }
+
+    function add(borrow mut self, operation: Operation, valueType: Type, span: Span) -> Int {
+        return program.addExpression(operation, valueType, span)
+    }
+
+    function typeOf(borrow self, expression: Int) -> Type {
+        return program.typeOf(expression)
+    }
+
+    // `expression` as a value of `target`. A literal written into a width
+    // becomes a literal of that width once it is known to fit; any other value
+    // crossing between `Int` and a width becomes an explicit conversion. Two
+    // different widths do not mix. `mismatch` is what a value that cannot
+    // become a `target` reports.
+    // A whole number where a machine word is wanted: a decimal one is narrowed
+    // the way `Int(n)` narrows it, and everything else keeps the mismatch it
+    // already had. Only a position asks for this, never a quantity.
+    function whole(borrow mut self, value: Int, target: Type, mismatch: Diagnostic) -> Int {
+        if typeOf(value).kind == .Decimal && target.kind != .Decimal {
+            let span = program.expressions[value].span
+            // A whole number written where a word is wanted is that word, and
+            // saying so while checking keeps it out of the run: `for index in
+            // 0..count` and `bytes[0]` are integer arithmetic, not a call into
+            // the number service to learn that zero is zero.
+            match wholeLiteralWord(value) {
+                Some(word) -> {
+                    let fits = target.isInteger() && target.holdsLiteral(word, false)
+                    if fits && !target.isInt() { return add(.Integer(word), target, span) }
+                    if fits { return add(.Integer(word), Type.int(), span) }
+                }
+                None -> {}
+            }
+            return fromNumber(value, target, span)
+        }
+        return coerce(value, target, mismatch)
+    }
+
+    function coerce(borrow mut self, expression: Int, target: Type, mismatch: Diagnostic) -> Int {
+        let actual = typeOf(expression)
+        if actual.isInvalid() || target.isInvalid() || actual.equals(target) {
+            return expression
+        }
+        let span = program.expressions[expression].span
+        // A value where an optional is wanted is that optional holding it,
+        // as Swift promotes `x` to `x?`. An optional is never promoted into
+        // another: `T??` is written out.
+        match optionalPayload(program, target) {
+            Some(payload) -> {
+                if optionalPayload(program, actual).isNone() {
+                    match program.enums[target.declaration].variant("Some") {
+                        Some(present) -> return add(.Tagged(present, .Some(coerce(expression, payload, mismatch))), target, span)
+                        None -> {}
+                    }
+                }
+            }
+            None -> {}
+        }
+        if actual.kind == .Structure && target.kind == .Pointer {
+            match program.structs[actual.declaration].shape {
+                CPointer -> return add(.Member(expression, 0), Type.pointer(), span)
+                Callback -> return add(.Member(expression, 0), Type.pointer(), span)
+                Plain -> {}
+                CLayout -> {}
+                CUnion -> {}
+                CArray -> {}
+            }
+        }
+        if actual.kind == .Pointer && target.kind == .Structure {
+            match program.structs[target.declaration].shape {
+                CPointer -> return add(.Construct([expression]), target, span)
+                Plain -> {}
+                CLayout -> {}
+                CUnion -> {}
+                CArray -> {}
+                Callback -> {}
+            }
+        }
+        if nativeStateErasure(program, declarations, actual, target) { return add(.ClassView(expression), target, span) }
+        if isNativeStateType(program, declarations, target) && actual.kind == .Pointer && exportedHandle(expression).isSome() {
+            let slot = nativeStateRegistryCall("nativeStateSlotOf", [expression], span)
+            return add(.Construct([slot]), target, span)
+        }
+        if classIsSubtype(program, actual, target) { return add(.ClassView(expression), target, span) }
+        match existentialCase(program, actual, target) {
+            Some(variant) -> return add(.Tagged(variant, .Some(expression)), target, span)
+            None -> {}
+        }
+        match witnessBoxOf(actual, target) {
+            Some(box) -> return callChecked(box, .None, [expression], span)
+            None -> {}
+        }
+        if isAnyType(program, target) {
+            let typeId = internAnyType(actual)
+            return add(.BoxAny(expression, typeId), target, span)
+        }
+        if isCStringType(program, target) && isStringType(program, actual) { return cStringOf(expression, target, span) }
+        // A sized number widens into a number that holds all its values, and
+        // a whole literal that fits is one already. Any other crossing loses
+        // range, so it is a conversion asked for: `UN32(n)`.
+        if actual.kind == .Decimal && target.kind == .Decimal {
+            if actual.widensToNumber(target) { return widenSized(expression, target, span) }
+            match wholeLiteralWord(expression) {
+                Some(word) -> {
+                    if target.holdsLiteral(word, false) { return sizedWord(word, target, span) }
+                }
+                None -> {}
+            }
+            report(mismatch, span)
+            return add(.Convert(expression), Type.invalid(), span)
+        }
+        if actual.kind == .Decimal && (target.isInteger() || target.kind == .Floating) {
+            return fromNumber(expression, target, span)
+        }
+        if target.kind == .Floating && (actual.kind == .Floating || actual.isInteger()) {
+            return add(.Convert(expression), target, span)
+        }
+        // An `Int` is 64 bits and a `Number`'s mantissa is 65, so every `Int`
+        // is exactly some `Number`: the two mix where a value is wanted, with
+        // no rounding and no range that can be lost. The other way round is a
+        // narrowing, and stays something a conversion is asked for.
+        if target.kind == .Decimal && actual.isInteger() {
+            if !actual.widensToNumber(target) {
+                report(mismatch, span)
+                return add(.Convert(expression), Type.invalid(), span)
+            }
+            // A `U64` past `Int`'s largest would trap on the way into an
+            // `Int`, so it widens from its own bits, as `Number(x)` does.
+            if target.isSizedNumber() { return add(.Convert(expression), target, span) }
+            if !actual.signed && actual.bits == 64 { return numberCall(10, [expression], target, span) }
+            return numberCall(2, [coerce(expression, Type.int(), .ArgumentTypeMismatch)], target, span)
+        }
+        // A `Float` widens to the exact `Number` for the same reason. It is the
+        // crossing `reaches` admits for overload choice, so a call that chose
+        // a `Number` parameter over a `Float` one has to be able to make the
+        // crossing it was scored on.
+        if target.kind == .Decimal && actual.kind == .Floating && target.isNumber() {
+            return numberCall(4, [coerce(expression, Type.floating(64), .ArgumentTypeMismatch)], target, span)
+        }
+        if actual.isInteger() && target.isInteger() && (actual.isInt() || target.isInt()) {
+            match program.expressions[expression].operation.integer() {
+                Some(value) -> {
+                    if !target.holdsLiteral(value, false) {
+                        report(.LiteralOutOfRange, span)
+                        return add(.Integer(value), Type.invalid(), span)
+                    }
+                    return add(.Integer(value), target, span)
+                }
+                None -> {}
+            }
+            return add(.Convert(expression), target, span)
+        }
+        report(mismatch, span)
+        return add(.Convert(expression), Type.invalid(), span)
+    }
+}
+
+function truncated(values: [Int], count: Int) -> [Int] {
+    var kept: [Int] = []
+    for index in 0..count {
+        kept.append(values[index])
+    }
+    return kept
+}
+
+// Whether the declaration named at `name` was written `public`.
+function isExportedName(tree: SyntaxTree, name: Span) -> Bool {
+    for exported in tree.exports {
+        if exported.span.file == name.file && exported.span.start == name.start && exported.span.end == name.end { return true }
+    }
+    return false
+}
+
+// The structs and enums of the package being built that are written
+// `public`, leaving out generic templates' instances.
+function publicTypes(tree: SyntaxTree, declarations: Declarations) -> [Type] {
+    var types: [Type] = []
+    for index in 0..declarations.structs.count {
+        let structure = declarations.structs[index]
+        if structure.specialized || !ownDeclaration(declarations, structure.name.span.file) { continue }
+        if isExportedName(tree, structure.name.span) { types.append(Type.structure(index)) }
+    }
+    for index in 0..declarations.enums.count {
+        let enumeration = declarations.enums[index]
+        if enumeration.specialized || !ownDeclaration(declarations, enumeration.name.span.file) { continue }
+        if isExportedName(tree, enumeration.name.span) { types.append(Type.enumeration(index)) }
+    }
+    return types
+}

@@ -1,0 +1,64 @@
+import Foundation
+
+// Ownership stress: `move` into consuming functions, owned aggregates created
+// and dropped in tight loops, structs holding owned array fields churned
+// repeatedly. Exposes leaks, double-frees and use-after-free under the affine
+// ownership model; the VM's exit accounting fails the run if the heap is
+// unbalanced.
+
+struct OwnBucket {
+    var items: [Number]
+    var tag: Number
+}
+
+function ownConsumeString(s: String) -> Number {
+    return s.count
+}
+
+function ownConsumeBucket(b: OwnBucket) -> Number {
+    var total = b.tag
+    for i in 0..b.items.count {
+        total = total + b.items[i]
+    }
+    return total
+}
+
+function ownMakeBucket(n: Number) -> OwnBucket {
+    var xs: [Number] = []
+    for i in 0..n {
+        xs.append(i + n)
+    }
+    return OwnBucket { items: move xs, tag: n }
+}
+
+@Test
+function movedStringIsConsumedRepeatedly() {
+    var total: Number = 0
+    for i in 0..100 {
+        let s = "owned-string-value"
+        total = total + ownConsumeString(move s)
+    }
+    expect!((total) == (1800))
+}
+
+@Test
+function ownedBucketChurnTotalsEveryMove() {
+    var total: Number = 0
+    for j in 0..300 {
+        let b = ownMakeBucket(20)
+        total = total + ownConsumeBucket(move b)
+    }
+    expect!((total) == (183000))
+}
+
+@Test
+function keptBucketFieldsReadBackAfterReplacement() {
+    var keep = ownMakeBucket(10)
+    var first: Number = 0
+    for k in 0..50 {
+        keep = ownMakeBucket(10)
+        first = first + keep.items[0]
+    }
+    expect!((first) == (500))
+    expect!((keep.tag) == (10))
+}

@@ -1,0 +1,489 @@
+import Heap
+
+// Sockets, readiness and name resolution on the kernel's `klf.net` services
+// (framework D-384). Every socket is non-blocking and readiness is reported
+// when it changes, so a caller reads or writes until `WouldBlock` before it
+// waits again. Addresses cross as text, `192.0.2.1:443` or `[2001:db8::1]:443`:
+// parsing one is `Network`'s concern. Each service answers a negative word for
+// a failure, and this file is the one place that word becomes a `NetFailure`.
+
+@Service("klfsvc_net_udp_bind")
+function kernelUdpBind(address: RawPtr, count: Int) -> Int
+
+@Service("klfsvc_net_udp_send")
+function kernelUdpSend(socket: Int, peer: RawPtr, peerCount: Int, data: RawPtr, count: Int) -> Int
+
+@Service("klfsvc_net_udp_receive")
+function kernelUdpReceive(
+    socket: Int,
+    destination: RawPtr,
+    capacity: Int,
+    peer: RawPtr,
+    peerCapacity: Int
+) -> Int
+
+@Service("klfsvc_net_tcp_connect")
+function kernelTcpConnect(address: RawPtr, count: Int) -> Int
+
+@Service("klfsvc_net_unix_connect")
+function kernelUnixConnect(path: RawPtr, count: Int) -> Int
+
+@Service("klfsvc_net_tcp_listen")
+function kernelTcpListen(address: RawPtr, count: Int, backlog: Int) -> Int
+
+@Service("klfsvc_net_tcp_accept")
+function kernelTcpAccept(listener: Int, peer: RawPtr, capacity: Int) -> Int
+
+@Service("klfsvc_net_tcp_send")
+function kernelTcpSend(stream: Int, data: RawPtr, count: Int) -> Int
+
+@Service("klfsvc_net_tcp_receive")
+function kernelTcpReceive(stream: Int, destination: RawPtr, capacity: Int) -> Int
+
+@Service("klfsvc_net_tcp_shutdown")
+function kernelTcpShutdown(stream: Int) -> Int
+
+@Service("klfsvc_net_local_address")
+function kernelLocalAddress(handle: Int, destination: RawPtr, capacity: Int) -> Int
+
+@Service("klfsvc_net_close")
+function kernelNetClose(handle: Int) -> Int
+
+@Service("klfsvc_net_poller_create")
+function kernelPollerCreate() -> Int
+
+@Service("klfsvc_net_poller_watch")
+function kernelPollerWatch(poller: Int, handle: Int, interest: Int, token: Int) -> Int
+
+@Service("klfsvc_net_poller_wait")
+function kernelPollerWait(poller: Int, timeout: Int, destination: RawPtr, capacity: Int) -> Int
+
+@Service("klfsvc_net_poller_wake")
+function kernelPollerWake(poller: Int) -> Int
+
+@Service("klfsvc_net_resolve")
+function kernelResolve(poller: Int, host: RawPtr, count: Int, token: Int) -> Int
+
+@Service("klfsvc_net_resolved")
+function kernelResolved(lookup: Int, destination: RawPtr, capacity: Int) -> Int
+
+// The failure words of `klf.net` (framework D-384), in their order.
+enum NetFailure {
+    WouldBlock
+    Refused
+    Unreachable
+    AddressInUse
+    InvalidHandle
+    InvalidAddress
+    TimedOut
+    Reset
+    NotFound
+    Io
+}
+
+// What a poller watches a socket for. `None` stops watching it.
+enum NetInterest: UN32 {
+    None = 0
+    Readable = 1
+    Writable = 2
+    Both = 3
+}
+
+namespace NetService {
+    // Room for any address text the kernel writes back: an IPv6 address with
+    // a zone, its brackets, a port and the NUL.
+    let addressRoom: Number = 128
+    // Room for a lookup's addresses at first; a longer list is asked again.
+    let addressListRoom: Number = 512
+    // An event is two words: the token, then the readiness bits.
+    let wordBytes: Number = 8
+    let eventBytes: Number = 16
+    let nanosecondsPerSecond: Number = 1000000000
+    // The token of a wake, which no watched socket may take.
+    let wakeToken: Number = 0
+}
+
+// The readiness bits of an event (framework D-384).
+distinct Readiness = Number
+
+namespace Readiness {
+    let readable: Readiness = Readiness(1)
+    let writable: Readiness = Readiness(2)
+    let closed: Readiness = Readiness(4)
+    let failed: Readiness = Readiness(8)
+    let resolved: Readiness = Readiness(16)
+    let woken: Readiness = Readiness(32)
+}
+
+extend Readiness {
+    function has(borrow self, flag: Readiness) -> Bool {
+        return (raw & flag.raw) != 0
+    }
+}
+
+// The kernel's word for one socket, poller or lookup.
+distinct NetHandle = Number
+
+struct UdpSocket {
+    let handle: NetHandle
+
+    // Sends one datagram; it goes whole or not at all.
+    function send(
+        borrow self,
+        bytes: borrow [UN8],
+        peer: borrow String
+    ) -> Result<Void, NetFailure> {
+        let answer = kernelUdpSend(handle.raw, peer.data, peer.count, bytes.data, bytes.count)
+        if answer < 0 { return .Error(netFailure(answer)) }
+        return .Ok
+    }
+
+    // The next datagram, cut to `capacity` bytes, and who sent it.
+    function receive(borrow self, capacity: UNumber) -> Result<Datagram, NetFailure> {
+        let room = Number(capacity)
+        let data = makeArrayData(max(room, 1))
+        let peer = allocateBytes(NetService.addressRoom)
+        let answer = kernelUdpReceive(handle.raw, data, room, peer, NetService.addressRoom)
+        if answer < 0 {
+            releaseArrayData(data)
+            freeBytes(peer)
+            return .Error(netFailure(answer))
+        }
+        let sender = stringFromCBytes(peer, NetService.addressRoom)
+        freeBytes(peer)
+        return .Ok(Datagram { bytes: bytesWritten(data, answer, room), peer: sender })
+    }
+
+    function localAddress(borrow self) -> Result<String, NetFailure> {
+        return boundAddress(handle)
+    }
+
+    function close(borrow self) -> Result<Void, NetFailure> {
+        return closeHandle(handle)
+    }
+}
+
+struct Datagram {
+    let bytes: [UN8]
+    let peer: String
+}
+
+struct TcpListener {
+    let handle: NetHandle
+
+    // The next connection waiting, or `WouldBlock` when none is.
+    function accept(borrow self) -> Result<Accepted, NetFailure> {
+        let peer = allocateBytes(NetService.addressRoom)
+        let answer = kernelTcpAccept(handle.raw, peer, NetService.addressRoom)
+        if answer < 0 {
+            freeBytes(peer)
+            return .Error(netFailure(answer))
+        }
+        let from = stringFromCBytes(peer, NetService.addressRoom)
+        freeBytes(peer)
+        return .Ok(Accepted { stream: TcpStream { handle: NetHandle(answer) }, peer: from })
+    }
+
+    function localAddress(borrow self) -> Result<String, NetFailure> {
+        return boundAddress(handle)
+    }
+
+    function close(borrow self) -> Result<Void, NetFailure> {
+        return closeHandle(handle)
+    }
+}
+
+struct Accepted {
+    let stream: TcpStream
+    let peer: String
+}
+
+struct TcpStream {
+    let handle: NetHandle
+
+    // How many of `bytes` the stream took, from the front; the rest waits
+    // for the poller to report it writable.
+    function send(borrow self, bytes: borrow [UN8]) -> Result<UNumber, NetFailure> {
+        let answer = kernelTcpSend(handle.raw, bytes.data, bytes.count)
+        if answer < 0 { return .Error(netFailure(answer)) }
+        return .Ok(Number(answer))
+    }
+
+    // How many of `bytes` past the first `offset` the stream took: `send`
+    // for the rest of a buffer, without copying it.
+    function sendFrom(
+        borrow self,
+        bytes: borrow [UN8],
+        offset: UNumber
+    ) -> Result<UNumber, NetFailure> {
+        if offset >= bytes.count { return .Ok(0) }
+        let answer = kernelTcpSend(handle.raw, heapOffset(bytes.data, offset), bytes.count - offset)
+        if answer < 0 { return .Error(netFailure(answer)) }
+        return .Ok(Number(answer))
+    }
+
+    // Up to `capacity` bytes; none at all is the peer's end of the stream.
+    function receive(borrow self, capacity: UNumber) -> Result<[UN8], NetFailure> {
+        let room = Number(capacity)
+        let data = makeArrayData(max(room, 1))
+        let answer = kernelTcpReceive(handle.raw, data, room)
+        if answer < 0 {
+            releaseArrayData(data)
+            return .Error(netFailure(answer))
+        }
+        return .Ok(bytesWritten(data, answer, room))
+    }
+
+    // Closes the sending side; the peer reads the end of the stream.
+    function shutdown(borrow self) -> Result<Void, NetFailure> {
+        return netOutcome(kernelTcpShutdown(handle.raw))
+    }
+
+    function localAddress(borrow self) -> Result<String, NetFailure> {
+        return boundAddress(handle)
+    }
+
+    function close(borrow self) -> Result<Void, NetFailure> {
+        return closeHandle(handle)
+    }
+}
+
+// One change of readiness. `token` is the word the socket or lookup was
+// watched with; a wake has none.
+struct NetEvent {
+    let token: Number?
+    let readiness: Readiness
+
+    function readable(borrow self) -> Bool {
+        return readiness.has(Readiness.readable)
+    }
+
+    function writable(borrow self) -> Bool {
+        return readiness.has(Readiness.writable)
+    }
+
+    function closed(borrow self) -> Bool {
+        return readiness.has(Readiness.closed)
+    }
+
+    function failed(borrow self) -> Bool {
+        return readiness.has(Readiness.failed)
+    }
+
+    function resolved(borrow self) -> Bool {
+        return readiness.has(Readiness.resolved)
+    }
+
+    function woken(borrow self) -> Bool {
+        return readiness.has(Readiness.woken)
+    }
+}
+
+struct Poller {
+    let handle: NetHandle
+
+    // Watches `socket` for `interest`, replacing what it was watched for.
+    // `token` names it in the events, a whole number above the wake's.
+    function watch(
+        borrow self,
+        socket: NetHandle,
+        interest: NetInterest,
+        token: Number
+    ) -> Result<Void, NetFailure> {
+        if token <= NetService.wakeToken { return .Error(.InvalidHandle) }
+        return netOutcome(kernelPollerWatch(handle.raw, socket.raw, code(interest), Number(token)))
+    }
+
+    // The events that are ready, at most `capacity` of them, waiting up to
+    // `timeout` seconds for one; no timeout waits until one comes, and 0
+    // takes only what is ready.
+    function wait(
+        borrow self,
+        timeout: Number?,
+        capacity: UNumber
+    ) -> Result<[NetEvent], NetFailure> {
+        let room = max(Number(capacity), 1)
+        let nanoseconds = match timeout {
+            Some(seconds) -> Number(max(seconds, 0) * NetService.nanosecondsPerSecond)
+            None -> -1
+        }
+        let buffer = allocateBytes(room * NetService.eventBytes)
+        let answer = kernelPollerWait(handle.raw, nanoseconds, buffer, room)
+        if answer < 0 {
+            freeBytes(buffer)
+            return .Error(netFailure(answer))
+        }
+        var events: [NetEvent] = []
+        for index in 0..answer {
+            let at = heapOffset(buffer, index * NetService.eventBytes)
+            events.append(
+                netEvent(heapReadInt(at), heapReadInt(heapOffset(at, NetService.wordBytes)))
+            )
+        }
+        freeBytes(buffer)
+        return .Ok(events)
+    }
+
+    // `wait` into a buffer the caller keeps, for a loop that waits often:
+    // up to `capacity` events of two words each, the token (0 for a wake)
+    // then the readiness bits, waiting up to `nanoseconds` (-1 until one
+    // comes). Answers how many it wrote.
+    function waitInto(
+        borrow self,
+        nanoseconds: Number,
+        events: RawPtr,
+        capacity: UNumber
+    ) -> Result<UNumber, NetFailure> {
+        let answer = kernelPollerWait(handle.raw, nanoseconds, events, capacity)
+        if answer < 0 { return .Error(netFailure(answer)) }
+        return .Ok(Number(answer))
+    }
+
+    // Ends a wait from any thread: the waiter sees an event that is woken.
+    function wake(borrow self) -> Result<Void, NetFailure> {
+        return netOutcome(kernelPollerWake(handle.raw))
+    }
+
+    // Starts looking `host` up, a name without a port. The poller reports
+    // `token` resolved when the lookup's addresses are ready to read.
+    function resolve(
+        borrow self,
+        host: borrow String,
+        token: Number
+    ) -> Result<Lookup, NetFailure> {
+        if token <= NetService.wakeToken { return .Error(.InvalidHandle) }
+        let answer = kernelResolve(handle.raw, host.data, host.count, Number(token))
+        if answer < 0 { return .Error(netFailure(answer)) }
+        return .Ok(Lookup { handle: NetHandle(answer) })
+    }
+
+    function close(borrow self) -> Result<Void, NetFailure> {
+        return closeHandle(handle)
+    }
+}
+
+struct Lookup {
+    let handle: NetHandle
+
+    // The host's addresses, without ports; `WouldBlock` while the lookup runs.
+    function addresses(borrow self) -> Result<[String], NetFailure> {
+        var room = NetService.addressListRoom
+        while true {
+            let buffer = allocateBytes(room)
+            let answer = kernelResolved(handle.raw, buffer, room)
+            if answer < 0 {
+                freeBytes(buffer)
+                return .Error(netFailure(answer))
+            }
+            if answer <= room {
+                let found = addressList(buffer, answer)
+                freeBytes(buffer)
+                return .Ok(found)
+            }
+            freeBytes(buffer)
+            room = answer
+        }
+        return .Error(.Io)
+    }
+
+    function close(borrow self) -> Result<Void, NetFailure> {
+        return closeHandle(handle)
+    }
+}
+
+function bindUdp(address: borrow String) -> Result<UdpSocket, NetFailure> {
+    let answer = kernelUdpBind(address.data, address.count)
+    if answer < 0 { return .Error(netFailure(answer)) }
+    return .Ok(UdpSocket { handle: NetHandle(answer) })
+}
+
+// A stream at once; connecting goes on until the poller reports it writable,
+// connected, or failed.
+function connectTcp(address: borrow String) -> Result<TcpStream, NetFailure> {
+    let answer = kernelTcpConnect(address.data, address.count)
+    if answer < 0 { return .Error(netFailure(answer)) }
+    return .Ok(TcpStream { handle: NetHandle(answer) })
+}
+
+// A stream to the Unix domain socket at `path` (framework D-387). It sends,
+// receives, shuts down and is watched as a TCP stream is; its local address
+// is its path, empty when it has none.
+function connectUnix(path: borrow String) -> Result<TcpStream, NetFailure> {
+    let answer = kernelUnixConnect(path.data, path.count)
+    if answer < 0 { return .Error(netFailure(answer)) }
+    return .Ok(TcpStream { handle: NetHandle(answer) })
+}
+
+function listenTcp(address: borrow String, backlog: UNumber) -> Result<TcpListener, NetFailure> {
+    let answer = kernelTcpListen(address.data, address.count, Number(backlog))
+    if answer < 0 { return .Error(netFailure(answer)) }
+    return .Ok(TcpListener { handle: NetHandle(answer) })
+}
+
+function makePoller() -> Result<Poller, NetFailure> {
+    let answer = kernelPollerCreate()
+    if answer < 0 { return .Error(netFailure(answer)) }
+    return .Ok(Poller { handle: NetHandle(answer) })
+}
+
+function netEvent(token: Number, bits: Number) -> NetEvent {
+    if token == NetService.wakeToken {
+        return NetEvent { token: .None, readiness: Readiness(bits) }
+    }
+    return NetEvent { token: .Some(Number(token)), readiness: Readiness(bits) }
+}
+
+// `count` bytes the kernel wrote into `data`, which holds `capacity`.
+function bytesWritten(data: RawPtr, count: Number, capacity: Number) -> [UN8] {
+    let empty: [UN8] = []
+    return Array { data = data, count = count, capacity = max(capacity, 1), ops = empty.ops }
+}
+
+// The NUL-ended texts in the first `count` bytes at `buffer`.
+function addressList(buffer: RawPtr, count: Number) -> [String] {
+    var found: [String] = []
+    var start: Number = 0
+    for at in 0..count {
+        if heapReadByte(heapOffset(buffer, at)) == UN8(0) {
+            if at > start { found.append(stringFromCBytes(heapOffset(buffer, start), at - start)) }
+            start = at + 1
+        }
+    }
+    return found
+}
+
+function boundAddress(handle: NetHandle) -> Result<String, NetFailure> {
+    let buffer = allocateBytes(NetService.addressRoom)
+    let answer = kernelLocalAddress(handle.raw, buffer, NetService.addressRoom)
+    if answer < 0 || answer >= NetService.addressRoom {
+        freeBytes(buffer)
+        return .Error(answer < 0 ? netFailure(answer) : .Io)
+    }
+    let text = stringFromCBytes(buffer, answer)
+    freeBytes(buffer)
+    return .Ok(text)
+}
+
+function closeHandle(handle: NetHandle) -> Result<Void, NetFailure> {
+    return netOutcome(kernelNetClose(handle.raw))
+}
+
+function netOutcome(answer: Number) -> Result<Void, NetFailure> {
+    if answer < 0 { return .Error(netFailure(answer)) }
+    return .Ok
+}
+
+function netFailure(word: Number) -> NetFailure {
+    return match word {
+            -1 -> .WouldBlock
+            - 2 -> .Refused
+            - 3 -> .Unreachable
+            - 4 -> .AddressInUse
+            - 5 -> .InvalidHandle
+            - 6 -> .InvalidAddress
+            - 7 -> .TimedOut
+            - 8 -> .Reset
+            - 9 -> .NotFound
+        else -> .Io
+    }
+}

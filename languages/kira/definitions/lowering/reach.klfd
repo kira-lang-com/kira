@@ -1,0 +1,110 @@
+// The functions a lowering needs: those its roots reach through calls,
+// references, closures and tasks. A program uses a small part of the
+// libraries it imports, so lowering only what it reaches keeps the module,
+// and every stage after it, the size of the program.
+
+function reachableFunctions(program: CheckedProgram, roots: [Int]) -> [Bool] {
+    var reached: [Bool] = []
+    for declared in program.functions { reached.append(false) }
+    var members = emptyMemberIndex()
+    var pending = implicitRoots(program)
+    for root in roots { pending.append(root) }
+    var visited = 0
+    while visited < pending.count {
+        let next = pending[visited]
+        visited += 1
+        if reached[next] { continue }
+        reached[next] = true
+        var walk = FunctionReach { called = [], dispatched = [], reads = [] }
+        walk.statements(program, program.functions[next].body)
+        for target in walk.called {
+            if !reached[target] { pending.append(target) }
+        }
+        for member in walk.dispatched {
+            for target in members.implementations(program, program.functions[member].memberName) {
+                if !reached[target] { pending.append(target) }
+            }
+        }
+    }
+    return reached
+}
+
+// The program a walk reads is handed to each step rather than held, so a
+// walk copies none of it.
+struct FunctionReach {
+    // The functions it names itself, the members its class calls dispatch
+    // on, each of whose implementations it may enter, and the globals it
+    // reads.
+    var called: [Int]
+    var dispatched: [Int]
+    var reads: [Int]
+
+    function statements(borrow mut self, program: CheckedProgram, body: [Int]) {
+        for statement in body { statement(program, statement) }
+    }
+
+    function statement(borrow mut self, program: CheckedProgram, index: Int) {
+        match program.statements[index] {
+            Declare(local, value) -> expression(program, value)
+            InitializeGlobal(global, value) -> expression(program, value)
+            Assign(place, value) -> {
+                expression(program, place)
+                expression(program, value)
+            }
+            Evaluate(value) -> expression(program, value)
+            Branch(condition, whenTrue, whenFalse) -> {
+                expression(program, condition)
+                statements(program, whenTrue)
+                statements(program, whenFalse)
+            }
+            Loop(condition, body) -> {
+                expression(program, condition)
+                statements(program, body)
+            }
+            Count(counter, low, high, body) -> {
+                expression(program, low)
+                expression(program, high)
+                statements(program, body)
+            }
+            Iterate(element, array, body) -> {
+                expression(program, array)
+                statements(program, body)
+            }
+            Dispatch(subject, arms) -> {
+                expression(program, subject)
+                for arm in arms { statements(program, arm.body) }
+            }
+            Attempt(body, local, subject, arms) -> {
+                statements(program, body)
+                expression(program, subject)
+                for arm in arms { statements(program, arm.body) }
+            }
+            Return(value) -> {
+                match value {
+                    Some(returned) -> expression(program, returned)
+                    None -> {}
+                }
+            }
+            Break -> {}
+            Continue -> {}
+        }
+    }
+
+    function expression(borrow mut self, program: CheckedProgram, index: Int) {
+        let operation = program.expressions[index].operation
+        match operation.namedFunction() {
+            Some(target) -> called.append(target)
+            None -> {}
+        }
+        match operation.dispatchedMember() {
+            Some(target) -> dispatched.append(target)
+            None -> {}
+        }
+        match operation.readGlobal() {
+            Some(global) -> reads.append(global)
+            None -> {}
+        }
+        for body in operation.nestedBodies() { statements(program, body) }
+        for operand in operation.operands() { expression(program, operand) }
+    }
+}

@@ -1,0 +1,200 @@
+// The parser: source text to a syntax tree.
+//
+// Every production returns its node or the failure that stops parsing, and
+// `try` hands a failure straight up to `parseSource`. This file holds the
+// cursor the productions share; declarations, statements and expressions
+// follow in their own files.
+
+// Parses one file of `module` into `tree`, which gathers every file of the
+// program.
+function parseFile(move tree: SyntaxTree, source: String, file: Int, module: Int) -> Result<SyntaxTree, Failure> {
+    let bodiesElsewhere = module >= 0 && module < tree.modules.count && tree.modules[module].separate && !(tree.modules[module].compileTime && tree.compileTimeBodies)
+    let lexed = try lexDocumented(source, file)
+    var parser = Parser {
+        source = source,
+        tokens = lexed.tokens,
+        docs = lexed.docs,
+        position = 0,
+        tree = move tree,
+        imports = [],
+        structLiterals = true, quotes = false, macroNames = [], handling = 0,
+        declared = false, excluded = false,
+        bodiesElsewhere = bodiesElsewhere
+    }
+    try parser.recordModuleDocs()
+    while !parser.at(.End) {
+        let importing = parser.at(.Import)
+        // A platform file built for a platform it does not name is not read
+        // past its imports (KLF-RIDL 27.8).
+        if !importing && parser.excluded { break }
+        try parser.declaration()
+        if !importing { parser.declared = true }
+    }
+    try parser.checkDocsClaimed()
+    // A file left out of this platform's build is no source of its module.
+    if parser.excluded { return .Ok(parser.tree) }
+    parser.tree.sources.append(SourceUnit {
+        file = file, module = module, hash = sourceHash(source), imports = parser.imports
+    })
+    return .Ok(parser.tree)
+}
+
+// The kernel's content hash of a source (`klf_source::source_hash`). Lowering
+// passes it with a name's span so the kernel reads the name from this file.
+function sourceHash(text: String) -> Int {
+    var hash = 17
+    let count = utf8Count(text)
+    let whole = count - count % 4
+    // Four steps of `hash * 131 + byte + 1` stay below 2^60 before the
+    // remainder, which is then the one each step taking it would give.
+    for index in 0..whole / 4 {
+        let at = index * 4
+        hash = (hash * 131 + utf8Byte(text, at) + 1) * 131 + utf8Byte(text, at + 1) + 1
+        hash = ((hash * 131 + utf8Byte(text, at + 2) + 1) * 131 + utf8Byte(text, at + 3) + 1) % 2147483647
+    }
+    for index in whole..count {
+        hash = (hash * 131 + utf8Byte(text, index) + 1) % 2147483647
+    }
+    if hash == 0 { return 1 }
+    return hash
+}
+
+struct Parser {
+    let source: String
+    var tokens: [Token]
+    var position: Int
+    var tree: SyntaxTree
+    // The file's `import` declarations.
+    var imports: [Import]
+    // Off while a condition is parsed, so the `{` after `if ready` opens the
+    // block instead of a struct literal named `ready`.
+    var structLiterals: Bool
+    // On inside a procedural macro's `expand` body, the only place
+    // `quote { ... }` builds syntax; elsewhere `quote` is a name.
+    var quotes: Bool
+    let macroNames: [MacroName]
+    // How many arms and fallbacks handling a failure enclose the code being
+    // parsed: a `return .Error` there converts the failure it handles.
+    var handling: Int
+    // Whether the file has made a declaration other than an import yet: a
+    // platform import comes before every one (KLF-RIDL 27.8).
+    var declared: Bool
+    // Whether an `import ... on` in the file names platforms this build is
+    // not for, which leaves the file out of the build.
+    var excluded: Bool
+    // Whether the file is of a package a unit of its own checks and lowers
+    // (`separate-packages.klfd`), and whether the function being read is one
+    // whose body only that unit reads: a free function or a method of a
+    // type with no type parameters, which no instance rebuilds here.
+    var bodiesElsewhere: Bool = false
+    var skipsBody: Bool = false
+    // The file's doc comments in source order, and how many outer ones the
+    // declarations read so far have claimed (`documentation.klfd`).
+    var docs: [DocComment] = []
+    var docCursor: Int = 0
+    // The doc comments a top-level declaration claimed and has not yet handed
+    // to the declaration it is (a namespace keeps them for itself).
+    var pendingDocs: [DocComment] = []
+
+    function current(borrow self) -> Token {
+        return tokens[position]
+    }
+
+    function peek(borrow self, ahead: Int) -> Token {
+        let index = position + ahead
+        if index >= tokens.count { return tokens[tokens.count - 1] }
+        return tokens[index]
+    }
+
+    function at(borrow self, kind: TokenKind) -> Bool {
+        return current().kind == kind
+    }
+
+    // Whether the current token is the identifier `word`, for the contextual
+    // words `borrow`, `mut` and `self`.
+    function atWord(borrow self, word: String) -> Bool {
+        return at(.Identifier) && text(current().span) == word
+    }
+
+    function advance(borrow mut self) -> Token {
+        let token = current()
+        if token.kind != .End { position += 1 }
+        return token
+    }
+
+    function eat(borrow mut self, kind: TokenKind) -> Bool {
+        if !at(kind) { return false }
+        advance()
+        return true
+    }
+
+    // The `>` closing a type argument or parameter list. Two lists closing
+    // together lex as one `>>`; the first close takes its first half.
+    function closeAngle(borrow mut self) -> Result<Token, Failure> {
+        if at(.GreaterGreater) {
+            let span = current().span
+            tokens[position] = Token { kind = .Greater, span = Span { file = span.file, start = span.start + 1, end = span.end } }
+            return .Ok(Token { kind = .Greater, span = Span { file = span.file, start = span.start, end = span.start + 1 } })
+        }
+        return expect(.Greater)
+    }
+
+    function atAngleClose(borrow self) -> Bool {
+        return at(.Greater) || at(.GreaterGreater)
+    }
+
+    function expect(borrow mut self, kind: TokenKind) -> Result<Token, Failure> {
+        return expectAs(kind, .Expected)
+    }
+
+    function expectAs(borrow mut self, kind: TokenKind, diagnostic: Diagnostic) -> Result<Token, Failure> {
+        if !at(kind) { return .Error(failure(diagnostic)) }
+        return .Ok(advance())
+    }
+
+    function identifier(borrow mut self, diagnostic: Diagnostic) -> Result<Identifier, Failure> {
+        if !at(.Identifier) && !at(.Type) { return .Error(failure(diagnostic)) }
+        let token = advance()
+        return .Ok(nameOf(token))
+    }
+
+    // The name a token spells. The kernel reads a declaration's name through
+    // its span and holds no `$`, so the span of a projection, `$name`, starts
+    // after the `$` while the text keeps it.
+    function nameOf(borrow self, token: Token) -> Identifier {
+        let written = text(token.span)
+        if utf8Byte(written, 0) != asciiDollar { return Identifier { text = written, span = token.span } }
+        return Identifier { text = written, span = Span { file = token.span.file, start = token.span.start + 1, end = token.span.end } }
+    }
+
+    function failure(borrow self, diagnostic: Diagnostic) -> Failure {
+        return Failure { diagnostic = diagnostic, span = current().span }
+    }
+
+    function text(borrow self, span: Span) -> String {
+        return utf8Slice(source, span.start, span.end)
+    }
+
+    // Whether the current token starts on the line the previous one ends on.
+    function continuesLine(borrow self) -> Bool {
+        if position == 0 { return true }
+        for index in tokens[position - 1].span.end..current().span.start {
+            if utf8Byte(source, index) == 10 { return false }
+        }
+        return true
+    }
+
+    // The span from `start` to the end of the last token consumed.
+    function spanFrom(borrow self, start: Span) -> Span {
+        return start.to(tokens[position - 1].span)
+    }
+
+    // Parses with struct literals allowed or not, restoring the setting after.
+    function expressionWith(borrow mut self, literals: Bool) -> Result<Int, Failure> {
+        let saved = structLiterals
+        structLiterals = literals
+        let parsed = expression()
+        structLiterals = saved
+        return parsed
+    }
+}

@@ -1,0 +1,231 @@
+import Foundation
+import Kten
+
+// What a build describes: artifacts, the actions that make them, the steps the
+// command line asks for and the options it may give (DESIGN.md section 5).
+
+/// A file or a tree that exists once the graph runs. It has no path while the graph is described; an action is handed the paths of its inputs and outputs when it runs.
+public struct Artifact {
+    /// The artifact's number in its graph.
+    let id: Number
+}
+
+/// Whether an output is a file or a tree.
+public enum OutputKind {
+    /// A single file.
+    File
+    /// A directory the action fills.
+    Tree
+}
+
+/// An output an action declares by name. A tree output is a directory the action fills.
+public struct Output {
+    /// The name the action gives the output, which the command lines refer to it by.
+    let name: String
+    /// Whether the output is a file or a tree.
+    let kind: OutputKind = .File
+}
+
+/// One argument of a command, so every path in a command line is one the library placed.
+public enum Argument {
+    /// Text written as it is.
+    Text(String)
+    /// The path of an input.
+    Input(Artifact)
+    /// The path of the output declared with this name.
+    Output(String)
+    /// The arguments written one after another as one, as `O=` and a path.
+    Joined([Argument])
+    /// The path of the command's workspace.
+    Workspace
+}
+
+/// An input a command reads at a path of its working directory that no argument names.
+public struct PlacedInput {
+    /// The path, relative to the command's working directory, where the input is placed.
+    let path: String
+    /// The artifact the input is.
+    let artifact: Artifact
+}
+
+/// An environment variable of a command whose value is an argument, so it can hold the path of an input or an output.
+public struct CommandVariable {
+    /// The variable's name.
+    let name: String
+    /// The argument the variable's value is given by.
+    let value: Argument
+}
+
+/// An external program the build runs. It starts from an empty environment but for `environment`, in a fresh working directory, with its standard input empty and its output kept in the build's logs. Sources it lists in `reads` stay where they are. A command that names `depfile` writes there a make-style depfile of everything else it read.
+public struct CommandAction {
+    /// What the action is, as the build reports it, such as `compile Shop`. Labels are unique in a graph.
+    let label: String
+    /// A path, or a name found on the build's `PATH` once. The program's own file is an input of the action.
+    let tool: String
+    /// The arguments the program is run with.
+    let arguments: [Argument] = []
+    /// The environment entries the program is given.
+    let environment: [EnvironmentEntry] = []
+    /// Variables of the build's own environment the program is given as they are when it runs, and which its key leaves out: a search path such as `PATH`, which differs from shell to shell while the programs it finds do not.
+    let inherited: [String] = []
+    /// The variables the program is given, each with an argument for its value.
+    let variables: [CommandVariable] = []
+    /// The inputs the program reads at paths its arguments name.
+    let inputs: [PlacedInput] = []
+    /// The outputs the program writes.
+    let outputs: [Output] = []
+    /// Sources the program reads in place. They are keyed by their absolute path.
+    let reads: [Artifact] = []
+    /// The source hierarchy whose relocation preserves the command's outputs. Paths under it are keyed and discovered relatively. Empty keeps absolute, path-sensitive reads. Relative to the graph's root. Opt in only when relocating this source hierarchy preserves the command's outputs.
+    let sourceRoot: String = ""
+    /// The make-style depfile the command writes in its working directory, listing what it read outside its working directory and its `reads`. Those paths are its discovered inputs.
+    let depfile: String = ""
+    /// The file output its standard output goes to instead of the logs.
+    let standardOutput: String = ""
+    /// A directory kept from run to run under this name, for a tool that redoes only what changed, as make does. The command still runs only when its key misses.
+    let workspace: String = ""
+    /// The directory `tool` runs in, made when missing. Empty is the working directory.
+    let directory: Argument = .Text("")
+    /// The programs run after `tool`, in order, each once the one before it exited with 0, as configuring, building and installing a project are.
+    let followedBy: [CommandStage] = []
+}
+
+/// A program a command runs after its first, with the command's environment.
+public struct CommandStage {
+    /// The program's path, or a name found on the build's `PATH` once.
+    let tool: String
+    /// The arguments the program is run with.
+    let arguments: [Argument] = []
+    /// The directory the program runs in, made when missing. Empty is the working directory.
+    let directory: Argument = .Text("")
+}
+
+/// A Kira function the build runs itself. Its key is its `code`, its `parameters` and its inputs: a function reading anything else is a bug in it.
+public struct NativeAction {
+    /// What the action is, as the build reports it. Labels are unique in a graph.
+    let label: String
+    /// The code the function runs: `sourceDigest!()`, written in the package the function is in, which covers that package and every package it imports. The key changes when that code does, and only then.
+    let code: String
+    /// Every value the function reads besides its inputs.
+    let parameters: Kten = .Null
+    /// The SHA-256 of its one output, a file, for an action fetching a file named by its digest. Its key is then that digest and the output's name alone, so new code or parameters do not fetch it again. The output having another digest fails the action.
+    let produces: String = ""
+    /// The artifacts the function reads.
+    let inputs: [Artifact] = []
+    /// The outputs the function writes.
+    let outputs: [Output] = []
+    /// The function itself, which runs the action and answers whether it succeeded.
+    let work: (NativeRun) -> Result<Void, BuildFailure>
+}
+
+/// What a native action is handed when it runs.
+public struct NativeRun {
+    /// The path of each input, in the order the action lists them.
+    let inputs: [String]
+    /// The entries of each input that is a tree, in byte order of their paths; empty for a file. A tree's permission bits are read here, not from the files placed at its path, which the store keeps read-only.
+    let trees: [[TreeEntry]]
+    /// The permission bits of each input that is a file; 0 for a tree.
+    let modes: [UNumber]
+    /// The path of each output, in the order the action declares them. A tree output's directory exists; a file output's does not.
+    let outputs: [String]
+    /// A directory of its own for anything else it writes.
+    let scratch: String
+    /// The digest the store keeps each input under, in the order the action lists them: a file's SHA-256, or a tree's, the SHA-256 of its listing.
+    let digests: [String]
+    /// Tells the build that the output file at a path is a whole copy of the stored file whose SHA-256 is the digest given, such as a tree entry's content, so it takes that digest without reading the file again. A file changed after the copy must not be told.
+    let copied: (String, String) -> Void
+}
+
+/// What a tree entry is: a file, a directory or a link.
+public enum TreeEntryKind {
+    /// A file, which names its contents by digest.
+    File
+    /// A directory, with no contents.
+    Directory
+    /// A link, which holds its target.
+    Link
+}
+
+/// One entry of a tree. A file names its contents by digest; a link holds its target.
+public struct TreeEntry {
+    /// The path inside the tree, `/`-separated, never with a leading `/`.
+    let path: String
+    /// Whether the entry is a file, a directory or a link.
+    let kind: TreeEntryKind
+    /// Permission bits: 493 is what `chmod 755` sets.
+    let mode: UNumber
+    /// A file's SHA-256 as hexadecimal, a link's target, empty for a directory.
+    let content: String
+}
+
+/// An action the build runs: an external program or a Kira function.
+public enum Action {
+    /// An external program.
+    Run(CommandAction)
+    /// A Kira function the build runs itself.
+    Native(NativeAction)
+}
+
+/// A name the command line asks for, with the artifacts it produces. They are placed under `.kira-build/out/<name>/`. `run`, when there is one, runs after they exist, every time, and its answer is the build's exit status.
+public struct Step {
+    /// The name the command line asks for.
+    let name: String
+    /// What the step does, as the build's help reports it.
+    let summary: String
+    /// The artifacts the step produces.
+    let produces: [Artifact] = []
+    /// A snapshot pins this step's artifacts and required action records. Empty when the step is not a snapshot.
+    let snapshot: Kten? = .None
+    /// Whether the step's artifacts are copied into this workspace. Snapshot-only steps need no output copies in this workspace, so they are not.
+    let materialize: Bool = true
+    /// What the step does once its artifacts exist, answering the build's exit status.
+    let run: ((StepRun) -> Number)? = .None
+}
+
+/// What a step's run is handed.
+public struct StepRun {
+    /// The artifacts the step produces.
+    let artifacts: [ArtifactReference] = []
+    /// The snapshot the step names, when it is a snapshot step.
+    let snapshot: String? = .None
+    /// The path of each artifact the step produces, in its order.
+    let paths: [String]
+    /// The digest the store keeps each of them under, in the same order: a file's SHA-256, or a tree's, the SHA-256 of its listing, all as lowercase hex.
+    let digests: [String]
+    /// What the command line gave after `--`.
+    let arguments: [String]
+}
+
+/// A `-name value` the command line may give. A choice with no values takes any text.
+public struct Choice {
+    /// The name the command line gives, written `-name`.
+    let name: String
+    /// What the choice is for, as the build's help reports it.
+    let summary: String
+    /// The values the choice may take. Empty when it takes any text.
+    let values: [String] = []
+    /// The value the choice takes when the command line does not give it.
+    let fallback: String
+}
+
+/// Why a build could not do what it was asked.
+public enum BuildFailure {
+    /// The command line asked for something the build does not have. Carries the text.
+    Usage(String)
+    /// The graph is described wrongly: an unknown artifact, a label used twice. Carries the text.
+    Description(String)
+    /// A file of the build could not be read or written. Carries the text.
+    Files(String)
+    /// An action ran and failed. Carries the text.
+    Failed(String)
+}
+
+/// A failure as one line of text.
+public function failureText(failure: borrow BuildFailure) -> String {
+    return match failure {
+        Usage(text) -> "usage: \(text)"
+        Description(text) -> "graph: \(text)"
+        Files(text) -> "files: \(text)"
+        Failed(text) -> text
+    }
+}

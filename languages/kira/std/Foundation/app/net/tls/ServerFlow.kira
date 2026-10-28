@@ -1,0 +1,247 @@
+// The server side of the handshake (RFC 8446 section 2): it chooses from the
+// ClientHello, asks again with a HelloRetryRequest when no offered share
+// suits it, sends its whole flight at once and waits for the client's
+// Finished. It never asks for a client certificate.
+
+// A server handshake waiting for a ClientHello.
+function tlsStartServer(settings: TlsServerSettings) -> TlsHandshake {
+    return TlsHandshake {
+        role: .Server,
+        carrier: settings.carrier,
+        serverName: "",
+        protocols: settings.protocols,
+        seconds: 0,
+        anchors: [],
+        transportParameters: settings.transportParameters,
+        identity: .Some(settings.identity),
+        stage: .AwaitClientHello
+    }
+}
+
+// What the server took from a ClientHello.
+struct TlsHelloChoice {
+    let parameters: TlsSuiteParameters
+    let applicationProtocol: String?
+    let peerTransport: [UN8]?
+    let share: TlsKeyShare?
+    // The group to ask for again when no offered share suits.
+    let retryGroup: KeyGroup?
+}
+
+function tlsChooseSuite(offered: borrow [CipherSuite]) -> TlsSuiteParameters? {
+    for suite in TlsOffer.suites {
+        if offered.contains(suite) { return tlsSuiteParameters(suite) }
+    }
+    return .None
+}
+
+function tlsChooseShare(shares: borrow [TlsKeyShare]) -> TlsKeyShare? {
+    for group in TlsOffer.groups {
+        for entry in shares {
+            if entry.group == group { return .Some(copy entry) }
+        }
+    }
+    return .None
+}
+
+function tlsChooseGroup(groups: borrow [KeyGroup]) -> KeyGroup? {
+    for group in TlsOffer.groups {
+        if groups.contains(group) { return .Some(group) }
+    }
+    return .None
+}
+
+extend TlsHandshake {
+    function serverIdentity(borrow self) -> Result<TlsServerIdentity, TlsAlert> {
+        return match identity {
+            Some(value) -> .Ok(value)
+            None -> .Error(.InternalError)
+        }
+    }
+
+    // The application protocol both sides speak. QUIC requires one (RFC
+    // 9001 section 8.1); over TCP a client that offers none gets none.
+    function chooseProtocol(
+        borrow self,
+        extensions: borrow [TlsExtension]
+    ) -> Result<String?, TlsAlert> {
+        let offered = tlsFindExtension(extensions, .ApplicationProtocols)
+        let names = match offered {
+            Some(data) -> try tlsReadProtocols(data)
+            None -> {
+                if carrier == .Quic { return .Error(.NoApplicationProtocol) }
+                return .Ok(.None)
+            }
+        }
+        if protocols.count == 0 { return .Ok(.None) }
+        let chosen = tlsFirstShared(protocols, names)
+        if chosen.isNone() { return .Error(.NoApplicationProtocol) }
+        return .Ok(chosen)
+    }
+
+    function chooseFrom(
+        borrow self,
+        hello: borrow TlsClientHello
+    ) -> Result<TlsHelloChoice, TlsAlert> {
+        let versions = try tlsRequireExtension(hello.extensions, .SupportedVersions)
+        let speaks13 = try tlsOffersVersion13(versions)
+        if !speaks13 { return .Error(.ProtocolVersion) }
+        let parameters = match tlsChooseSuite(hello.suites) {
+            Some(value) -> value
+            None -> return .Error(.HandshakeFailure)
+        }
+        let schemeData = try tlsRequireExtension(hello.extensions, .SignatureAlgorithms)
+        let schemes = try tlsReadSchemes(schemeData)
+        let own = try serverIdentity()
+        if !schemes.contains(own.scheme) { return .Error(.HandshakeFailure) }
+        let groupData = try tlsRequireExtension(hello.extensions, .SupportedGroups)
+        let groups = try tlsReadGroups(groupData)
+        let shareData = try tlsRequireExtension(hello.extensions, .KeyShare)
+        let shares = try tlsReadOfferedShares(shareData)
+        let transport = tlsFindExtension(hello.extensions, .QuicTransportParameters)
+        if carrier == .Quic && transport.isNone() { return .Error(.MissingExtension) }
+        let applicationProtocol = try chooseProtocol(hello.extensions)
+        return .Ok(
+            TlsHelloChoice {
+                parameters: parameters,
+                applicationProtocol: applicationProtocol,
+                peerTransport: carrier == .Quic ? transport : .None,
+                share: tlsChooseShare(shares),
+                retryGroup: tlsChooseGroup(groups)
+            }
+        )
+    }
+
+    function takeClientHello(
+        borrow mut self,
+        message: borrow TlsHandshakeMessage
+    ) -> Result<Void, TlsAlert> {
+        if message.kind != .ClientHello { return .Error(.UnexpectedMessage) }
+        let hello = try tlsDecodeClientHello(message.body)
+        let choice = try chooseFrom(hello)
+        match retrySuite {
+            Some(suite) -> if suite != choice.parameters.suite { return .Error(.IllegalParameter) }
+            None -> {}
+        }
+        let share = match choice.share {
+            Some(value) -> value
+            None -> return retryOrRefuse(hello, choice, message)
+        }
+        match requestedGroup {
+            // The second ClientHello carries the share asked for, alone.
+            Some(group) -> if share.group != group { return .Error(.IllegalParameter) }
+            None -> {}
+        }
+        sessionId = hello.sessionId
+        chosenProtocol = choice.applicationProtocol
+        peerTransport = choice.peerTransport
+        transcript.add(message.encoded)
+        let agreement = try startKeyAgreement(share.group) otherwise return .Error(.InternalError)
+        let shared = try agreement.finish(share.share) otherwise return .Error(.IllegalParameter)
+        let ownShare = TlsKeyShare { group: share.group, share: copy agreement.share }
+        try sendServerHello(choice.parameters, ownShare)
+        try enterHandshake(choice.parameters, shared)
+        try sendServerFlight()
+        try enterApplication()
+        stage = .AwaitClientFinished
+        return .Ok
+    }
+
+    // No offered share suits: ask once for a group both sides support
+    // (RFC 8446 section 4.1.4), or refuse.
+    function retryOrRefuse(
+        borrow mut self,
+        hello: borrow TlsClientHello,
+        choice: borrow TlsHelloChoice,
+        message: borrow TlsHandshakeMessage
+    ) -> Result<Void, TlsAlert> {
+        if requestedGroup.isSome() { return .Error(.IllegalParameter) }
+        let group = match choice.retryGroup {
+            Some(value) -> value
+            None -> return .Error(.HandshakeFailure)
+        }
+        transcript.add(message.encoded)
+        try transcript.restartForRetry(choice.parameters.hash) otherwise return .Error(
+            .InternalError
+        )
+        let retry = TlsServerHello {
+            random: Tls.helloRetryRandom,
+            sessionId: copy hello.sessionId,
+            suite: choice.parameters.suite,
+            extensions: [tlsSelectedVersion(), tlsRequestedGroup(group)]
+        }
+        let encoded = try tlsEncodeServerHello(retry)
+        send(.Initial, encoded)
+        requestedGroup = .Some(group)
+        retrySuite = .Some(choice.parameters.suite)
+        stage = .AwaitRetriedHello
+        return .Ok
+    }
+
+    function sendServerHello(
+        borrow mut self,
+        parameters: borrow TlsSuiteParameters,
+        share: borrow TlsKeyShare
+    ) -> Result<Void, TlsAlert> {
+        let fresh = try randomBytes(UNumber(Tls.randomBytes)) otherwise return .Error(
+            .InternalError
+        )
+        let hello = TlsServerHello {
+            random: fresh,
+            sessionId: copy sessionId,
+            suite: parameters.suite,
+            extensions: [tlsSelectedVersion(), tlsChosenShare(share)]
+        }
+        let encoded = try tlsEncodeServerHello(hello)
+        send(.Initial, encoded)
+        return .Ok
+    }
+
+    // EncryptedExtensions, Certificate, CertificateVerify and Finished.
+    function sendServerFlight(borrow mut self) -> Result<Void, TlsAlert> {
+        var extensions: [TlsExtension] = []
+        match chosenProtocol {
+            Some(name) -> {
+                let alpn = try tlsProtocolList([name])
+                extensions.append(alpn)
+            }
+            None -> {}
+        }
+        if carrier == .Quic {
+            extensions.append(
+                TlsExtension { kind: .QuicTransportParameters, data: copy transportParameters }
+            )
+        }
+        let encrypted = try tlsEncodeEncryptedExtensions(extensions)
+        send(.Handshake, encrypted)
+        let own = try serverIdentity()
+        let chain = try tlsEncodeCertificate(
+            TlsCertificateChain { certificates: copy own.certificates }
+        )
+        send(.Handshake, chain)
+        let current = try handshakeKeys()
+        let hash = try transcriptHash(current.parameters)
+        let signature = try own.key.sign(own.scheme, tlsSignedContent(.Server, hash))
+        otherwise return .Error(.InternalError)
+        send(
+            .Handshake,
+            tlsEncodeCertificateVerify(
+                TlsCertificateProof { scheme: own.scheme, signature: signature }
+            )
+        )
+        let finished = try finishedFor(.Server)
+        send(.Handshake, tlsEncodeFinished(finished))
+        return .Ok
+    }
+
+    function takeClientFinished(
+        borrow mut self,
+        message: borrow TlsHandshakeMessage
+    ) -> Result<Void, TlsAlert> {
+        if message.kind != .Finished { return .Error(.UnexpectedMessage) }
+        let expected = try finishedFor(.Client)
+        if !tlsFinishedMatches(message.body, expected) { return .Error(.DecryptError) }
+        transcript.add(message.encoded)
+        return complete()
+    }
+}

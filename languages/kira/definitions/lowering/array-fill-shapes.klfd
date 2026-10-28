@@ -1,0 +1,445 @@
+extend FunctionLowering {
+    function arrayFillRead(borrow self, index: Int, expected: Int) -> Bool {
+        match program.expressions[index].operation.readLocal() {
+            Some(local) -> return local == expected
+            None -> return false
+        }
+    }
+
+    function zeroArrayElement(borrow self, index: Int) -> Bool {
+        let expression = program.expressions[index]
+        if needsArrayCleanup(program, expression.valueType) { return false }
+        match expression.operation {
+            Integer(value) -> return value == 0
+            Boolean(value) -> return !value
+            Convert(value) -> return zeroArrayElement(value)
+            Construct(values) -> {
+                if expression.valueType.kind != .Structure { return false }
+                match program.structs[expression.valueType.declaration].shape {
+                    Plain -> {}
+                    CLayout -> return false
+                    CUnion -> return false
+                    CArray -> return false
+                    Callback -> return false
+                    CPointer -> return false
+                }
+                for value in values { if !zeroArrayElement(value) { return false } }
+                return true
+            }
+            StringText -> return false
+            Sequence -> return false
+            FloatLiteral -> return false
+            BoxAny -> return false
+            TypeIs -> return false
+            UnboxAny -> return false
+            FunctionReference -> return false
+            IndirectCall -> return false
+            MakeClosure -> return false
+            GlobalRead -> return false
+            TaskSpawn -> return false
+            TaskReady -> return false
+            TaskAwait -> return false
+            TaskCancel -> return false
+            TaskDetach -> return false
+            Async -> return false
+            RuntimeTrap -> return false
+            Try -> return false
+            ChannelCreate -> return false
+            ChannelReceiver -> return false
+            ChannelSend -> return false
+            ChannelClose -> return false
+            ClassView -> return false
+            ClassCall -> return false
+            StringLiteral -> return false
+            StringConcat -> return false
+            TraceText -> return false
+            HeapAllocateRaw -> return false
+            HeapFreeRaw -> return false
+            Print -> return false
+            HeapRead -> return false
+            HeapWrite -> return false
+            Atomic -> return false
+            HeapCopy -> return false
+            HeapFill -> return false
+            HeapOffset -> return false
+            HeapLayout -> return false
+            ArrayLiteral -> return false
+            ArrayIndex -> return false
+            ArrayAppend -> return false
+            Transfer -> return false
+            Read -> return false
+            Member -> return false
+            Call -> return false
+            Tagged -> return false
+            Unary -> return false
+            Arithmetic -> return false
+            Wrapping -> return false
+            Compare -> return false
+            Logical -> return false
+            Select -> return false
+            Choice -> return false
+            Bitcast -> return false
+            ForeignImage -> return false
+            ForeignElements -> return false
+            ForeignCallback -> return false
+            ForeignRead -> return false
+            ForeignUnion -> return false
+            EnumCode -> return false
+            EnumFromCode -> return false
+            Order -> return false
+            Hash -> return false
+        }
+    }
+
+    function emptyArrayDeclaration(borrow self, statement: CheckedStatement) -> Optional<Int> {
+        match statement {
+            Declare(local, initializer) -> {
+                match program.expressions[initializer].operation {
+                    ArrayLiteral(elements) -> {
+                        if elements.count == 0 { return .Some(local) }
+                        return .None
+                    }
+                    StringText -> return .None
+                    Sequence -> return .None
+                    Integer -> return .None
+                    FloatLiteral -> return .None
+                    BoxAny -> return .None
+                    TypeIs -> return .None
+                    UnboxAny -> return .None
+                    FunctionReference -> return .None
+                    IndirectCall -> return .None
+                    MakeClosure -> return .None
+                    GlobalRead -> return .None
+                    TaskSpawn -> return .None
+                    TaskReady -> return .None
+                    TaskAwait -> return .None
+                    TaskCancel -> return .None
+                    TaskDetach -> return .None
+                    Async -> return .None
+                    RuntimeTrap -> return .None
+                    Try -> return .None
+                    ChannelCreate -> return .None
+                    ChannelReceiver -> return .None
+                    ChannelSend -> return .None
+                    ChannelClose -> return .None
+                    ClassView -> return .None
+                    ClassCall -> return .None
+                    Boolean -> return .None
+                    StringLiteral -> return .None
+                    StringConcat -> return .None
+                    TraceText -> return .None
+                    HeapAllocateRaw -> return .None
+                    HeapFreeRaw -> return .None
+                    Print -> return .None
+                    HeapRead -> return .None
+                    HeapWrite -> return .None
+                    Atomic -> return .None
+                    HeapCopy -> return .None
+                    HeapFill -> return .None
+                    HeapOffset -> return .None
+                    HeapLayout -> return .None
+                    ArrayIndex -> return .None
+                    ArrayAppend -> return .None
+                    Transfer -> return .None
+                    Read -> return .None
+                    Member -> return .None
+                    Call -> return .None
+                    Construct -> return .None
+                    Tagged -> return .None
+                    Unary -> return .None
+                    Arithmetic -> return .None
+                    Wrapping -> return .None
+                    Compare -> return .None
+                    Logical -> return .None
+                    Select -> return .None
+                    Choice -> return .None
+                    Bitcast -> return .None
+                    Convert -> return .None
+                    ForeignImage -> return .None
+                    ForeignElements -> return .None
+                    ForeignCallback -> return .None
+                    ForeignRead -> return .None
+                    ForeignUnion -> return .None
+                    EnumCode -> return .None
+                    EnumFromCode -> return .None
+                    Order -> return .None
+                    Hash -> return .None
+                }
+            }
+            InitializeGlobal -> return .None
+            Assign -> return .None
+            Evaluate -> return .None
+            Branch -> return .None
+            Loop -> return .None
+            Count -> return .None
+            Iterate -> return .None
+            Dispatch -> return .None
+            Attempt -> return .None
+            Return -> return .None
+            Break -> return .None
+            Continue -> return .None
+        }
+    }
+
+    function zeroCounterDeclaration(borrow self, statement: CheckedStatement) -> Optional<Int> {
+        match statement {
+            Declare(local, initializer) -> {
+                match program.expressions[initializer].operation.integer() {
+                    Some(value) -> { if value == 0 { return .Some(local) } }
+                    None -> {}
+                }
+                return .None
+            }
+            InitializeGlobal -> return .None
+            Assign -> return .None
+            Evaluate -> return .None
+            Branch -> return .None
+            Loop -> return .None
+            Count -> return .None
+            Iterate -> return .None
+            Dispatch -> return .None
+            Attempt -> return .None
+            Return -> return .None
+            Break -> return .None
+            Continue -> return .None
+        }
+    }
+
+    function arrayFillLoop(borrow self, statement: CheckedStatement, array: Int, counter: Int) -> Optional<Int> {
+        match statement {
+            Loop(condition, body) -> {
+                if body.count != 2 { return .None }
+                if !zeroArrayAppend(program.statements[body[0]], array) || !unitCounterStep(program.statements[body[1]], counter) { return .None }
+                match program.expressions[condition].operation {
+                    Compare(comparison, left, right) -> {
+                        if comparison != .Less || !arrayFillRead(left, counter) { return .None }
+                        match program.expressions[right].operation.readLocal() {
+                            Some(local) -> {
+                                if local >= checked.parameterCount || checked.locals[local].byReference || !checked.locals[local].valueType.equals(Type.int()) { return .None }
+                                return .Some(right)
+                            }
+                            None -> return .None
+                        }
+                    }
+                    StringText -> return .None
+                    Sequence -> return .None
+                    Integer -> return .None
+                    FloatLiteral -> return .None
+                    BoxAny -> return .None
+                    TypeIs -> return .None
+                    UnboxAny -> return .None
+                    FunctionReference -> return .None
+                    IndirectCall -> return .None
+                    MakeClosure -> return .None
+                    GlobalRead -> return .None
+                    TaskSpawn -> return .None
+                    TaskReady -> return .None
+                    TaskAwait -> return .None
+                    TaskCancel -> return .None
+                    TaskDetach -> return .None
+                    Async -> return .None
+                    RuntimeTrap -> return .None
+                    Try -> return .None
+                    ChannelCreate -> return .None
+                    ChannelReceiver -> return .None
+                    ChannelSend -> return .None
+                    ChannelClose -> return .None
+                    ClassView -> return .None
+                    ClassCall -> return .None
+                    Boolean -> return .None
+                    StringLiteral -> return .None
+                    StringConcat -> return .None
+                    TraceText -> return .None
+                    HeapAllocateRaw -> return .None
+                    HeapFreeRaw -> return .None
+                    Print -> return .None
+                    HeapRead -> return .None
+                    HeapWrite -> return .None
+                    Atomic -> return .None
+                    HeapCopy -> return .None
+                    HeapFill -> return .None
+                    HeapOffset -> return .None
+                    HeapLayout -> return .None
+                    ArrayLiteral -> return .None
+                    ArrayIndex -> return .None
+                    ArrayAppend -> return .None
+                    Transfer -> return .None
+                    Read -> return .None
+                    Member -> return .None
+                    Call -> return .None
+                    Construct -> return .None
+                    Tagged -> return .None
+                    Unary -> return .None
+                    Arithmetic -> return .None
+                    Wrapping -> return .None
+                    Logical -> return .None
+                    Select -> return .None
+                    Choice -> return .None
+                    Bitcast -> return .None
+                    Convert -> return .None
+                    ForeignImage -> return .None
+                    ForeignElements -> return .None
+                    ForeignCallback -> return .None
+                    ForeignRead -> return .None
+                    ForeignUnion -> return .None
+                    EnumCode -> return .None
+                    EnumFromCode -> return .None
+                    Order -> return .None
+                    Hash -> return .None
+                }
+            }
+            Declare -> return .None
+            InitializeGlobal -> return .None
+            Assign -> return .None
+            Evaluate -> return .None
+            Branch -> return .None
+            Count -> return .None
+            Iterate -> return .None
+            Dispatch -> return .None
+            Attempt -> return .None
+            Return -> return .None
+            Break -> return .None
+            Continue -> return .None
+        }
+    }
+
+    function zeroArrayAppend(borrow self, statement: CheckedStatement, array: Int) -> Bool {
+        match statement {
+            Evaluate(index) -> {
+                match program.expressions[index].operation.arrayAppendOperands() {
+                    Some(operands) -> return arrayFillRead(operands.array, array) && zeroArrayElement(operands.element)
+                    None -> return false
+                }
+            }
+            Declare -> return false
+            InitializeGlobal -> return false
+            Assign -> return false
+            Branch -> return false
+            Loop -> return false
+            Count -> return false
+            Iterate -> return false
+            Dispatch -> return false
+            Attempt -> return false
+            Return -> return false
+            Break -> return false
+            Continue -> return false
+        }
+    }
+
+    function unitCounterStep(borrow self, statement: CheckedStatement, counter: Int) -> Bool {
+        match statement {
+            Assign(place, index) -> {
+                if !arrayFillRead(place, counter) { return false }
+                match program.expressions[index].operation {
+                    Arithmetic(operator, left, right) -> {
+                        if operator != .Add || !arrayFillRead(left, counter) { return false }
+                        match program.expressions[right].operation.integer() {
+                            Some(value) -> return value == 1
+                            None -> return false
+                        }
+                    }
+                    StringText -> return false
+                    Sequence -> return false
+                    Integer -> return false
+                    FloatLiteral -> return false
+                    BoxAny -> return false
+                    TypeIs -> return false
+                    UnboxAny -> return false
+                    FunctionReference -> return false
+                    IndirectCall -> return false
+                    MakeClosure -> return false
+                    GlobalRead -> return false
+                    TaskSpawn -> return false
+                    TaskReady -> return false
+                    TaskAwait -> return false
+                    TaskCancel -> return false
+                    TaskDetach -> return false
+                    Async -> return false
+                    RuntimeTrap -> return false
+                    Try -> return false
+                    ChannelCreate -> return false
+                    ChannelReceiver -> return false
+                    ChannelSend -> return false
+                    ChannelClose -> return false
+                    ClassView -> return false
+                    ClassCall -> return false
+                    Boolean -> return false
+                    StringLiteral -> return false
+                    StringConcat -> return false
+                    TraceText -> return false
+                    HeapAllocateRaw -> return false
+                    HeapFreeRaw -> return false
+                    Print -> return false
+                    HeapRead -> return false
+                    HeapWrite -> return false
+                    Atomic -> return false
+                    HeapCopy -> return false
+                    HeapFill -> return false
+                    HeapOffset -> return false
+                    HeapLayout -> return false
+                    ArrayLiteral -> return false
+                    ArrayIndex -> return false
+                    ArrayAppend -> return false
+                    Transfer -> return false
+                    Read -> return false
+                    Member -> return false
+                    Call -> return false
+                    Construct -> return false
+                    Tagged -> return false
+                    Unary -> return false
+                    Wrapping -> return false
+                    Compare -> return false
+                    Logical -> return false
+                    Select -> return false
+                    Choice -> return false
+                    Bitcast -> return false
+                    Convert -> return false
+                    ForeignImage -> return false
+                    ForeignElements -> return false
+                    ForeignCallback -> return false
+                    ForeignRead -> return false
+                    ForeignUnion -> return false
+                    EnumCode -> return false
+                    EnumFromCode -> return false
+                    Order -> return false
+                    Hash -> return false
+                }
+            }
+            Declare -> return false
+            InitializeGlobal -> return false
+            Evaluate -> return false
+            Branch -> return false
+            Loop -> return false
+            Count -> return false
+            Iterate -> return false
+            Dispatch -> return false
+            Attempt -> return false
+            Return -> return false
+            Break -> return false
+            Continue -> return false
+        }
+    }
+
+    function returnsArray(borrow self, statement: CheckedStatement, array: Int) -> Bool {
+        match statement {
+            Return(returned) -> {
+                match returned {
+                    Some(index) -> return arrayFillRead(index, array)
+                    None -> return false
+                }
+            }
+            Declare -> return false
+            InitializeGlobal -> return false
+            Assign -> return false
+            Evaluate -> return false
+            Branch -> return false
+            Loop -> return false
+            Count -> return false
+            Iterate -> return false
+            Dispatch -> return false
+            Attempt -> return false
+            Break -> return false
+            Continue -> return false
+        }
+    }
+}

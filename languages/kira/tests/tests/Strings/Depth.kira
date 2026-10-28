@@ -1,0 +1,240 @@
+import Foundation
+
+// Strings in depth: literals and `.count`, `String` struct fields (flat and
+// nested), passing strings by `move` and by `borrow`, returning strings from
+// functions and struct methods, strings stored in arrays, a String-payload enum
+// matched out, and per-iteration string building in loops.
+
+function strLen(s: String) -> Number {
+    return s.count
+}
+
+function strBorrowLen(s: borrow String) -> Number {
+    return s.count
+}
+
+function strPick(i: Number) -> String {
+    let m = i % 5
+    if m == 0 {
+        return "alpha"
+    }
+    if m == 1 {
+        return "be"
+    }
+    if m == 2 {
+        return "gamma"
+    }
+    if m == 3 {
+        return "d"
+    }
+    return ""
+}
+
+function strTagFor(i: Number) -> String {
+    let m = i % 3
+    if m == 0 {
+        return "lo"
+    }
+    if m == 1 {
+        return "high"
+    }
+    return "mid"
+}
+
+struct StrPair {
+    var first: String
+    var second: String
+    var weight: Number
+
+    function lenSum() -> Number {
+        return self.first.count + self.second.count
+    }
+
+    function pick(useFirst: Bool) -> String {
+        if useFirst {
+            return self.first
+        }
+        return self.second
+    }
+}
+
+struct StrInner {
+    var word: String
+}
+
+struct StrDoc {
+    var head: StrInner
+    var note: String
+    var n: Number
+}
+
+enum StrTok {
+    Word(String)
+    Blank
+}
+
+function strDocLen(d: borrow StrDoc) -> Number {
+    return d.head.word.count + d.note.count + d.n
+}
+
+function strTokLen(t: borrow StrTok) -> Number {
+    match t {
+        Word(n) -> { return n.count }
+        Blank -> { return 0 }
+    }
+}
+
+function strTokFor(i: Number) -> StrTok {
+    let m = i % 3
+    if m == 0 {
+        return .Word("redred")
+    }
+    if m == 1 {
+        return .Blank
+    }
+    return .Word("xy")
+}
+
+function strBumpWeight(p: borrow mut StrPair) {
+    p.weight = p.weight + 1
+}
+
+@Test
+function literalLengthsIncludeTheEmptyString() {
+    expect!(("alpha".count) == (5))
+    expect!(("".count) == (0))
+    expect!(("a longer phrase".count) == (15))
+    expect!((strBorrowLen("xyz")) == (3))
+    expect!((strBorrowLen("")) == (0))
+}
+
+@Test
+function borrowedStringStaysUsableAfterTheCall() {
+    let kept = "reusable"
+    expect!((strBorrowLen(kept)) == (8))
+    expect!((strBorrowLen(kept)) == (8))
+}
+
+@Test
+function movedStringIsConsumedByTheCallee() {
+    let consumed = "consumed"
+    expect!((strLen(move consumed)) == (8))
+}
+
+@Test
+function strPickReturnsOneOfFiveLengthsPerPeriod() {
+    var pickTotal: Number = 0
+    for i in 0..40 {
+        let s = strPick(i)
+        pickTotal = pickTotal + s.count
+    }
+    expect!((pickTotal) == (104))
+}
+
+@Test
+function structPairsFoldLengthsAndMethodResults() {
+    var pairTotal: Number = 0
+    for p in 0..30 {
+        let tagA = strTagFor(p)
+        let tagB = strTagFor(p + 1)
+        let pair = StrPair { first: move tagA, second: move tagB, weight: p }
+        pairTotal = pairTotal + pair.lenSum() + pair.weight
+        let chosen = pair.pick(p % 2 == 0)
+        pairTotal = pairTotal + chosen.count
+    }
+    expect!((pairTotal) == (705))
+}
+
+@Test
+function borrowMutWritebackKeepsStringFields() {
+    var bumped = StrPair { first: "keepme", second: "and", weight: 0 }
+    for b in 0..25 {
+        strBumpWeight(bumped)
+    }
+    expect!((bumped.weight) == (25))
+    expect!((bumped.first.count) == (6))
+    expect!((bumped.second.count) == (3))
+}
+
+@Test
+function copiedStructWithStringsDoesNotAlias() {
+    let orig = StrPair { first: "left", second: "right", weight: 7 }
+    var copy = orig
+    copy.weight = 999
+    expect!((orig.weight) == (7))
+    expect!((copy.weight) == (999))
+    expect!((copy.second.count) == (5))
+}
+
+@Test
+function nestedStringFieldReadsThroughBorrowAndDirectly() {
+    let doc = StrDoc { head: StrInner { word: "abcd" }, note: "xy", n: 100 }
+    expect!((strDocLen(doc)) == (106))
+    expect!((doc.head.word.count) == (4))
+    expect!((doc.note.count) == (2))
+}
+
+@Test
+function literalArrayOfStringsIteratesLengths() {
+    let words = ["one", "three", "f", ""]
+    var litTotal: Number = 0
+    for w in words {
+        litTotal = litTotal + w.count
+    }
+    expect!((litTotal) == (9))
+}
+
+@Test
+function ownedStringArrayBuiltAcrossALoopMatchesItsCopies() {
+    var built: [String] = []
+    var buildTotal: Number = 0
+    for k in 0..60 {
+        let s = strPick(k)
+        buildTotal = buildTotal + s.count
+        built.append(move s)
+    }
+    var indexedTotal: Number = 0
+    for bi in 0..built.count {
+        indexedTotal = indexedTotal + built[bi].count
+    }
+    expect!((buildTotal) == (156))
+    expect!((indexedTotal) == (156))
+    expect!((built.count) == (60))
+}
+
+@Test
+function arrayOfStructsWithStringFieldsReadsByIndex() {
+    var pairs: [StrPair] = []
+    for pj in 0..24 {
+        let a = strTagFor(pj)
+        let c = strTagFor(pj + 2)
+        pairs.append(StrPair { first: move a, second: move c, weight: pj })
+    }
+    var fieldTotal: Number = 0
+    for fp in 0..pairs.count {
+        fieldTotal = fieldTotal + pairs[fp].first.count + pairs[fp].second.count
+    }
+    expect!((fieldTotal) == (144))
+    expect!((pairs.count) == (24))
+}
+
+@Test
+function stringPayloadEnumMatchesOutTheString() {
+    let w1: StrTok = .Word("hello")
+    let w2: StrTok = .Blank
+    expect!((strTokLen(w1)) == (5))
+    expect!((strTokLen(w2)) == (0))
+}
+
+@Test
+function tokenArrayInterleavesPayloadAndBlank() {
+    var toks: [StrTok] = []
+    for ti in 0..45 {
+        toks.append(strTokFor(ti))
+    }
+    var tokTotal: Number = 0
+    for tj in 0..toks.count {
+        tokTotal = tokTotal + strTokLen(toks[tj])
+    }
+    expect!((tokTotal) == (120))
+}

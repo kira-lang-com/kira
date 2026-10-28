@@ -1,0 +1,132 @@
+import Foundation
+
+// A request and its response over HTTP/3, on two QUIC connections talking
+// through memory.
+
+struct Http3Pair {
+    var client: QuicConnection
+    var server: QuicConnection
+    var clientHttp: Http3Session = http3Session(.Client)
+    var serverHttp: Http3Session = http3Session(.Server)
+    var now: QuicInstant
+    var notes: [String] = []
+
+    function exchange(borrow mut self) {
+        for _ in 0..TestClock.rounds {
+            let up = deliver(client, server, now)
+            serverHttp.pump(server)
+            let down = deliver(server, client, now)
+            clientHttp.pump(client)
+            now = now.plus(TestClock.step)
+            if !up && !down { break }
+        }
+        noteAll("client", clientHttp)
+        noteAll("server", serverHttp)
+    }
+
+    function noteAll(borrow mut self, side: String, session: borrow mut Http3Session) {
+        while true {
+            let next = session.event()
+            let event = match next {
+                Some(value) -> value
+                None -> return
+            }
+            notes.append("\(side) \(describeHttp(event))")
+        }
+    }
+}
+
+function describeFields(fields: borrow Fields) -> String {
+    var parts: [String] = []
+    for field in fields.entries { parts.append("\(field.name)=\(field.value)") }
+    return joined(parts, ",")
+}
+
+function describeHttp(event: borrow Http3Event) -> String {
+    return match event {
+        Connected(agreement) -> "connected \(traceText(agreement.applicationProtocol))"
+        Head(head) -> match head.head {
+            RequestHead(
+                request
+            ) -> "request \(traceText(request.method)) \(request.target.scheme)://\(request.target.authority)\(request.target.path) \(describeFields(request.fields))"
+            ResponseHead(
+                response
+            ) -> "response \(code(response.status)) \(describeFields(response.fields))"
+        }
+        Body(chunk) -> match textFromBytes(chunk.bytes) {
+            Some(text) -> "body \(text)"
+            None -> "body ?"
+        }
+        Ended(end) -> "ended \(describeFields(end.trailers))"
+        Reset(failure) -> "reset \(failure.error)"
+        Stopped(failure) -> "stopped \(failure.error)"
+        Goaway(id) -> "goaway \(id)"
+        Closed(end) -> "closed \(end.error) \(end.reason)"
+        TransportStream(opened) -> "wt stream \(opened.session.raw) \(opened.stream.raw)"
+        TransportData(data) -> match textFromBytes(data.bytes) {
+            Some(text) -> "wt data \(data.stream.raw) \(text) \(data.finished)"
+            None -> "wt data ?"
+        }
+        TransportReset(failure) -> "wt reset \(failure.stream.raw) \(traceText(failure.error))"
+        TransportStopped(failure) -> "wt stopped \(failure.stream.raw) \(traceText(failure.error))"
+        TransportDatagram(datagram) -> match textFromBytes(datagram.bytes) {
+            Some(text) -> "wt datagram \(datagram.session.raw) \(text)"
+            None -> "wt datagram ?"
+        }
+        TransportDraining(session) -> "wt draining \(session.raw)"
+        TransportClosed(
+            close
+        ) -> "wt closed \(close.session.raw) \(close.error) \(close.reason) \(traceText(close.reset))"
+    }
+}
+
+function http3Pair() -> Result<Http3Pair, String> {
+    let quic = try quicPair()
+    return .Ok(Http3Pair { client: quic.client, server: quic.server, now: quic.now })
+}
+
+function exchangeMessages(pair: borrow mut Http3Pair) -> String {
+    var fields = Fields {}
+    fields.add("Content-Type", "application/json")
+    let head = RequestHead {
+        method: .Post,
+        target: Target { scheme: "https", authority: "localhost", path: "/v1/messages" },
+        fields: fields
+    }
+    let stream = match pair.clientHttp.sendRequest(pair.client, head, false) {
+        Ok(value) -> value
+        Error(problem) -> return traceText(problem)
+    }
+    absorb pair.clientHttp.sendData(pair.client, stream, "{}".utf8(), true)
+    pair.exchange()
+    var answer = Fields {}
+    answer.add("content-type", "text/plain")
+    absorb pair.serverHttp.respond(
+        pair.server,
+        stream,
+        ResponseHead { status: .Ok, fields: answer }
+    )
+    absorb pair.serverHttp.sendData(pair.server, stream, "hello".utf8(), false)
+    var trailers = Fields {}
+    trailers.add("x-done", "1")
+    absorb pair.serverHttp.sendTrailers(pair.server, stream, trailers)
+    pair.exchange()
+    return "stream \(stream.raw)"
+}
+
+@Test
+function http3RequestAndResponse() {
+    let expected: String = "client connected Some(\"h3\"); server connected Some(\"h3\"); server request Method.Post https://localhost/v1/messages content-type=application/json; server body {}; server ended ; client response 200 content-type=text/plain; client body hello; client ended x-done=1 | stream 0"
+    var pair = match http3Pair() {
+        Ok(value) -> value
+        Error(text) -> {
+            expect!((text) == expected)
+            return
+        }
+    }
+    pair.exchange()
+    let stream = exchangeMessages(pair)
+    expect!((joined(pair.notes, "; ")) == ("client connected Some(\"h3\"); server connected Some(\"h3\"); server request Method.Post https://localhost/v1/messages content-type=application/json; server body {}; server ended ; client response 200 content-type=text/plain; client body hello; client ended x-done=1"))
+    expect!((stream) == ("stream 0"))
+}
+

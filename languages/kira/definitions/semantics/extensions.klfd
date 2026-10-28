@@ -1,0 +1,137 @@
+// `extend Type { ... }` and `extend Type: Trait { ... }`.
+//
+// A block on a generic template joins the template, so each instance gets its
+// methods. A block on a construct family adds modifiers to the family's
+// values, or with a trait gives every declaration the family backs the
+// trait's members. Any other block is declared against the type it names
+// once types resolve, which is what lets `Int`, `[Int]` and `Box<Int>` take
+// methods.
+function materializeExtensions(move tree: SyntaxTree) -> SyntaxTree {
+    var prepared = move tree
+    var remaining: [ExtensionDeclaration] = []
+    // The loops read their own copies: `extendStruct` writes through
+    // `prepared`, and a write through a borrow of the value a loop is reading
+    // is not seen by the loop's owner.
+    let constructs = prepared.constructs
+    let extensions = prepared.extensions
+    let constructsByName = constructIndex(constructs)
+    for extension in extensions {
+        checkExtensionMembers(prepared.traits, extension)
+        let owner = extension.owner.name.text
+        match constructsByName.named(owner) {
+            Some(family) -> {
+                if family.parameters.isNone() {
+                    if extension.traits.count == 0 {
+                        // A family whose values never leave the program is an
+                        // enum; one that crosses RIDL is its trait object, a
+                        // struct.
+                        extendNamedEnum(prepared, familyTypeName(owner), extension.methods)
+                        extendStruct(prepared, familyTypeName(owner), extension.methods)
+                    } else {
+                        for declared in constructs {
+                            if declared.parameters.isSome() && constructsByName.seenThrough(declared, owner, 0) {
+                                extendStruct(prepared, declared.name.text, extension.methods)
+                            }
+                        }
+                    }
+                    continue
+                }
+            }
+            None -> {}
+        }
+        if namesTemplate(prepared, extension.owner) {
+            for index in 0..prepared.genericStructs.count {
+                if prepared.genericStructs[index].name.text == owner {
+                    for method in extension.methods { prepared.genericStructs[index].methods.append(method) }
+                }
+            }
+            for index in 0..prepared.genericEnums.count {
+                if prepared.genericEnums[index].name.text == owner {
+                    for method in extension.methods { prepared.genericEnums[index].methods.append(method) }
+                }
+            }
+            continue
+        }
+        remaining.append(extension)
+    }
+    prepared.extensions = remaining
+    return prepared
+}
+
+// `extend Name` or `extend Name<Element>`: a block on a generic template, which
+// names it without its arguments or with its own type parameters standing in
+// for them, so its methods join the template and each instance gets them.
+function namesTemplate(tree: SyntaxTree, owner: TypeReference) -> Bool {
+    if templateParameters(tree, owner.name.text).count == 0 { return false }
+    if owner.arguments.count == 0 { return true }
+    return isTemplateReference(tree, owner)
+}
+
+function extendStruct(tree: borrow mut SyntaxTree, name: String, methods: [FunctionDeclaration]) {
+    for index in 0..tree.structs.count {
+        if tree.structs[index].name.text == name {
+            var extended = tree.structs[index].methods
+            for method in methods { addMethod(extended, method) }
+            tree.structs[index].methods = extended
+        }
+    }
+}
+
+function extendNamedEnum(tree: borrow mut SyntaxTree, name: String, methods: [FunctionDeclaration]) {
+    for index in 0..tree.enums.count {
+        if tree.enums[index].name.text == name {
+            for method in methods { tree.enums[index].methods.append(method) }
+        }
+    }
+}
+
+// The methods of the remaining blocks, against the types they name. A block on
+// a struct writes through a receiver like the struct's own methods do, so its
+// omitted receiver borrows mutably when the body needs it to.
+function declareExtensions(declarations: borrow mut Declarations, tree: SyntaxTree) {
+    for extension in tree.extensions {
+        let owner = declarations.resolve(extension.owner)
+        if owner.isInvalid() { continue }
+        var methods = extension.methods
+        if owner.kind == .Structure && declarations.structs[owner.declaration].genericBase != "Class" {
+            methods = inferredReceivers(tree, methods, typeFieldNames(declarations, owner))
+        }
+        for method in methods {
+            if method.typeParameters.count == 0 { declareFunction(declarations, tree, method, .Some(owner)) }
+        }
+    }
+}
+
+function dropFunctions(tree: SyntaxTree, declarations: Declarations) -> [Int] {
+    var functions: [Int] = []
+    for index in 0..declarations.structs.count { functions.append(dropFunctionOf(tree, declarations, index)) }
+    return functions
+}
+
+// The `drop` body a struct runs on release, claimed on the struct or on the
+// template it instantiates, or -1 for none.
+function dropFunctionOf(tree: SyntaxTree, declarations: Declarations, index: Int) -> Int {
+    let structure = declarations.structs[index]
+    let owner = Type.structure(index)
+    var drop = -1
+    for conformance in tree.conformances {
+        if conformance.traitName.name.text != "Drop" { continue }
+        if isTemplateReference(tree, conformance.owner) {
+            if instanceArguments(declarations, owner, conformance.owner.name.text).isNone() { continue }
+        } else if conformance.owner.instanceName != structure.name.text {
+            continue
+        }
+        match declarations.findFunction(.Some(owner), "drop") {
+            Some(target) -> {
+                let signature = declarations.signatures[target]
+                if signature.receiver != .MutablyBorrowed || signature.parameters.count != 1 || signature.result.kind != .Void {
+                    report(.DropSignature, signature.name.span)
+                } else {
+                    drop = target
+                }
+            }
+            None -> report(.DropSignature, conformance.traitName.name.span)
+        }
+    }
+    return drop
+}

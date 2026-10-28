@@ -1,0 +1,120 @@
+import Foundation
+
+// `.await` inside an expression of an async body: an operand, an argument, a
+// `match` subject, an `if` condition. Each is taken out before its statement
+// into a binding of its own, and whatever runs before it is taken out first,
+// so the statement computes what it would have in the order it would have.
+// Prefix: awx / Awx.
+
+// Pending (and self-woken) `remaining` times, then ready with `value`.
+struct AwxDelay: Future<Number> {
+    var remaining: Number
+    let value: Number
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Number> {
+        if self.remaining == 0 { return .Ready(self.value) }
+        self.remaining -= 1
+        context.waker.wakeUp()
+        return .Pending
+    }
+}
+
+function awxDelay(remaining: Number, value: Number) -> AwxDelay {
+    return AwxDelay { remaining = remaining, value = value }
+}
+
+// What ran, in the order it ran.
+class AwxLog {
+    var text: String = ""
+
+    function note(mark: borrow String, value: Number) -> Number {
+        self.text += mark
+        return value
+    }
+}
+
+async function awxNoted(log: AwxLog, mark: String, value: Number) -> Number {
+    let waited = awxDelay(1, value).await
+    return log.note(mark, waited)
+}
+
+async function awxMaybe(value: Number) -> Number? {
+    let waited = awxDelay(1, value).await
+    if waited < 0 { return .None }
+    return .Some(waited)
+}
+
+function awxThree(a: Number, b: Number, c: Number) -> Number {
+    return a * 100 + b * 10 + c
+}
+
+async function awxOperands() -> Number {
+    return awxDelay(1, 2).await + awxDelay(2, 3).await * 10
+}
+
+async function awxSubject(value: Number) -> Number {
+    match awxMaybe(value).await {
+        Some(found) -> return found
+        None -> return 99
+    }
+}
+
+async function awxCondition(value: Number) -> Number {
+    if awxDelay(2, value).await > 5 { return 1 }
+    return 0
+}
+
+async function awxArguments(log: AwxLog) -> Number {
+    return awxThree(log.note("a", 1), awxNoted(copy log, "b", 2).await, log.note("c", 3))
+}
+
+async function awxNestedFuture() -> Number {
+    return awxDelay(1, awxDelay(2, 4).await + 1).await
+}
+
+async function awxCompound() -> Number {
+    var total: Number = 1
+    total += awxDelay(1, 2).await * 3
+    return total
+}
+
+async function awxBinding() -> Number {
+    let sum = awxDelay(1, 6).await + awxDelay(1, 7).await
+    return sum
+}
+
+@Test
+function awxAwaitsAreOperands() {
+    expect!(blockOn(awxOperands()) == 32)
+    expect!(blockOn(awxBinding()) == 13)
+}
+
+@Test
+function awxAnAwaitIsAMatchSubject() {
+    expect!(blockOn(awxSubject(4)) == 4)
+    expect!(blockOn(awxSubject(-1)) == 99)
+}
+
+@Test
+function awxAnAwaitIsAnIfCondition() {
+    expect!(blockOn(awxCondition(9)) == 1)
+    expect!(blockOn(awxCondition(2)) == 0)
+}
+
+// The argument before the await runs before it, the one after runs after.
+@Test
+function awxArgumentsKeepTheirOrder() {
+    let log = AwxLog()
+    expect!(blockOn(awxArguments(copy log)) == 123)
+    expect!(log.text == "abc")
+}
+
+@Test
+function awxAnAwaitInsideAnAwaitedFuture() {
+    expect!(blockOn(awxNestedFuture()) == 5)
+}
+
+@Test
+function awxAnAwaitInsideACompoundAssignment() {
+    expect!(blockOn(awxCompound()) == 7)
+}

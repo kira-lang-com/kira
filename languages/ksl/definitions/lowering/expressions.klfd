@@ -1,0 +1,199 @@
+// Expressions. `place` is the pointer a local, a host resource or a part
+// of either names, or -1; `value` is what an expression computes. A list
+// operand (a composition's parts, a call's arguments) is pushed only after
+// every operand is computed, since computing one may push its own.
+
+function binaryName(op: Operator) -> String {
+    match op {
+        Add -> return "add"
+        Subtract -> return "subtract"
+        Multiply -> return "multiply"
+        Divide -> return "divide"
+        Remainder -> return "modulo"
+        Equal -> return "equal"
+        NotEqual -> return "not_equal"
+        Less -> return "less"
+        LessEqual -> return "less_equal"
+        Greater -> return "greater"
+        GreaterEqual -> return "greater_equal"
+        LogicalAnd -> return "logical_and"
+        LogicalOr -> return "logical_or"
+        BitAnd -> return "and"
+        BitOr -> return "inclusive_or"
+        BitXor -> return "exclusive_or"
+        ShiftLeft -> return "shift_left"
+        ShiftRight -> return "shift_right"
+        Negate -> return "negate"
+        Not -> return "not"
+    }
+}
+
+function swizzleText(components: [Int]) -> String {
+    let letters = ["x", "y", "z", "w"]
+    var parts: [String] = []
+    for component in components {
+        parts.append(letters[component])
+    }
+    return joinText(parts)
+}
+
+extend Lowering {
+    function typeOf(borrow self, expression: Int) -> ShaderType {
+        return program.expressions[expression].expressionType
+    }
+
+    function place(borrow mut self, expression: Int) -> Int {
+        let checked = program.expressions[expression]
+        match checked.kind {
+            Local -> {
+                if direct[checked.target] { return -1 }
+                return places[checked.target]
+            }
+            Resource -> {
+                if isHandleType(checked.expressionType) { return -1 }
+                return shader_expr_global(module, builder, globals[checked.target])
+            }
+            Field -> {
+                let base = place(checked.left)
+                if base < 0 { return -1 }
+                return shader_expr_access_index(module, builder, base, checked.target)
+            }
+            Index -> {
+                let base = place(checked.left)
+                if base < 0 { return -1 }
+                return shader_expr_access(module, builder, base, value(checked.right))
+            }
+            Swizzle -> {
+                if checked.components.count != 1 { return -1 }
+                let base = place(checked.left)
+                if base < 0 { return -1 }
+                return shader_expr_access_index(module, builder, base, checked.components[0])
+            }
+            Constant -> return -1
+            OptionValue -> return -1
+            ArrayLength -> return -1
+            Construct -> return -1
+            Call -> return -1
+            Builtin -> return -1
+            Unary -> return -1
+            Binary -> return -1
+            Cast -> return -1
+            Invalid -> return -1
+        }
+    }
+
+    function value(borrow mut self, expression: Int) -> Int {
+        let checked = program.expressions[expression]
+        match checked.kind {
+            Constant -> return literal(builder, checked.value)
+            Local -> {
+                if direct[checked.target] { return places[checked.target] }
+                return shader_expr_load(module, builder, places[checked.target])
+            }
+            Resource -> {
+                let global = shader_expr_global(module, builder, globals[checked.target])
+                if isHandleType(checked.expressionType) { return global }
+                return shader_expr_load(module, builder, global)
+            }
+            OptionValue -> return shader_expr_override(module, builder, overrides[checked.target])
+            Field -> {
+                let pointer = place(expression)
+                if pointer >= 0 { return shader_expr_load(module, builder, pointer) }
+                return shader_expr_access_index(module, builder, value(checked.left), checked.target)
+            }
+            Swizzle -> {
+                let vector = value(checked.left)
+                if checked.components.count == 1 {
+                    return shader_expr_access_index(module, builder, vector, checked.components[0])
+                }
+                return shader_expr_swizzle(module, builder, vector, swizzleText(checked.components))
+            }
+            ArrayLength -> return shader_expr_array_length(module, builder, place(checked.left))
+            Index -> {
+                let pointer = place(expression)
+                if pointer >= 0 { return shader_expr_load(module, builder, pointer) }
+                let base = value(checked.left)
+                return shader_expr_access(module, builder, base, value(checked.right))
+            }
+            Construct -> return construction(checked)
+            Call -> {
+                let arguments = values(checked.arguments)
+                pushAll(arguments)
+                return shader_stmt_call(module, builder, handles[checked.target])
+            }
+            Builtin -> return builtinCall(checked)
+            Unary -> {
+                var name = "negate"
+                if checked.operator == .Not { name = "not" }
+                return shader_expr_unary(module, builder, name, value(checked.left))
+            }
+            Binary -> return binaryValue(checked)
+            Cast -> {
+                let converted = value(checked.left)
+                if typeOf(checked.left).same(checked.expressionType) { return converted }
+                return shader_expr_convert(module, builder, converted, checked.expressionType.scalar.name())
+            }
+            Invalid -> return -1
+        }
+    }
+
+    function values(borrow mut self, expressions: [Int]) -> [Int] {
+        var computed: [Int] = []
+        for expression in expressions {
+            computed.append(value(expression))
+        }
+        return computed
+    }
+
+    function pushAll(borrow mut self, words: [Int]) {
+        for word in words {
+            shader_push(module, word)
+        }
+    }
+
+    // `operand` widened to `width` lanes when it is a scalar.
+    function widened(borrow mut self, operand: Int, operandType: ShaderType, width: Int) -> Int {
+        if operandType.shape != .ScalarShape || width <= 1 { return operand }
+        return shader_expr_splat(module, builder, width, operand)
+    }
+
+    function construction(borrow mut self, checked: CheckedExpression) -> Int {
+        let built = checked.expressionType
+        var parts = values(checked.arguments)
+        if built.shape == .Vector && parts.count == 1 && typeOf(checked.arguments[0]).shape == .ScalarShape {
+            return shader_expr_splat(module, builder, built.width, parts[0])
+        }
+        // A matrix of scalars is built column by column.
+        if built.shape == .Matrix && parts.count == built.width * built.rows {
+            var columns: [Int] = []
+            let column = vectorType(.Float, built.rows)
+            for at in 0..built.width {
+                for row in 0..built.rows {
+                    shader_push(module, parts[at * built.rows + row])
+                }
+                columns.append(shader_expr_compose(module, builder, typeHandle(column)))
+            }
+            parts = columns
+        }
+        pushAll(parts)
+        return shader_expr_compose(module, builder, typeHandle(built))
+    }
+
+    function binaryValue(borrow mut self, checked: CheckedExpression) -> Int {
+        let leftType = typeOf(checked.left)
+        let rightType = typeOf(checked.right)
+        var left = value(checked.left)
+        var right = value(checked.right)
+        if leftType.shape == .Vector { right = widened(right, rightType, leftType.width) }
+        if rightType.shape == .Vector { left = widened(left, leftType, rightType.width) }
+        let combined = shader_expr_binary(module, builder, binaryName(checked.operator), left, right)
+        // KSL compares whole vectors to one `Bool`.
+        let vector = leftType.shape == .Vector || rightType.shape == .Vector
+        if vector && isComparison(checked.operator) {
+            var reduce = "all"
+            if checked.operator == .NotEqual { reduce = "any" }
+            return shader_expr_relational(module, builder, reduce, combined)
+        }
+        return combined
+    }
+}

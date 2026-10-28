@@ -1,0 +1,186 @@
+// Statements and scopes. Every `let` declares a new local, so a name bound
+// again in the same scope is a second variable that hides the first.
+
+extend Checker {
+    function bind(borrow mut self, name: String, localType: ShaderType) -> Int {
+        locals.append(LocalVariable { name = name, localType = localType })
+        visible.append(locals.count - 1)
+        return locals.count - 1
+    }
+
+    function lookup(borrow self, name: String) -> Int {
+        var at = visible.count - 1
+        while at >= 0 {
+            if locals[visible[at]].name == name { return visible[at] }
+            at -= 1
+        }
+        return -1
+    }
+
+    function checkBlock(borrow mut self, statements: [Int]) -> [Int] {
+        scopes.append(visible.count)
+        var checked: [Int] = []
+        for statement in statements {
+            checked.append(checkStatement(statement))
+        }
+        let start = scopes[scopes.count - 1]
+        var kept: [Int] = []
+        for index in 0..start {
+            kept.append(visible[index])
+        }
+        visible = kept
+        var open: [Int] = []
+        for index in 0..scopes.count - 1 {
+            open.append(scopes[index])
+        }
+        scopes = open
+        return checked
+    }
+
+    function addStatement(borrow mut self, kind: CheckedStatementKind, value: Int, span: Span) -> Int {
+        program.statements.append(CheckedStatement {
+            kind = kind, local = -1, target = -1, value = value, body = [], otherwise = [],
+            hasElse = false, span = span
+        })
+        return program.statements.count - 1
+    }
+
+    function checkStatement(borrow mut self, index: Int) -> Int {
+        let statement = tree.statements[index]
+        match statement.kind {
+            Let -> return checkLet(statement)
+            Assign -> return checkAssign(statement)
+            If -> return checkIf(statement)
+            While -> {
+                let condition = checkCondition(statement.value, statement.span)
+                let body = checkBlock(statement.body)
+                program.statements.append(CheckedStatement {
+                    kind = .WhileLoop, local = -1, target = -1, value = condition, body = body,
+                    otherwise = [], hasElse = false, span = statement.span
+                })
+                return program.statements.count - 1
+            }
+            Return -> return checkReturn(statement)
+            Block -> {
+                let body = checkBlock(statement.body)
+                program.statements.append(CheckedStatement {
+                    kind = .Nested, local = -1, target = -1, value = -1, body = body, otherwise = [],
+                    hasElse = false, span = statement.span
+                })
+                return program.statements.count - 1
+            }
+            Evaluate -> return addStatement(.EvaluateValue, checkExpression(statement.value), statement.span)
+        }
+    }
+
+    // `let name[: T][ = value]`: the annotation decides the type, else the
+    // value's; with neither the type is unknown.
+    function checkLet(borrow mut self, statement: Statement) -> Int {
+        var annotated = voidType()
+        let hasAnnotation = statement.typeReference >= 0
+        if hasAnnotation { annotated = resolve(statement.typeReference) }
+        var value = -1
+        if statement.value >= 0 {
+            value = checkExpression(statement.value)
+            if hasAnnotation { value = coerce(value, annotated, statement.span) }
+        }
+        var localType = annotated
+        if !hasAnnotation {
+            if value >= 0 {
+                localType = program.expressions[value].expressionType
+            } else {
+                report(.TypeMismatch, statement.span)
+            }
+        }
+        let local = bind(statement.name.text, localType)
+        program.statements.append(CheckedStatement {
+            kind = .LetLocal, local = local, target = -1, value = value, body = [], otherwise = [],
+            hasElse = false, span = statement.span
+        })
+        return program.statements.count - 1
+    }
+
+    function checkAssign(borrow mut self, statement: Statement) -> Int {
+        let target = checkExpression(statement.target)
+        let expected = program.expressions[target].expressionType
+        if !isAssignable(target) { report(.NotAssignable, statement.span) }
+        let value = coerce(checkExpression(statement.value), expected, statement.span)
+        program.statements.append(CheckedStatement {
+            kind = .AssignPlace, local = -1, target = target, value = value, body = [], otherwise = [],
+            hasElse = false, span = statement.span
+        })
+        return program.statements.count - 1
+    }
+
+    function checkIf(borrow mut self, statement: Statement) -> Int {
+        let condition = checkCondition(statement.value, statement.span)
+        let body = checkBlock(statement.body)
+        var otherwise: [Int] = []
+        let hasElse = statement.otherwise >= 0
+        if hasElse {
+            let alternative = tree.statements[statement.otherwise]
+            if alternative.kind == .Block {
+                otherwise = checkBlock(alternative.body)
+            } else {
+                otherwise = [checkStatement(statement.otherwise)]
+            }
+        }
+        program.statements.append(CheckedStatement {
+            kind = .IfElse, local = -1, target = -1, value = condition, body = body, otherwise = otherwise,
+            hasElse = hasElse, span = statement.span
+        })
+        return program.statements.count - 1
+    }
+
+    function checkReturn(borrow mut self, statement: Statement) -> Int {
+        var value = -1
+        if statement.value >= 0 {
+            value = coerce(checkExpression(statement.value), result, statement.span)
+        } else if !result.isVoid() {
+            report(.TypeMismatch, statement.span)
+        }
+        return addStatement(.ReturnValue, value, statement.span)
+    }
+
+    function checkCondition(borrow mut self, expression: Int, span: Span) -> Int {
+        let checked = checkExpression(expression)
+        let conditionType = program.expressions[checked].expressionType
+        if !conditionType.isScalar(.Bool) && !conditionType.isVoid() { report(.TypeMismatch, span) }
+        return checked
+    }
+
+    // A local, a writable storage element, or a part of either.
+    function isAssignable(borrow self, expression: Int) -> Bool {
+        let checked = program.expressions[expression]
+        match checked.kind {
+            Local -> return !isHandleType(locals[checked.target].localType)
+            Resource -> return program.resources[checked.target].access == .ReadWrite
+            Field -> return isAssignable(checked.left)
+            Swizzle -> return isAssignable(checked.left)
+            Index -> return isAssignable(checked.left)
+            Invalid -> return true
+            Constant -> return false
+            OptionValue -> return false
+            ArrayLength -> return false
+            Construct -> return false
+            Call -> return false
+            Builtin -> return false
+            Unary -> return false
+            Binary -> return false
+            Cast -> return false
+        }
+    }
+
+    function returnsOnEveryPath(borrow self, body: [Int]) -> Bool {
+        for index in body {
+            let statement = program.statements[index]
+            if statement.kind == .ReturnValue { return true }
+            if statement.kind == .IfElse && statement.hasElse {
+                if returnsOnEveryPath(statement.body) && returnsOnEveryPath(statement.otherwise) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+}

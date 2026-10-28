@@ -1,0 +1,249 @@
+import Foundation
+
+// cpio in the "new ASCII" format, `070701`, which Linux unpacks as an
+// initramfs: a 110-byte header of hexadecimal fields, the name ending in a
+// zero byte, the contents, each padded to 4 bytes, and a last entry named
+// `TRAILER!!!`.
+
+/// What an archive entry is: a file, a directory or a link.
+public enum ArchiveEntryKind {
+    /// A regular file, with contents.
+    File
+    /// A directory, with no contents.
+    Directory
+    /// A symbolic link, whose target is the entry's text.
+    Link
+}
+
+/// One entry read from an archive.
+public struct ArchiveEntry {
+    /// The path inside the archive, `/`-separated.
+    let path: String
+    /// What the entry is: a file, a directory or a link.
+    let kind: ArchiveEntryKind
+    /// The permission bits: 493 is what `chmod 755` sets.
+    let mode: UNumber
+    /// A file's contents.
+    let bytes: [UN8] = []
+    /// A link's target.
+    let target: String = ""
+}
+
+namespace CpioFormat {
+    let magic: String = "070701"
+    let checked: String = "070702"
+    let header: Number = 110
+    let trailer: String = "TRAILER!!!"
+    // The file type bits of a mode, and each type.
+    let typeBits: Number = 61440
+    let directory: Number = 16384
+    let regular: Number = 32768
+    let symbolic: Number = 40960
+    // The permission bits a mode keeps.
+    let permissionBits: Number = 4095
+}
+
+/// A writer of a cpio archive in the new ASCII format, `070701`, which Linux unpacks as an initramfs.
+public struct CpioWriter {
+    /// Where the archive's bytes go.
+    var sink: ArchiveSink
+    /// The inode number of the next entry.
+    var inode: Number = 1
+
+    /// Adds a directory at `path` with permission bits `mode`.
+    function addDirectory(
+        borrow mut self,
+        path: borrow String,
+        mode: UNumber
+    ) -> Result<Void, ArchiveFailure> {
+        let empty: [UN8] = []
+        return addEntry(path, CpioFormat.directory, mode, 2, empty)
+    }
+
+    /// Adds a file at `path` with permission bits `mode` and the contents `bytes`.
+    function addFile(
+        borrow mut self,
+        path: borrow String,
+        mode: UNumber,
+        bytes: borrow [UN8]
+    ) -> Result<Void, ArchiveFailure> {
+        return addEntry(path, CpioFormat.regular, mode, 1, bytes)
+    }
+
+    /// Adds a symbolic link at `path` pointing to `target`.
+    function addLink(
+        borrow mut self,
+        path: borrow String,
+        target: borrow String
+    ) -> Result<Void, ArchiveFailure> {
+        return addEntry(path, CpioFormat.symbolic, 511, 1, target.utf8())
+    }
+
+    /// Writes the trailer and closes the file, answering its length.
+    function finish(borrow mut self) -> Result<UNumber, ArchiveFailure> {
+        let empty: [UN8] = []
+        inode = 0
+        match addEntry(CpioFormat.trailer, 0, 0, 1, empty) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        return sink.finish()
+    }
+
+    /// Writes one entry's header, name and contents, each padded to 4 bytes.
+    function addEntry(
+        borrow mut self,
+        path: borrow String,
+        type: Number,
+        mode: UNumber,
+        links: Number,
+        bytes: borrow [UN8]
+    ) -> Result<Void, ArchiveFailure> {
+        let name = path.utf8()
+        let fields = [
+            inode,
+            type | (mode & CpioFormat.permissionBits),
+            0,
+            0,
+            links,
+            0,
+            bytes.count,
+            0,
+            0,
+            0,
+            0,
+            name.count + 1,
+            0
+        ]
+        sink.append(CpioFormat.magic.utf8())
+        for field in fields { appendHexField(sink, field) }
+        sink.append(name)
+        sink.appendByte(0)
+        padToFour(sink)
+        sink.append(bytes)
+        padToFour(sink)
+        if inode > 0 { inode += 1 }
+        return sink.spill()
+    }
+}
+
+/// A cpio writer writing the file `path`, which must not exist yet.
+public function createCpioWriter(path: borrow String) -> Result<CpioWriter, ArchiveFailure> {
+    return match createArchiveSink(path) {
+        Ok(sink) -> .Ok(CpioWriter { sink: sink })
+        Error(failure) -> .Error(failure)
+    }
+}
+
+/// Every entry of the cpio archive `bytes`, up to its trailer.
+public function readCpio(bytes: borrow [UN8]) -> Result<[ArchiveEntry], ArchiveFailure> {
+    var entries: [ArchiveEntry] = []
+    var at: Number = 0
+    while true {
+        if at + 110 > bytes.count {
+            return .Error(.Malformed("a cpio archive ends without a trailer"))
+        }
+        let magic = textOfBytes(bytes, at, 6)
+        if magic != CpioFormat.magic && magic != CpioFormat.checked {
+            return .Error(.Unsupported("a cpio header begins \(magic), not 070701"))
+        }
+        var fields: [Number] = []
+        for index in 0..13 {
+            match hexField(bytes, at + 6 + index * 8) {
+                Some(value) -> fields.append(value)
+                None -> return .Error(.Malformed("a cpio header field is not hexadecimal"))
+            }
+        }
+        let mode = fields[1]
+        let size = fields[6]
+        let nameSize = fields[11]
+        let nameAt = at + 110
+        let dataAt = fourAligned(nameAt + nameSize)
+        if nameSize < 1 || dataAt + size > bytes.count {
+            return .Error(.Malformed("a cpio entry runs past the archive's end"))
+        }
+        let path = match textFromByteRun(bytes, nameAt, nameAt + nameSize - 1) {
+            Some(text) -> text
+            None -> return .Error(.Unsupported("a cpio entry's name is not UTF-8"))
+        }
+        at = fourAligned(dataAt + size)
+        if path == CpioFormat.trailer { return .Ok(entries) }
+        let permissions = Number(mode) & CpioFormat.permissionBits
+        let data = byteRun(bytes, dataAt, dataAt + size)
+        let kind = match cpioKind(Number(mode) & CpioFormat.typeBits) {
+            Some(found) -> found
+            None -> return .Error(.Unsupported("\(path) is neither a file, a directory nor a link"))
+        }
+        match kind {
+            Directory -> entries.append(
+                ArchiveEntry { path: path, kind: .Directory, mode: permissions }
+            )
+            File -> entries.append(
+                ArchiveEntry { path: path, kind: .File, mode: permissions, bytes: data }
+            )
+            Link -> {
+                let target = match textFromBytes(data) {
+                    Some(text) -> text
+                    None -> return .Error(.Unsupported("the target of \(path) is not UTF-8"))
+                }
+                entries.append(
+                    ArchiveEntry { path: path, kind: .Link, mode: permissions, target: target }
+                )
+            }
+        }
+    }
+    return .Ok(entries)
+}
+
+// `value` as 8 upper-case hexadecimal digits.
+function appendHexField(sink: borrow mut ArchiveSink, value: Number) {
+    for index in 0..8 {
+        let digit = (value >> ((7 - index) * 4)) & 15
+        sink.appendByte(UN8(digit < 10 ? 48 + digit : 55 + digit))
+    }
+}
+
+function padToFour(sink: borrow mut ArchiveSink) {
+    while sink.count() % 4 != 0 { sink.appendByte(0) }
+}
+
+function fourAligned(offset: Number) -> Number {
+    return trunc((offset + 3) / 4) * 4
+}
+
+// The 8 hexadecimal digits at `at`, when they are.
+function hexField(bytes: borrow [UN8], at: Number) -> Number? {
+    var value: Number = 0
+    for index in 0..8 {
+        let byte = Number(bytes[at + index])
+        var digit: Number = 0
+        if byte >= 48 && byte <= 57 {
+            digit = byte - 48
+        } else if byte >= 65 && byte <= 70 {
+            digit = byte - 55
+        } else if byte >= 97 && byte <= 102 {
+            digit = byte - 87
+        } else {
+            return .None
+        }
+        value = value * 16 + digit
+    }
+    return .Some(value)
+}
+
+// The kind of entry a mode's type bits name: 0o040000, 0o100000 and
+// 0o120000.
+function cpioKind(type: Number) -> ArchiveEntryKind? {
+    return match type {
+        16384 -> .Some(.Directory)
+        32768 -> .Some(.File)
+        40960 -> .Some(.Link)
+        else -> .None
+    }
+}
+
+// The `count` bytes at `at` as text, or nothing when they are not UTF-8; a
+// header's magic is ASCII.
+function textOfBytes(bytes: borrow [UN8], at: Number, count: Number) -> String {
+    return textFromByteRun(bytes, at, at + count).or("")
+}

@@ -1,0 +1,124 @@
+// Writing a `JsonValue` back out as text.
+//
+// What `writeJson` produces parses back to the value it was given, which is the
+// property worth having: a document read, changed in one place and written out
+// is the same document everywhere else.
+//
+// Object members are written in the order the value holds them, repeats and
+// all. Sorting them would be a second opinion about a document somebody else
+// wrote, and a signature computed over the text would stop matching.
+
+// How much space goes between tokens.
+enum JsonLayout {
+    // Nothing the format does not require.
+    Compact
+    // One element to a line, indented this many spaces per level.
+    Indented(Number)
+}
+
+// The value as compact JSON.
+function writeJson(value: borrow JsonValue) -> String {
+    return writtenJson(value, .Compact, 0)
+}
+
+// The value as JSON indented two spaces per level, one element to a line.
+//
+// For a document a person is going to read: a diff of two of these is a diff of
+// what changed, while a diff of two compact documents is one long line.
+function writeJsonPretty(value: borrow JsonValue) -> String {
+    return writtenJson(value, .Indented(2), 0)
+}
+
+// Both forms, because they differ only in what goes between the tokens. A
+// `Number` is written as `String` spells it, which reads back as the same
+// `Number`.
+function writtenJson(value: borrow JsonValue, layout: borrow JsonLayout, level: Number) -> String {
+    match value {
+        Null -> return "null"
+        Boolean(flag) -> return flag ? "true" : "false"
+        Number(number) -> return String(number)
+        Text(text) -> return quotedJson(text)
+        Array(items) -> {
+            if items.count == 0 { return "[]" }
+            let inner = jsonBreak(layout, level + 1)
+            var out = "["
+            for index in 0..items.count {
+                out = out + (index > 0 ? "," : "") + inner
+                out = out + writtenJson(items[index], layout, level + 1)
+            }
+            return out + jsonBreak(layout, level) + "]"
+        }
+        Object(members) -> {
+            if members.count == 0 { return "{}" }
+            let inner = jsonBreak(layout, level + 1)
+            let separator = jsonBreak(layout, 0) == "" ? ":" : ": "
+            var out = "{"
+            for index in 0..members.count {
+                out = out + (index > 0 ? "," : "") + inner
+                out = out + quotedJson(members[index].name) + separator
+                out = out + writtenJson(members[index].value, layout, level + 1)
+            }
+            return out + jsonBreak(layout, level) + "}"
+        }
+    }
+}
+
+// The line break and indent before an element, or nothing when compact.
+function jsonBreak(layout: borrow JsonLayout, level: Number) -> String {
+    match layout {
+        Compact -> return ""
+        Indented(spaces) -> {
+            var out = "\n"
+            for index in 0..spaces * level { out = out + " " }
+            return out
+        }
+    }
+}
+
+// A string as a quoted JSON string.
+//
+// Bytes are copied in runs between the ones that need escaping, so text that
+// needs none costs one copy. Only what the format requires is escaped: a
+// multi-byte UTF-8 scalar is already legal JSON and stays as it is, rather than
+// becoming a `\u` pair that says the same thing in three times the bytes.
+function quotedJson(text: borrow String) -> String {
+    var out = "\""
+    var runStart: Number = 0
+    for index in 0..text.count {
+        match jsonEscape(storedByte(text, index)) {
+            Some(escape) -> {
+                out = out + slice(text, runStart, index) + escape
+                runStart = index + 1
+            }
+            None -> {}
+        }
+    }
+    return out + slice(text, runStart, text.count) + "\""
+}
+
+// The escape a byte needs inside a JSON string: the quote, the backslash, the
+// five control bytes the format names, and `\u00xx` for the other control
+// bytes, which is the only spelling they have.
+function jsonEscape(byte: Number) -> String? {
+    match Number(byte) {
+        0x22 -> return .Some("\\\"")
+        0x5C -> return .Some("\\\\")
+        0x08 -> return .Some("\\b")
+        0x09 -> return .Some("\\t")
+        0x0A -> return .Some("\\n")
+        0x0C -> return .Some("\\f")
+        0x0D -> return .Some("\\r")
+        0x00..0x08, 0x0B, 0x0E..0x20 -> {
+            let digits = "0123456789abcdef"
+            let value = Number(byte)
+            return .Some(
+                "\\u00" + slice(digits, trunc(value / 16), trunc(value / 16) + 1) + slice(
+                    digits,
+                    value % 16,
+                    value % 16 + 1
+                )
+            )
+        }
+        else -> return .None
+    }
+}

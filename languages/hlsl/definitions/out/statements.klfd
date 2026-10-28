@@ -1,0 +1,384 @@
+// Math functions, the statements HLSL spells its own way (interlocked
+// operations, which return their result through an `out` argument, and
+// barriers), and the helper functions bodies call.
+
+function hlslMathName(fun: String) -> String {
+    match fun {
+        "fract" -> return "frac"
+        "inverse_sqrt" -> return "rsqrt"
+        "face_forward" -> return "faceforward"
+        "mix" -> return "lerp"
+        "fma" -> return "mad"
+        "reverse_bits" -> return "reversebits"
+        "abs" -> return fun
+        "min" -> return fun
+        "max" -> return fun
+        "clamp" -> return fun
+        "saturate" -> return fun
+        "sin" -> return fun
+        "cos" -> return fun
+        "tan" -> return fun
+        "asin" -> return fun
+        "acos" -> return fun
+        "atan" -> return fun
+        "atan2" -> return fun
+        "sinh" -> return fun
+        "cosh" -> return fun
+        "tanh" -> return fun
+        "radians" -> return fun
+        "degrees" -> return fun
+        "ceil" -> return fun
+        "floor" -> return fun
+        "round" -> return fun
+        "trunc" -> return fun
+        "exp" -> return fun
+        "exp2" -> return fun
+        "log" -> return fun
+        "log2" -> return fun
+        "pow" -> return fun
+        "sqrt" -> return fun
+        "dot" -> return fun
+        "cross" -> return fun
+        "distance" -> return fun
+        "length" -> return fun
+        "normalize" -> return fun
+        "reflect" -> return fun
+        "refract" -> return fun
+        "step" -> return fun
+        "smoothstep" -> return fun
+        "transpose" -> return fun
+        "determinant" -> return fun
+        else -> return ""
+    }
+}
+
+function hlslAtomicFunction(fun: String) -> String {
+    match fun {
+        "add" -> return "InterlockedAdd"
+        "subtract" -> return "InterlockedAdd"
+        "and" -> return "InterlockedAnd"
+        "or" -> return "InterlockedOr"
+        "xor" -> return "InterlockedXor"
+        "min" -> return "InterlockedMin"
+        "max" -> return "InterlockedMax"
+        "exchange" -> return "InterlockedExchange"
+        else -> return "InterlockedCompareExchange"
+    }
+}
+
+// Whether `a` sorts before `b` byte by byte.
+function sortsBefore(a: String, b: String) -> Bool {
+    let aLength = utf8Count(a)
+    let bLength = utf8Count(b)
+    var shorter = aLength
+    if bLength < shorter { shorter = bLength }
+    for at in 0..shorter {
+        let x = utf8Byte(a, at)
+        let y = utf8Byte(b, at)
+        if x != y { return x < y }
+    }
+    return aLength < bLength
+}
+
+extend TextOut {
+    function hlslMath(borrow self, expression: Int) -> String {
+        var parts: [String] = []
+        let items = fieldCount("expressions", current, expression, "items")
+        for at in 0..items {
+            parts.append(operand(fieldItem("expressions", current, expression, "items", at)))
+        }
+        let fun = text("expressions", current, expression, "fun")
+        let named = hlslMathName(fun)
+        if utf8Count(named) > 0 { return joinText([named, "(", joinWith(parts, ", "), ")"]) }
+        let ty = resultType(expression)
+        let x = parts[0]
+        let unsigned = scalarKind(scalarOf(fieldItem("expressions", current, expression, "items", 0))) == "uint"
+        if fun == "sign" && unsigned { return joinText(["min(", x, ", 1u)"]) }
+        if fun == "sign" { return joinText([ty, "(sign(", x, "))"]) }
+        if fun == "asinh" { return joinText(["log(", x, " + sqrt(", x, " * ", x, " + 1.0))"]) }
+        if fun == "acosh" { return joinText(["log(", x, " + sqrt(", x, " * ", x, " - 1.0))"]) }
+        if fun == "atanh" { return joinText(["(0.5 * log((1.0 + ", x, ") / (1.0 - ", x, ")))"]) }
+        if fun == "count_one_bits" { return joinText([ty, "(countbits(", x, "))"]) }
+        if fun == "first_leading_bit" { return joinText([ty, "(firstbithigh(", x, "))"]) }
+        if fun == "first_trailing_bit" { return joinText([ty, "(firstbitlow(", x, "))"]) }
+        if fun == "count_leading_zeros" { return joinText([ty, "(31 - int(firstbithigh(asuint(", x, "))))"]) }
+        if fun == "count_trailing_zeros" { return joinText([ty, "(min(firstbitlow(", x, "), 32u))"]) }
+        if fun == "pack2x16float" {
+            return joinText(["(f32tof16(", x, ".x) | (f32tof16(", x, ".y) << 16))"])
+        }
+        if fun == "unpack2x16float" { return joinText(["float2(f16tof32(", x, "), f16tof32(", x, " >> 16))"]) }
+        if fun == "pack4x8unorm" {
+            return joinText(["dot(uint4(round(saturate(", x, ") * 255.0)), uint4(1u, 256u, 65536u, 16777216u))"])
+        }
+        if fun == "unpack4x8unorm" { return joinText(["(float4((", x, " >> uint4(0u, 8u, 16u, 24u)) & 255u) / 255.0)"]) }
+        if fun == "extract_bits" || fun == "insert_bits" || fun == "pack4x8snorm" || fun == "pack2x16snorm"
+            || fun == "pack2x16unorm" || fun == "unpack4x8snorm" || fun == "unpack2x16snorm"
+            || fun == "unpack2x16unorm" {
+            refuse(joinText(["the HLSL backend has no form of ", fun]))
+            return ""
+        }
+        return joinText([fun, "(", joinWith(parts, ", "), ")"])
+    }
+
+    // `T name` for a value of an expression's type.
+    function temporaryDeclaration(borrow self, expression: Int, name: String) -> String {
+        if flag("expressions", current, expression, "shaped") {
+            return joinText([resultType(expression), " ", name])
+        }
+        return commentedText(declaredText(typeOf(expression), name))
+    }
+
+    function writeAtomic(borrow mut self, block: Int, position: Int, depth: Int) {
+        let target = operand(statementField(block, position, "pointer"))
+        let valueIndex = statementField(block, position, "value")
+        var value = operand(valueIndex)
+        let fun = text("statements", block, position, "fun")
+        if fun == "subtract" { value = joinText(["(-", value, ")"]) }
+        let compareIndex = statementField(block, position, "compare")
+        var compare = ""
+        if compareIndex >= 0 { compare = joinText([operand(compareIndex), ", "]) }
+        let result = statementField(block, position, "result")
+        var out = ""
+        if result >= 0 {
+            let name = scopeName(joinText(["_e", decimalText(result)]))
+            line(depth, joinText([temporaryDeclaration(result, name), ";"]))
+            baked[result] = name
+            out = joinText([", ", name])
+        } else if fun == "exchange" || fun == "compare_exchange" {
+            let name = scopeFresh("discarded")
+            line(depth, joinText([resultType(valueIndex), " ", name, ";"]))
+            out = joinText([", ", name])
+        }
+        line(depth, joinText([hlslAtomicFunction(fun), "(", target, ", ", compare, value, out, ");"]))
+    }
+
+    function dialectStatement(borrow mut self, block: Int, position: Int, which: String, depth: Int) -> Bool {
+        if which == "kill" {
+            line(depth, "discard;")
+            return true
+        }
+        if which == "image_store" {
+            let image = operand(statementField(block, position, "image"))
+            let at = texelCoordinate(statementField(block, position, "coordinate"),
+                statementField(block, position, "array_index"), "")
+            let value = operand(statementField(block, position, "value"))
+            line(depth, joinText([image, "[", at, "] = ", value, ";"]))
+            return true
+        }
+        if which == "atomic" {
+            writeAtomic(block, position, depth)
+            return true
+        }
+        if which == "control_barrier" || which == "memory_barrier" {
+            var sync = ""
+            if which == "control_barrier" { sync = "WithGroupSync" }
+            let flags = text("statements", block, position, "flags")
+            let device = containsWord(flags, "storage") || containsWord(flags, "image")
+            var barrier = "GroupMemoryBarrier"
+            if containsWord(flags, "workgroup") && device {
+                barrier = "AllMemoryBarrier"
+            } else if device {
+                barrier = "DeviceMemoryBarrier"
+            }
+            line(depth, joinText([barrier, sync, "();"]))
+            return true
+        }
+        if which == "workgroup_uniform_load" {
+            let value = operand(statementField(block, position, "pointer"))
+            line(depth, "GroupMemoryBarrierWithGroupSync();")
+            bake(statementField(block, position, "result"), value, depth)
+            line(depth, "GroupMemoryBarrierWithGroupSync();")
+            return true
+        }
+        if which == "store" || which == "return" {
+            // An array's zero is a brace list, which HLSL takes only in a
+            // declaration.
+            let value = statementField(block, position, "value")
+            if value >= 0 && expressionKind(value) == "zero" && typeKindOf(value) == "array"
+                && utf8Count(baked[value]) == 0 {
+                let zero = operand(value)
+                bake(value, zero, depth)
+            }
+            return false
+        }
+        if which == "call" {
+            let arguments = fieldCount("statements", block, position, "arguments")
+            for at in 0..arguments {
+                let argumentType = typeOf(fieldItem("statements", block, position, "arguments", at))
+                if typeKind(argumentType) == "pointer" {
+                    let space = typeText(argumentType, "space")
+                    if space != "function" && space != "private" {
+                        refuseAt("a pointer argument outside function or private memory", "statements", block,
+                            position)
+                    }
+                }
+            }
+        }
+        return false
+    }
+
+    // `array_length` calls a helper that asks the buffer its length.
+    function arrayLength(borrow self, pointer: Int) -> String {
+        if expressionKind(pointer) != "global" {
+            refuse("the length of an array that is not a whole buffer")
+            return ""
+        }
+        return joinText(["_ksir_length_", globalNames[operandOf(pointer, "global")], "()"])
+    }
+
+    // What a texture query's helper returns, in order.
+    function queryOutputs(borrow self, imageType: Int) -> [String] {
+        let dimension = typeText(imageType, "dimension")
+        var outputs: [String] = ["w"]
+        if dimension != "1d" { outputs.append("h") }
+        if dimension == "3d" { outputs.append("d") }
+        if flag("types", -1, imageType, "arrayed") { outputs.append("layers") }
+        if flag("types", -1, imageType, "multisampled") {
+            outputs.append("samples")
+        } else if typeText(imageType, "class") != "storage" {
+            outputs.append("levels")
+        }
+        return outputs
+    }
+
+    function levelParameter(borrow self, imageType: Int) -> Bool {
+        return typeText(imageType, "class") != "storage" && !flag("types", -1, imageType, "multisampled")
+    }
+
+    function imageTypeText(borrow self, imageType: Int) -> String {
+        let written = hlslImage(imageType)
+        if failedText(written) { return "" }
+        return written
+    }
+
+    function hlslQuery(borrow self, expression: Int) -> String {
+        let image = operandOf(expression, "image")
+        let imageType = typeOf(image)
+        let written = imageTypeText(imageType)
+        var number = 0
+        for at in 0..dialect.dimensionTypes.count {
+            if dialect.dimensionTypes[at] == written { number = at }
+        }
+        let helper = joinText(["_ksir_dimensions", decimalText(number)])
+        let outputs = queryOutputs(imageType)
+        let texture = operand(image)
+        let query = text("expressions", current, expression, "query")
+        var level = "0u"
+        let levelIndex = operandOf(expression, "level_value")
+        if query == "size" && levelIndex >= 0 { level = joinText(["uint(", operand(levelIndex), ")"]) }
+        var call = joinText([helper, "(", texture, ")"])
+        if levelParameter(imageType) { call = joinText([helper, "(", texture, ", ", level, ")"]) }
+        if query == "size" {
+            var swizzle: [String] = []
+            for at in 0..outputs.count {
+                let output = outputs[at]
+                if output == "w" || output == "h" || output == "d" { swizzle.append(laneText(at)) }
+            }
+            return joinText([resultType(expression), "(", call, ".", joinText(swizzle), ")"])
+        }
+        for at in 0..outputs.count {
+            if outputs[at] == query { return joinText([call, ".", laneText(at)]) }
+        }
+        return ""
+    }
+
+    function addHelper(borrow mut self, name: String, body: String) {
+        if hasText(dialect.helperNames, name) { return }
+        var names: [String] = []
+        var texts: [String] = []
+        var placed = false
+        for known in 0..dialect.helperNames.count {
+            if !placed && sortsBefore(name, dialect.helperNames[known]) {
+                names.append(name)
+                texts.append(body)
+                placed = true
+            }
+            names.append(dialect.helperNames[known])
+            texts.append(dialect.helperTexts[known])
+        }
+        if !placed {
+            names.append(name)
+            texts.append(body)
+        }
+        dialect.helperNames = names
+        dialect.helperTexts = texts
+    }
+
+    // Finds the helpers the bodies will call, in the order the bodies are
+    // written, since they come before the first function.
+    function prepareHelpers(borrow mut self) {
+        let functions = count("functions", -1)
+        for which in 0..functions {
+            if !isEntry(which) { helpersOfFunction(which) }
+        }
+        for which in 0..functions {
+            if isEntry(which) { helpersOfFunction(which) }
+        }
+        current = -1
+    }
+
+    function helpersOfFunction(borrow mut self, which: Int) {
+        current = which
+        helpersOfBlock(field("functions", -1, which, "body"))
+    }
+
+    function helpersOfBlock(borrow mut self, block: Int) {
+        let statements = count("statements", block)
+        for position in 0..statements {
+            let which = statementKind(block, position)
+            if which == "emit" {
+                let end = statementField(block, position, "last") + 1
+                for expression in statementField(block, position, "first")..end {
+                    if shouldBake(expression) { helpersOfExpression(expression) }
+                }
+            } else if which == "block" {
+                helpersOfBlock(statementField(block, position, "body"))
+            } else if which == "if" {
+                helpersOfBlock(statementField(block, position, "accept"))
+                helpersOfBlock(statementField(block, position, "reject"))
+            } else if which == "switch" {
+                let cases = fieldCount("statements", block, position, "case_block")
+                for at in 0..cases {
+                    helpersOfBlock(fieldItem("statements", block, position, "case_block", at))
+                }
+            } else if which == "loop" {
+                // The continuing is written first, at the top of the loop.
+                helpersOfBlock(statementField(block, position, "continuing"))
+                helpersOfBlock(statementField(block, position, "body"))
+            }
+        }
+    }
+
+    function helpersOfExpression(borrow mut self, expression: Int) {
+        let which = expressionKind(expression)
+        if which == "array_length" {
+            let pointer = operandOf(expression, "pointer")
+            if expressionKind(pointer) == "global" {
+                let name = globalNames[operandOf(pointer, "global")]
+                let helper = joinText(["_ksir_length_", name])
+                addHelper(helper, joinText(["uint ", helper, "() {\n    uint count, stride;\n    ", name,
+                    ".GetDimensions(count, stride);\n    return count;\n}\n"]))
+            }
+        } else if which == "image_query" {
+            let imageType = typeOf(operandOf(expression, "image"))
+            let written = imageTypeText(imageType)
+            if hasText(dialect.dimensionTypes, written) { return }
+            let helper = joinText(["_ksir_dimensions", decimalText(dialect.dimensionTypes.count)])
+            dialect.dimensionTypes.append(written)
+            let outputs = queryOutputs(imageType)
+            let declarations = joinWith(outputs, ", ")
+            var parameter = ""
+            var call = joinText(["t.GetDimensions(", declarations, ")"])
+            if levelParameter(imageType) {
+                parameter = ", uint level"
+                call = joinText(["t.GetDimensions(level, ", declarations, ")"])
+            }
+            var padded = copiedTexts(outputs)
+            while padded.count < 4 {
+                padded.append("0u")
+            }
+            addHelper(helper, joinText(["uint4 ", helper, "(", written, " t", parameter, ") {\n    uint ", declarations,
+                ";\n    ", call, ";\n    return uint4(", joinWith(padded, ", "), ");\n}\n"]))
+        }
+    }
+}

@@ -1,0 +1,119 @@
+// Compile-time values: literals, `const`s, enum variants and option
+// defaults. A value is retyped to the scalar its use expects when the
+// oracle allows it: integers become either integer kind or either float
+// kind, a float either float kind, and nothing becomes `Bool` but a
+// boolean.
+
+// The largest `Int` an integer literal can be; past it, a literal is a
+// `UInt`.
+let largestInt = "9223372036854775807"
+
+function literalValue(digits: String) -> ConstValue {
+    if digitsExceed(digits, largestInt) { return ConstValue { scalar = .UInt, text = digits } }
+    return ConstValue { scalar = .Int, text = digits }
+}
+
+function retype(value: ConstValue, scalar: Scalar) -> Optional<ConstValue> {
+    let none: Optional<ConstValue> = .None
+    let retyped = ConstValue { scalar = scalar, text = value.text }
+    match value.scalar {
+        Bool -> {
+            if scalar == .Bool { return .Some(retyped) }
+            return none
+        }
+        Int -> {
+            if scalar == .Bool { return none }
+            return .Some(retyped)
+        }
+        UInt -> {
+            if scalar == .Bool { return none }
+            if scalar == .Int && digitsExceed(value.text, largestInt) { return none }
+            return .Some(retyped)
+        }
+        Float -> {
+            if scalar == .Float || scalar == .Half { return .Some(retyped) }
+            return none
+        }
+        Half -> {
+            if scalar == .Float || scalar == .Half { return .Some(retyped) }
+            return none
+        }
+    }
+}
+
+// `-value`, for the signed kinds: a `UInt` or `Bool` has no negative.
+function negated(value: ConstValue) -> Optional<ConstValue> {
+    let none: Optional<ConstValue> = .None
+    if value.scalar != .Int && value.scalar != .Float { return none }
+    if negativeText(value.text) {
+        return .Some(ConstValue { scalar = value.scalar, text = utf8Slice(value.text, 1, utf8Count(value.text)) })
+    }
+    return .Some(ConstValue { scalar = value.scalar, text = joinText(["-", value.text]) })
+}
+
+// A thread extent: a whole number from 1 to the largest `UInt`.
+function extentValue(value: ConstValue) -> Int {
+    if value.scalar == .Bool || value.scalar == .Float { return -1 }
+    match decimalValue(value.text, 4294967295) {
+        Some(extent) -> {
+            if extent < 1 { return -1 }
+            return extent
+        }
+        None -> return -1
+    }
+}
+
+extend Checker {
+    // The value `expression` folds to at type `expected`: a literal, a
+    // name of an option or constant, or an `Enum.Variant` path.
+    function constant(borrow mut self, expression: Int, expected: ShaderType) -> Optional<ConstValue> {
+        let none: Optional<ConstValue> = .None
+        if expected.shape != .ScalarShape || expected.array { return none }
+        let written = tree.expressions[expression]
+        match written.kind {
+            IntegerLiteral -> return retype(literalValue(written.text), expected.scalar)
+            FloatLiteral -> return retype(ConstValue { scalar = .Float, text = written.text }, expected.scalar)
+            BooleanLiteral -> return retype(ConstValue { scalar = .Bool, text = written.text }, expected.scalar)
+            Name -> {
+                let option = lastNamed(optionNames, written.text)
+                if option >= 0 { return retype(program.options[option].value, expected.scalar) }
+                var found = constantNamed(qualified(written.text))
+                if found < 0 { found = constantNamed(written.text) }
+                if found < 0 { return none }
+                return retype(constants[found].value, expected.scalar)
+            }
+            Field -> {
+                match writtenPath(expression) {
+                    Some(path) -> {
+                        let found = constantNamed(path)
+                        if found < 0 { return none }
+                        return retype(constants[found].value, expected.scalar)
+                    }
+                    None -> return none
+                }
+            }
+            Index -> return none
+            Call -> return none
+            Unary -> {
+                if written.operator != .Negate { return none }
+                match constant(written.left, expected) {
+                    Some(value) -> return negated(value)
+                    None -> return none
+                }
+            }
+            Binary -> return none
+        }
+    }
+
+    // `A.B.c` as `A_B_c`, when the expression is a dotted path of names.
+    function writtenPath(borrow self, expression: Int) -> Optional<String> {
+        let none: Optional<String> = .None
+        let written = tree.expressions[expression]
+        if written.kind == .Name { return .Some(written.text) }
+        if written.kind != .Field { return none }
+        match writtenPath(written.left) {
+            Some(base) -> return .Some(joinText([base, "_", written.text]))
+            None -> return none
+        }
+    }
+}

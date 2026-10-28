@@ -1,0 +1,221 @@
+// Entry points and resources KSL spells only one way. A KSL stage takes one
+// input struct and returns one output struct, where an entry MSL wrote takes
+// a `[[stage_in]]` struct and loose built-ins and may return a bare value; a
+// KSL uniform is a struct, where MSL binds a bare `uint` as well. The out
+// declares a struct for each and unpacks it where it is read.
+
+function stageWord(stage: String) -> String {
+    if stage == "vertex" { return "Vertex" }
+    if stage == "fragment" { return "Fragment" }
+    return "Compute"
+}
+
+extend KslOut {
+    // Whether the entry's arguments are already one struct, or none.
+    function plainInput(borrow self, entry: Int) -> Bool {
+        let arguments = count("arguments", entry)
+        if arguments == 0 { return true }
+        return arguments == 1 && kind("types", -1, field("arguments", entry, 0, "type")) == "struct"
+    }
+
+    function plainOutput(borrow self, entry: Int) -> Bool {
+        let result = field("functions", -1, entry, "result")
+        return result < 0 || kind("types", -1, result) == "struct"
+    }
+
+    function inputName(borrow self, entry: Int) -> String {
+        return joinText(["_", stageWord(text("functions", -1, entry, "stage")), "Input"])
+    }
+
+    function outputName(borrow self, entry: Int) -> String {
+        return joinText(["_", stageWord(text("functions", -1, entry, "stage")), "Output"])
+    }
+
+    // The members of the input struct, one per argument that is not a
+    // struct and one per member of each that is, in argument order.
+    function inputMembers(borrow self, entry: Int) -> [String] {
+        var names: [String] = []
+        let arguments = count("arguments", entry)
+        for argument in 0..arguments {
+            let argumentType = field("arguments", entry, argument, "type")
+            if kind("types", -1, argumentType) == "struct" {
+                let members = count("members", argumentType)
+                for member in 0..members {
+                    names.append(uniqueName(kslName(text("members", argumentType, member, "name")), names))
+                }
+            } else {
+                var name = text("arguments", entry, argument, "name")
+                if utf8Count(name) == 0 { name = joinText(["_a", decimalText(argument)]) }
+                names.append(uniqueName(kslName(name), names))
+            }
+        }
+        return names
+    }
+
+    function writeEntryTypes(borrow mut self, entry: Int) {
+        if !plainInput(entry) { writeInputStruct(entry) }
+        if !plainOutput(entry) { writeOutputStruct(entry) }
+    }
+
+    // KSL numbers locations by declaration, so built-ins come first and
+    // the rest in location order, which must leave no gap.
+    function writeInputStruct(borrow mut self, entry: Int) {
+        let names = inputMembers(entry)
+        var tables: [String] = []
+        var owners: [Int] = []
+        var indices: [Int] = []
+        let arguments = count("arguments", entry)
+        for argument in 0..arguments {
+            let argumentType = field("arguments", entry, argument, "type")
+            if kind("types", -1, argumentType) == "struct" {
+                let members = count("members", argumentType)
+                for member in 0..members {
+                    tables.append("members")
+                    owners.append(argumentType)
+                    indices.append(member)
+                }
+            } else {
+                tables.append("arguments")
+                owners.append(entry)
+                indices.append(argument)
+            }
+        }
+        line(joinText(["type ", inputName(entry), " {"]))
+        indent += 1
+        for at in 0..names.count {
+            let builtin = text(tables[at], owners[at], indices[at], "builtin")
+            if utf8Count(builtin) > 0 {
+                writeInterfaceMember(names[at], tables[at], owners[at], indices[at])
+            }
+        }
+        var location = 0
+        var placing = true
+        while placing {
+            placing = false
+            for at in 0..names.count {
+                if field(tables[at], owners[at], indices[at], "location") == location {
+                    writeInterfaceMember(names[at], tables[at], owners[at], indices[at])
+                    placing = true
+                }
+            }
+            location += 1
+        }
+        for at in 0..names.count {
+            let builtin = text(tables[at], owners[at], indices[at], "builtin")
+            if utf8Count(builtin) == 0 && field(tables[at], owners[at], indices[at], "location") >= location {
+                refuse("gap between input locations", -1)
+            }
+        }
+        indent -= 1
+        line("}")
+        line("")
+    }
+
+    function writeOutputStruct(borrow mut self, entry: Int) {
+        let builtin = text("functions", -1, entry, "result_builtin")
+        if utf8Count(builtin) == 0 && field("functions", -1, entry, "result_location") > 0 {
+            refuse("output at a location other than 0 alone", -1)
+        }
+        line(joinText(["type ", outputName(entry), " {"]))
+        indent += 1
+        writeAttributes(builtin, text("functions", -1, entry, "result_interpolation"),
+            text("functions", -1, entry, "result_sampling"), field("functions", -1, entry, "result_blend_src"))
+        line(joinText(["let value: ", typeName(field("functions", -1, entry, "result"), -1)]))
+        indent -= 1
+        line("}")
+        line("")
+    }
+
+    // A member, with its attributes, of a record of `table` (`members` or
+    // `arguments`).
+    function writeInterfaceMember(borrow mut self, name: String, table: String, owner: Int, index: Int) {
+        writeAttributes(text(table, owner, index, "builtin"), text(table, owner, index, "interpolation"),
+            text(table, owner, index, "sampling"), field(table, owner, index, "blend_src"))
+        line(joinText(["let ", name, ": ", typeName(field(table, owner, index, "type"), -1)]))
+    }
+
+    function writeAttributes(borrow mut self, builtin: String, interpolation: String, sampling: String, blendSrc: Int) {
+        if utf8Count(builtin) > 0 {
+            let word = builtinWord(builtin)
+            if utf8Count(word) == 0 { refuse(joinText(["built-in `", builtin, "`"]), -1) }
+            line(joinText(["@builtin(", word, ")"]))
+            return
+        }
+        if utf8Count(sampling) > 0 && sampling != "center" {
+            refuse(joinText(["`", sampling, "` sampling"]), -1)
+        }
+        if blendSrc >= 0 { refuse("dual-source blending", -1) }
+        if interpolation == "flat" || interpolation == "linear" {
+            line(joinText(["@interpolate(", interpolation, ")"]))
+        }
+    }
+
+    // Gives each argument of an entry with a built input its own variable,
+    // read from the input struct.
+    function unpackInput(borrow mut self, entry: Int) {
+        let names = inputMembers(entry)
+        var at = 0
+        let arguments = count("arguments", entry)
+        for argument in 0..arguments {
+            let argumentType = field("arguments", entry, argument, "type")
+            let variable = argumentNames[argument]
+            if kind("types", -1, argumentType) == "struct" {
+                line(joinText(["let ", variable, ": ", typeName(argumentType, -1)]))
+                let members = count("members", argumentType)
+                for member in 0..members {
+                    let memberName = kslName(text("members", argumentType, member, "name"))
+                    line(joinText([variable, ".", memberName, " = _input.", names[at]]))
+                    at += 1
+                }
+            } else {
+                line(joinText(["let ", variable, " = _input.", names[at]]))
+                at += 1
+            }
+        }
+    }
+
+    // Returns `value` from an entry whose output the out built.
+    function writeOutputReturn(borrow mut self, value: String) {
+        let name = joinText(["_output", decimalText(nextId)])
+        nextId += 1
+        line(joinText(["let ", name, ": ", outputName(current)]))
+        line(joinText([name, ".value = ", value]))
+        line(joinText(["return ", name]))
+    }
+
+    // The name each global is read by: a bare uniform is the `value` of the
+    // struct that holds it.
+    function prepareGlobals(borrow mut self) {
+        globalNames = []
+        let globals = count("globals", -1)
+        for global in 0..globals {
+            let name = kslName(text("globals", -1, global, "name"))
+            if wrapsUniform(global) {
+                globalNames.append(joinText([name, ".value"]))
+            } else {
+                globalNames.append(name)
+            }
+        }
+    }
+
+    function wrapsUniform(borrow self, global: Int) -> Bool {
+        let globalType = field("globals", -1, global, "type")
+        return text("globals", -1, global, "space") == "uniform" && kind("types", -1, globalType) != "struct"
+    }
+
+    function uniformWrapper(borrow self, global: Int) -> String {
+        return joinText(["_", kslName(text("globals", -1, global, "name")), "Uniform"])
+    }
+
+    function writeUniformWrappers(borrow mut self) {
+        let globals = count("globals", -1)
+        for global in 0..globals {
+            if wrapsUniform(global) {
+                line(joinText(["type ", uniformWrapper(global), " {"]))
+                line(joinText(["    let value: ", typeName(field("globals", -1, global, "type"), -1)]))
+                line("}")
+                line("")
+            }
+        }
+    }
+}

@@ -1,0 +1,159 @@
+// `Map<Key, Value>` and `Set<Element>`: the prelude's copy-on-write
+// collections, which iterate in the order their keys were first added (KLF
+// section 6.4). Replacing a key's value keeps the key where it was; removing
+// it and adding it again moves it to the end.
+
+// One key and the value the map holds for it.
+struct MapEntry<Key, Value> {
+    let key: Key
+    let value: Value
+}
+
+struct Map<Key, Value> {
+    var index: MapIndex<Key> = MapIndex()
+    // A value for each position of `index`, `.None` where its key was removed.
+    var slots: [Value?] = []
+
+    function count(borrow self) -> Number {
+        return index.count
+    }
+
+    function isEmpty(borrow self) -> Bool {
+        return index.count == 0
+    }
+
+    function contains(borrow self, key: borrow Key) -> Bool {
+        return index.position(key).isSome()
+    }
+
+    // The value held for `key`, when the map holds one.
+    function value(borrow self, key: borrow Key) -> Value? {
+        match index.position(key) {
+            Some(place) -> return slots[place]
+            None -> return .None
+        }
+    }
+
+    // Holds `value` for `key`, replacing any value the key had.
+    function set(borrow mut self, key: Key, value: Value) {
+        match index.position(key) {
+            Some(place) -> slots[place] = .Some(move value)
+            None -> {
+                index.insert(move key)
+                slots.append(.Some(move value))
+            }
+        }
+    }
+
+    // Drops `key`, answering the value it held, when it held one.
+    function remove(borrow mut self, key: borrow Key) -> Value? {
+        match index.position(key) {
+            Some(place) -> {
+                let removed = slots[place]
+                index.remove(place)
+                slots[place] = .None
+                if index.sparse() { self = compacted() }
+                return removed
+            }
+            None -> return .None
+        }
+    }
+
+    function removeAll(borrow mut self) {
+        self = Map<Key, Value>()
+    }
+
+    function keys(borrow self) -> [Key] {
+        var keys: [Key] = []
+        for entry in entries() { keys.append(entry.key) }
+        return keys
+    }
+
+    function values(borrow self) -> [Value] {
+        var values: [Value] = []
+        for entry in entries() { values.append(entry.value) }
+        return values
+    }
+
+    // Every key with its value, in insertion order.
+    function entries(borrow self) -> [MapEntry<Key, Value>] {
+        var entries: [MapEntry<Key, Value>] = []
+        for (place, held) in index.keys.enumerated() {
+            match held {
+                Some(key) -> {
+                    match slots[place] {
+                        Some(value) -> entries.append(MapEntry<Key, Value>(key: key, value: value))
+                        // A live key always has its value.
+                        None -> {}
+                    }
+                }
+                // A removed key is not an entry.
+                None -> {}
+            }
+        }
+        return entries
+    }
+
+    // The same entries in the same order, with no removed positions.
+    function compacted(borrow self) -> Map<Key, Value> {
+        var map = Map<Key, Value>()
+        for entry in entries() { map.set(entry.key, entry.value) }
+        return map
+    }
+}
+
+struct Set<Element> {
+    var index: MapIndex<Element> = MapIndex()
+
+    function count(borrow self) -> Number {
+        return index.count
+    }
+
+    function isEmpty(borrow self) -> Bool {
+        return index.count == 0
+    }
+
+    function contains(borrow self, element: borrow Element) -> Bool {
+        return index.position(element).isSome()
+    }
+
+    // Adds `element` at the end of the order, unless the set holds it.
+    function insert(borrow mut self, element: Element) {
+        if !contains(element) { index.insert(move element) }
+    }
+
+    // Drops `element`, answering whether the set held it.
+    function remove(borrow mut self, element: borrow Element) -> Bool {
+        match index.position(element) {
+            Some(place) -> {
+                index.remove(place)
+                if index.sparse() { self = compacted() }
+                return true
+            }
+            None -> return false
+        }
+    }
+
+    function removeAll(borrow mut self) {
+        self = Set<Element>()
+    }
+
+    // Every element, in insertion order.
+    function elements(borrow self) -> [Element] {
+        var elements: [Element] = []
+        for held in index.keys {
+            match held {
+                Some(element) -> elements.append(element)
+                // A removed element leaves its position empty.
+                None -> {}
+            }
+        }
+        return elements
+    }
+
+    function compacted(borrow self) -> Set<Element> {
+        var set = Set<Element>()
+        for element in elements() { set.insert(copy element) }
+        return set
+    }
+}

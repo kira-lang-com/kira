@@ -1,0 +1,32 @@
+// Interpolate each component independently, preserving the target's shape.
+comptime macro Lerp {
+    kind { derive }
+    appliesTo { struct }
+    expand(target: Declaration) -> Syntax {
+        var fields: [Syntax] = []
+        for field in target.fields {
+            if field.type == "Float" {
+                fields.append(
+                    quote {
+                        #{field.name}: a.#{field.name} + (b.#{field.name} - a.#{field.name}) * t
+                    }
+                )
+            } else {
+                fields.append(
+                    quote {
+                        #{field.name}: lerp(a.#{field.name}, b.#{field.name}, t)
+                    }
+                )
+            }
+        }
+        return quote {
+            function lerp(
+                a: borrow #{target.name},
+                b: borrow #{target.name},
+                t: Float
+            ) -> #{target.name} {
+                return #{target.name} { #{joinSyntax(fields, ", ")} }
+            }
+        }
+    }
+}

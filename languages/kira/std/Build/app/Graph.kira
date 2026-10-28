@@ -1,0 +1,500 @@
+import Foundation
+
+// The graph a build program describes, and the calls that describe it.
+
+// Where an artifact comes from.
+enum Origin {
+    Source(String)
+    SourceTree(SourceTree)
+    Produced(Produced)
+    Stored(ArtifactReference)
+}
+
+// A directory of the project, by its path from the project root, without the
+// entries under `excluding`, each a path from that directory.
+struct SourceTree {
+    let path: String
+    let excluding: [String]
+}
+
+// The output at `output` of the action at `action`.
+struct Produced {
+    let action: Number
+    let output: Number
+}
+
+/// The graph a build program describes, and the calls that describe it: its artifacts, its actions, its steps and its options.
+public struct Graph {
+    /// The name of the project the graph describes.
+    let project: String
+    /// The directory holding the project's `build/` package.
+    let root: String
+    /// The command line the build was started with.
+    let request: BuildRequest
+    /// Where each artifact comes from, by its number.
+    var origins: [Origin] = []
+    /// The actions the graph runs, in the order they were added.
+    var actions: [Action] = []
+    /// The artifacts each action produces, in the order it declares them.
+    var produced: [[Artifact]] = []
+    /// The steps the command line may ask for.
+    var steps: [Step] = []
+    /// The options the command line may give.
+    var choices: [Choice] = []
+    /// The positions in `request.arguments` an option took.
+    var taken: [Number] = []
+    /// What was described wrongly, reported before anything runs.
+    var problems: [String] = []
+
+    /// A file of the project, by its path from the project root.
+    function source(borrow mut self, path: borrow String) -> Artifact {
+        if !fileExists(joinPath(root, path)) { problems.append("no source file \(path)") }
+        origins.append(.Source(copy path))
+        return Artifact { id: origins.count - 1 }
+    }
+
+    /// A directory of the project, by its path from the project root, without the entries under `excluding`, each a path from that directory. Its digest covers every name, permission bit and byte under it.
+    function sourceTree(
+        borrow mut self,
+        path: borrow String,
+        excluding: borrow [String]
+    ) -> Artifact {
+        if !isDirectory(joinPath(root, path)) { problems.append("no source directory \(path)") }
+        origins.append(.SourceTree(SourceTree { path: copy path, excluding: copy excluding }))
+        return Artifact { id: origins.count - 1 }
+    }
+
+    /// Adds a command, answering its outputs in the order it declares them.
+    function command(borrow mut self, action: CommandAction) -> [Artifact] {
+        var inputs: [Artifact] = []
+        for argument in action.arguments { collectInputs(argument, inputs) }
+        for variable in action.variables { collectInputs(variable.value, inputs) }
+        collectInputs(action.directory, inputs)
+        for stage in action.followedBy {
+            for argument in stage.arguments { collectInputs(argument, inputs) }
+            collectInputs(stage.directory, inputs)
+            if stage.tool.count == 0 {
+                problems.append("\(action.label) runs a stage with no tool")
+            }
+        }
+        for placed in action.inputs {
+            inputs.append(placed.artifact)
+            if !placeablePath(placed.path) {
+                problems.append(
+                    "\(action.label) places an input at \(placed.path), outside its working directory"
+                )
+            }
+        }
+        for read in action.reads {
+            inputs.append(read)
+            checkArtifact(read, action.label)
+            if read.id >= 0 && read.id < origins.count {
+                match origins[read.id] {
+                    Stored(reference) -> problems.append("\(action.label) reads a stored artifact in place")
+                    Source(path) -> {}
+                    SourceTree(tree) -> {}
+                    Produced(produced) -> {}
+                }
+            }
+            if read.id >= 0 && read.id < origins.count && producer(read).isSome() {
+                problems.append(
+                    "\(action.label) reads \(artifactName(read)) where it is, which only a source can be"
+                )
+            }
+        }
+        if action.depfile.count > 0 && !placeablePath(action.depfile) {
+            problems.append(
+                "\(action.label) writes its depfile at \(action.depfile), outside its working directory"
+            )
+        }
+        if action.workspace.count > 0 && !placeablePath(action.workspace) {
+            problems.append(
+                "\(action.label) names the workspace \(action.workspace), which is no plain path"
+            )
+        }
+        checkWorkspace(action)
+        if action.standardOutput.count > 0 {
+            var declared = false
+            for output in action.outputs {
+                if output.name == action.standardOutput && output.kind == .File { declared = true }
+            }
+            if !declared {
+                problems.append(
+                    "\(action.label) sends its output to \(action.standardOutput), which is no file it declares"
+                )
+            }
+        }
+        for argument in action.arguments { checkOutputNames(argument, action) }
+        for variable in action.variables { checkOutputNames(variable.value, action) }
+        checkOutputNames(action.directory, action)
+        for stage in action.followedBy {
+            for argument in stage.arguments { checkOutputNames(argument, action) }
+            checkOutputNames(stage.directory, action)
+        }
+        let label = copy action.label
+        let outputs = copy action.outputs
+        return add(label, inputs, outputs, .Run(move action))
+    }
+
+    /// Adds a Kira function, answering its outputs in the order it declares them.
+    function native(borrow mut self, action: NativeAction) -> [Artifact] {
+        let label = copy action.label
+        if action.code.count != 64 {
+            problems.append("\(label) names no code; write `code: sourceDigest!()`")
+        }
+        if action.produces.count > 0 && action.produces.count != 64 {
+            problems.append("\(label) produces \(action.produces), which is no SHA-256")
+        }
+        if action.produces.count > 0 && (
+            action.inputs.count > 0 || action.outputs.count != 1 || action.outputs[0].kind != .File
+        ) {
+            problems.append(
+                "\(label) names the file it produces, so it takes no inputs and makes one file"
+            )
+        }
+        let inputs = copy action.inputs
+        let outputs = copy action.outputs
+        return add(label, inputs, outputs, .Native(move action))
+    }
+
+    /// Declares a step the command line may ask for. Fails with a problem when a step of the same name is already declared.
+    function step(borrow mut self, step: Step) {
+        for known in steps {
+            if known.name == step.name { problems.append("step \(step.name) is declared twice") }
+        }
+        for artifact in step.produces { checkArtifact(artifact, "step \(step.name)") }
+        if !step.materialize && step.snapshot.isNone() && step.run.isNone() {
+            problems.append("step \(step.name) omits placement but names no snapshot or callback")
+        }
+        steps.append(move step)
+    }
+
+    /// The value the command line gave `choice` as `-name value` or `-name=value`, or its fallback. The arguments it took go to no step.
+    function option(borrow mut self, choice: Choice) -> String {
+        var value = copy choice.fallback
+        let flag = "-\(choice.name)"
+        let given = "\(flag)="
+        let arguments = request.arguments
+        var index = 0
+        while index < arguments.count {
+            let argument = arguments[index]
+            if taken.contains(index) {
+                index += 1
+                continue
+            }
+            if argument == flag {
+                if index + 1 < arguments.count {
+                    value = copy arguments[index + 1]
+                    taken.append(index)
+                    taken.append(index + 1)
+                    index += 2
+                    continue
+                }
+                problems.append("\(flag) needs a value")
+                taken.append(index)
+            } else if argument.startsWith(given) {
+                value = argument.substring(given.count, argument.count)
+                taken.append(index)
+            }
+            index += 1
+        }
+        if choice.values.count > 0 && !choice.values.contains(value) {
+            problems.append("\(flag) is \(value); it takes \(joined(choice.values, ", "))")
+        }
+        choices.append(move choice)
+        return value
+    }
+
+    /// The arguments no option took, in order.
+    function remaining(borrow self) -> [String] {
+        var left: [String] = []
+        let arguments = request.arguments
+        for index in 0..arguments.count {
+            if !taken.contains(index) { left.append(copy arguments[index]) }
+        }
+        return left
+    }
+
+    /// Whether the command line names step `name`. A description reads it before every step is declared, so it is any argument no option took.
+    function requested(borrow self, name: borrow String) -> Bool {
+        return remaining().contains(name)
+    }
+
+    /// What the command line gives step `name`: the arguments after it that no option declared so far took. A description that reads it declares its options first.
+    function passed(borrow self, name: borrow String) -> [String] {
+        var after: [String] = []
+        var seen = false
+        for argument in remaining() {
+            if seen {
+                after.append(copy argument)
+            } else if argument == name {
+                seen = true
+            }
+        }
+        return after
+    }
+
+    /// The steps the command line names: its leading arguments that name a declared step. What follows them goes to the steps.
+    function chosenNames(borrow self) -> [String] {
+        var names: [String] = []
+        for argument in remaining() {
+            var declared = false
+            for step in steps {
+                if step.name == argument { declared = true }
+            }
+            if !declared { break }
+            names.append(copy argument)
+        }
+        return names
+    }
+
+    /// What follows the steps, handed to those that run something.
+    function stepArguments(borrow self) -> [String] {
+        let left = remaining()
+        var after: [String] = []
+        for index in chosenNames().count..left.count { after.append(copy left[index]) }
+        return after
+    }
+
+    /// Adds the action `action` under `label`, reading `inputs` and writing `outputs`, and answers the artifacts it produces. Fails with a problem when the label is already used.
+    function add(
+        borrow mut self,
+        label: borrow String,
+        inputs: borrow [Artifact],
+        outputs: borrow [Output],
+        action: Action
+    ) -> [Artifact] {
+        for known in actions {
+            if actionLabel(known) == label { problems.append("label \(label) is used twice") }
+        }
+        for input in inputs { checkArtifact(input, label) }
+        var names: [String] = []
+        for output in outputs {
+            if names.contains(output.name) || output.name.count == 0 || output.name.contains("/") {
+                problems.append("\(label) declares the output `\(output.name)` wrongly")
+            }
+            names.append(copy output.name)
+        }
+        let index = actions.count
+        actions.append(move action)
+        var made: [Artifact] = []
+        for position in 0..outputs.count {
+            origins.append(.Produced(Produced { action: index, output: position }))
+            made.append(Artifact { id: origins.count - 1 })
+        }
+        produced.append(copy made)
+        return made
+    }
+
+    /// Checks that every output an argument of `action` names is one it declares.
+    function checkOutputNames(
+        borrow mut self,
+        argument: borrow Argument,
+        action: borrow CommandAction
+    ) {
+        match argument {
+            Output(name) -> {
+                var declared = false
+                for output in action.outputs {
+                    if output.name == name { declared = true }
+                }
+                if !declared { problems.append("\(action.label) names no output \(name)") }
+            }
+            Joined(parts) -> {
+                for part in parts { checkOutputNames(part, action) }
+            }
+            Text(text) -> {}
+            Input(artifact) -> {}
+            Workspace -> {}
+        }
+    }
+
+    /// Checks that a command naming `Argument.Workspace` has a workspace.
+    function checkWorkspace(borrow mut self, action: borrow CommandAction) {
+        if action.workspace.count > 0 { return }
+        var named = false
+        for argument in action.arguments {
+            if namesWorkspace(argument) { named = true }
+        }
+        for variable in action.variables {
+            if namesWorkspace(variable.value) { named = true }
+        }
+        if namesWorkspace(action.directory) { named = true }
+        for stage in action.followedBy {
+            for argument in stage.arguments {
+                if namesWorkspace(argument) { named = true }
+            }
+            if namesWorkspace(stage.directory) { named = true }
+        }
+        if named { problems.append("\(action.label) names its workspace but has none") }
+    }
+
+    /// Checks that `artifact` belongs to this graph, reporting a problem as `user` names it when it does not.
+    function checkArtifact(borrow mut self, artifact: borrow Artifact, user: borrow String) {
+        if artifact.id < 0 || artifact.id >= origins.count {
+            problems.append("\(user) names an artifact of another graph")
+        }
+    }
+
+    /// The outputs of the action labelled `label`, when the graph has one: an action several parts of a build need, added by the first.
+    function outputsOf(borrow self, label: borrow String) -> [Artifact]? {
+        for (index, known) in actions.enumerated() {
+            if actionLabel(known) == label { return .Some(copy produced[index]) }
+        }
+        return .None
+    }
+
+    /// The action that produces `artifact`, when an action does.
+    function producer(borrow self, artifact: borrow Artifact) -> Number? {
+        return match origins[artifact.id] {
+            Produced(made) -> .Some(made.action)
+            Source(path) -> .None
+            SourceTree(tree) -> .None
+            Stored(reference) -> .None
+        }
+    }
+
+    /// The artifacts an action reads, each once.
+    function inputsOf(borrow self, action: Number) -> [Artifact] {
+        var inputs: [Artifact] = []
+        match actions[action] {
+            Run(command) -> {
+                for argument in command.arguments { collectInputs(argument, inputs) }
+                for variable in command.variables { collectInputs(variable.value, inputs) }
+                collectInputs(command.directory, inputs)
+                for stage in command.followedBy {
+                    for argument in stage.arguments { collectInputs(argument, inputs) }
+                    collectInputs(stage.directory, inputs)
+                }
+                for placed in command.inputs { inputs.append(placed.artifact) }
+                for read in command.reads { inputs.append(read) }
+            }
+            Native(native) -> {
+                for input in native.inputs { inputs.append(input) }
+            }
+        }
+        var unique: [Artifact] = []
+        for input in inputs {
+            var seen = false
+            for known in unique {
+                if known.id == input.id { seen = true }
+            }
+            if !seen { unique.append(input) }
+        }
+        return unique
+    }
+
+    /// The sources the command `action` reads where they are.
+    function readsOf(borrow self, action: Number) -> [Artifact] {
+        return match actions[action] {
+            Run(command) -> command.reads
+            Native(native) -> []
+        }
+    }
+
+    /// The absolute path of a source; empty for an artifact an action makes.
+    function sourcePath(borrow self, artifact: borrow Artifact) -> String {
+        return match origins[artifact.id] {
+            Source(path) -> joinPath(root, path)
+            SourceTree(tree) -> joinPath(root, tree.path)
+            Produced(made) -> ""
+            Stored(reference) -> ""
+        }
+    }
+
+    /// What an artifact is called in a report.
+    function artifactName(borrow self, artifact: borrow Artifact) -> String {
+        match origins[artifact.id] {
+            Stored(reference) -> return copy reference.name
+            Source(path) -> return copy path
+            SourceTree(tree) -> return tree.path + "/"
+            Produced(made) -> {
+                let outputs = actionOutputs(actions[made.action])
+                return "\(actionLabel(actions[made.action])): \(outputs[made.output].name)"
+            }
+        }
+    }
+}
+
+/// A graph for the project whose `build/` package is running, reading the command line it was given.
+public function buildGraph(project: borrow String) -> Graph {
+    return Graph {
+        project: copy project,
+        root: projectRoot(),
+        request: parseRequest(commandArguments())
+    }
+}
+
+function collectInputs(argument: borrow Argument, inputs: borrow mut [Artifact]) {
+    match argument {
+        Input(artifact) -> inputs.append(artifact)
+        Joined(parts) -> {
+            for part in parts { collectInputs(part, inputs) }
+        }
+        Text(text) -> {}
+        Output(name) -> {}
+        Workspace -> {}
+    }
+}
+
+// Whether `directory` is the working directory: an empty text.
+function isPlainDirectory(directory: borrow Argument) -> Bool {
+    return match directory {
+        Text(text) -> text.count == 0
+        Input(artifact) -> false
+        Output(name) -> false
+        Joined(parts) -> false
+        Workspace -> false
+    }
+}
+
+function namesWorkspace(argument: borrow Argument) -> Bool {
+    return match argument {
+        Workspace -> true
+        Joined(parts) -> {
+            var found = false
+            for part in parts {
+                if namesWorkspace(part) { found = true }
+            }
+            found
+        }
+        Text(text) -> false
+        Input(artifact) -> false
+        Output(name) -> false
+    }
+}
+
+function actionLabel(action: borrow Action) -> String {
+    return match action {
+        Run(command) -> command.label
+        Native(native) -> native.label
+    }
+}
+
+// The SHA-256 the one output of `action` has, or "" when it is not known
+// before it runs.
+function actionProduces(action: borrow Action) -> String {
+    return match action {
+        Run(command) -> ""
+        Native(native) -> copy native.produces
+    }
+}
+
+function actionOutputs(action: borrow Action) -> [Output] {
+    return match action {
+        Run(command) -> command.outputs
+        Native(native) -> native.outputs
+    }
+}
+
+// The program's own arguments.
+function commandArguments() -> [String] {
+    var arguments: [String] = []
+    for index in 0..processArgumentCount() {
+        match processArgument(index) {
+            Some(argument) -> arguments.append(argument)
+            None -> {}
+        }
+    }
+    return arguments
+}

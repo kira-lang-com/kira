@@ -1,0 +1,155 @@
+// QUIC version 1's registry code points (RFC 9000 sections 12.4, 18.2 and
+// 20), as the wire spells them. Each is `@Open`, so an unknown value survives
+// a decode and is refused or ignored where the RFC says.
+
+@Open
+enum QuicFrameType: Number {
+    Padding = 0
+    Ping = 1
+    Ack = 2
+    AckEcn = 3
+    ResetStream = 4
+    StopSending = 5
+    Crypto = 6
+    NewToken = 7
+    // STREAM is 0x08 to 0x0f: the low three bits are its OFF, LEN and FIN
+    // flags.
+    Stream = 8
+    MaxData = 16
+    MaxStreamData = 17
+    MaxStreamsBidirectional = 18
+    MaxStreamsUnidirectional = 19
+    DataBlocked = 20
+    StreamDataBlocked = 21
+    StreamsBlockedBidirectional = 22
+    StreamsBlockedUnidirectional = 23
+    NewConnectionId = 24
+    RetireConnectionId = 25
+    PathChallenge = 26
+    PathResponse = 27
+    ConnectionClose = 28
+    ApplicationClose = 29
+    HandshakeDone = 30
+    // draft-ietf-quic-reliable-stream-reset: RESET_STREAM with a size the
+    // receiver still gets.
+    ResetStreamAt = 36
+    // RFC 9221; 0x31 carries a length, 0x30 runs to the packet's end.
+    Datagram = 48
+    DatagramWithLength = 49
+}
+
+// Transport error codes (RFC 9000 section 20.1). A TLS alert travels as
+// `cryptoError` plus the alert.
+@Open
+enum QuicTransportError: Number {
+    NoError = 0
+    InternalError = 1
+    ConnectionRefused = 2
+    FlowControlError = 3
+    StreamLimitError = 4
+    StreamStateError = 5
+    FinalSizeError = 6
+    FrameEncodingError = 7
+    TransportParameterError = 8
+    ConnectionIdLimitError = 9
+    ProtocolViolation = 10
+    InvalidToken = 11
+    ApplicationError = 12
+    CryptoBufferExceeded = 13
+    KeyUpdateError = 14
+    AeadLimitReached = 15
+    NoViablePath = 16
+}
+
+@Open
+enum QuicTransportParameterId: Number {
+    OriginalDestinationConnectionId = 0
+    MaxIdleTimeout = 1
+    StatelessResetToken = 2
+    MaxUdpPayloadSize = 3
+    InitialMaxData = 4
+    InitialMaxStreamDataBidiLocal = 5
+    InitialMaxStreamDataBidiRemote = 6
+    InitialMaxStreamDataUni = 7
+    InitialMaxStreamsBidi = 8
+    InitialMaxStreamsUni = 9
+    AckDelayExponent = 10
+    MaxAckDelay = 11
+    DisableActiveMigration = 12
+    PreferredAddress = 13
+    ActiveConnectionIdLimit = 14
+    InitialSourceConnectionId = 15
+    RetrySourceConnectionId = 16
+    ResetStreamAt = 29
+    MaxDatagramFrameSize = 32
+}
+
+// Long header packet types of version 1 (RFC 9000 section 17.2).
+enum QuicLongPacketType: Number {
+    Initial = 0
+    ZeroRtt = 1
+    Handshake = 2
+    Retry = 3
+}
+
+namespace Quic {
+    let version1: Number = 1
+    // RFC 9001 section 5.2.
+    let initialSalt: [UN8] = [
+        56, 118, 44, 247, 245, 89, 52, 179, 77, 23, 154, 230, 164, 200, 12, 173, 204, 187, 127,
+        10
+    ]
+    // A client's Initial datagrams are padded to at least this (RFC 9000
+    // section 14.1), and every path carries at least this much.
+    let minimumDatagram: Number = 1200
+    let maximumConnectionId: Number = 20
+    // The connection ID length this endpoint issues.
+    let connectionIdBytes: Number = 8
+    let statelessResetTokenBytes: Number = 16
+    // A stateless reset is at least this long: five unpredictable bytes,
+    // then the token (RFC 9000 section 10.3).
+    let smallestReset: Number = 21
+    let pathChallengeBytes: Number = 8
+    // Header bits (RFC 9000 section 17).
+    let longHeader: Number = 128
+    let fixedBit: Number = 64
+    let keyPhaseBit: Number = 4
+    let longTypeShift: Number = 4
+    let packetNumberLengthMask: Number = 3
+    let longProtectedBits: Number = 15
+    let shortProtectedBits: Number = 31
+    let longReservedBits: Number = 12
+    // A version negotiation packet's bits after the long header bit.
+    let unusedNegotiationBits: Number = 127
+    let shortReservedBits: Number = 24
+    // Header protection samples 16 bytes, 4 past the packet number's start
+    // (RFC 9001 section 5.4.2).
+    let sampleBytes: Number = 16
+    let sampleOffset: Number = 4
+    // A TLS alert's QUIC error is this plus the alert (RFC 9001 section 4.8).
+    let cryptoError: Number = 256
+    let streamFlagOffset: Number = 4
+    let streamFlagLength: Number = 2
+    let streamFlagFin: Number = 1
+    let streamTypeMask: Number = 7
+    // The most streams of a kind a peer may allow (RFC 9000 section 4.6).
+    let maximumStreams: Number = 1152921504606846976
+}
+
+// What an endpoint announces to its peer and holds it to, each default
+// declared once (DESIGN.md section 6).
+struct QuicLimits {
+    let maxIdleMilliseconds: Number = 30000
+    let maxUdpPayload: Number = 1452
+    let connectionData: Number = 16777216
+    let streamData: Number = 1048576
+    let bidirectionalStreams: Number = 100
+    let unidirectionalStreams: Number = 100
+    let maxAckDelayMilliseconds: Number = 25
+    let ackDelayExponent: Number = 3
+    let activeConnectionIds: Number = 4
+    let maxDatagramFrame: Number = 65535
+    // The CRYPTO bytes held for one level before refusing (RFC 9000 section
+    // 7.5).
+    let cryptoBuffer: Number = 65536
+}

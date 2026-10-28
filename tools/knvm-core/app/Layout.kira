@@ -1,0 +1,450 @@
+import Foundation
+
+// The managed layout: where a toolchain lives, which one is selected, and which
+// one a directory tree has pinned.
+//
+// Every path knvm touches is derived here, once, and every one of them is
+// derived from a `Compiler` rather than from a compiler's name: the tree holds
+// a directory per compiler, and what is inside one is that compiler's business.
+// An installer that answered this question itself would be a second opinion
+// about the shape of the tree, and the launcher — which reads the same files —
+// would be the one to disagree.
+
+// The environment variable that relocates the whole KLFD home.
+//
+// Not `KLF_HOME`: that is the framework's own, holding its kernel archives and
+// its provisioned LLVM, and a toolchain tree is not either of those. Sharing one
+// variable would let an install write into the framework's state and leave the
+// framework reading a directory whose shape it does not know.
+//
+// It never falls through to `~/.klf` when set: an override that merged the two
+// would let a test write into the developer's real state, which is the whole
+// reason the override exists.
+public let homeVariable: String = "KLFD_HOME"
+
+// The file that names the selected toolchain, under one compiler's directory.
+// Per compiler rather than one for the whole tree: each compiler is selected
+// independently, and a shared file could only ever name one of them.
+public let currentFileName: String = "current.toml"
+
+// The directory installs are staged in before they are moved into place. Shared
+// by every compiler, because it is scratch space rather than state: one staging
+// directory keeps an install from having to know which compilers exist.
+public let stagingDirectoryName: String = ".staging"
+
+// Where an installed toolchain keeps its drivers.
+public let binaryDirectoryName: String = "bin"
+
+// Where a definition package keeps its definitions.
+public let definitionsDirectoryName: String = "definitions"
+
+// The definition manifest a toolchain's driver was built from.
+public let languageDefinitionName: String = "language.klfd"
+
+// The framework's own compiler, the one that builds a toolchain.
+public let klfCompilerName: String = "klf"
+
+// Its binary, in a toolchain and on PATH.
+public let klfBinary: String = "klf"
+
+// The repositories whose releases knvm installs: the framework's `klf`, and
+// every language this checkout defines.
+public let klfRepository: String = "kira-lang-com/kira-language-framework"
+public let languagesRepository: String = "kira-lang-com/kira"
+
+// The framework's kernel definitions, copied beside an installed `klf`.
+// The directory a distribution keeps one subdirectory per target triple in:
+// `platforms/<triple>/` holds that target's runtime archives, its service
+// manifest and its bytecode runner.
+public let platformsDirectoryName: String = "platforms"
+
+
+// The release channel a toolchain was installed from. Both a directory under
+// the toolchains root and a feed: `release` is the default, as in rustup and nvm.
+public enum Channel {
+    Release
+    Dev
+}
+
+// Why a file could not be used as what it claims to be.
+public enum StateFailure {
+    Malformed(String)
+    Unreadable(String)
+    UnknownChannel(String)
+}
+
+// What a `current.toml` says: nothing selected, a selection, or a file that
+// cannot be read as one.
+public enum SelectionState {
+    NothingSelected
+    Selected(Selection)
+    Unusable(StateFailure)
+}
+
+// What a `kira-toolchain.toml` says.
+public enum PinState {
+    NoPin
+    Pinned(Pin)
+    Unusable(StateFailure)
+}
+
+// Every channel, in the order a listing reports them. Stable rather than
+// alphabetical: `release` reads first because it is the default.
+public function allChannels() -> [Channel] {
+    let channels: [Channel] = [.Release, .Dev]
+    return channels
+}
+
+// The directory name of a channel.
+public function channelName(channel: borrow Channel) -> String {
+    match channel {
+        Release -> { return "release" }
+        Dev -> { return "dev" }
+    }
+    return "release"
+}
+
+// The channel `text` names, or nothing.
+public function parseChannel(text: borrow String) -> Optional<Channel> {
+    if text == "release" { return .Some(.Release) }
+    if text == "dev" { return .Some(.Dev) }
+    return .None
+}
+
+// `~/.klf`, or the whole tree relocated by `KLF_HOME`.
+public function klfHome() -> String {
+    let relocated = environmentValue(homeVariable)
+    if !relocated.isEmpty() { return relocated }
+    let home = userHomeDirectory()
+    match home {
+        Some(directory) -> { return joinPath(directory, ".klf") }
+        None -> { return "" }
+    }
+    return ""
+}
+
+// `<home>/toolchains` — the root of every managed toolchain.
+public function toolchainsRoot() -> String {
+    let home = klfHome()
+    if home.isEmpty() { return "" }
+    return joinPath(home, "toolchains")
+}
+
+// `<home>/toolchains/<compiler>`: one compiler's whole tree, its selection file
+// and its channels, and nothing of any other compiler's.
+public function compilerRoot(compiler: borrow Compiler) -> String {
+    return joinPath(toolchainsRoot(), compiler.name)
+}
+
+// `<home>/toolchains/.staging`, where every install is unpacked before it is
+// landed. Shared, because it is scratch space rather than state: an install
+// should not have to know which compilers exist to keep out of a concurrent
+// one's way.
+public function stagingRoot() -> String {
+    return joinPath(toolchainsRoot(), stagingDirectoryName)
+}
+// `<home>/toolchains/<compiler>/current.toml`.
+public function currentToolchainPath(compiler: borrow Compiler) -> String {
+    return joinPath(compilerRoot(compiler), currentFileName)
+}
+
+// `<compiler root>/<channel>/<version>`: one installed toolchain.
+public function toolchainRoot(
+    compiler: borrow Compiler,
+    channel: borrow Channel,
+    version: borrow String
+) -> String {
+    return joinPath(joinPath(compilerRoot(compiler), channelName(channel)), version)
+}
+
+// `<root>/bin/<binary>`: the binary the launcher dispatches to.
+public function binaryPath(root: borrow String, compiler: borrow Compiler) -> String {
+    return binaryPathIn(root, compiler.binary)
+}
+
+// `bin/<binary>` under `root`, as one path.
+public function binaryPathIn(root: borrow String, binary: borrow String) -> String {
+    return joinPath(joinPath(root, binaryDirectoryName), binary)
+}
+
+// The file a directory tree pins one compiler's toolchain in.
+//
+// Named after the compiler, because a tree may pin one compiler and follow
+// another's selection: `kira-toolchain.toml` and `klf-toolchain.toml` say two
+// different things about the same directory, and one pin file could not say
+// both. Deliberately the two fields `current.toml` carries, minus `primary`: a
+// pin says which toolchain, never which binary inside it.
+public function pinFileName(compiler: borrow Compiler) -> String {
+    return compiler.name + "-toolchain.toml"
+}
+
+// Whether a version names exactly one directory, so joining it cannot escape.
+//
+// Checked on the string rather than on the joined path, which normalizes a
+// trailing separator away and would accept `1.7.3/`. A version is a directory
+// name, so any separator at all is a refusal — and every operation that joins a
+// version onto the toolchains root runs this first, because a release feed is
+// not necessarily careful about what it calls a version.
+public function isSingleComponent(version: borrow String) -> Bool {
+    if version.isEmpty() { return false }
+    if version == "." { return false }
+    if version == ".." { return false }
+    for index in 0..version.count {
+        let byte = version.charAt(index)
+        if byte == 47 || byte == 92 || byte == 0 { return false }
+    }
+    return true
+}
+
+// The selected toolchain, as `current.toml` records it.
+public struct Selection {
+    var channel: Channel = .Release
+    var version: String = ""
+    var primary: String = ""
+}
+
+// A toolchain pinned to a directory tree.
+public struct Pin {
+    var channel: Channel = .Release
+    var version: String = ""
+    var path: String = ""
+}
+
+// Whether two values name the same channel and version.
+public function namesSelection(
+    channel: borrow Channel,
+    version: borrow String,
+    other: borrow Selection
+) -> Bool {
+    return other.channel == channel && other.version == version
+}
+
+// The selected toolchain, or why there is not one to name.
+//
+// An absent `current.toml` means nothing is selected and is not an error. A
+// present but unreadable one is: reporting that as "nothing selected" would let
+// `list` and `use` quietly disagree with the launcher, which reads the same
+// file and refuses to dispatch on it.
+public function readSelection(compiler: borrow Compiler) -> SelectionState {
+    let path = currentToolchainPath(compiler)
+    if path.isEmpty() { return .Unusable(.Unreadable(homeVariable)) }
+    if !pathExists(path) { return .NothingSelected }
+    match textOf(path) {
+        Some(text) -> return parseSelection(path, text)
+        None -> return .Unusable(.Unreadable(path))
+    }
+}
+
+public function parseSelection(path: borrow String, text: borrow String) -> SelectionState {
+    let fields = tomlFields(text)
+    let version = fields.get("version")
+    match version {
+        None -> { return .Unusable(.Malformed(path)) }
+        Some(named) -> {
+            let channel = parseChannel(textOrEmpty(fields.get("channel")))
+            match channel {
+                None -> { return .Unusable(.Malformed(path)) }
+                Some(on) -> {
+                    let selection = Selection {
+                        channel: on,
+                        version: named,
+                        primary: textOrEmpty(fields.get("primary"))
+                    }
+                    return .Selected(selection)
+                }
+            }
+        }
+    }
+    return .NothingSelected
+}
+
+// Writes the selection the launcher reads.
+public function writeSelection(compiler: borrow Compiler, selection: borrow Selection) -> Bool {
+    if !makeDirectoryTree(compilerRoot(compiler)) { return false }
+    let text = "channel = \"" + channelName(selection.channel) + "\"\n"
+        + "version = \"" + selection.version + "\"\n"
+        + "primary = \"" + selection.primary + "\"\n"
+    return succeeded(writeFile(currentToolchainPath(compiler), text))
+}
+
+// Removes the selection, which is what uninstalling the selected toolchain
+// leaves behind: nothing selected rather than a guess at a replacement.
+public function clearSelection(compiler: borrow Compiler) -> Bool {
+    let path = currentToolchainPath(compiler)
+    if !pathExists(path) { return true }
+    return succeeded(removePath(path))
+}
+
+// Writes a pin into `directory`.
+public function writePin(compiler: borrow Compiler, directory: borrow String, pin: borrow Pin) -> Bool {
+    let text = "# Written by `knvm " + compiler.name + " pin`: the " + compiler.name
+        + " toolchain this directory tree uses.\n"
+        + "channel = \"" + channelName(pin.channel) + "\"\n"
+        + "version = \"" + pin.version + "\"\n"
+    return succeeded(writeFile(joinPath(directory, pinFileName(compiler)), text))
+}
+
+// Removes the pin in `directory`, reporting whether there was one.
+public function removePin(compiler: borrow Compiler, directory: borrow String) -> Bool {
+    let path = joinPath(directory, pinFileName(compiler))
+    if !pathExists(path) { return false }
+    return succeeded(removePath(path))
+}
+
+// The pin governing `directory`, found by walking up from it.
+//
+// The nearest pin wins, so a pinned subproject inside a pinned repository gets
+// its own. No pin anywhere above `directory` is the ordinary case and is not an
+// error. A pin that exists and cannot be read *is* one: falling back to the
+// global selection would run a compiler the tree explicitly said it does not
+// want, silently.
+public function findPin(compiler: borrow Compiler, directory: borrow String) -> PinState {
+    var current = directory
+    while true {
+        let path = joinPath(current, pinFileName(compiler))
+        if pathExists(path) {
+            match textOf(path) {
+                Some(text) -> return parsePin(path, text)
+                None -> return .Unusable(.Unreadable(path))
+            }
+        }
+        let parent = directoryOfPath(current)
+        if parent.isEmpty() || parent == current { return .NoPin }
+        current = parent
+    }
+}
+
+public function parsePin(path: borrow String, text: borrow String) -> PinState {
+    let fields = tomlFields(text)
+    match fields.get("version") {
+        None -> { return .Unusable(.Malformed(path)) }
+        Some(version) -> {
+            let named = textOrEmpty(fields.get("channel"))
+            if named.isEmpty() {
+                return .Pinned(Pin { channel: .Release, version: version, path: path })
+            }
+            let channel = parseChannel(named)
+            match channel {
+                None -> { return .Unusable(.UnknownChannel(named)) }
+                Some(on) -> { return .Pinned(Pin { channel: on, version: version, path: path }) }
+            }
+        }
+    }
+    return .NoPin
+}
+
+// The `key = "value"` fields of a TOML file, a comment or blank line at a time.
+//
+// These files are the layout's own contract and hold nothing but flat strings,
+// so they are read as what they are: a line, a key, a quoted value. The parser
+// is not TOML's, and a file that must carry a field it does not is refused by
+// the caller that needed it.
+public function tomlFields(text: borrow String) -> TomlFields {
+    var fields = TomlFields()
+    let lines = text.split("\n")
+    for index in 0..lines.count {
+        let line = lines[index].trim()
+        if line.isEmpty() || line.startsWith("#") { continue }
+        match line.indexOf("=") {
+            Some(separator) -> {
+                let key = line.substring(0, separator).trim()
+                if !key.isEmpty() {
+                    fields.put(key, quotedValueOf(line.substring(separator + 1, line.count).trim()))
+                }
+            }
+            None -> {}
+        }
+    }
+    return fields
+}
+
+// The quoted string in `text`, or "" when it holds none.
+public function quotedValueOf(text: borrow String) -> String {
+    if text.count < 2 { return "" }
+    if text.charAt(0) != quoteByte || text.charAt(text.count - 1) != quoteByte { return "" }
+    return text.substring(1, text.count - 1)
+}
+
+public let quoteByte: Number = 34
+
+// The flat string fields of a `current.toml` or a pin file.
+public struct TomlFields {
+    // Each key, and its value.
+    var entries: [(String, String)] = []
+
+    function put(borrow mut self, key: borrow String, value: borrow String) {
+        self.entries.append((copy key, copy value))
+    }
+
+    // The value of `key`, or nothing when the file does not carry it.
+    function get(borrow self, key: borrow String) -> Optional<String> {
+        for (known, value) in entries {
+            if known == key { return .Some(value) }
+        }
+        return .None
+    }
+}
+
+// An optional string's text, or "" when it is absent.
+public function textOrEmpty(value: Optional<String>) -> String {
+    match value {
+        Some(text) -> { return text }
+        None -> { return "" }
+    }
+    return ""
+}
+
+// Moves a tree written before toolchains were kept per compiler into the
+// default compiler's directory: `<toolchains>/<channel>/` and
+// `<toolchains>/current.toml` become `<toolchains>/kira/<channel>/` and
+// `<toolchains>/kira/current.toml`.
+//
+// Every one of those was a kira toolchain, because kira was the only compiler
+// there was, and a kira tree from before languages were registered is
+// registered as the one it was. A destination that already exists is left alone
+// rather than merged: two trees claiming one name is a conflict for a person to
+// settle, and the legacy one stays where it can still be found. Answers false
+// when a move that was due could not be made.
+public function migrateLegacyLayout() -> Bool {
+    let root = toolchainsRoot()
+    if root.isEmpty() { return true }
+    let kira = legacyCompiler()
+    let directory = compilerRoot(kira)
+    var moved = true
+    for channel in allChannels() {
+        moved = moveIfVacant(
+            joinPath(root, channelName(channel)),
+            joinPath(directory, channelName(channel))
+        ) && moved
+    }
+    moved = moveIfVacant(
+        joinPath(root, currentFileName),
+        joinPath(directory, currentFileName)
+    ) && moved
+    if isDirectory(directory) && !fileExists(joinPath(directory, registrationFileName)) {
+        moved = register(kira) && moved
+    }
+    return moved
+}
+
+// The one compiler there was before languages were registered: the driver with
+// its definitions and standard library beside it.
+public function legacyCompiler() -> Compiler {
+    let parts: [String] = [joinPath(binaryDirectoryName, "kira"), definitionsDirectoryName, "std"]
+    return Compiler {
+        name: "kira",
+        binary: "kira",
+        isDefault: true,
+        parts: copy parts,
+        markers: manifestMarkers(),
+        route: .Registered,
+        feedVariable: feedVariableFor("kira")
+    }
+}
+
+// `from` renamed to `to` when there is something to move and nothing in the way.
+public function moveIfVacant(from: borrow String, to: borrow String) -> Bool {
+    if !pathExists(from) || pathExists(to) { return true }
+    if !makeDirectoryTree(directoryOfPath(to)) { return false }
+    return succeeded(renamePath(from, to))
+}

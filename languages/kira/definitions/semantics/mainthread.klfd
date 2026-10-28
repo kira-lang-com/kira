@@ -1,0 +1,129 @@
+// `MainThread.invoke { call }`, `MainThread.spawn { call }` and
+// `MainThread.post { call }`: requests to run one direct call on the main
+// thread, the only way to reach a `@MainThread` function.
+//
+// Deferred work runs on the thread that awaits it, and the program's own
+// thread is its main thread, so `invoke` makes the call in place, `post`
+// makes it and drops the result, and `spawn` defers it to a
+// `MainThreadTask` whose `.await` runs it. Each still holds to the
+// crossing rules a separate main thread would need: the arguments are
+// `Send`, nothing is borrowed mutably, and a spawned result is `Send`.
+
+extend Checker {
+    function checkMainThreadRequest(borrow mut self, declared: TaskDeclaration, operation: Identifier) -> Int {
+        if declared.written.count > 0 || declared.body.count != 1 {
+            report(.MainThreadArguments, declared.span)
+            return add(.Integer(0), Type.invalid(), declared.span)
+        }
+        match tree.statements[declared.body[0]].kind.evaluatedExpression() {
+            Some(value) -> {
+                match tree.expressions[value].kind.taskCall() {
+                    Some(invocation) -> return mainThreadCall(operation, invocation, tree.expressions[value].span, declared.span)
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+        report(.MainThreadIndirectCall, declared.span)
+        return add(.Integer(0), Type.invalid(), declared.span)
+    }
+
+    function mainThreadCall(borrow mut self, operation: Identifier, invocation: TaskCallSyntax, callSpan: Span, span: Span) -> Int {
+        let outer = mainThreadCall
+        mainThreadCall = .Some(callSpan)
+        let checked = requestedInvocation(invocation, callSpan)
+        mainThreadCall = outer
+        match checked {
+            None -> return add(.Integer(0), Type.invalid(), span)
+            Some(request) -> {
+                let callee = declarations.signatures[request.called.target]
+                var crosses = true
+                for index in 0..request.called.arguments.count {
+                    if callee.parameters[index].mode == .MutablyBorrowed {
+                        report(.MainThreadMutableBorrow, program.expressions[request.called.arguments[index]].span)
+                        crosses = false
+                    } else if !keepsMarker(declarations, tree, typeOf(request.called.arguments[index]), "Send") {
+                        report(.MainThreadCrossing, program.expressions[request.called.arguments[index]].span)
+                        crosses = false
+                    }
+                }
+                if !crosses { return add(.Integer(0), Type.invalid(), span) }
+                var call = add(.Call(request.called.target, request.called.arguments), callee.result, callSpan)
+                if request.dynamic { call = add(.ClassCall(request.called.target, request.called.arguments), callee.result, callSpan) }
+                match operation.text {
+                    "invoke" -> return call
+                    "post" -> {
+                        let done = add(.Integer(0), Type.int(), span)
+                        return add(.Sequence([program.addStatement(.Evaluate(call))], done), Type.void(), span)
+                    }
+                    "spawn" -> {
+                        if !keepsMarker(declarations, tree, callee.result, "Send") {
+                            report(.MainThreadSpawnResult, callSpan)
+                            return add(.Integer(0), Type.invalid(), span)
+                        }
+                        for parameter in callee.parameters {
+                            if parameter.mode != .Owned {
+                                report(.TaskBorrowedTarget, span)
+                                return add(.Integer(0), Type.invalid(), span)
+                            }
+                        }
+                        return deferredCall(request.called, request.dynamic, "MainThreadTask", span)
+                    }
+                    else -> {
+                        report(.OutsideSubset, operation.span)
+                        return add(.Integer(0), Type.invalid(), span)
+                    }
+                }
+            }
+        }
+    }
+
+    // The function and checked arguments `invocation` names: a free function,
+    // or a method of the receiver's type with the receiver first.
+    function requestedInvocation(borrow mut self, invocation: TaskCallSyntax, span: Span) -> Optional<Request> {
+        var receiver: Optional<Int> = .None
+        var owner: Optional<Type> = .None
+        match invocation.receiver {
+            Some(syntax) -> {
+                let value = expression(syntax, .None)
+                if typeOf(value).isInvalid() { return .None }
+                receiver = .Some(value)
+                owner = .Some(typeOf(value))
+            }
+            None -> {}
+        }
+        match overload(owner, invocation.name.text, invocation.arguments, span) {
+            Some(target) -> {
+                declarations.requireVisible(file(), declarations.signatures[target].name.span.file, invocation.name.span)
+                let checked = call(target, receiver, invocation.arguments, span)
+                match program.expressions[checked].operation.invocation() {
+                    Some(called) -> {
+                        var dynamic = false
+                        match owner {
+                            Some(ownerType) -> dynamic = isClassType(program, ownerType)
+                            None -> {}
+                        }
+                        return .Some(Request { called = called, dynamic = dynamic })
+                    }
+                    None -> return .None
+                }
+            }
+            None -> {
+                report(.UndefinedFunction, invocation.name.span)
+                return .None
+            }
+        }
+    }
+
+    function requestedCall(borrow self, span: Span) -> Bool {
+        match mainThreadCall {
+            Some(request) -> return request.file == span.file && request.start == span.start && request.end == span.end
+            None -> return false
+        }
+    }
+}
+
+struct Request {
+    let called: Invocation
+    let dynamic: Bool
+}

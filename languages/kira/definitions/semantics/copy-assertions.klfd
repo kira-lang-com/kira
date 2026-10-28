@@ -1,0 +1,15 @@
+// Copy is a checked structural assertion; it cannot make owned storage copyable.
+function checkCopyAssertions(declarations: Declarations, tree: SyntaxTree) {
+    for assertion in tree.copyAssertions {
+        for index in declarations.structsAt(assertion.span) {
+            if !keepsMarker(declarations, tree, Type.structure(index), "Copyable") {
+                report(.BoundUnsatisfied, assertion.span)
+            }
+        }
+        for index in declarations.enumsAt(assertion.span) {
+            if !keepsMarker(declarations, tree, Type.enumeration(index), "Copyable") {
+                report(.BoundUnsatisfied, assertion.span)
+            }
+        }
+    }
+}

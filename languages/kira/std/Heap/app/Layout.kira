@@ -1,0 +1,81 @@
+// The shape a block of memory takes: how many bytes it spans and the
+// boundary its address falls on. The alignment is a power of two. A layout
+// is checked where it is made, so one held is always one that can be
+// allocated: its size, padded out to its alignment, stays within
+// `maximumBlockBytes`.
+struct MemoryLayout {
+    let size: Int
+    let alignment: Int
+
+    // The size padded out to a multiple of the alignment: the distance from
+    // one element of an array of this layout to the next.
+    function stride(borrow self) -> Int {
+        return alignUp(self.size, self.alignment)
+    }
+
+    function padded(borrow self) -> MemoryLayout {
+        return MemoryLayout { size = self.stride(), alignment = self.alignment }
+    }
+
+    // The offset a field of layout `field` lands at when laid after this
+    // layout's bytes, C style.
+    function fieldOffset(borrow self, field: borrow MemoryLayout) -> Int {
+        return alignUp(self.size, field.alignment)
+    }
+
+    // This layout grown by a field laid after it: the struct C would make of
+    // the two, before its tail is padded.
+    function extended(borrow self, field: borrow MemoryLayout) -> MemoryLayout {
+        let offset = self.fieldOffset(field)
+        if field.size > maximumBlockBytes() - offset { runtimeTrap() }
+        let alignment = self.alignment > field.alignment ? self.alignment : field.alignment
+        return memoryLayout(offset + field.size, alignment)
+    }
+
+    // `count` of this layout end to end.
+    function repeated(borrow self, count: Int) -> MemoryLayout {
+        let stride = self.stride()
+        if count < 0 || (stride > 0 && count > maximumBlockBytes() / stride) { runtimeTrap() }
+        return memoryLayout(stride * count, self.alignment)
+    }
+}
+
+// The most bytes one block may span: far past any address space a machine
+// has, and far enough below the largest `Int` that padding never overflows.
+function maximumBlockBytes() -> Int {
+    return 4611686018427387904
+}
+
+// A checked layout. A negative size, an alignment that is not a power of
+// two, or a size that would pass `maximumBlockBytes` traps.
+function memoryLayout(size: Int, alignment: Int) -> MemoryLayout {
+    if size < 0 || !isPowerOfTwo(alignment) || alignment > maximumBlockBytes() { runtimeTrap() }
+    if size > maximumBlockBytes() - (alignment - 1) { runtimeTrap() }
+    return MemoryLayout { size = size, alignment = alignment }
+}
+
+// The layout C gives a value of `T`.
+function layoutOf<T>() -> MemoryLayout {
+    return memoryLayout(sizeOf<T>(), alignOf<T>())
+}
+
+// The layout of `count` values of `T` end to end.
+function arrayLayout<T>(count: Int) -> MemoryLayout {
+    return layoutOf<T>().repeated(count)
+}
+
+function isPowerOfTwo(value: Int) -> Bool {
+    return value > 0 && (value & (value - 1)) == 0
+}
+
+// `value` rounded up to the next multiple of `alignment`, a power of two.
+function alignUp(value: Int, alignment: Int) -> Int {
+    if !isPowerOfTwo(alignment) { runtimeTrap() }
+    return (value + alignment - 1) & (0 - alignment)
+}
+
+// `value` rounded down to a multiple of `alignment`, a power of two.
+function alignDown(value: Int, alignment: Int) -> Int {
+    if !isPowerOfTwo(alignment) { runtimeTrap() }
+    return value & (0 - alignment)
+}

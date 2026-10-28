@@ -1,0 +1,80 @@
+import Foundation
+
+// HTTP/3 and QPACK registry code points (RFC 9114 sections 7.2, 6.2, 7.2.4.1
+// and 8.1; RFC 9204 section 6), as the wire spells them.
+
+@Open
+enum Http3FrameType: Number {
+    Data = 0
+    Headers = 1
+    CancelPush = 3
+    Settings = 4
+    PushPromise = 5
+    Goaway = 7
+    MaxPushId = 13
+    // WT_STREAM: not a frame but the signal opening a bidirectional
+    // WebTransport stream, its session ID in place of a length
+    // (draft-ietf-webtrans-http3 section 4.3).
+    WtStream = 65
+}
+
+@Open
+enum Http3StreamType: Number {
+    Control = 0
+    Push = 1
+    QpackEncoder = 2
+    QpackDecoder = 3
+    // draft-ietf-webtrans-http3 section 4.2.
+    WebTransport = 84
+}
+
+@Open
+enum Http3Setting: Number {
+    QpackMaxTableCapacity = 1
+    MaxFieldSectionSize = 6
+    QpackBlockedStreams = 7
+    // RFC 9220.
+    EnableConnectProtocol = 8
+    // RFC 9297.
+    H3Datagram = 51
+    // SETTINGS_WT_ENABLED, 0x2c7cf000, whose code point names the draft
+    // version (draft-ietf-webtrans-http3 section 7.1).
+    WtEnabled = 746385408
+}
+
+@Open
+enum Http3Error: Number {
+    NoError = 256
+    GeneralProtocolError = 257
+    InternalError = 258
+    StreamCreationError = 259
+    ClosedCriticalStream = 260
+    FrameUnexpected = 261
+    FrameError = 262
+    ExcessiveLoad = 263
+    IdError = 264
+    SettingsError = 265
+    MissingSettings = 266
+    RequestRejected = 267
+    RequestCancelled = 268
+    RequestIncomplete = 269
+    MessageError = 270
+    ConnectError = 271
+    VersionFallback = 272
+    QpackDecompressionFailed = 512
+    QpackEncoderStreamError = 513
+    QpackDecoderStreamError = 514
+    // draft-ietf-webtrans-http3 section 9.5.
+    WtFlowControlError = 73221255
+    WtAlpnError = 135771101
+    WtSessionGone = 386759528
+    WtRequirementsNotMet = 556535112
+    WtBufferedStreamRejected = 966049156
+}
+
+namespace Http3 {
+    // HTTP/2 frame types with no meaning in HTTP/3 (RFC 9114 section
+    // 7.2.8), and HTTP/2 settings likewise (section 7.2.4.1).
+    let http2Frames: [Number] = [2, 6, 8, 9]
+    let http2Settings: [Number] = [2, 3, 4, 5]
+}

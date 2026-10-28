@@ -1,0 +1,326 @@
+// Expressions. `place` is the pointer a local, a buffer, a workgroup
+// variable or a part of one names, or -1; `value` is what an expression
+// computes. A list operand (a composition's parts, a call's arguments) is
+// pushed only after every operand is computed, since computing one may
+// push its own. A bound parameter is the global its specialization binds.
+
+function binaryName(operator: Operator) -> String {
+    match operator {
+        Add -> return "add"
+        Subtract -> return "subtract"
+        Multiply -> return "multiply"
+        Divide -> return "divide"
+        Remainder -> return "modulo"
+        Equal -> return "equal"
+        NotEqual -> return "not_equal"
+        Less -> return "less"
+        LessEqual -> return "less_equal"
+        Greater -> return "greater"
+        GreaterEqual -> return "greater_equal"
+        LogicalAnd -> return "logical_and"
+        LogicalOr -> return "logical_or"
+        BitAnd -> return "and"
+        BitOr -> return "inclusive_or"
+        BitXor -> return "exclusive_or"
+        ShiftLeft -> return "shift_left"
+        ShiftRight -> return "shift_right"
+        Negate -> return "negate"
+        Plus -> return ""
+        Not -> return "not"
+        BitNot -> return "bit_not"
+        Dereference -> return ""
+        AddressOf -> return ""
+        Increment -> return "add"
+        Decrement -> return "subtract"
+        Comma -> return ""
+        Plain -> return ""
+    }
+}
+
+function swizzleText(components: [Int]) -> String {
+    var parts: [String] = []
+    for component in components {
+        parts.append(utf8Slice("xyzw", component, component + 1))
+    }
+    return joinText(parts)
+}
+
+extend Lowering {
+    function typeOf(borrow self, expression: Int) -> Int {
+        return program.expressions[expression].expressionType
+    }
+
+    // The global a global or bound parameter expression names.
+    function globalOf(borrow self, checked: CheckedExpression) -> Int {
+        if checked.kind == .BoundParameter { return bound[checked.target] }
+        return checked.target
+    }
+
+    function place(borrow mut self, expression: Int) -> Int {
+        let checked = program.expressions[expression]
+        if checked.kind == .Local { return places[checked.target] }
+        if checked.kind == .Global || checked.kind == .BoundParameter {
+            if !checked.place { return -1 }
+            return shader_expr_global(module, builder, globals[globalOf(checked)])
+        }
+        if checked.kind == .Member {
+            let base = place(checked.left)
+            if base < 0 { return -1 }
+            return shader_expr_access_index(module, builder, base, checked.target)
+        }
+        if checked.kind == .Index {
+            let base = place(checked.left)
+            if base < 0 { return -1 }
+            return shader_expr_access(module, builder, base, value(checked.right))
+        }
+        if checked.kind == .Swizzle && checked.components.count == 1 {
+            let base = place(checked.left)
+            if base < 0 { return -1 }
+            return shader_expr_access_index(module, builder, base, checked.components[0])
+        }
+        return -1
+    }
+
+    function load(borrow mut self, pointer: Int) -> Int {
+        return shader_expr_load(module, builder, pointer)
+    }
+
+    function value(borrow mut self, expression: Int) -> Int {
+        let checked = program.expressions[expression]
+        match checked.kind {
+            Literal -> return literal(checked.value)
+            Local -> return load(places[checked.target])
+            Global -> return globalValue(checked)
+            BoundParameter -> return globalValue(checked)
+            Member -> {
+                if checked.place { return load(place(expression)) }
+                return shader_expr_access_index(module, builder, value(checked.left), checked.target)
+            }
+            Swizzle -> {
+                let vector = value(checked.left)
+                if checked.components.count == 1 {
+                    return shader_expr_access_index(module, builder, vector, checked.components[0])
+                }
+                return shader_expr_swizzle(module, builder, vector, swizzleText(checked.components))
+            }
+            Index -> return indexValue(expression, checked)
+            Construct -> {
+                let parts = values(checked.arguments)
+                pushAll(parts)
+                return shader_expr_compose(module, builder, typeHandle(checked.expressionType))
+            }
+            Splat -> {
+                let lane = value(checked.left)
+                return shader_expr_splat(module, builder, program.types[checked.expressionType].width, lane)
+            }
+            Zero -> return shader_expr_zero(module, builder, typeHandle(checked.expressionType))
+            Convert -> {
+                let converted = value(checked.left)
+                return shader_expr_convert(module, builder, converted, program.types[checked.expressionType].scalar.ksir())
+            }
+            Bitcast -> {
+                let operand = value(checked.left)
+                return shader_expr_bitcast(module, builder, operand, typeHandle(checked.expressionType))
+            }
+            Call -> return callValue(checked)
+            Library -> return libraryValue(checked)
+            ImageCall -> return imageValue(checked)
+            Atomic -> return atomicValue(checked)
+            Barrier -> {
+                shader_stmt_barrier(module, builder, "control", checked.name)
+                return -1
+            }
+            Discard -> {
+                shader_stmt_kill(module, builder)
+                return -1
+            }
+            Unary -> return shader_expr_unary(module, builder, binaryName(checked.operator), value(checked.left))
+            Binary -> {
+                let left = value(checked.left)
+                let right = value(checked.right)
+                return shader_expr_binary(module, builder, binaryName(checked.operator), left, right)
+            }
+            Select -> {
+                let condition = value(checked.left)
+                let accept = value(checked.right)
+                let reject = value(checked.third)
+                return shader_expr_select(module, builder, condition, accept, reject)
+            }
+            Choose -> return chooseValue(checked)
+            ShortCircuit -> return shortCircuitValue(checked)
+            Assign -> {
+                let stored = value(checked.right)
+                assign(checked.left, stored)
+                return stored
+            }
+            Step -> return stepValue(checked)
+            Sequence -> {
+                value(checked.arguments[0])
+                return value(checked.arguments[1])
+            }
+            Invalid -> return -1
+        }
+    }
+
+    function globalValue(borrow mut self, checked: CheckedExpression) -> Int {
+        let global = globalOf(checked)
+        let declared = program.globals[global]
+        match declared.kind {
+            Buffer -> return load(shader_expr_global(module, builder, globals[global]))
+            Threadgroup -> return load(shader_expr_global(module, builder, globals[global]))
+            Texture -> return shader_expr_global(module, builder, globals[global])
+            SamplerGlobal -> return shader_expr_global(module, builder, globals[global])
+            ConstantGlobal -> {
+                if inlined[global] { return value(declared.value) }
+                return shader_expr_constant(module, builder, globals[global])
+            }
+            FunctionConstant -> return shader_expr_override(module, builder, globals[global])
+        }
+    }
+
+    // An element: through its pointer when it has one; an array value
+    // indexed by a computed index is first stored in a local.
+    function indexValue(borrow mut self, expression: Int, checked: CheckedExpression) -> Int {
+        if checked.place { return load(place(expression)) }
+        let base = value(checked.left)
+        let index = value(checked.right)
+        let array = program.types[typeOf(checked.left)].shape == .Array
+        if array && program.expressions[checked.right].kind != .Literal {
+            let spilled = newLocal("indexed", typeOf(checked.left))
+            shader_stmt_store(module, builder, spilled, base)
+            return load(shader_expr_access(module, builder, spilled, index))
+        }
+        return shader_expr_access(module, builder, base, index)
+    }
+
+    function values(borrow mut self, expressions: [Int]) -> [Int] {
+        var computed: [Int] = []
+        for expression in expressions {
+            computed.append(value(expression))
+        }
+        return computed
+    }
+
+    function pushAll(borrow mut self, words: [Int]) {
+        for word in words {
+            shader_push(module, word)
+        }
+    }
+
+    // Writes `written` to the place `target` names. A swizzle of several
+    // lanes rebuilds the whole vector: the lanes it names from `written`,
+    // the rest from what the vector held.
+    function assign(borrow mut self, target: Int, written: Int) {
+        let checked = program.expressions[target]
+        if checked.kind != .Swizzle || checked.components.count == 1 {
+            shader_stmt_store(module, builder, place(target), written)
+            return
+        }
+        let base = place(checked.left)
+        let vector = program.types[typeOf(checked.left)]
+        let old = load(base)
+        var lanes: [Int] = []
+        for lane in 0..vector.width {
+            var from = -1
+            for position in 0..checked.components.count {
+                if checked.components[position] == lane { from = position }
+            }
+            if from >= 0 {
+                lanes.append(shader_expr_access_index(module, builder, written, from))
+            } else {
+                lanes.append(shader_expr_access_index(module, builder, old, lane))
+            }
+        }
+        pushAll(lanes)
+        shader_stmt_store(module, builder, base, shader_expr_compose(module, builder, typeHandle(typeOf(checked.left))))
+    }
+
+    // A call: value arguments as computed, a reference argument as the
+    // pointer it names. A reference to part of a variable goes through a
+    // duplicate, written back after the call.
+    function callValue(borrow mut self, checked: CheckedExpression) -> Int {
+        let callee = program.functions[checked.target]
+        let handle = specialization(checked.target, boundBy(checked, bound))
+        var arguments: [Int] = []
+        var copies: [Int] = []
+        var targets: [Int] = []
+        for index in 0..callee.parameters.count {
+            let argument = checked.arguments[index]
+            match callee.parameters[index].mode {
+                ByValue -> arguments.append(value(argument))
+                Bound -> {}
+                ThreadgroupReference -> arguments.append(place(argument))
+                ThreadReference -> {
+                    let whole = program.expressions[argument].kind == .Local
+                    if whole {
+                        arguments.append(place(argument))
+                    } else {
+                        let duplicate = newLocal("argument", typeOf(argument))
+                        shader_stmt_store(module, builder, duplicate, value(argument))
+                        arguments.append(duplicate)
+                        if program.expressions[argument].place {
+                            copies.append(duplicate)
+                            targets.append(argument)
+                        }
+                    }
+                }
+            }
+        }
+        pushAll(arguments)
+        let result = shader_stmt_call(module, builder, handle)
+        for index in 0..copies.count {
+            assign(targets[index], load(copies[index]))
+        }
+        return result
+    }
+
+    // `c ? a : b` when a side has effects: each side stored in a local
+    // under its branch.
+    function chooseValue(borrow mut self, checked: CheckedExpression) -> Int {
+        let condition = value(checked.left)
+        let resultType = checked.expressionType
+        if program.types[resultType].shape == .Void {
+            shader_stmt_if(module, builder, condition)
+            value(checked.right)
+            shader_stmt_else(module, builder)
+            value(checked.third)
+            shader_stmt_end_if(module, builder)
+            return -1
+        }
+        let chosen = newLocal("chosen", resultType)
+        shader_stmt_if(module, builder, condition)
+        shader_stmt_store(module, builder, chosen, value(checked.right))
+        shader_stmt_else(module, builder)
+        shader_stmt_store(module, builder, chosen, value(checked.third))
+        shader_stmt_end_if(module, builder)
+        return load(chosen)
+    }
+
+    // `a && b` and `a || b` whose right side has effects: it runs only
+    // when the left does not decide.
+    function shortCircuitValue(borrow mut self, checked: CheckedExpression) -> Int {
+        let decided = newLocal("decided", checked.expressionType)
+        shader_stmt_store(module, builder, decided, value(checked.left))
+        var test = load(decided)
+        if checked.operator == .LogicalOr { test = shader_expr_unary(module, builder, "not", test) }
+        shader_stmt_if(module, builder, test)
+        shader_stmt_store(module, builder, decided, value(checked.right))
+        shader_stmt_end_if(module, builder)
+        return load(decided)
+    }
+
+    // `++` and `--`: the stepped value stored; the new value before, the
+    // old one after.
+    function stepValue(borrow mut self, checked: CheckedExpression) -> Int {
+        let old = value(checked.left)
+        let found = program.types[checked.expressionType]
+        var text = "1"
+        if found.scalar.isFloat() { text = "1.0" }
+        var one = shader_expr_literal(module, builder, found.scalar.ksir(), text)
+        if found.shape == .Vector { one = shader_expr_splat(module, builder, found.width, one) }
+        let stepped = shader_expr_binary(module, builder, binaryName(checked.operator), old, one)
+        assign(checked.left, stepped)
+        if checked.detail == "prefix" { return stepped }
+        return old
+    }
+}

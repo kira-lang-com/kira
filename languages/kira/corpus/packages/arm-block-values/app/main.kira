@@ -1,0 +1,36 @@
+import Foundation
+
+// A match arm whose block ends in a local it declared moves that local out as
+// the arm's value. The local must outlive the move: freeing it with the block
+// left the value pointing at freed storage, which the next allocation reused.
+
+function make(n: Int) -> [String] {
+    return ["a\(n)", "b\(n)"]
+}
+
+function fromArm(n: Int) -> [String] {
+    let list = match n >= 0 {
+        true -> {
+            let read = make(n)
+            read
+        }
+        false -> []
+    }
+    return list
+}
+
+@Main
+function main() -> Int {
+    var kept: [[String]] = []
+    for n in 0..4 {
+        kept.append(fromArm(n))
+        let noise = make(n + 100)
+        if noise.count != 2 { return 1 }
+    }
+    var total = 0
+    for list in kept {
+        for text in list { total += text.count }
+    }
+    if kept[0][0] == "a0" && kept[3][1] == "b3" { total += 1 }
+    return total
+}

@@ -1,0 +1,206 @@
+// Stream data both ways (RFC 9000 sections 2 to 4): bytes reassembled in
+// order from frames that arrive in any order, bytes queued to send and
+// resent when lost, and the credit each side gives the other.
+
+// Bytes at an offset of a stream or of a level's CRYPTO stream.
+struct QuicPiece {
+    let offset: Number
+    let data: [UN8]
+}
+
+// What arrived, delivered in order. Overlaps are allowed and must agree;
+// the earlier copy is kept.
+struct QuicReassembly {
+    var delivered: Number = 0
+    var pieces: [QuicPiece] = []
+    var finalSize: Number? = .None
+    var buffered: Number = 0
+
+    // The highest offset any received byte reached.
+    function highest(borrow self) -> Number {
+        var top = delivered
+        for piece in pieces { top = max(top, piece.offset + piece.data.count) }
+        return top
+    }
+
+    function add(
+        borrow mut self,
+        offset: Number,
+        data: borrow [UN8],
+        fin: Bool
+    ) -> Result<Void, QuicTransportError> {
+        let end = offset + data.count
+        match finalSize {
+            Some(size) -> {
+                if end > size || fin && end != size { return .Error(.FinalSizeError) }
+            }
+            None -> {
+                if fin {
+                    if end < highest() { return .Error(.FinalSizeError) }
+                    finalSize = .Some(end)
+                }
+            }
+        }
+        if end <= delivered || data.count == 0 { return .Ok }
+        let start = max(offset, delivered)
+        let fresh = QuicPiece { offset: start, data: byteRun(data, start - offset, data.count) }
+        buffered += fresh.data.count
+        pieces = quicInsertedPiece(pieces, move fresh)
+        return .Ok
+    }
+
+    // The contiguous bytes from the read point.
+    function read(borrow mut self) -> [UN8] {
+        var out: [UN8] = []
+        var rest: [QuicPiece] = []
+        for piece in pieces {
+            let end = piece.offset + piece.data.count
+            if piece.offset <= delivered && end > delivered {
+                out.appendAll(byteRun(piece.data, delivered - piece.offset, piece.data.count))
+                delivered = end
+            } else if end > delivered {
+                rest.append(piece)
+            }
+        }
+        pieces = rest
+        buffered = max(buffered - out.count, 0)
+        return out
+    }
+
+    function isFinished(borrow self) -> Bool {
+        return match finalSize {
+            Some(size) -> delivered == size
+            None -> false
+        }
+    }
+}
+
+// `pieces` with `fresh` placed by offset.
+function quicInsertedPiece(pieces: borrow [QuicPiece], fresh: QuicPiece) -> [QuicPiece] {
+    var out: [QuicPiece] = []
+    var placed = false
+    for piece in pieces {
+        if !placed && fresh.offset < piece.offset {
+            out.append(copy fresh)
+            placed = true
+        }
+        out.append(piece)
+    }
+    if !placed { out.append(fresh) }
+    return out
+}
+
+// A stream's send side: queued pieces, the next new offset, and the credit
+// the peer gave.
+struct QuicSendSide {
+    var queued: [QuicPiece] = []
+    var offset: Number = 0
+    // The highest offset sent so far: bytes past it count against the
+    // connection's credit, resent bytes do not.
+    var sentHighest: Number = 0
+    var limit: Number = 0
+    var finQueued: Bool = false
+    var finSent: Bool = false
+    var finAcknowledged: Bool = false
+    var outstanding: Number = 0
+    // The error a RESET_STREAM this side sent carried.
+    var resetError: Number? = .None
+    // The bytes a reset still delivers; `queued` holds only those once the
+    // stream is reset.
+    var reliableSize: Number = 0
+
+    function hasWork(borrow self) -> Bool {
+        return queued.count > 0 || resetError.isNone() && finQueued && !finSent
+    }
+
+    // A reset at size zero ends the stream at once; one that delivers
+    // bytes ends it once they are acknowledged, as a FIN would (draft
+    // section 5.3).
+    function isDone(borrow self) -> Bool {
+        let delivered = outstanding == 0 && queued.count == 0
+        return match resetError {
+            Some(_) -> reliableSize == 0 || delivered
+            None -> finAcknowledged && delivered
+        }
+    }
+}
+
+// The part of `pieces` below `limit`.
+function quicPiecesBelow(pieces: borrow [QuicPiece], limit: Number) -> [QuicPiece] {
+    var kept: [QuicPiece] = []
+    for piece in pieces {
+        if piece.offset >= limit { continue }
+        let count = min(piece.data.count, limit - piece.offset)
+        kept.append(QuicPiece { offset: piece.offset, data: byteRun(piece.data, 0, count) })
+    }
+    return kept
+}
+
+struct QuicStream {
+    let id: QuicStreamNumber
+    var incoming: QuicReassembly = QuicReassembly {}
+    var receiveLimit: Number
+    let receiveWindow: Number
+    var sending: QuicSendSide = QuicSendSide {}
+    // The peer's reset, with the smallest reliable size it gave.
+    var peerReset: QuicResetStreamFrame? = .None
+    // The reset was reported, once every byte below its reliable size was
+    // read.
+    var resetAnnounced: Bool = false
+    // The error a peer's STOP_SENDING carried.
+    var peerStopped: Number? = .None
+    var announcedEnd: Bool = false
+
+    // Whether this side can send on it: not a peer's unidirectional stream.
+    function sends(borrow self, role: TlsRole) -> Bool {
+        return id.kind() == .Bidirectional || id.openedBy() == role
+    }
+
+    function receives(borrow self, role: TlsRole) -> Bool {
+        return id.kind() == .Bidirectional || id.openedBy() != role
+    }
+
+    function take(
+        borrow mut self,
+        frame: borrow QuicStreamFrame
+    ) -> Result<Void, QuicTransportError> {
+        match peerReset {
+            Some(reset) -> {
+                if frame.offset + frame.data.count > reset.finalSize {
+                    return .Error(.FinalSizeError)
+                }
+                // Bytes past the reliable size need not be kept.
+                if frame.offset >= reset.reliableSize { return .Ok }
+            }
+            None -> {}
+        }
+        if frame.offset + frame.data.count > receiveLimit { return .Error(.FlowControlError) }
+        return incoming.add(frame.offset, frame.data, frame.fin)
+    }
+
+    // New credit to announce once half the window is used (RFC 9000
+    // section 4.2), none otherwise.
+    function creditUpdate(borrow mut self) -> Number? {
+        if incoming.finalSize.isSome() { return .None }
+        if receiveLimit - incoming.delivered > trunc(receiveWindow / 2) { return .None }
+        receiveLimit = incoming.delivered + receiveWindow
+        return .Some(receiveLimit)
+    }
+
+    function isClosed(borrow self, role: TlsRole) -> Bool {
+        let sendDone = !sends(role) || sending.isDone()
+        let receiveDone = !receives(role) || resetAnnounced || incoming.isFinished() && announcedEnd
+        return sendDone && receiveDone
+    }
+}
+
+// The peer's credit for new streams of one kind, and ours for it.
+struct QuicStreamCounts {
+    // Streams of this kind this side opened.
+    var opened: Number = 0
+    var peerAllows: Number = 0
+    // Streams of this kind the peer opened, and how many it may.
+    var accepted: Number = 0
+    var allowed: Number = 0
+    let window: Number
+}

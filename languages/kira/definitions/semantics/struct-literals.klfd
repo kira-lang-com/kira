@@ -1,0 +1,296 @@
+// Struct literals: the written fields, in the order they are written, and
+// the declared defaults of the ones left out.
+
+extend Checker {
+    // `Point { x = 1, y = 2 }`, and `Chunked<String> { }` for an instance of a
+    // generic struct. A field the literal leaves out takes its declared
+    // default, checked afresh here with no local in sight.
+    //
+    // `types` are the type arguments the name was written with. Written, they
+    // name the instance; expected, the type the position wants does; neither,
+    // a template's own fields decide them, and a name no template answers to
+    // is the struct it declares.
+    function checkStructLiteral(borrow mut self, written: Identifier, types: [TypeReference], fields: [FieldValue], expected: Optional<Type>, span: Span) -> Int {
+        // A `Library.Point` the namespace pass left alone means the one type
+        // of that name there is.
+        let name = Identifier { text = unqualifiedName(written.text), span = written.span }
+        if types.count == 0 && lookup(name.text).isSome() { return checkUpdatedStruct(name, fields, span) }
+        if types.count > 0 { return checkTypedStructLiteral(name, types, fields, span) }
+        var owner: Optional<Int> = .None
+        match expected {
+            Some(target) -> {
+                if target.kind == .Structure && instantiates(program.structs[target.declaration], name.text) {
+                    owner = .Some(target.declaration)
+                }
+            }
+            None -> {}
+        }
+        if owner.isNone() {
+            match genericStruct(tree.genericStructs, name.text) {
+                Some(template) -> { return inferredLiteral(template, name, fields, span) }
+                None -> {}
+            }
+        }
+        match declarations.typeNamedAt(name.text, name.span.file) {
+            Some(named) -> {
+                if named.kind == .Structure && owner.isNone() { owner = .Some(named.declaration) }
+            }
+            None -> {}
+        }
+        match owner {
+            None -> {
+                report(.UnknownStruct, name.span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+            Some(index) -> return checkStructFields(index, name, fields, span)
+        }
+    }
+
+    // `Chunked<String> { }`: the instance the written type arguments name, as
+    // `Box<Int>` answers everywhere else.
+    function checkTypedStructLiteral(borrow mut self, name: Identifier, types: [TypeReference], fields: [FieldValue], span: Span) -> Int {
+        if declarations.typeNamedAt(name.text, name.span.file).isSome() {
+            report(.TypeArgumentCount, name.span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let instance = resolveType(TypeReference {
+            qualifier = .None, name = name, arguments = types, modes = [],
+            instanceName = referenceInstanceName(name.text, types, [])
+        })
+        if instance.kind != .Structure {
+            if !instance.isInvalid() { report(.UnknownStruct, name.span) }
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        return checkStructFields(instance.declaration, name, fields, span)
+    }
+
+    function checkUpdatedStruct(borrow mut self, name: Identifier, fields: [FieldValue], span: Span) -> Int {
+        return updatedStruct(checkName(name), fields, span)
+    }
+
+    // `source` with `fields` replaced. A field written `inner.x` updates the
+    // `x` of the `inner` it copies.
+    function updatedStruct(borrow mut self, source: Int, fields: [FieldValue], span: Span) -> Int {
+        let valueType = typeOf(source)
+        if valueType.kind != .Structure || isClassType(program, valueType) {
+            report(.UnknownStruct, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let owner = program.structs[valueType.declaration]
+        let local = declareLocal(joinText(["__update_", decimalText(program.expressions.count)]), valueType, false, false)
+        let saved = program.addStatement(.Declare(local, source))
+        let base = add(.Read(local), valueType, span)
+        for field in fields {
+            if owner.field(pathHead(field.name.text)).isNone() { report(.UnknownField, field.name.span) }
+        }
+        var values: [FieldValue] = []
+        for index in 0..owner.fields.count {
+            let field = owner.fields[index]
+            var direct: Optional<Int> = .None
+            var nested: [FieldValue] = []
+            for given in fields {
+                if given.name.text == field.name.text { direct = .Some(given.value) }
+                if pathHead(given.name.text) == field.name.text && given.name.text != field.name.text {
+                    let rest = utf8Slice(given.name.text, utf8Count(field.name.text) + 1, utf8Count(given.name.text))
+                    nested.append(FieldValue { name = Identifier { text = rest, span = given.name.span }, value = given.value })
+                }
+            }
+            let current = add(.Member(base, index), field.valueType, span)
+            match direct {
+                Some(value) -> values.append(FieldValue { name = field.name, value = expression(value, .Some(field.valueType)) })
+                None -> {
+                    if nested.count > 0 {
+                        values.append(FieldValue { name = field.name, value = updatedStruct(current, nested, span) })
+                    } else {
+                        values.append(FieldValue { name = field.name, value = current })
+                    }
+                }
+            }
+        }
+        let updated = assembleStruct(valueType.declaration, owner.name, values, span)
+        return add(.Sequence([saved], updated), valueType, span)
+    }
+
+    function checkStructFields(borrow mut self, owner: Int, name: Identifier, fields: [FieldValue], span: Span) -> Int {
+        let structType = program.structs[owner]
+        var checked: [FieldValue] = []
+        for given in fields {
+            let filled = backingLabel(owner, given.name)
+            match structType.field(filled.text) {
+                Some(index) -> {
+                    let value = expression(given.value, .Some(structType.fields[index].valueType))
+                    checked.append(FieldValue { name = filled, value = value })
+                }
+                None -> report(.UnknownField, given.name.span)
+            }
+        }
+        return assembleStruct(owner, name, checked, span)
+    }
+
+    // The member a label fills. A computed member `name` backed by a stored
+    // `_name`, as a property wrapper writes it, takes its storage under its
+    // own name, as Swift's memberwise initializer takes a wrapped property's.
+    function backingLabel(borrow self, owner: Int, label: Identifier) -> Identifier {
+        let structType = program.structs[owner]
+        if structType.field(label.text).isSome() { return label }
+        if computedMember(Type.structure(owner), label.text).isNone() { return label }
+        let backing = joinText(["_", label.text])
+        if structType.field(backing).isNone() { return label }
+        return Identifier { text = backing, span = label.span }
+    }
+
+    // A struct value from fields whose values are already checked; a field
+    // left out takes its declared default. Values evaluate in the order they
+    // are written, so ones written out of declaration order are bound first.
+    function assembleStruct(borrow mut self, owner: Int, name: Identifier, fields: [FieldValue], span: Span) -> Int {
+        let structType = program.structs[owner]
+        // A zero the checker fills in names the type by its declaration, and
+        // is no reference of the file's.
+        if !name.span.same(structType.name.span) {
+            declarations.requireVisible(file(), structType.name.span.file, name.span)
+        }
+        var values: [Optional<Int>] = []
+        for field in structType.fields {
+            let missing: Optional<Int> = .None
+            values.append(missing)
+        }
+        let reordered = writtenOutOfOrder(structType, fields)
+        let suffix = decimalText(program.expressions.count)
+        var bound: [Int] = []
+        for given in fields {
+            match structType.field(given.name.text) {
+                None -> report(.UnknownField, given.name.span)
+                Some(index) -> {
+                    if values[index].isSome() { report(.FieldRepeated, given.name.span) }
+                    let fieldType = structType.fields[index].valueType
+                    var value = given.value
+                    if isForeignShaped(structType) {
+                        value = foreignCoerce(value, fieldType, false)
+                    } else {
+                        value = coerce(value, fieldType, .FieldTypeMismatch)
+                    }
+                    if reordered {
+                        let local = declareLocal(joinText(["__field_", suffix, "_", given.name.text]), fieldType, false, false)
+                        bound.append(program.addStatement(.Declare(local, value)))
+                        value = add(.Read(local), fieldType, given.name.span)
+                    }
+                    values[index] = .Some(value)
+                }
+            }
+        }
+        if isUnionShape(structType.shape) {
+            var member = 0
+            var written: Optional<Int> = .None
+            for index in 0..values.count {
+                match values[index] {
+                    Some(value) -> {
+                        if written.isSome() { report(.ForeignUnionMembers, span) }
+                        member = index
+                        written = .Some(value)
+                    }
+                    None -> {}
+                }
+            }
+            let union = add(.ForeignUnion(member, written), Type.structure(owner), span)
+            if bound.count == 0 { return union }
+            return add(.Sequence(bound, union), Type.structure(owner), span)
+        }
+        var checked: [Int] = []
+        let slots = constructSlotsAmong(tree, constructIndices, structType.name.text)
+        for index in 0..values.count {
+            let field = structType.fields[index]
+            match values[index] {
+                Some(value) -> checked.append(value)
+                None -> {
+                    match slotNamed(slots, field.name.text) {
+                        Some(slot) -> {
+                            if slots[slot].list && field.initial.isNone() {
+                                checked.append(add(.ArrayLiteral([]), field.valueType, span))
+                                continue
+                            }
+                        }
+                        None -> {}
+                    }
+                    checked.append(fieldDefault(owner, field, span))
+                }
+            }
+        }
+        let constructed = add(.Construct(checked), Type.structure(owner), span)
+        if bound.count == 0 { return constructed }
+        return add(.Sequence(bound, constructed), Type.structure(owner), span)
+    }
+
+    function fieldDefault(borrow mut self, owner: Int, field: Field, span: Span) -> Int {
+        match field.initial {
+            Some(initial) -> {
+                if !field.inferred { return isolatedDefault(initial, field.valueType, .FieldTypeMismatch) }
+                if field.valueType.equals(Type.invalid()) { return add(.Integer(0), Type.invalid(), span) }
+                diag_hold()
+                let value = isolatedDefault(initial, field.valueType, .FieldTypeMismatch)
+                diag_release(0)
+                return value
+            }
+            None -> {
+                if isForeignShaped(program.structs[owner]) { return foreignFieldZero(owner, field, span) }
+                report(.FieldMissing, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+
+    // A declared default, checked where it is used but with no local in sight
+    // and in the scope of the file that declares it: the names it writes are
+    // that file's, whichever file's literal leaves it out.
+    function isolatedDefault(borrow mut self, initial: Int, valueType: Type, mismatch: Diagnostic) -> Int {
+        let savedVisible = visible
+        let savedBareMembers = bareMembers
+        let savedSource = sourceOverride
+        visible = []
+        bareMembers = false
+        sourceOverride = .Some(tree.expressions[initial].span.file)
+        let value = coerce(expression(initial, .Some(valueType)), valueType, mismatch)
+        sourceOverride = savedSource
+        bareMembers = savedBareMembers
+        visible = savedVisible
+        return value
+    }
+}
+
+// Whether a field is written before one declared ahead of it.
+function writtenOutOfOrder(structType: StructType, fields: [FieldValue]) -> Bool {
+    var last = -1
+    for given in fields {
+        match structType.field(given.name.text) {
+            Some(index) -> {
+                if index < last { return true }
+                last = index
+            }
+            None -> {}
+        }
+    }
+    return false
+}
+
+// The name after the last `.` of a qualified name, or the name itself.
+function unqualifiedName(text: String) -> String {
+    let dot = lastDot(text)
+    if dot < 0 { return text }
+    return utf8Slice(text, dot + 1, utf8Count(text))
+}
+
+// The byte index of the last `.` in a name, or -1.
+function lastDot(text: String) -> Int {
+    var found = -1
+    for index in 0..utf8Count(text) {
+        if utf8Byte(text, index) == 46 { found = index }
+    }
+    return found
+}
+
+// The first segment of a field path, `inner` for `inner.x`.
+function pathHead(path: String) -> String {
+    for index in 0..utf8Count(path) {
+        if utf8Byte(path, index) == 46 { return utf8Slice(path, 0, index) }
+    }
+    return path
+}

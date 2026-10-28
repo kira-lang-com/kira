@@ -1,0 +1,191 @@
+// The wire: big-endian integers, QUIC variable-length integers (RFC 9000
+// section 16) and length-prefixed vectors (TLS's 8-, 16- and 24-bit
+// prefixes). Bytes from a peer are untrusted, so every read checks what
+// remains before it reads and answers a `WireFailure`, never a trap.
+
+// Why bytes from a peer do not decode.
+enum WireFailure {
+    // Fewer bytes remain than the encoding says.
+    Truncated
+    // An encoding the format forbids.
+    Malformed
+    // A length past a limit the engine declares.
+    TooLarge
+}
+
+namespace Wire {
+    let byteBits: Number = 8
+    let byteValues: Number = 256
+    // The longest big-endian integer read whole: seven bytes stay below
+    // `Number`'s sign bit.
+    let widestInteger: Number = 7
+    // A variable-length integer's two high bits give its length (RFC 9000
+    // section 16), leaving 62 bits of value.
+    let varintLengthShift: Number = 6
+    let varintValueMask: Number = 63
+    let varintOneByte: Number = 63
+    let varintTwoBytes: Number = 16383
+    let varintFourBytes: Number = 1073741823
+    let varintMaximum: Number = 4611686018427387903
+}
+
+struct WireReader {
+    let bytes: [UN8]
+    var at: Number = 0
+
+    function remaining(borrow self) -> Number {
+        return bytes.count - at
+    }
+
+    function atEnd(borrow self) -> Bool {
+        return at >= bytes.count
+    }
+
+    function peekByte(borrow self) -> Result<Number, WireFailure> {
+        if atEnd() { return .Error(.Truncated) }
+        return .Ok(Number(bytes[at]))
+    }
+
+    function readByte(borrow mut self) -> Result<Number, WireFailure> {
+        if atEnd() { return .Error(.Truncated) }
+        let value = Number(bytes[at])
+        at += 1
+        return .Ok(value)
+    }
+
+    // A big-endian unsigned integer of `width` bytes, at most seven.
+    function readInteger(borrow mut self, width: Number) -> Result<Number, WireFailure> {
+        if width > Wire.widestInteger { return .Error(.TooLarge) }
+        if remaining() < width { return .Error(.Truncated) }
+        var value: Number = 0
+        for index in 0..width { value = value * Wire.byteValues + Number(bytes[at + index]) }
+        at += width
+        return .Ok(value)
+    }
+
+    // A QUIC variable-length integer, in any of its four lengths.
+    function readVarint(borrow mut self) -> Result<Number, WireFailure> {
+        let first = try peekByte()
+        let width = 1 << (first >> Wire.varintLengthShift)
+        if remaining() < width { return .Error(.Truncated) }
+        var value = first & Wire.varintValueMask
+        for index in 1..width { value = value * Wire.byteValues + Number(bytes[at + index]) }
+        at += width
+        return .Ok(value)
+    }
+
+    function readBytes(borrow mut self, count: Number) -> Result<[UN8], WireFailure> {
+        if count < 0 || remaining() < count { return .Error(.Truncated) }
+        let run = byteRun(bytes, at, at + count)
+        at += count
+        return .Ok(run)
+    }
+
+    // A vector behind a big-endian length of `width` bytes.
+    function readVector(borrow mut self, width: Number) -> Result<[UN8], WireFailure> {
+        let count = try readInteger(width)
+        return readBytes(count)
+    }
+
+    // A vector behind a length of `width` bytes, read as a reader of its own,
+    // so a malformed inner length never reads past the vector.
+    function readSection(borrow mut self, width: Number) -> Result<WireReader, WireFailure> {
+        let inner = try readVector(width)
+        return .Ok(WireReader { bytes: inner })
+    }
+
+    // Whatever remains.
+    function readRest(borrow mut self) -> [UN8] {
+        let run = byteRun(bytes, at, bytes.count)
+        at = bytes.count
+        return run
+    }
+
+    function skip(borrow mut self, count: Number) -> Result<Void, WireFailure> {
+        if count < 0 || remaining() < count { return .Error(.Truncated) }
+        at += count
+        return .Ok
+    }
+}
+
+// Where a length prefix was reserved, to be filled once its vector is written.
+struct WireLengthMark {
+    let at: Number
+    let width: Number
+}
+
+struct WireWriter {
+    var bytes: [UN8] = []
+
+    function count(borrow self) -> Number {
+        return bytes.count
+    }
+
+    function writeByte(borrow mut self, value: Number) {
+        bytes.append(UN8(value))
+    }
+
+    // `value` as a big-endian integer of `width` bytes; it must fit.
+    function writeInteger(borrow mut self, value: Number, width: Number) {
+        for index in 0..width {
+            let shift = (width - 1 - index) * Wire.byteBits
+            bytes.append(UN8((value >> shift) % Wire.byteValues))
+        }
+    }
+
+    // `value` as a QUIC variable-length integer in its shortest length.
+    function writeVarint(borrow mut self, value: Number) {
+        let width = wireVarintSize(value)
+        let lengthBits = match width {
+            1 -> 0
+            2 -> 1
+            4 -> 2
+            else -> 3
+        }
+        let shift = (width - 1) * Wire.byteBits
+        bytes.append(
+            UN8(((value >> shift) % Wire.byteValues) | (lengthBits << Wire.varintLengthShift))
+        )
+        for index in 1..width {
+            bytes.append(UN8((value >> ((width - 1 - index) * Wire.byteBits)) % Wire.byteValues))
+        }
+    }
+
+    function writeBytes(borrow mut self, more: borrow [UN8]) {
+        bytes.appendAll(more)
+    }
+
+    // `more` behind its length as a big-endian integer of `width` bytes.
+    function writeVector(borrow mut self, more: borrow [UN8], width: Number) {
+        writeInteger(more.count, width)
+        bytes.appendAll(more)
+    }
+
+    // Room for a length of `width` bytes, filled by `fillLength` once the
+    // vector after it is written.
+    function reserveLength(borrow mut self, width: Number) -> WireLengthMark {
+        let mark = WireLengthMark { at: bytes.count, width: width }
+        writeInteger(0, width)
+        return mark
+    }
+
+    // Writes how many bytes follow `mark`'s prefix, or `TooLarge` when the
+    // prefix cannot hold it.
+    function fillLength(borrow mut self, mark: borrow WireLengthMark) -> Result<Void, WireFailure> {
+        let length = bytes.count - mark.at - mark.width
+        if length >= 1 << (mark.width * Wire.byteBits) { return .Error(.TooLarge) }
+        for index in 0..mark.width {
+            let shift = (mark.width - 1 - index) * Wire.byteBits
+            bytes[mark.at + index] = UN8((length >> shift) % Wire.byteValues)
+        }
+        return .Ok
+    }
+}
+
+// How many bytes a variable-length integer of `value` takes at its shortest.
+function wireVarintSize(value: Number) -> Number {
+    if value <= Wire.varintOneByte { return 1 }
+    if value <= Wire.varintTwoBytes { return 2 }
+    if value <= Wire.varintFourBytes { return 4 }
+    return 8
+}

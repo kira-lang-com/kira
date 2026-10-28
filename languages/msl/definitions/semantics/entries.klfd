@@ -1,0 +1,274 @@
+// Entry points: what each parameter of a `vertex`, `fragment` or `kernel`
+// function is, and how a file's entries form its one shader.
+//
+// A buffer, texture or sampler parameter becomes a module global named
+// after it, the same global for every entry that uses the slot. A
+// `[[stage_in]]` struct and each built-in remain parameters. A kernel's
+// workgroup size is not written in Metal source, so it is three overrides
+// the host sets (section 23.3).
+
+struct BuiltinInput {
+    let builtin: String
+    let stage: StageWord
+    let scalar: Scalar
+    let lanes: Int
+}
+
+function builtinInput(name: String) -> Optional<BuiltinInput> {
+    match name {
+        "vertex_id" -> return .Some(BuiltinInput { builtin = "vertex_index", stage = .VertexStage, scalar = .UInt, lanes = 1 })
+        "instance_id" -> return .Some(BuiltinInput { builtin = "instance_index", stage = .VertexStage, scalar = .UInt, lanes = 1 })
+        "position" -> return .Some(BuiltinInput { builtin = "position", stage = .FragmentStage, scalar = .Float, lanes = 4 })
+        "front_facing" -> return .Some(BuiltinInput { builtin = "front_facing", stage = .FragmentStage, scalar = .Bool, lanes = 1 })
+        "sample_id" -> return .Some(BuiltinInput { builtin = "sample_index", stage = .FragmentStage, scalar = .UInt, lanes = 1 })
+        "sample_mask" -> return .Some(BuiltinInput { builtin = "sample_mask", stage = .FragmentStage, scalar = .UInt, lanes = 1 })
+        "thread_position_in_grid" -> return .Some(BuiltinInput {
+            builtin = "global_invocation_id", stage = .KernelStage, scalar = .UInt, lanes = 3
+        })
+        "thread_position_in_threadgroup" -> return .Some(BuiltinInput {
+            builtin = "local_invocation_id", stage = .KernelStage, scalar = .UInt, lanes = 3
+        })
+        "thread_index_in_threadgroup" -> return .Some(BuiltinInput {
+            builtin = "local_invocation_index", stage = .KernelStage, scalar = .UInt, lanes = 1
+        })
+        "threadgroup_position_in_grid" -> return .Some(BuiltinInput {
+            builtin = "workgroup_id", stage = .KernelStage, scalar = .UInt, lanes = 3
+        })
+        "threadgroups_per_grid" -> return .Some(BuiltinInput {
+            builtin = "num_workgroups", stage = .KernelStage, scalar = .UInt, lanes = 3
+        })
+        "threads_per_threadgroup" -> return .Some(BuiltinInput {
+            builtin = "workgroup_size", stage = .KernelStage, scalar = .UInt, lanes = 3
+        })
+        else -> {
+            let none: Optional<BuiltinInput> = .None
+            return none
+        }
+    }
+}
+
+// The first of the three override ids that size a kernel's workgroup,
+// the top of the range Metal gives function constants.
+let workgroupOverrideId = 65533
+
+// The name of the override for a kernel's workgroup extent on `axis`.
+function workgroupOverride(axis: Int) -> String {
+    let names = ["workgroup_size_x", "workgroup_size_y", "workgroup_size_z"]
+    return names[axis]
+}
+
+extend Checker {
+    // Binds an entry's parameters: inputs as parameters and locals,
+    // resources as names of their globals.
+    function entryParameters(borrow mut self, declared: FunctionDeclaration) -> [EntryInput] {
+        var inputs: [EntryInput] = []
+        for parameter in declared.parameters {
+            if utf8Count(parameter.name) == 0 { report(.BadEntryParameter, parameter.span) }
+            let resource = resourceAttribute(parameter)
+            if resource >= 0 {
+                let global = entryResource(parameter, parameter.attributes[resource])
+                handles.append(HandleName { name = parameter.name, global = global, parameter = -1 })
+                continue
+            }
+            if attributeNamed(parameter.attributes, "stage_in") >= 0 {
+                let structure = resolve(parameter.typeSyntax)
+                if typeAt(structure).shape != .Struct {
+                    report(.BadEntryParameter, parameter.span)
+                } else {
+                    checkInterface(typeAt(structure).structure, stage, true, parameter.span)
+                }
+                inputs.append(addInput(parameter, structure, "", structure, 0))
+                continue
+            }
+            inputs.append(builtinParameter(parameter))
+        }
+        return inputs
+    }
+
+    function addInput(borrow mut self, parameter: ParameterDeclaration, declaredType: Int, builtin: String, ksirType: Int, lanes: Int) -> EntryInput {
+        program.functions[current].parameters.append(CheckedParameter {
+            name = parameter.name, parameterType = declaredType, mode = .ByValue, readOnly = false, plain = false,
+            comparison = false
+        })
+        let local = bind(parameter.name, declaredType, false, parameter.span)
+        return EntryInput { parameter = local, builtin = builtin, ksirType = ksirType, lanes = lanes }
+    }
+
+    // The index of a parameter's resource attribute, or -1. A refused
+    // attribute beside it, such as a gating `[[function_constant]]`, is
+    // reported here, since the resource path reads no other attribute.
+    function resourceAttribute(borrow mut self, parameter: ParameterDeclaration) -> Int {
+        var found = -1
+        for index in 0..parameter.attributes.count {
+            let name = parameter.attributes[index].name
+            if name == "buffer" || name == "texture" || name == "sampler" {
+                if found < 0 { found = index }
+            }
+            if name == "threadgroup" { report(.UnsupportedAttribute, parameter.attributes[index].span) }
+        }
+        if found < 0 { return -1 }
+        for attribute in parameter.attributes {
+            match refusedAttribute(attribute.name) {
+                Some(diagnostic) -> report(diagnostic, attribute.span)
+                None -> {}
+            }
+        }
+        return found
+    }
+
+    // A built-in parameter: its attribute names what it reads, and its
+    // type takes the built-in's leading lanes.
+    function builtinParameter(borrow mut self, parameter: ParameterDeclaration) -> EntryInput {
+        if parameter.attributes.count != 1 {
+            report(.BadEntryParameter, parameter.span)
+            return addInput(parameter, voidType(), "", voidType(), 0)
+        }
+        let attribute = parameter.attributes[0]
+        match refusedAttribute(attribute.name) {
+            Some(diagnostic) -> {
+                report(diagnostic, attribute.span)
+                return addInput(parameter, voidType(), "", voidType(), 0)
+            }
+            None -> {}
+        }
+        match builtinInput(attribute.name) {
+            Some(input) -> {
+                let written = widenedSyntax(tree.types[parameter.typeSyntax])
+                let declaredType = resolve(writtenIndex(written, parameter.typeSyntax))
+                let found = typeAt(declaredType)
+                let fits = isLaned(declaredType) && found.scalar == input.scalar
+                    && lanes(declaredType) <= input.lanes && (input.lanes != 4 || lanes(declaredType) == 4)
+                if input.stage != stage || !fits { report(.BadEntryParameter, parameter.span) }
+                let ksirType = vectorType(input.scalar, input.lanes)
+                return addInput(parameter, declaredType, input.builtin, ksirType, lanes(declaredType))
+            }
+            None -> {
+                report(.UnsupportedAttribute, attribute.span)
+                return addInput(parameter, voidType(), "", voidType(), 0)
+            }
+        }
+    }
+
+    // The global for a `[[buffer(n)]]`, `[[texture(n)]]` or `[[sampler(n)]]`
+    // parameter: shared by every entry that names the slot with the same
+    // type, refused when the types differ.
+    function entryResource(borrow mut self, parameter: ParameterDeclaration, attribute: Attribute) -> Int {
+        let slot = attributeInteger(attribute, parameter.span)
+        let written = tree.types[parameter.typeSyntax]
+        var resourceType = resolve(parameter.typeSyntax)
+        var kind: GlobalKind = .Buffer
+        var device = false
+        var readOnly = true
+        if attribute.name == "buffer" {
+            let spaced = written.space == .ConstantSpace || written.space == .DeviceSpace
+            if !spaced || (!written.pointer && !written.reference) {
+                report(.BadEntryParameter, parameter.span)
+            }
+            device = written.space == .DeviceSpace
+            readOnly = !device || written.constant
+            if written.pointer { resourceType = arrayType(resourceType, -1) }
+            if containsAtomic(resourceType) && readOnly { report(.BadEntryParameter, parameter.span) }
+        } else if attribute.name == "texture" {
+            kind = .Texture
+            if typeAt(resourceType).shape != .Image { report(.BadEntryParameter, parameter.span) }
+        } else {
+            kind = .SamplerGlobal
+            if typeAt(resourceType).shape != .Sampler { report(.BadEntryParameter, parameter.span) }
+        }
+        for index in 0..program.globals.count {
+            let known = program.globals[index]
+            if known.kind == kind && known.slot == slot {
+                let same = known.globalType == resourceType && known.device == device && known.readOnly == readOnly
+                if !same { report(.SlotConflict, parameter.span) }
+                return index
+            }
+        }
+        program.globals.append(CheckedGlobal {
+            name = parameter.name, kind = kind, globalType = resourceType, device = device, readOnly = readOnly,
+            slot = slot, value = -1, id = -1, plain = false, comparison = false, span = parameter.span
+        })
+        return program.globals.count - 1
+    }
+
+    function containsAtomic(borrow self, index: Int) -> Bool {
+        let found = typeAt(index)
+        if found.shape == .Atomic { return true }
+        if found.shape == .Array { return containsAtomic(found.element) }
+        if found.shape == .Struct {
+            for member in program.structs[found.structure].members {
+                if containsAtomic(member.memberType) { return true }
+            }
+        }
+        return false
+    }
+
+    // Checks a struct a stage passes in `input` or out, and marks it as an
+    // interface.
+    function checkInterface(borrow mut self, structure: Int, entryStage: StageWord, input: Bool, span: Span) {
+        program.structs[structure].interface = true
+        for member in program.structs[structure].members {
+            let kind = member.binding.kind
+            var allowed = false
+            match kind {
+                Unbound -> allowed = (entryStage == .VertexStage && !input) || (entryStage == .FragmentStage && input)
+                Attribute -> allowed = entryStage == .VertexStage && input
+                User -> allowed = (entryStage == .VertexStage && !input) || (entryStage == .FragmentStage && input)
+                Position -> allowed = (entryStage == .VertexStage && !input) || (entryStage == .FragmentStage && input)
+                Color -> allowed = entryStage == .FragmentStage && !input
+                Depth -> allowed = entryStage == .FragmentStage && !input
+                SampleMask -> allowed = entryStage == .FragmentStage && !input
+                ClipDistance -> allowed = entryStage == .VertexStage && !input
+            }
+            if !allowed || !isConstructible(member.memberType) { report(.BadInterface, span) }
+        }
+    }
+
+    // What an entry's result is: a struct of bound members, or a bare
+    // position (vertex) or colour 0 (fragment).
+    function entryResult(borrow mut self, declared: FunctionDeclaration, resultType: Int) -> CheckedEntry {
+        var builtin = ""
+        var location = -1
+        let found = typeAt(resultType)
+        if stage == .KernelStage {
+            if found.shape != .Void { report(.BadInterface, declared.span) }
+        } else if found.shape == .Struct {
+            checkInterface(found.structure, stage, false, declared.span)
+        } else if stage == .VertexStage {
+            builtin = "position"
+            if resultType != vectorType(.Float, 4) { report(.BadInterface, declared.span) }
+        } else if found.shape != .Void {
+            location = 0
+            if !isNumeric(resultType) { report(.BadInterface, declared.span) }
+        }
+        return CheckedEntry { routine = current, inputs = [], resultBuiltin = builtin, resultLocation = location }
+    }
+
+    // A file is one shader: one `kernel`, or at most one `vertex` and one
+    // `fragment` function, as KSIR allows either stage alone (D-356).
+    function checkStages(borrow mut self) {
+        var vertices: [Int] = []
+        var fragments: [Int] = []
+        var kernels: [Int] = []
+        for entry in program.entries {
+            match program.functions[entry.routine].stage {
+                VertexStage -> vertices.append(entry.routine)
+                FragmentStage -> fragments.append(entry.routine)
+                KernelStage -> kernels.append(entry.routine)
+                NoStage -> {}
+            }
+        }
+        let graphics = vertices.count + fragments.count
+        if kernels.count > 0 && graphics > 0 {
+            report(.MixedStages, program.functions[kernels[0]].span)
+        } else if kernels.count > 1 {
+            report(.ComputeEntries, program.functions[kernels[1]].span)
+        } else if graphics > 0 && (vertices.count > 1 || fragments.count > 1) {
+            var span = program.functions[vertices[1]].span
+            if fragments.count > 1 { span = program.functions[fragments[1]].span }
+            report(.GraphicsEntries, span)
+        } else if kernels.count == 0 && graphics == 0 {
+            report(.NoEntry, Span { file = tree.file, start = 0, end = 0 })
+        }
+    }
+
+}

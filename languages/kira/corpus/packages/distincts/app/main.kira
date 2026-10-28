@@ -1,0 +1,22 @@
+import Foundation
+
+distinct Ticket = U32
+distinct Time = U64
+distinct Ticks = Time
+
+@Main
+function main() -> Int {
+    let ticket = Ticket(7)
+    let ticks = Ticks(U64(5))
+    let sender = Channel<Ticket>()
+    sender.send(ticket)
+    attempt {
+        let received = try sender.receiver.receive()
+        if received == Ticket(7) && received != Ticket(8) {
+            return Int(received.raw) + Int(ticks.raw)
+        }
+        return 0
+    } handle {
+        Closed { return -1 }
+    }
+}

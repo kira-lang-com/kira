@@ -1,0 +1,102 @@
+import Foundation
+
+// AnxTypeTests.kira — asking an erased `Any` what it holds: `value is Type`
+// answers by nominal runtime identity, `value as Type` hands the held value
+// back (a mismatch traps, which the backend-parity fixtures prove).
+// PREFIX: anx / Anx  (all top-level names use this prefix).
+
+struct AnxPoint {
+    let x: Int
+    let y: Int
+}
+
+struct AnxOther {
+    let x: Int
+    let y: Int
+}
+
+enum AnxShade {
+    Light
+    Dark
+}
+
+function anxErase(p: AnxPoint) -> Any {
+    return p
+}
+
+function anxEraseInt(n: Int) -> Any {
+    return n
+}
+
+@Test
+function anxIsTellsStructsApart() {
+    let boxed: Any = AnxPoint(x: 1, y: 2)
+    var score = 0
+    if boxed is AnxPoint { score = score + 1 }
+    if boxed is AnxOther { score = score + 10 }
+    if boxed is Int { score = score + 100 }
+    let got = score
+    expect!(got == 1)
+}
+
+@Test
+function anxIsSeesScalarsAndStrings() {
+    let n: Any = Int(7)
+    let s: Any = "seven"
+    let f: Any = Float(7.5)
+    var score: Int = 0
+    if n is Int { score = score + 1 }
+    if s is String { score = score + 10 }
+    if f is Float { score = score + 100 }
+    if n is String { score = score + 1000 }
+    let got = score
+    expect!(got == 111)
+}
+
+@Test
+function anxAsRecoversAStruct() {
+    let boxed = anxErase(AnxPoint(x: 4, y: 5))
+    let back = boxed as AnxPoint
+    let got = back.x * 10 + back.y
+    expect!(got == 45)
+}
+
+@Test
+function anxAsRecoversScalarsAndStrings() {
+    let n = anxEraseInt(21)
+    let s: Any = "hello"
+    let got = (n as Int) * 2 + (s as String).count
+    expect!(got == 47)
+}
+
+@Test
+function anxIsAndAsSeeEnumsAndArrays() {
+    let dark: AnxShade = .Dark
+    let shade: Any = dark
+    let numbers: [Int] = [1, 2, 3]
+    let items: Any = numbers
+    var score = 0
+    if shade is AnxShade { score = score + 1 }
+    if items is [Int] { score = score + 10 }
+    let back = items as [Int]
+    let got = score + back.count * 100
+    expect!(got == 311)
+}
+
+@Test
+function anxIsGuardsACast() {
+    let boxes: [Any] = [Int(1), "two", AnxPoint(x: 3, y: 0)]
+    var total: Int = 0
+    for index in 0..boxes.count {
+        let item = boxes[index]
+        if item is Int {
+            total = total + (item as Int)
+        } else if item is AnxPoint {
+            total = total + (item as AnxPoint).x
+        } else {
+            total = total + 100
+        }
+    }
+    let got = total
+    expect!(got == 104)
+}

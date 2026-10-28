@@ -1,0 +1,141 @@
+// KSIR types, with Metal's natural layout.
+//
+// Each struct is declared once with explicit offsets: a member sits at its
+// size and alignment under rule `msl`, except a `packed_floatN`, which is
+// `vecN<f32>` of size 4N aligned to 4. An array strides by its element's
+// size rounded to its alignment. A texture KSIR samples is `sampled`; one
+// a kernel writes is a storage image of `rgba8unorm`, `r32uint` or
+// `r32sint` by its texel.
+
+function roundUp(value: Int, alignment: Int) -> Int {
+    if alignment <= 0 { return value }
+    return (value + alignment - 1) / alignment * alignment
+}
+
+function imageClass(found: TypeEntry) -> String {
+    if found.depth {
+        if found.multisampled { return "depth<multisampled>" }
+        return "depth"
+    }
+    if found.access == .Write || found.access == .ReadWrite {
+        var format = "rgba8unorm"
+        if found.scalar == .UInt { format = "r32uint" }
+        if found.scalar == .Int { format = "r32sint" }
+        var access = "store"
+        if found.access == .ReadWrite { access = "load store" }
+        return joinText(["storage<", format, ", ", access, ">"])
+    }
+    var texel = "float"
+    if found.scalar == .Int { texel = "sint" }
+    if found.scalar == .UInt { texel = "uint" }
+    if found.multisampled { return joinText(["sampled<", texel, ", multisampled>"]) }
+    return joinText(["sampled<", texel, ">"])
+}
+
+function imageText(found: TypeEntry) -> String {
+    var arrayed = ""
+    if found.arrayed { arrayed = ", arrayed" }
+    return joinText(["image<", found.dimension.ksir(), arrayed, ", ", imageClass(found), ">"])
+}
+
+extend Lowering {
+    // The KSIR spelling of type `index`; a struct is declared first.
+    function typeText(borrow mut self, index: Int) -> String {
+        let found = program.types[index]
+        match found.shape {
+            Void -> return "void"
+            ScalarShape -> return found.scalar.ksir()
+            Vector -> return joinText(["vec", decimalText(found.width), "<", found.scalar.ksir(), ">"])
+            Matrix -> return joinText([
+                "mat", decimalText(found.width), "x", decimalText(found.rows), "<", found.scalar.ksir(), ">"
+            ])
+            Atomic -> return joinText(["atomic<", found.scalar.ksir(), ">"])
+            Struct -> {
+                declareStruct(found.structure)
+                return joinText(["%", program.structs[found.structure].name])
+            }
+            Array -> {
+                var length = "runtime"
+                if found.length >= 0 { length = decimalText(found.length) }
+                let element = typeText(found.element)
+                let stride = roundUp(sizeOf(found.element), alignOf(found.element))
+                return joinText(["array<", element, ", ", length, ", stride ", decimalText(stride), ">"])
+            }
+            Image -> return imageText(found)
+            Sampler -> return "sampler"
+        }
+    }
+
+    function typeHandle(borrow mut self, index: Int) -> Int {
+        if program.types[index].shape == .Void { return -1 }
+        return shader_type(module, typeText(index))
+    }
+
+    function sizeOf(borrow mut self, index: Int) -> Int {
+        return shader_type_size(module, typeHandle(index), "msl")
+    }
+
+    function alignOf(borrow mut self, index: Int) -> Int {
+        return shader_type_align(module, typeHandle(index), "msl")
+    }
+
+    // Declares struct `structure` and every struct it holds, each once.
+    function declareStruct(borrow mut self, structure: Int) {
+        if structHandles[structure] >= 0 { return }
+        let declared = program.structs[structure]
+        var handles: [Int] = []
+        var sizes: [Int] = []
+        var alignments: [Int] = []
+        for member in declared.members {
+            handles.append(typeHandle(member.memberType))
+            if member.packed {
+                sizes.append(4 * program.types[member.memberType].width)
+                alignments.append(4)
+            } else {
+                sizes.append(sizeOf(member.memberType))
+                alignments.append(alignOf(member.memberType))
+            }
+        }
+        var cursor = 0
+        var widest = 1
+        for position in 0..declared.members.count {
+            let member = declared.members[position]
+            cursor = roundUp(cursor, alignments[position])
+            var binding = ""
+            if declared.interface { binding = memberBinding(member) }
+            shader_type_member(module, member.name, handles[position], binding, cursor, sizes[position], alignments[position])
+            cursor += sizes[position]
+            if alignments[position] > widest { widest = alignments[position] }
+        }
+        shader_span(module, declared.span.file, declared.span.start, declared.span.end)
+        structHandles[structure] = shader_type_struct_explicit(module, declared.name, roundUp(cursor, widest), widest)
+    }
+
+    // A stage interface member's KSIR binding. A member without an
+    // attribute passes between stages as one named after it.
+    function memberBinding(borrow mut self, member: CheckedMember) -> String {
+        let binding = member.binding
+        match binding.kind {
+            Unbound -> {}
+            Position -> return "@builtin(position)"
+            Depth -> return "@builtin(frag_depth)"
+            SampleMask -> return "@builtin(sample_mask)"
+            ClipDistance -> return "@builtin(clip_distances)"
+            Attribute -> return joinText(["@location(", decimalText(binding.index), ")"])
+            Color -> return joinText(["@location(", decimalText(binding.index), ")"])
+            User -> {}
+        }
+        var location = binding.index
+        if location < 0 && binding.kind == .Unbound { location = userLocation(member.name) }
+        if location < 0 && binding.kind == .User { location = userLocation(binding.name) }
+        var interpolation = binding.interpolation
+        let integral = program.types[member.memberType].scalar.isInteger()
+        if utf8Count(interpolation) == 0 && integral { interpolation = "flat" }
+        var parts = [joinText(["@location(", decimalText(location), ")"])]
+        if utf8Count(interpolation) > 0 { parts.append(joinText([" @interpolate(", interpolation, ")"])) }
+        if utf8Count(binding.sampling) > 0 && interpolation != "flat" {
+            parts.append(joinText([" @sampling(", binding.sampling, ")"]))
+        }
+        return joinText(parts)
+    }
+}

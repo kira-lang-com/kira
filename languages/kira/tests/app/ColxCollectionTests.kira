@@ -1,0 +1,393 @@
+import Foundation
+
+// ColxCollectionTests.kira
+// Deep array test suite. All top-level names use colx / Colx prefix.
+// ~85 tests (including ~20 trap tests).
+
+// ---------------------------------------------------------------------------
+// Struct types
+// ---------------------------------------------------------------------------
+
+struct ColxPt {
+    var x: Int
+    var y: Int
+}
+
+struct ColxBox {
+    var lo: Int
+    var hi: Int
+
+    function size() -> Int {
+        return self.hi - self.lo
+    }
+
+    function mid() -> Int {
+        return (self.lo + self.hi) / 2
+    }
+}
+
+struct ColxGrid {
+    var cells: [Int]
+
+    function sum() -> Int {
+        var t = 0
+        for i in 0..self.cells.count {
+            t = t + self.cells[i]
+        }
+        return t
+    }
+
+    function cellCount() -> Int {
+        return self.cells.count
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+function colxSum(xs: borrow [Int]) -> Int {
+    var total = 0
+    for i in 0..xs.count {
+        total = total + xs[i]
+    }
+    return total
+}
+
+function colxMin(xs: borrow [Int]) -> Int {
+    var m = xs[0]
+    for i in 1..xs.count {
+        if xs[i] < m {
+            m = xs[i]
+        }
+    }
+    return m
+}
+
+function colxMax(xs: borrow [Int]) -> Int {
+    var m = xs[0]
+    for i in 1..xs.count {
+        if xs[i] > m {
+            m = xs[i]
+        }
+    }
+    return m
+}
+
+function colxContainsVal(xs: borrow [Int], val: Int) -> Bool {
+    for i in 0..xs.count {
+        if xs[i] == val {
+            return true
+        }
+    }
+    return false
+}
+
+function colxBuildRange(n: Int) -> [Int] {
+    var xs: [Int] = []
+    for i in 0..n {
+        xs.append(i)
+    }
+    return xs
+}
+
+function colxBuildSquares(n: Int) -> [Int] {
+    var xs: [Int] = []
+    for i in 0..n {
+        xs.append(i * i)
+    }
+    return xs
+}
+
+function colxBuildFib(n: Int) -> [Int] {
+    var xs: [Int] = []
+    if n == 0 {
+        return xs
+    }
+    xs.append(0)
+    if n == 1 {
+        return xs
+    }
+    xs.append(1)
+    for i in 2..n {
+        let p1 = xs[i - 1]
+        let p2 = xs[i - 2]
+        xs.append(p1 + p2)
+    }
+    return xs
+}
+
+function colxReverse(xs: borrow [Int]) -> [Int] {
+    var out: [Int] = []
+    var i = xs.count
+    while i > 0 {
+        i = i - 1
+        out.append(xs[i])
+    }
+    return out
+}
+
+function colxCountGt(xs: borrow [Int], thresh: Int) -> Int {
+    var c = 0
+    for i in 0..xs.count {
+        if xs[i] > thresh {
+            c = c + 1
+        }
+    }
+    return c
+}
+
+function colxProduct(xs: borrow [Int]) -> Int {
+    var p = 1
+    for i in 0..xs.count {
+        p = p * xs[i]
+    }
+    return p
+}
+
+// ---------------------------------------------------------------------------
+// GROUP A - Empty / count
+// ---------------------------------------------------------------------------
+@Test
+function colxEmptyCount() {
+    let xs: [Int] = []
+    expect!(xs.count == 0)
+}
+
+@Test
+function colxOneAppendCount() {
+    var xs: [Int] = []
+    xs.append(42)
+    expect!(xs.count == 1)
+}
+
+@Test
+function colxFiveAppendCount() {
+    var xs: [Int] = []
+    xs.append(1)
+    xs.append(2)
+    xs.append(3)
+    xs.append(4)
+    xs.append(5)
+    expect!(xs.count == 5)
+}
+
+// A trap test: `expectTrap!` names the trap it expects, and the body runs in a child that traps.
+@Test
+function colxTrapEmptyIdx0() {
+    expectTrap!("")
+    var xs: [Int] = []
+    let _ = xs[0]
+}
+
+@Test
+function colxTrapEmptyIdx99() {
+    expectTrap!("")
+    var xs: [Int] = []
+    let _ = xs[99]
+}
+
+// ---------------------------------------------------------------------------
+// GROUP B - Sums via helpers
+// ---------------------------------------------------------------------------
+
+@Test
+function colxSumLiteral() {
+    var xs: [Int] = []
+    xs.append(1)
+    xs.append(2)
+    xs.append(3)
+    xs.append(4)
+    xs.append(5)
+    expect!(colxSum(xs) == 15)
+}
+
+// 0+1+...+9 = 45
+@Test
+function colxSumRange10() {
+    let xs = colxBuildRange(10)
+    expect!(colxSum(xs) == 45)
+}
+
+// 0+1+4+9+16 = 30
+@Test
+function colxSumSquares5() {
+    let xs = colxBuildSquares(5)
+    expect!(colxSum(xs) == 30)
+}
+
+// 0+1+4+9+16+25+36+49+64+81 = 285
+@Test
+function colxSumSquares10() {
+    let xs = colxBuildSquares(10)
+    expect!(colxSum(xs) == 285)
+}
+
+// [0,1,1,2,3,5,8,13] -> 33
+@Test
+function colxSumFib8() {
+    let xs = colxBuildFib(8)
+    expect!(colxSum(xs) == 33)
+}
+
+// 10+20+30+40+50 = 150
+@Test
+function colxForInSumLiteral() {
+    var acc = 0
+    for v in [10, 20, 30, 40, 50] {
+        acc = acc + v
+    }
+    expect!(acc == 150)
+}
+
+// 1*2*3*4*5 = 120
+@Test
+function colxForInProductLiteral() {
+    var p = 1
+    for v in [1, 2, 3, 4, 5] {
+        p = p * v
+    }
+    expect!(p == 120)
+}
+
+// elements >4: 5,9,6,5 => 4
+@Test
+function colxForInCountGt4() {
+    var c = 0
+    for v in [3, 1, 4, 1, 5, 9, 2, 6, 5, 3] {
+        if v > 4 {
+            c = c + 1
+        }
+    }
+    expect!(c == 4)
+}
+
+@Test
+function colxForInMax() {
+    var m = 0
+    for v in [3, 1, 4, 1, 5, 9, 2, 6, 5, 3] {
+        if v > m {
+            m = v
+        }
+    }
+    expect!(m == 9)
+}
+
+// 1+4+9+16+25 = 55
+@Test
+function colxForInSquaresSum() {
+    var acc = 0
+    for v in [1, 2, 3, 4, 5] {
+        acc = acc + v * v
+    }
+    expect!(acc == 55)
+}
+
+// ---------------------------------------------------------------------------
+// GROUP C - Min / Max
+// ---------------------------------------------------------------------------
+
+@Test
+function colxMinManual5() {
+    var xs: [Int] = []
+    xs.append(5)
+    xs.append(3)
+    xs.append(8)
+    xs.append(2)
+    xs.append(7)
+    expect!(colxMin(xs) == 2)
+}
+
+@Test
+function colxMaxManual5() {
+    var xs: [Int] = []
+    xs.append(5)
+    xs.append(3)
+    xs.append(8)
+    xs.append(2)
+    xs.append(7)
+    expect!(colxMax(xs) == 8)
+}
+
+@Test
+function colxMinAppend5() {
+    var xs: [Int] = []
+    xs.append(3)
+    xs.append(1)
+    xs.append(4)
+    xs.append(1)
+    xs.append(5)
+    expect!(colxMin(xs) == 1)
+}
+
+@Test
+function colxMaxRange10() {
+    let xs = colxBuildRange(10)
+    expect!(colxMax(xs) == 9)
+}
+
+// squares[0]=0
+@Test
+function colxMinSquares8() {
+    let xs = colxBuildSquares(8)
+    expect!(colxMin(xs) == 0)
+}
+
+// [0,1,4,9,16] -> max=16
+@Test
+function colxMaxSquares5() {
+    let xs = colxBuildSquares(5)
+    expect!(colxMax(xs) == 16)
+}
+
+// [0,1,1,2,3,5,8,13] -> min=0
+@Test
+function colxMinFib8() {
+    let xs = colxBuildFib(8)
+    expect!(colxMin(xs) == 0)
+}
+
+// max=13
+@Test
+function colxMaxFib8() {
+    let xs = colxBuildFib(8)
+    expect!(colxMax(xs) == 13)
+}
+
+// ---------------------------------------------------------------------------
+// GROUP D - Contains
+// ---------------------------------------------------------------------------
+
+@Test
+function colxContainsTrue() {
+    let xs = colxBuildRange(10)
+    expect!(colxContainsVal(xs, 5) == true)
+}
+
+@Test
+function colxContainsFalse() {
+    let xs = colxBuildRange(10)
+    expect!(colxContainsVal(xs, 10) == false)
+}
+
+@Test
+function colxContainsFirst() {
+    let xs = colxBuildRange(10)
+    expect!(colxContainsVal(xs, 0) == true)
+}
+
+@Test
+function colxContainsLast() {
+    let xs = colxBuildRange(10)
+    expect!(colxContainsVal(xs, 9) == true)
+}
+
+@Test
+function colxContainsMissing() {
+    var xs: [Int] = []
+    xs.append(2)
+    xs.append(4)
+    xs.append(6)
+    xs.append(8)
+    expect!(colxContainsVal(xs, 5) == false)
+}

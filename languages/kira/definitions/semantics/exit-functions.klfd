@@ -1,0 +1,29 @@
+// `@AtExit`: a function the runtime calls once as the program ends, with why
+// it ended and a detail. The reason is 0 when the program returned, the
+// detail its result; 1 when it trapped, the detail the trap's `KLF-RT`
+// number; 2 when it failed, the detail the failure value; and, on the VM, 3
+// for a `KLF-VM` fault. A program's globals are already released when it
+// returns, so an exit function reads them only for the other reasons.
+
+extend Checker {
+    function checkExitFunction(borrow mut self, index: Int) {
+        let signature = declarations.signatures[index]
+        var valid = signature.owner.isNone() && signature.declaration.typeParameters.count == 0
+        // A package built apart is read here without its bodies; its own
+        // unit checks the body is there.
+        // A body the parser skipped is built by the unit of its package, as a separate package's is.
+        let bodyHere = separateDeclaration(declarations, signature.name.span.file) || signature.declaration.body.count > 0 || hasAttribute(signature.declaration.annotations, .Elsewhere)
+        valid = valid && bodyHere && !signature.entry
+        valid = valid && signature.result.equals(Type.void()) && signature.parameters.count == 2
+        if valid {
+            for parameter in signature.parameters {
+                if parameter.mode != .Owned || !parameter.valueType.equals(Type.int()) { valid = false }
+            }
+        }
+        if !valid {
+            report(.ExitFunctionSignature, signature.name.span)
+            return
+        }
+        program.exitFunctions.append(index)
+    }
+}

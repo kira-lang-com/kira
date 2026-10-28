@@ -1,0 +1,290 @@
+import Foundation
+
+// Seyoul's runtime end to end: timers wake tasks in deadline order, spawned
+// tasks run beside the one `run` drives, mailboxes carry values between
+// them, a timeout gives up on a slow future, and a TCP connection and a UDP
+// datagram cross loopback.
+
+async function napThenAnswer(seconds: Number, answer: Number) -> Number {
+    sleep(seconds).await
+    return answer
+}
+
+@Test
+function sleepWakesAfterItsDeadline() {
+    let started = now()
+    expect!(run(napThenAnswer(0.02, 7)) == 7)
+    expect!(started.elapsed() >= 0.02)
+}
+
+async function sendLater(mailbox: Mailbox<Number>, seconds: Number, value: Number) -> Number {
+    sleep(seconds).await
+    let sent = mailbox.send(value)
+    return value
+}
+
+async function collectThree(mailbox: Mailbox<Number>) -> Number {
+    let late = spawn(sendLater(copy mailbox, 0.03, 3))
+    let early = spawn(sendLater(copy mailbox, 0.01, 1))
+    let middle = spawn(sendLater(copy mailbox, 0.02, 2))
+    var order: Number = 0
+    for index in 0..3 {
+        match mailbox.receive().await {
+            Some(value) -> order = order * 10 + value
+            None -> return -1
+        }
+    }
+    return order
+}
+
+@Test
+function timersFireInDeadlineOrder() {
+    expect!(run(collectThree(Mailbox<Number>())) == 123)
+}
+
+async function closedAfterTwo(mailbox: Mailbox<Number>) -> Number {
+    let first = mailbox.send(4)
+    let second = mailbox.send(5)
+    mailbox.close()
+    var total: Number = 0
+    while true {
+        match mailbox.receive().await {
+            Some(value) -> total += value
+            None -> return total
+        }
+    }
+    return -1
+}
+
+@Test
+function closedMailboxDrainsThenEnds() {
+    expect!(run(closedAfterTwo(Mailbox<Number>())) == 9)
+}
+
+async function deliverFive(box: Mailbox<Number>) -> Number {
+    var queued: Number = 0
+    for value in 1..6 {
+        let sent = box.deliver(value).await
+        if sent { queued += 1 }
+        // A bounded mailbox never holds more than its limit.
+        if box.count() > 2 { return -1 }
+    }
+    box.close()
+    return queued
+}
+
+async function drainBounded() -> Number {
+    let box = boundedMailbox<Number>(2)
+    let producer = spawn(deliverFive(copy box))
+    let allTaken = box.send(0) && box.send(0) && box.send(0)
+    var total: Number = 0
+    while true {
+        match box.receive().await {
+            Some(value) -> total += value
+            None -> break
+        }
+    }
+    let queued = producer.await
+    return (allTaken ? 1000 : 0) + queued * 100 + total
+}
+
+// `deliver` waits while the mailbox holds its limit, and the receiver's
+// takes make room; a third `send` into a full mailbox is refused.
+@Test
+function boundedMailboxMakesSendersWait() {
+    expect!(run(drainBounded()) == 515)
+}
+
+async function raceTwo(first: Number, second: Number) -> Number {
+    match select(napThenAnswer(first, 1), napThenAnswer(second, 2)).await {
+        First(value) -> return value
+        Second(value) -> return value * 10
+    }
+}
+
+// The quicker future wins, whichever side it is on.
+@Test
+function selectAnswersTheFirstToFinish() {
+    expect!(run(raceTwo(0.2, 0.01)) == 20)
+    expect!(run(raceTwo(0.01, 0.2)) == 1)
+}
+
+async function raceTheClock(slow: Number, limit: Number) -> Number {
+    match timeout(limit, napThenAnswer(slow, 1)).await {
+        Some(value) -> return value
+        None -> return 0
+    }
+}
+
+@Test
+function timeoutGivesUpOnASlowFuture() {
+    expect!(run(raceTheClock(0.2, 0.01)) == 0)
+    expect!(run(raceTheClock(0.01, 0.2)) == 1)
+}
+
+async function serveOnce(listener: Listener) -> Number {
+    match listener.accept().await {
+        Ok(incoming) -> {
+            match incoming.connection.read(64).await {
+                Ok(bytes) -> {
+                    let echoed = incoming.connection.writeAll(copy bytes).await
+                    let closed = incoming.connection.close()
+                    return bytes.count
+                }
+                Error(failure) -> return -2
+            }
+        }
+        Error(failure) -> return -1
+    }
+}
+
+async function echoOverTcp() -> Number {
+    let listener = match listen("127.0.0.1:0") {
+        Ok(made) -> made
+        Error(failure) -> return -10
+    }
+    let address = match listener.localAddress() {
+        Ok(text) -> text
+        Error(failure) -> return -11
+    }
+    let server = spawn(serveOnce(copy listener))
+    match connect(copy address).await {
+        Ok(connection) -> {
+            let sent = connection.writeAll("seyoul".utf8()).await
+            match connection.read(64).await {
+                Ok(bytes) -> {
+                    let closed = connection.close()
+                    let served = server.await
+                    let stopped = listener.close()
+                    return served * 100 + bytes.count
+                }
+                Error(failure) -> return -12
+            }
+        }
+        Error(failure) -> return -13
+    }
+}
+
+@Test
+function tcpEchoesOverLoopback() {
+    expect!(run(echoOverTcp()) == 606)
+}
+
+async function datagramOverUdp() -> Number {
+    let receiver = match bind("127.0.0.1:0") {
+        Ok(made) -> made
+        Error(failure) -> return -1
+    }
+    let sender = match bind("127.0.0.1:0") {
+        Ok(made) -> made
+        Error(failure) -> return -2
+    }
+    let address = match receiver.localAddress() {
+        Ok(text) -> text
+        Error(failure) -> return -3
+    }
+    let sent = sender.send("ping".utf8(), copy address).await
+    match receiver.receive(64).await {
+        Ok(datagram) -> {
+            let a = receiver.close()
+            let b = sender.close()
+            return datagram.bytes.count
+        }
+        Error(failure) -> return -4
+    }
+}
+
+@Test
+function udpCarriesADatagram() {
+    expect!(run(datagramOverUdp()) == 4)
+}
+
+// Reads until the peer's end of the stream: the bytes it saw.
+async function readToEnd(listener: Listener) -> Number {
+    let incoming = match listener.accept().await {
+        Ok(value) -> value
+        Error(failure) -> return -1
+    }
+    var total: Number = 0
+    while true {
+        let bytes = match incoming.connection.read(64).await {
+            Ok(value) -> value
+            Error(failure) -> return -2
+        }
+        if bytes.count == 0 { return total }
+        total += bytes.count
+    }
+    return total
+}
+
+// Writes to a fresh connection and lets it go without `close()`.
+async function writeAndLetGo(address: String) -> Number {
+    let connection = match connect(move address).await {
+        Ok(value) -> value
+        Error(failure) -> return -3
+    }
+    let sent = connection.writeAll("bye".utf8()).await
+    return 0
+}
+
+async function dropClosesTheSocket() -> Number {
+    let listener = match listen("127.0.0.1:0") {
+        Ok(made) -> made
+        Error(failure) -> return -10
+    }
+    let address = match listener.localAddress() {
+        Ok(text) -> text
+        Error(failure) -> return -11
+    }
+    let server = spawn(readToEnd(copy listener))
+    let wrote = writeAndLetGo(copy address).await
+    return server.await + wrote
+}
+
+// The peer reads the end of the stream once the last holder of a
+// connection goes, though nothing called `close()`.
+@Test
+function droppedConnectionCloses() {
+    expect!(run(dropClosesTheSocket()) == 3)
+}
+
+async function addInto(value: Number, totals: Conduit<Number>) {
+    sleep(0.001).await
+    let sent = totals.send(value)
+}
+
+async function gather(totals: Conduit<Number>, count: Number) -> Number {
+    var sum: Number = 0
+    for index in 0..count {
+        match totals.receive().await {
+            Some(value) -> sum += value
+            None -> return -1
+        }
+    }
+    return sum
+}
+
+@Test
+function poolRunsTasksOnItsWorkers() {
+    let pool = workerPool(4)
+    let totals = Conduit<Number>()
+    for index in 1..11 { pool.spawn(addInto(index, copy totals)) }
+    expect!(run(gather(copy totals, 10)) == 55)
+    pool.join()
+}
+
+async function sendAfar(totals: Conduit<Number>) {
+    let sent = totals.send(9)
+}
+
+@Test
+function conduitCarriesValuesBetweenThreads() {
+    let totals = Conduit<Number>()
+    var worker = spawnThread(
+        { in
+            let done = run(sendAfar(copy totals))
+        }
+    )
+    expect!(run(gather(copy totals, 1)) == 9)
+    worker.join()
+}

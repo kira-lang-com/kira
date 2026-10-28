@@ -1,0 +1,184 @@
+import Foundation
+import Kten
+
+extend Engine {
+    // Places what `step` produces under `.kira-build/out/<step>/`, answering
+    // what its run is given, or the exit status it fails with.
+    function placeChosen(
+        borrow self,
+        graph: borrow Graph,
+        step: borrow Step
+    ) -> Result<StepRun, Number> {
+        let directory = joinPath(joinPath(state, "out"), pathSafe(step.name))
+        var paths: [String] = []
+        var digests: [String] = []
+        // What the directory holds once placed: each artifact, then every
+        // entry found under it. While it still holds that, nothing is placed
+        // again.
+        var placed: [String] = []
+        for artifact in step.produces {
+            let path = joinPath(directory, inputName(graph, artifact))
+            if step.materialize && paths.contains(path) {
+                printError("kira build: step \(step.name) produces two artifacts at \(path)")
+                return .Error(BuildExit.usage)
+            }
+            match made[artifact.id] {
+                Some(known) -> digests.append(copy known.digest)
+                None -> {
+                    printError("kira build: \(graph.artifactName(artifact)) was not made")
+                    return .Error(BuildExit.failed)
+                }
+            }
+            placed.append("\(path) \(digests[digests.count - 1])")
+            paths.append(path)
+        }
+        var references: [ArtifactReference] = []
+        for artifact in step.produces {
+            match made[artifact.id] {
+                Some(known) -> references.append(ArtifactReference {
+                    name: inputName(graph, artifact), digest: copy known.digest,
+                    kind: known.tree ? .Tree : .File, mode: known.mode
+                })
+                None -> return .Error(BuildExit.failed)
+            }
+        }
+        var snapshot: String? = .None
+        match step.snapshot {
+            Some(metadata) -> match pinStep(graph, step, metadata) {
+                Ok(digest) -> {
+                    snapshot = .Some(digest)
+                    print("snapshot \(digest)")
+                }
+                Error(failure) -> {
+                    printError("kira build: \(failureText(failure))")
+                    return .Error(BuildExit.failed)
+                }
+            }
+            None -> {}
+        }
+        if !step.materialize {
+            return .Ok(StepRun { paths: [], digests: digests, arguments: graph.stepArguments(), snapshot: snapshot, artifacts: references })
+        }
+        let record = joinPath(joinPath(state, "placed"), pathSafe(step.name))
+        var found = copy placed
+        found.appendAll(placedEntries(directory))
+        if recordedLines(record) != found {
+            match placeStep(graph, step, directory) {
+                Ok -> {}
+                Error(failure) -> {
+                    printError("kira build: \(failureText(failure))")
+                    return .Error(BuildExit.failed)
+                }
+            }
+            placed.appendAll(placedEntries(directory))
+            match keepLines(record, placed) {
+                Ok -> {}
+                Error(failure) -> printError("kira build: \(failureText(failure))")
+            }
+        }
+        return .Ok(StepRun { paths: paths, digests: digests, arguments: graph.stepArguments(), snapshot: snapshot, artifacts: references })
+    }
+}
+
+extend Engine {
+    // Places every artifact `step` produces in `directory`, made anew.
+    function placeStep(
+        borrow self,
+        graph: borrow Graph,
+        step: borrow Step,
+        directory: borrow String
+    ) -> Result<Void, BuildFailure> {
+        match clearPath(directory) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        match makePathTree(directory) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        for artifact in step.produces {
+            let path = joinPath(directory, inputName(graph, artifact))
+            match made[artifact.id] {
+                Some(known) -> match store.place(known, path, false) {
+                    Ok -> {}
+                    Error(failure) -> return .Error(failure)
+                }
+                None -> return .Error(.Failed("\(graph.artifactName(artifact)) was not made"))
+            }
+        }
+        return .Ok
+    }
+}
+
+// Every entry under `directory`, in path order, as a line of its path, kind,
+// bits, size, modification time and inode: what tells whether anything was
+// changed, added or removed there since. None when there is no directory.
+function placedEntries(directory: borrow String) -> [String] {
+    var lines: [String] = []
+    let names = match listDirectory(directory) {
+        Ok(listing) -> copy listing.entries
+        Error(failure) -> {
+            // A step placed for the first time has no directory yet.
+            if !missing(failure) { absorb failure }
+            return lines
+        }
+    }
+    for name in names.sorted({ left, right in return orderStrings(left, right) < 0 }) {
+        let path = joinPath(directory, name)
+        match linkStatus(path) {
+            Ok(status) -> {
+                lines.append(
+                    "\(path) \(traceText(status.kind)) \(status.mode) \(status.size) \(status.modified) \(status.inode)"
+                )
+                if status.kind == .Directory { lines.appendAll(placedEntries(path)) }
+            }
+            Error(failure) -> {
+                absorb failure
+                lines.append("\(path) gone")
+            }
+        }
+    }
+    return lines
+}
+
+// The lines kept at `path`; none when there is no such file or it does not
+// read.
+function recordedLines(path: borrow String) -> [String] {
+    var lines: [String] = []
+    if !fileExists(path) { return lines }
+    let items = match readKtenFile(path) {
+        Ok(value) -> match value.items() {
+            Ok(found) -> found
+            Error(failure) -> {
+                absorb failure
+                return lines
+            }
+        }
+        Error(failure) -> {
+            absorb failure
+            return lines
+        }
+    }
+    for item in items {
+        match item.text() {
+            Ok(text) -> lines.append(text)
+            Error(failure) -> {
+                absorb failure
+                let none: [String] = []
+                return none
+            }
+        }
+    }
+    return lines
+}
+
+function keepLines(path: borrow String, lines: borrow [String]) -> Result<Void, BuildFailure> {
+    match makePathTree(parentPath(path)) {
+        Ok -> {}
+        Error(failure) -> return .Error(failure)
+    }
+    var items: [Kten] = []
+    for line in lines { items.append(.Text(copy line)) }
+    return writeKtenFile(path, Kten.List(items))
+}
+

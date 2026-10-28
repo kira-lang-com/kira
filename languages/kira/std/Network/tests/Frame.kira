@@ -1,0 +1,67 @@
+import Foundation
+
+// One frame of every kind the codec writes, in a fixed order.
+function sampleFrames() -> [QuicFrame] {
+    let id = quicStreamId(1, .Bidirectional, .Client)
+    return [
+        .Ping,
+        .Ack(
+            QuicAckFrame {
+                ranges: [QuicAckRange { smallest: 90, largest: 100 }, QuicAckRange {
+                    smallest: 10,
+                    largest: 80
+                }],
+                delay: 7
+            }
+        ),
+        .Crypto(QuicCryptoFrame { offset: 1200, data: [1, 2, 3] }),
+        .Stream(QuicStreamFrame { id: id, offset: 0, data: [4], fin: true }),
+        .Stream(QuicStreamFrame { id: id, offset: 70000, data: [5, 6], fin: false }),
+        .MaxStreams(QuicStreamCount { kind: .Unidirectional, maximum: 3 }),
+        .MaxStreamData(QuicStreamCredit { id: id, maximum: 1 << 20 }),
+        .ResetStream(QuicResetStreamFrame { id: id, error: 258, finalSize: 9 }),
+        .ResetStream(QuicResetStreamFrame { id: id, error: 3, finalSize: 9, reliableSize: 4 }),
+        .Close(QuicCloseFrame { application: false, error: 10, frameType: 8, reason: [111, 107] }),
+        .HandshakeDone,
+        .Datagram([9, 9])
+    ]
+}
+
+// Every sample frame encodes and decodes back to itself, in order.
+@Test
+function framesRoundTrip() {
+    var writer = WireWriter {}
+    let frames = sampleFrames()
+    for frame in frames { quicWriteFrame(writer, frame) }
+    let back = match quicDecodeFrames(writer.bytes) {
+        Ok(value) -> value
+        Error(failure) -> {
+            expect!(traceText(failure) == "")
+            return
+        }
+    }
+    expect!((back.count) == (frames.count))
+    expect!((traceText(back) == traceText(frames)) == (true))
+}
+
+// An ACK whose ranges run below zero is refused, not wrapped.
+@Test
+function impossibleAcksAreEncodingErrors() {
+    expect!(traceText(quicDecodeFrames([2, 5, 0, 1, 2, 4, 0])) == "Error(QuicTransportError.FrameEncodingError)")
+}
+
+// A stream id carries its index, its kind and which side opened it.
+@Test
+function streamIdsCarryKindAndOpener() {
+    let id = quicStreamId(5, .Unidirectional, .Server)
+    expect!("\(id.raw)" == "23")
+    expect!(traceText(id.kind()) == "QuicStreamKind.Unidirectional")
+    expect!(traceText(id.openedBy()) == "TlsRole.Server")
+    expect!("\(id.index())" == "5")
+}
+
+// RESET_STREAM_AT cannot promise more bytes than the stream has.
+@Test
+function resetsBeyondTheirFinalSizeAreEncodingErrors() {
+    expect!(traceText(quicDecodeFrames([36, 0, 1, 2, 3])) == "Error(QuicTransportError.FrameEncodingError)")
+}

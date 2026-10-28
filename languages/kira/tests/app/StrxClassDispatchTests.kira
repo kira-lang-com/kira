@@ -1,0 +1,133 @@
+import Foundation
+
+// ---------------------------------------------------------------------------
+// H9: self-dispatch from an inherited body, which the parity rule above used
+// to avoid.
+//
+// The rule at the top of this file says no inherited base method may call
+// `self.<m>()` where a descendant overrides `<m>`, because that dispatch was
+// virtual on vm and hybrid and static on llvm. It is not any more: classes are
+// monomorphized, so a parent's body is registered once per descendant with the
+// receiver typed as the concrete class, and `self` is therefore statically the
+// leaf on every backend. Static and virtual dispatch coincide, and the case the
+// rule steered around has one answer everywhere.
+//
+// These are the cases that would have diverged. They are here so that a change
+// which reintroduces a shared parent body — a vtable, or any lowering that
+// stops monomorphizing — fails rather than quietly bringing back a program
+// whose answer depends on its backend.
+// ---------------------------------------------------------------------------
+
+class StrxCDispatchBase {
+    function tier() -> Int {
+        return 1
+    }
+
+    // The shape the parity rule forbade: an inherited body reaching a method
+    // the descendant replaced.
+    function viaSelf() -> Int {
+        return 100 + self.tier()
+    }
+
+    // Two hops, so a lowering that resolved the first correctly and the second
+    // statically is caught as well.
+    function viaSelfTwice() -> Int {
+        return self.viaSelf() + self.tier()
+    }
+}
+
+class StrxCDispatchMiddle extends StrxCDispatchBase {
+    override function tier() -> Int {
+        return 2
+    }
+}
+
+class StrxCDispatchLeaf extends StrxCDispatchMiddle {
+    override function tier() -> Int {
+        return 3
+    }
+
+    // Calls up to the grandparent's body, which itself dispatches back down
+    // through `self` — the two directions in one expression.
+    override function viaSelf() -> Int {
+        return 1000 + StrxCDispatchBase.viaSelf() + self.tier()
+    }
+}
+
+@Test
+function strxClsSelfDispatchAtTheBase() {
+    let base = StrxCDispatchBase()
+    let got = base.viaSelf()
+    expect!(got == 101)
+}
+
+@Test
+function strxClsSelfDispatchReachesTheOverride() {
+    let middle = StrxCDispatchMiddle()
+    let got = middle.viaSelf()
+    expect!(got == 102)
+}
+
+@Test
+function strxClsSelfDispatchThroughTwoHops() {
+    let middle = StrxCDispatchMiddle()
+    let got = middle.viaSelfTwice()
+    expect!(got == 104)
+}
+
+@Test
+function strxClsSelfDispatchUpThenDown() {
+    let leaf = StrxCDispatchLeaf()
+    let got = leaf.viaSelf()
+    expect!(got == 1106)
+}
+
+@Test
+function strxClsSelfDispatchUpThenDownTwice() {
+    let leaf = StrxCDispatchLeaf()
+    let got = leaf.viaSelfTwice()
+    expect!(got == 1109)
+}
+
+class StrxCDispatchLeft {
+    function who() -> Int {
+        return 1
+    }
+}
+
+class StrxCDispatchRight {
+    function tag() -> Int {
+        return 20
+    }
+}
+
+class StrxCDispatchMulti extends StrxCDispatchLeft, StrxCDispatchRight {
+    override function who() -> Int {
+        return 5
+    }
+
+    function both() -> Int {
+        return self.who() + self.tag()
+    }
+}
+
+@Test
+function strxClsSelfDispatchAcrossTwoParents() {
+    let multi = StrxCDispatchMulti()
+    let got = multi.both()
+    expect!(got == 25)
+}
+
+@Test
+function strxClsSelfDispatchOverAnArray() {
+    var items: [StrxCDispatchMiddle] = []
+    for i in 0..3 {
+        items.append(StrxCDispatchMiddle())
+    }
+    var total = 0
+    for j in 0..items.count {
+        total = total + items[j].viaSelf()
+    }
+    let got = total
+    expect!(got == 306)
+}

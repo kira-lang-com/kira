@@ -1,0 +1,156 @@
+// What a check that fails at run time reports (KLF-RIDL sections 18.8 and
+// 31.4). Each check says what went wrong, why the rule it checks holds and
+// how to fix the source; the kernel adds where, from the span the trap
+// names, and renders the report while the program compiles. The values the
+// check compared reach the running program's report as `{0}` and `{1}`
+// through `klf.trap.operands`.
+
+struct TrapReport {
+    // `KLF-RT-0005` for a bounds check, `KLF-RT-0007` for any other check
+    // (section 18.8).
+    let code: String
+    let headline: String
+    // What the carets under the source mark.
+    let label: String
+    let note: String
+    let help: String
+}
+
+extend TrapReport {
+    // The report as `klf.kir.block.trap_text_byte` takes it.
+    function text(borrow self) -> String {
+        return joinText([code, "\n", headline, "\nlabel: ", label, "\nnote: ", note, "\nhelp: ", help])
+    }
+}
+
+let boundsTrap = "KLF-RT-0005"
+let checkTrap = "KLF-RT-0007"
+
+extend FunctionLowering {
+    // Continues when `condition` holds; otherwise records `operands` and
+    // traps with `report` at `span`.
+    function trapUnlessReported(borrow mut self, condition: KirValue, span: Span, report: TrapReport, operands: [KirValue]) {
+        let passes = kir.block()
+        let fails = kir.block()
+        kir.branchIf(condition, passes, fails)
+        enter(fails)
+        trapReported(span, report, operands)
+        enter(passes)
+    }
+
+    // Traps here with `report` at `span`, after recording `operands`.
+    function trapReported(borrow mut self, span: Span, report: TrapReport, operands: [KirValue]) {
+        recordOperands(operands)
+        kir.trapReported(program.named(span), report.text())
+    }
+
+    // Hands the runtime the values the report names, each widened to 64
+    // bits; a report naming none records nothing.
+    function recordOperands(borrow mut self, operands: [KirValue]) {
+        if operands.count == 0 { return }
+        match types.trapOperands {
+            Some(service) -> {
+                for operand in operands { kir.argument(operand) }
+                if operands.count < 2 { kir.argument(kir.integer(types.integer64, 0)) }
+                kir.callVoid(service)
+            }
+            None -> {}
+        }
+    }
+
+    // Hands the runtime the name of the type numbered `typeId`, which the
+    // report names as `{text}`, read from Foundation's type table.
+    function recordTypeName(borrow mut self, typeId: KirValue) {
+        match program.typeNames {
+            Some(table) -> {
+                match types.trapText {
+                    Some(service) -> {
+                        let name = temporary(program.functions[table].result)
+                        kir.argument(kir.pointer(name))
+                        kir.argument(typeId)
+                        kir.callVoid(functions[table])
+                        markInitialized(name)
+                        kir.argument(kir.load(kir.field(name, 0, types.pointer)))
+                        kir.argument(kir.load(kir.field(name, 1, types.integer64)))
+                        kir.callVoid(service)
+                    }
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+    }
+
+    // Traps unless `condition` holds, with a report that names the type an
+    // `Any` held, numbered `actual`.
+    function trapUnlessHeld(borrow mut self, condition: KirValue, span: Span, report: TrapReport, actual: KirValue) {
+        let passes = kir.block()
+        let fails = kir.block()
+        kir.branchIf(condition, passes, fails)
+        enter(fails)
+        recordTypeName(actual)
+        trapReported(span, report, [actual])
+        enter(passes)
+    }
+
+    // `value`, an integer of `valueType`, at 64 bits.
+    function wideOperand(borrow mut self, value: KirValue, valueType: Type) -> KirValue {
+        if valueType.kind != .Integer || valueType.bits >= 64 { return value }
+        return kir.convert(valueType.signed ? convertSignExtend : convertZeroExtend, value, types.integer64)
+    }
+}
+
+extend KirTypes {
+    // `klfsvc_trap_operands`, which every check that names values calls on
+    // its way to the trap. It is declared under the name of the program's
+    // first function, as the output service borrows its `print`.
+    function declareTrapOperands(borrow mut self, builder: KirModuleBuilder, program: CheckedProgram) {
+        if program.functions.count == 0 { return }
+        let name = program.named(program.functions[0].name)
+        let signature = kir_signature_new_named(builder, name.start, name.end, unit, 0)
+        let symbol = "klfsvc_trap_operands"
+        for index in 0..utf8Count(symbol) { kir_signature_name_byte(signature, utf8Byte(symbol, index)) }
+        kir_signature_parameter(signature, integer64)
+        kir_signature_parameter(signature, integer64)
+        trapOperands = .Some(kir_signature_declare(signature))
+        let textSignature = kir_signature_new_named(builder, name.start, name.end, unit, 0)
+        let textSymbol = "klfsvc_trap_text"
+        for index in 0..utf8Count(textSymbol) { kir_signature_name_byte(textSignature, utf8Byte(textSymbol, index)) }
+        kir_signature_parameter(textSignature, pointer)
+        kir_signature_parameter(textSignature, integer64)
+        trapText = .Some(kir_signature_declare(textSignature))
+    }
+}
+
+// A type as the program's source spells it: `[Selection]`, `Picker<String>`,
+// `UN8`.
+function spelledType(program: CheckedProgram, valueType: Type) -> String {
+    match valueType.kind {
+        Structure -> {
+            if isArrayType(program, valueType) {
+                return joinText(["[", spelledType(program, program.structs[valueType.declaration].typeArguments[0]), "]"])
+            }
+            return displayedTypeName(program.structs[valueType.declaration].name.text)
+        }
+        Enumeration -> return displayedTypeName(program.enums[valueType.declaration].name.text)
+        Integer -> return integerSpelling(valueType)
+        Decimal -> return valueType.numberName()
+        Floating -> return valueType.bits == 32 ? "F32" : "Float"
+        Boolean -> return "Bool"
+        Pointer -> return "RawPtr"
+        Void -> return "Void"
+        Invalid -> return "a type the checker could not name"
+    }
+}
+
+function integerSpelling(valueType: Type) -> String {
+    if valueType.isInt() { return "Int" }
+    return joinText([valueType.signed ? "I" : "U", decimalText(valueType.bits)])
+}
+
+// The range of values `target` holds, as the report says it.
+function rangeText(target: Type) -> String {
+    if !target.signed && target.bits == 64 { return "0 through 18446744073709551615" }
+    return joinText([decimalText(target.minimum()), " through ", decimalText(target.maximum())])
+}
+

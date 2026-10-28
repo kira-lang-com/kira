@@ -1,0 +1,95 @@
+// `place op= value` reads the place, combines it with the value and writes
+// the result back: `place = place op value`, with each index the place is
+// reached through evaluated once, before both, into a binding of its own.
+
+enum PlaceStep {
+    Indexed(Int, Int)
+    Field(Int, Identifier)
+    // A name or a literal, which reads the same however often it is read.
+    Plain
+    // Anything else, which `checkAssignment` judges as a place.
+    Other
+}
+
+function placeStep(kind: ExpressionKind) -> PlaceStep {
+    match kind {
+        Index(base, index) -> return .Indexed(base, index)
+        Member(base, name) -> return .Field(base, name)
+        Name -> return .Plain
+        IntegerLiteral -> return .Plain
+        BooleanLiteral -> return .Plain
+        ExpandedMacro -> return .Other
+        Quote -> return .Other
+        MacroCall -> return .Other
+        Try -> return .Other
+        GenericCall -> return .Other
+        Call -> return .Other
+        MethodCall -> return .Other
+        IndirectCall -> return .Other
+        Lambda -> return .Other
+        KeyPath -> return .Other
+        Task -> return .Other
+        TypeQuery -> return .Other
+        Labelled -> return .Other
+        FloatLiteral -> return .Other
+        StringLiteral -> return .Other
+        ArrayLiteral -> return .Other
+        Transfer -> return .Other
+        Variant -> return .Other
+        StructLiteral -> return .Other
+        Unary -> return .Other
+        Binary -> return .Other
+        Conditional -> return .Other
+        MatchValue -> return .Other
+        Content -> return .Other
+    }
+}
+
+extend Checker {
+    function checkCompoundAssignment(borrow mut self, operator: BinaryOperator, target: Int, value: Int, span: Span) -> CheckedStatement {
+        var hoisted: [Int] = []
+        let place = evaluatedOnce(target, hoisted)
+        let combined = tree.addExpression(.Binary(operator, place, value), span)
+        let assigned = checkAssignment(place, combined)
+        if hoisted.count == 0 { return assigned }
+        hoisted.append(program.addStatement(assigned))
+        let done = add(.Integer(0), Type.int(), span)
+        return .Evaluate(add(.Sequence(hoisted, done), Type.void(), span))
+    }
+
+    // `target` with each index that is not plain replaced by a binding of
+    // it, the bindings' declarations appended to `hoisted`.
+    function evaluatedOnce(borrow mut self, target: Int, hoisted: borrow mut [Int]) -> Int {
+        let span = tree.expressions[target].span
+        match placeStep(tree.expressions[target].kind) {
+            Indexed(base, index) -> {
+                let rebased = evaluatedOnce(base, hoisted)
+                var position = index
+                match placeStep(tree.expressions[index].kind) {
+                    Plain -> {}
+                    Indexed -> position = hoistIndex(index, hoisted)
+                    Field -> position = hoistIndex(index, hoisted)
+                    Other -> position = hoistIndex(index, hoisted)
+                }
+                if rebased == base && position == index { return target }
+                return tree.addExpression(.Index(rebased, position), span)
+            }
+            Field(base, name) -> {
+                let rebased = evaluatedOnce(base, hoisted)
+                if rebased == base { return target }
+                return tree.addExpression(.Member(rebased, name), span)
+            }
+            Plain -> return target
+            Other -> return target
+        }
+    }
+
+    function hoistIndex(borrow mut self, index: Int, hoisted: borrow mut [Int]) -> Int {
+        let span = tree.expressions[index].span
+        let checked = expression(index, .Some(Type.int()))
+        let name = Identifier { text = joinText(["__index#", decimalText(index)]), span = span }
+        let local = declareLocal(name.text, typeOf(checked), false, false)
+        hoisted.append(program.addStatement(.Declare(local, checked)))
+        return tree.addExpression(.Name(name), span)
+    }
+}

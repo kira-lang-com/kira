@@ -1,0 +1,249 @@
+// The number a class's descriptor carries, which a call through a class
+// reference tells the class by: a hash of the class's name, so every unit
+// that sees the class numbers it alike.
+function classTypeId(program: CheckedProgram, index: Int) -> Int {
+    return instanceSuffix(typeKey(program, Type.structure(index)))
+}
+
+function classMethodTarget(program: CheckedProgram, owner: Int, member: String) -> Optional<Int> {
+    let name = joinText([program.structs[owner].name.text, ".", member])
+    for index in 0..program.functions.count {
+        if program.functions[index].symbol == name { return .Some(index) }
+    }
+    return .None
+}
+
+extend FunctionLowering {
+    function classProducerId(borrow self, object: KirValue) -> KirValue {
+        let box = kir.typedMemory(object, kir_type_array(0, types.pointer))
+        let descriptor = kir.load(kir.element(box, kir.integer(types.integer64, 0), types.pointer))
+        let typed = kir.typedMemory(descriptor, types.descriptorTypes[0])
+        return kir.load(kir.field(typed, 7, types.integer64))
+    }
+
+    function dynamicClassField(borrow mut self, owner: Int, field: Int) -> KirAddress {
+        let view = program.typeOf(owner)
+        let key = program.structs[view.declaration].fields[field].name.text
+        let fieldType = program.structs[view.declaration].fields[field].valueType
+        let object = kir.load(address(owner))
+        let typeId = classProducerId(object)
+        let result = temporary(Type.pointer())
+        let done = kir.block()
+        for index in types.classIndices {
+            let actual = Type.structure(index)
+            if !classIsSubtype(program, actual, view) { continue }
+            match program.structs[index].field(key) {
+                Some(actualField) -> {
+                    let selected = kir.block()
+                    let next = kir.block()
+                    kir.branchIf(kir.compare(kirPredicate(.Equal, false), typeId, kir.integer(types.integer64, classTypeId(program, index))), selected, next)
+                    enter(selected)
+                    let description = types.classDescription(index)
+                    let box = kir.typedMemory(object, description.boxType)
+                    let payload = kir.field(box, 2, description.payloadType)
+                    let address = kir.field(payload, actualField, types.of(fieldType))
+                    kir.store(kir.convert(convertBitcast, kir.pointer(address), types.pointer), result)
+                    flowInto(done)
+                    enter(next)
+                }
+                None -> {}
+            }
+        }
+        // A subclass this unit does not see, one a program declares for a
+        // package built apart, starts with its ancestors' fields, laid out
+        // as the class it is viewed as lays them out.
+        let description = types.classDescription(view.declaration)
+        let box = kir.typedMemory(object, description.boxType)
+        let payload = kir.field(box, 2, description.payloadType)
+        let address = kir.field(payload, field, types.of(fieldType))
+        kir.store(kir.convert(convertBitcast, kir.pointer(address), types.pointer), result)
+        flowInto(done)
+        enter(done)
+        return kir.typedMemory(kir.load(result), types.of(fieldType))
+    }
+
+    function classCall(borrow mut self, target: Int, arguments: [Int], resultType: Type, destination: Optional<KirAddress>) -> KirValue {
+        let callee = program.functions[target]
+        let view = program.typeOf(arguments[0])
+        let receiver = temporary(view)
+        write(arguments[0], receiver)
+        let object = kir.load(receiver)
+        let typeId = classProducerId(object)
+        var values: [KirValue] = []
+        match destination {
+            Some(result) -> values.append(kir.pointer(result))
+            None -> {}
+        }
+        values.append(kir.pointer(receiver))
+        for index in 1..arguments.count {
+            let parameter = callee.locals[index]
+            values.append(passedArgument(parameter.valueType, parameter.passingMode, parameter.byReference, arguments[index]))
+        }
+        var result: Optional<KirAddress> = .None
+        if !resultType.isAggregate() && !resultType.equals(Type.void()) { result = .Some(temporary(resultType)) }
+        let done = kir.block()
+        for index in types.classIndices {
+            if !classIsSubtype(program, Type.structure(index), view) { continue }
+            match classMethodTarget(program, index, callee.memberName) {
+                Some(actualTarget) -> {
+                    let selected = kir.block()
+                    let next = kir.block()
+                    kir.branchIf(kir.compare(kirPredicate(.Equal, false), typeId, kir.integer(types.integer64, classTypeId(program, index))), selected, next)
+                    enter(selected)
+                    for value in values { kir.argument(value) }
+                    match result {
+                        Some(slot) -> kir.store(kir.call(functions[actualTarget], types.of(resultType)), slot)
+                        None -> kir.callVoid(functions[actualTarget])
+                    }
+                    flowInto(done)
+                    enter(next)
+                }
+                None -> {}
+            }
+        }
+        // A class this unit does not see is the program's unit's to tell.
+        // Every unit lowers it alike, so a generic instance two units build
+        // is one definition.
+        if target < types.classDispatcherSlots.count && types.classDispatcherSlots[target] >= 0 {
+            let dispatcher = types.classDispatchers[types.classDispatcherSlots[target]]
+            for value in values { kir.argument(value) }
+            match result {
+                Some(slot) -> kir.store(kir.call(dispatcher, types.of(resultType)), slot)
+                None -> kir.callVoid(dispatcher)
+            }
+            flowInto(done)
+        } else {
+            kir.unreachable()
+        }
+        enter(done)
+        match result {
+            Some(slot) -> return kir.load(slot)
+            None -> return kir.integer(types.integer64, 0)
+        }
+    }
+}
+
+// A class a package built apart declares may have subclasses that package's
+// unit never sees: the program's own, or the instances of a generic subclass
+// the program names. A call through such a class in that unit tells apart
+// the classes it sees and hands any other to the method's dispatcher,
+// `<method>#dispatch`, which the program's own unit defines over every
+// class it sees.
+function classDispatched(program: CheckedProgram, index: Int) -> Bool {
+    if !program.classFallback(index) || program.neverChecked(index) { return false }
+    let checked = program.functions[index]
+    if checked.lambda || checked.foreign.isSome() || checked.asyncResume.isSome() || checked.locals.count < checked.parameterCount || checked.parameterCount == 0 { return false }
+    // `Class.Ancestor.method`, an ancestor's method a `super` call names,
+    // runs as written.
+    if containsText(checked.memberName, ".") { return false }
+    return isClassType(program, checked.locals[0].valueType)
+}
+
+// Per class the program sees that is method `index`'s class or one of its
+// subclasses, the class and the method it answers it with.
+function classDispatchTargets(program: CheckedProgram, members: borrow mut MemberIndex, index: Int) -> [ClassDispatchTarget] {
+    let base = program.functions[index]
+    let view = base.locals[0].valueType
+    let found = members.implementations(program, base.memberName)
+    var targets: [ClassDispatchTarget] = []
+    for structure in 0..program.structs.count {
+        if program.structs[structure].genericBase != "Class" || !classIsSubtype(program, Type.structure(structure), view) { continue }
+        let symbol = joinText([program.structs[structure].name.text, ".", base.memberName])
+        for target in found {
+            if program.functions[target].symbol == symbol && program.functions[target].locals.count >= program.functions[target].parameterCount {
+                targets.append(ClassDispatchTarget { structure = structure, method = target })
+                break
+            }
+        }
+    }
+    return targets
+}
+
+struct ClassDispatchTarget {
+    let structure: Int
+    let method: Int
+}
+
+// The dispatchers the program's unit defines, and every method they call.
+function classDispatchRoots(program: CheckedProgram) -> [Int] {
+    var roots: [Int] = []
+    if program.dependencyUnit { return roots }
+    var members = emptyMemberIndex()
+    for index in 0..program.classFallbacks.count {
+        if !classDispatched(program, index) { continue }
+        roots.append(index)
+        for target in classDispatchTargets(program, members, index) { roots.append(target.method) }
+    }
+    return roots
+}
+
+extend KirTypes {
+    // A dispatcher for each method a call reached may fall back on, taking
+    // the method's own parameters.
+    function declareClassDispatchers(borrow mut self, builder: KirModuleBuilder, program: CheckedProgram, reached: [Bool]) {
+        for index in 0..program.functions.count {
+            if !reached[index] || !classDispatched(program, index) {
+                classDispatcherSlots.append(-1)
+                continue
+            }
+            let checked = program.functions[index]
+            var result = of(checked.result)
+            if checked.result.isAggregate() { result = unit }
+            let name = program.named(checked.name)
+            let signature = kir_signature_new(builder, name.start, name.end, result)
+            let symbol = joinText([checked.symbol, "#dispatch"])
+            for offset in 0..utf8Count(symbol) {
+                kir_signature_name_byte(signature, utf8Byte(symbol, offset))
+            }
+            if checked.result.isAggregate() {
+                kir_signature_parameter(signature, address(checked.result))
+            }
+            for parameter in checked.captures.count..checked.parameterCount {
+                kir_signature_parameter(signature, parameterType(self, checked.locals[parameter]))
+            }
+            classDispatcherSlots.append(classDispatchers.count)
+            classDispatchers.append(kir_signature_declare(signature))
+        }
+    }
+}
+
+// The program's unit's dispatchers: each tells the receiver's class by its
+// descriptor's number and calls that class's method with the arguments as
+// they came.
+function lowerClassDispatchers(program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder]) {
+    if program.dependencyUnit { return }
+    var members = emptyMemberIndex()
+    for index in 0..types.classDispatcherSlots.count {
+        let slot = types.classDispatcherSlots[index]
+        if slot < 0 { continue }
+        var lowering = FunctionLowering.startChecked(program, types, functions, program.functions[index], types.classDispatchers[slot])
+        lowering.lowerClassDispatcher(classDispatchTargets(program, members, index))
+    }
+}
+
+extend FunctionLowering {
+    function lowerClassDispatcher(borrow mut self, targets: [ClassDispatchTarget]) {
+        let body = kir.block()
+        enter(body)
+        var first = 0
+        if checked.result.isAggregate() { first = 1 }
+        let receiver = kir.parameter(first)
+        let object = kir.load(kir.typedMemory(receiver, types.pointer))
+        let id = classProducerId(object)
+        for target in targets {
+            let selected = kir.block()
+            let next = kir.block()
+            kir.branchIf(kir.compare(kirPredicate(.Equal, false), id, kir.integer(types.integer64, classTypeId(program, target.structure))), selected, next)
+            enter(selected)
+            if first == 1 { kir.argument(kir.parameter(0)) }
+            kir.argument(receiver)
+            forwardDispatched(first)
+            returnDispatched(functions[target.method])
+            enter(next)
+        }
+        kir.unreachable()
+        open = false
+        kir.switchTo(entry)
+        kir.branch(body)
+    }
+}

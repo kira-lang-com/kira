@@ -1,0 +1,245 @@
+// KSL's types. A type is a shape with the fields that shape reads: a
+// scalar's kind; a vector's kind and width; a matrix's columns and rows; a
+// struct's index among the checked structs; a texture's or sampler's kind.
+// `array` wraps any of them in a runtime array, the one array KSL has.
+//
+// `Void` is both "returns nothing" and the type a failed expression takes,
+// which every later check accepts silently, as the oracle does.
+
+enum Scalar {
+    Bool
+    Int
+    UInt
+    Float
+    Half
+
+    function name(borrow self) -> String {
+        match self {
+            Bool -> return "bool"
+            Int -> return "i32"
+            UInt -> return "u32"
+            Float -> return "f32"
+            Half -> return "f16"
+        }
+    }
+}
+
+enum Shape {
+    Void
+    ScalarShape
+    Vector
+    Matrix
+    Struct
+    Texture
+    Sampler
+}
+
+enum TextureKind {
+    Texture2d
+    TextureCube
+    Depth2d
+    Texture2dUint
+}
+
+struct ShaderType {
+    let shape: Shape
+    let scalar: Scalar
+    // A vector's width, or a matrix's columns.
+    let width: Int
+    let rows: Int
+    // A struct's index; for a sampler, 1 when it compares.
+    let index: Int
+    let texture: TextureKind
+    let array: Bool
+
+    function isVoid(borrow self) -> Bool {
+        return shape == .Void && !array
+    }
+
+    function isScalar(borrow self, kind: Scalar) -> Bool {
+        return shape == .ScalarShape && scalar == kind && !array
+    }
+
+    function isNumeric(borrow self) -> Bool {
+        if array { return false }
+        if shape == .Matrix { return true }
+        return (shape == .ScalarShape || shape == .Vector) && scalar != .Bool
+    }
+
+    // The type of one element of a runtime array.
+    function element(borrow self) -> ShaderType {
+        return ShaderType {
+            shape = shape, scalar = scalar, width = width, rows = rows, index = index,
+            texture = texture, array = false
+        }
+    }
+
+    function arrayOf(borrow self) -> ShaderType {
+        return ShaderType {
+            shape = shape, scalar = scalar, width = width, rows = rows, index = index,
+            texture = texture, array = true
+        }
+    }
+
+    // A vector's or scalar's kind as a scalar; a matrix's components are
+    // `Float`.
+    function component(borrow self) -> ShaderType {
+        if shape == .Matrix { return scalarType(.Float) }
+        if shape == .Vector { return scalarType(scalar) }
+        return self
+    }
+
+    function same(borrow self, other: ShaderType) -> Bool {
+        if shape != other.shape || array != other.array { return false }
+        match shape {
+            Void -> return true
+            ScalarShape -> return scalar == other.scalar
+            Vector -> return scalar == other.scalar && width == other.width
+            Matrix -> return width == other.width && rows == other.rows
+            Struct -> return index == other.index
+            Texture -> return texture == other.texture
+            Sampler -> return index == other.index
+        }
+    }
+}
+
+function shaderType(shape: Shape, scalar: Scalar, width: Int, rows: Int, index: Int) -> ShaderType {
+    return ShaderType {
+        shape = shape, scalar = scalar, width = width, rows = rows, index = index,
+        texture = .Texture2d, array = false
+    }
+}
+
+function voidType() -> ShaderType {
+    return shaderType(.Void, .Bool, 0, 0, -1)
+}
+
+function scalarType(scalar: Scalar) -> ShaderType {
+    return shaderType(.ScalarShape, scalar, 1, 1, -1)
+}
+
+function vectorType(scalar: Scalar, width: Int) -> ShaderType {
+    return shaderType(.Vector, scalar, width, 1, -1)
+}
+
+function matrixType(columns: Int, rows: Int) -> ShaderType {
+    return shaderType(.Matrix, .Float, columns, rows, -1)
+}
+
+function structType(index: Int) -> ShaderType {
+    return shaderType(.Struct, .Float, 0, 0, index)
+}
+
+function textureType(kind: TextureKind) -> ShaderType {
+    return ShaderType {
+        shape = .Texture, scalar = .Float, width = 0, rows = 0, index = -1, texture = kind, array = false
+    }
+}
+
+function samplerType(comparison: Bool) -> ShaderType {
+    var index = 0
+    if comparison { index = 1 }
+    return shaderType(.Sampler, .Float, 0, 0, index)
+}
+
+// The types KSL names without declaring them.
+function builtinType(name: String) -> Optional<ShaderType> {
+    match name {
+        "Bool" -> return .Some(scalarType(.Bool))
+        "Int" -> return .Some(scalarType(.Int))
+        "UInt" -> return .Some(scalarType(.UInt))
+        "Float" -> return .Some(scalarType(.Float))
+        "Half" -> return .Some(scalarType(.Half))
+        "Bool2" -> return .Some(vectorType(.Bool, 2))
+        "Bool3" -> return .Some(vectorType(.Bool, 3))
+        "Bool4" -> return .Some(vectorType(.Bool, 4))
+        "Int2" -> return .Some(vectorType(.Int, 2))
+        "Int3" -> return .Some(vectorType(.Int, 3))
+        "Int4" -> return .Some(vectorType(.Int, 4))
+        "UInt2" -> return .Some(vectorType(.UInt, 2))
+        "UInt3" -> return .Some(vectorType(.UInt, 3))
+        "UInt4" -> return .Some(vectorType(.UInt, 4))
+        "Float2" -> return .Some(vectorType(.Float, 2))
+        "Float3" -> return .Some(vectorType(.Float, 3))
+        "Float4" -> return .Some(vectorType(.Float, 4))
+        "Half2" -> return .Some(vectorType(.Half, 2))
+        "Half3" -> return .Some(vectorType(.Half, 3))
+        "Half4" -> return .Some(vectorType(.Half, 4))
+        "Float2x2" -> return .Some(matrixType(2, 2))
+        "Float3x3" -> return .Some(matrixType(3, 3))
+        "Float4x4" -> return .Some(matrixType(4, 4))
+        "Texture2d" -> return .Some(textureType(.Texture2d))
+        "TextureCube" -> return .Some(textureType(.TextureCube))
+        "Depth2d" -> return .Some(textureType(.Depth2d))
+        "Texture2dUint" -> return .Some(textureType(.Texture2dUint))
+        "Sampler" -> return .Some(samplerType(false))
+        "SamplerComparison" -> return .Some(samplerType(true))
+        "Void" -> return .Some(voidType())
+        else -> {
+            let none: Optional<ShaderType> = .None
+            return none
+        }
+    }
+}
+
+// The component a swizzle letter selects, or -1.
+function swizzleComponent(letter: Int) -> Int {
+    let letters = ["xr", "yg", "zb", "wa"]
+    for component in 0..letters.count {
+        let pair = letters[component]
+        if letter == utf8Byte(pair, 0) || letter == utf8Byte(pair, 1) { return component }
+    }
+    return -1
+}
+
+// The components `name` selects as a swizzle, or none when it is not one.
+function swizzle(name: String) -> Optional<[Int]> {
+    let none: Optional<[Int]> = .None
+    if utf8Count(name) == 0 || utf8Count(name) > 4 { return none }
+    var components: [Int] = []
+    for index in 0..utf8Count(name) {
+        let component = swizzleComponent(utf8Byte(name, index))
+        if component < 0 { return none }
+        components.append(component)
+    }
+    return .Some(components)
+}
+
+// The KSIR built-in a `@builtin(word)` names, or none.
+function builtinValue(word: String) -> Optional<String> {
+    match word {
+        "position" -> return .Some("position")
+        "frag_coord" -> return .Some("position")
+        "vertex_index" -> return .Some("vertex_index")
+        "instance_index" -> return .Some("instance_index")
+        "front_facing" -> return .Some("front_facing")
+        "thread_id" -> return .Some("global_invocation_id")
+        "local_id" -> return .Some("local_invocation_id")
+        "group_id" -> return .Some("workgroup_id")
+        "local_index" -> return .Some("local_invocation_index")
+        else -> {
+            let none: Optional<String> = .None
+            return none
+        }
+    }
+}
+
+// Whether a stage may carry `word` (a KSL built-in) on its input or output.
+function builtinAllowed(word: String, stage: StageKind, input: Bool) -> Bool {
+    match word {
+        "position" -> return (stage == .Vertex && !input) || (stage == .Fragment && input)
+        "vertex_index" -> return stage == .Vertex && input
+        "instance_index" -> return stage == .Vertex && input
+        "front_facing" -> return stage == .Fragment && input
+        "frag_coord" -> return stage == .Fragment && input
+        "thread_id" -> return stage == .Compute && input
+        "local_id" -> return stage == .Compute && input
+        "group_id" -> return stage == .Compute && input
+        "local_index" -> return stage == .Compute && input
+        else -> return false
+    }
+}
+
+function isInterpolation(word: String) -> Bool {
+    return word == "perspective" || word == "linear" || word == "flat"
+}

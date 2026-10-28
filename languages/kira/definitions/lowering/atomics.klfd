@@ -1,0 +1,32 @@
+// The atomic operations (`semantics/atomics.klfd`), each one KIR instruction
+// on the word at a raw pointer.
+
+extend FunctionLowering {
+    function atomicValue(borrow mut self, step: AtomicStep, valueType: Type) -> KirValue {
+        match step {
+            Load(pointer, order) -> return kir.atomicLoad(types.imageType(program, valueType), value(pointer), order)
+            Store(pointer, stored, order) -> {
+                kir.atomicStore(value(stored), value(pointer), order)
+                return noValue()
+            }
+            Modify(operator, pointer, operand, order) -> {
+                // KIR exchanges integers, so a pointer goes as its word.
+                if valueType.kind == .Pointer {
+                    let word = kir.convert(convertBitcast, value(operand), types.integer64)
+                    let before = kir.atomicModify(operator, value(pointer), word, order)
+                    return kir.convert(convertBitcast, before, types.pointer)
+                }
+                return kir.atomicModify(operator, value(pointer), value(operand), order)
+            }
+            Exchange(pointer, expected, replacement, success, failure, weak) -> {
+                let read = kir.compareExchange(weak, value(pointer), value(expected), value(replacement), success, failure)
+                if weak { return kir.exchanged(read) }
+                return read
+            }
+            Fence(order) -> {
+                kir.fence(order)
+                return noValue()
+            }
+        }
+    }
+}

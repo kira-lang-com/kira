@@ -1,0 +1,138 @@
+extend KirTypes {
+    // A thunk for each reached function named as a value. One nothing reaches
+    // is only declared, and a thunk with no body would read as a C import.
+    function declareClosureThunks(borrow mut self, builder: KirModuleBuilder, program: CheckedProgram, reached: [Bool]) {
+        for target in program.functions {
+            let absent: Optional<KirFunctionBuilder> = .None
+            closureThunks.append(absent)
+        }
+        for expression in program.expressions {
+            match expression.operation.referencedFunction() {
+                Some(target) -> {
+                    if closureThunks[target].isSome() || !reached[target] { continue }
+                    let checked = program.functions[target]
+                    let name = program.named(checked.name)
+                    var result = of(checked.result)
+                    if checked.result.isAggregate() { result = unit }
+                    let signature = kir_signature_new_named(builder, name.start, name.end, result, generatedSuffix(builder, "closure thunk", checked.symbol))
+                    kir_signature_parameter(signature, pointer)
+                    if checked.result.isAggregate() { kir_signature_parameter(signature, address(checked.result)) }
+                    for index in 0..checked.parameterCount {
+                        kir_signature_parameter(signature, parameterType(self, checked.locals[index]))
+                    }
+                    closureThunks[target] = .Some(kir_signature_declare(signature))
+                }
+                None -> {}
+            }
+        }
+    }
+}
+
+function lowerClosureThunks(program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder], reached: [Bool]) {
+    for target in 0..types.closureThunks.count {
+        if !reached[target] { continue }
+        match types.closureThunks[target] {
+            Some(thunk) -> {
+                kir_function_body(thunk)
+                thunk.switchTo(thunk.entryBlock())
+                let checked = program.functions[target]
+                var parameters = checked.parameterCount
+                if checked.result.isAggregate() { parameters += 1 }
+                for index in 0..parameters { thunk.argument(thunk.parameter(index + 1)) }
+                if checked.result.isAggregate() || checked.result.equals(Type.void()) {
+                    thunk.callVoid(functions[target])
+                    thunk.returnVoid()
+                } else {
+                    thunk.returnValue(thunk.call(functions[target], types.of(checked.result)))
+                }
+            }
+            None -> {}
+        }
+    }
+}
+
+extend FunctionLowering {
+    function functionReference(borrow mut self, target: Int, valueType: Type) -> KirAddress {
+        match types.closureThunks[target] {
+            Some(thunk) -> {
+                let header = temporary(valueType)
+                let reference = kir_value_function_reference(kir, thunk)
+                let code = kir.convert(convertBitcast, reference, types.pointer)
+                kir.store(code, kir.field(header, 0, types.pointer))
+                kir.store(kir_value_null(kir, types.pointer), kir.field(header, 1, types.pointer))
+                markInitialized(header)
+                return header
+            }
+            None -> {
+                abort()
+                return temporary(valueType)
+            }
+        }
+    }
+
+    function indirectCall(borrow mut self, target: Int, arguments: [Int], result: Type, destination: Optional<KirAddress>) -> KirValue {
+        let callableType = program.typeOf(target)
+        if isCallbackType(program, callableType) { return pointerCall(target, arguments, result, destination) }
+        let callable = program.structs[callableType.declaration]
+        let header = address(target)
+        let rawCode = kir.load(kir.field(header, 0, types.pointer))
+        var parameters: [KirType] = [types.pointer]
+        var values: [KirValue] = [kir.load(kir.field(header, 1, types.pointer))]
+        var returnType = types.of(result)
+        match destination {
+            Some(resultSlot) -> {
+                parameters.append(types.address(result))
+                values.append(kir.pointer(resultSlot))
+                returnType = types.unit
+            }
+            None -> {}
+        }
+        for index in 0..arguments.count {
+            let argumentType = callable.typeArguments[index]
+            let mode = callable.callableModes[index]
+            let borrowed = mode == .MutablyBorrowed
+            if argumentType.isAggregate() || borrowed {
+                parameters.append(types.address(argumentType))
+            } else {
+                parameters.append(types.of(argumentType))
+            }
+            values.append(passedArgument(argumentType, mode, borrowed, arguments[index]))
+        }
+        for parameter in parameters { kir_type_parameter(parameter) }
+        let codeType = kir_type_function(returnType)
+        let code = kir.convert(convertBitcast, rawCode, codeType)
+        for parameter in parameters { kir_value_indirect_parameter(kir, parameter) }
+        for argument in values { kir.argument(argument) }
+        if returnType == types.unit {
+            kir_value_call_indirect_void(kir, code)
+            return kir.integer(types.integer64, 0)
+        }
+        return kir_value_call_indirect(kir, code, returnType)
+    }
+
+    function copyClosure(borrow mut self, from: KirAddress, to: KirAddress) {
+        kir.store(kir.load(kir.field(from, 0, types.pointer)), kir.field(to, 0, types.pointer))
+        let context = kir.load(kir.field(from, 1, types.pointer))
+        kir.store(context, kir.field(to, 1, types.pointer))
+        let bits = kir.convert(convertBitcast, context, types.integer64)
+        let retain = kir.block()
+        let done = kir.block()
+        kir.branchIf(kir.compare(kirPredicate(.NotEqual, false), bits, kir.integer(types.integer64, 0)), retain, done)
+        enter(retain)
+        kir.store(arrayRuntimePointer(2, [context]), kir.field(to, 1, types.pointer))
+        flowInto(done)
+        enter(done)
+    }
+
+    function destroyClosureBody(borrow mut self, header: KirAddress) {
+        let context = kir.load(kir.field(header, 1, types.pointer))
+        let bits = kir.convert(convertBitcast, context, types.integer64)
+        let release = kir.block()
+        let done = kir.block()
+        kir.branchIf(kir.compare(kirPredicate(.NotEqual, false), bits, kir.integer(types.integer64, 0)), release, done)
+        enter(release)
+        destroyContext(context)
+        flowInto(done)
+        enter(done)
+    }
+}

@@ -1,0 +1,50 @@
+// `Type: Trait`, written in a declaration's colon list or an `extend`.
+struct TypeConformance {
+    let owner: TypeReference
+    let traitName: TypeReference
+}
+
+struct ExtensionDeclaration {
+    let owner: TypeReference
+    // The traits the block implements, when it is written `extend T: Trait`.
+    let traits: [TypeReference]
+    let methods: [FunctionDeclaration]
+    // Whether its methods' bodies were passed over, for the unit of the
+    // package that declares it to read.
+    var bodiesElsewhere: Bool = false
+}
+
+extend Parser {
+    // `: Trait, Other` after a declaration's name; the traits it claims.
+    function conformances(borrow mut self, owner: TypeReference) -> Result<[TypeReference], Failure> {
+        var traits: [TypeReference] = []
+        if !eat(.Colon) { return .Ok(traits) }
+        traits.append(try typeReference())
+        while eat(.Comma) { traits.append(try typeReference()) }
+        for traitName in traits { tree.conformances.append(TypeConformance { owner = owner, traitName = traitName }) }
+        return .Ok(traits)
+    }
+
+    function extensionDeclaration(borrow mut self) -> Result<Span, Failure> {
+        let start = advance().span
+        let owner = try typeReference()
+        let traits = try conformances(owner)
+        try expect(.LeftBrace)
+        var methods: [FunctionDeclaration] = []
+        // A block on an instance, `extend Array<U8>`, gives its methods to
+        // the instance, which every unit naming it compiles.
+        let elsewhere = bodiesElsewhere && !tree.extensionBodies && owner.arguments.count == 0
+        while !at(.RightBrace) {
+            let memberDocs = try claimDocs()
+            skipsBody = elsewhere
+            let method = prefixedMethod()
+            skipsBody = false
+            let declared = try method
+            recordDocs(memberDocs, "method", declared.name.text, owner.name.text)
+            methods.append(declared)
+        }
+        try expect(.RightBrace)
+        tree.extensions.append(ExtensionDeclaration { owner = owner, traits = traits, methods = methods, bodiesElsewhere = elsewhere })
+        return .Ok(spanFrom(start))
+    }
+}

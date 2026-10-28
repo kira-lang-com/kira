@@ -1,0 +1,114 @@
+// The messages after ServerHello (RFC 8446 sections 4.3 and 4.4):
+// EncryptedExtensions, Certificate, CertificateVerify and Finished.
+
+function tlsEncodeEncryptedExtensions(
+    extensions: borrow [TlsExtension]
+) -> Result<TlsHandshakeMessage, TlsAlert> {
+    var writer = WireWriter {}
+    try tlsWriteExtensions(writer, extensions)
+    return .Ok(tlsHandshakeMessage(.EncryptedExtensions, writer.bytes))
+}
+
+function tlsDecodeEncryptedExtensions(body: borrow [UN8]) -> Result<[TlsExtension], TlsAlert> {
+    var reader = WireReader { bytes: copy body }
+    let extensions = try tlsReadExtensions(reader)
+    if !reader.atEnd() { return .Error(.DecodeError) }
+    return .Ok(extensions)
+}
+
+// A Certificate message: DER certificates, the end-entity one first. The
+// per-entry extensions (OCSP, SCT) are neither sent nor needed, so they are
+// written empty and passed over when read.
+struct TlsCertificateChain {
+    let context: [UN8] = []
+    let certificates: [[UN8]]
+}
+
+function tlsEncodeCertificate(
+    chain: borrow TlsCertificateChain
+) -> Result<TlsHandshakeMessage, TlsAlert> {
+    var writer = WireWriter {}
+    writer.writeVector(chain.context, Tls.shortVector)
+    let mark = writer.reserveLength(Tls.longVector)
+    for certificate in chain.certificates {
+        writer.writeVector(certificate, Tls.longVector)
+        writer.writeInteger(0, Tls.vector)
+    }
+    try writer.fillLength(mark) otherwise return .Error(.InternalError)
+    return .Ok(tlsHandshakeMessage(.Certificate, writer.bytes))
+}
+
+function tlsDecodeCertificate(body: borrow [UN8]) -> Result<TlsCertificateChain, TlsAlert> {
+    var reader = WireReader { bytes: copy body }
+    let context = try reader.readVector(Tls.shortVector) otherwise return .Error(.DecodeError)
+    var list = try reader.readSection(Tls.longVector) otherwise return .Error(.DecodeError)
+    if !reader.atEnd() { return .Error(.DecodeError) }
+    var certificates: [[UN8]] = []
+    while !list.atEnd() {
+        let certificate = try list.readVector(Tls.longVector) otherwise return .Error(.DecodeError)
+        // cert_data is at least one byte (RFC 8446 section 4.4.2).
+        if certificate.count == 0 { return .Error(.DecodeError) }
+        try list.readVector(Tls.vector) otherwise return .Error(.DecodeError)
+        certificates.append(certificate)
+    }
+    return .Ok(TlsCertificateChain { context: context, certificates: certificates })
+}
+
+struct TlsCertificateProof {
+    let scheme: SignatureScheme
+    let signature: [UN8]
+}
+
+function tlsEncodeCertificateVerify(proof: borrow TlsCertificateProof) -> TlsHandshakeMessage {
+    var writer = WireWriter {}
+    writer.writeInteger(code(proof.scheme), TlsLimit.schemeBytes)
+    writer.writeVector(proof.signature, Tls.vector)
+    return tlsHandshakeMessage(.CertificateVerify, writer.bytes)
+}
+
+function tlsDecodeCertificateVerify(body: borrow [UN8]) -> Result<TlsCertificateProof, TlsAlert> {
+    var reader = WireReader { bytes: copy body }
+    let scheme = try reader.readInteger(TlsLimit.schemeBytes) otherwise return .Error(.DecodeError)
+    let signature = try reader.readVector(Tls.vector) otherwise return .Error(.DecodeError)
+    if !reader.atEnd() { return .Error(.DecodeError) }
+    return .Ok(
+        TlsCertificateProof { scheme: fromCode<SignatureScheme>(scheme), signature: signature }
+    )
+}
+
+enum TlsSigner {
+    Server
+    Client
+}
+
+// What a CertificateVerify signs: 64 spaces, the signer's context string, a
+// zero and the transcript hash (RFC 8446 section 4.4.3). The padding and
+// context keep a TLS 1.3 signature from being replayed in another protocol.
+function tlsSignedContent(signer: TlsSigner, transcriptHash: borrow [UN8]) -> [UN8] {
+    var writer = WireWriter {}
+    for _ in 0..Tls.signaturePadding { writer.writeByte(Tls.space) }
+    let context = match signer {
+        Server -> Tls.serverContext
+        Client -> Tls.clientContext
+    }
+    writer.writeBytes(tlsTextBytes(context))
+    writer.writeByte(0)
+    writer.writeBytes(transcriptHash)
+    return writer.bytes
+}
+
+function tlsEncodeFinished(verifyData: borrow [UN8]) -> TlsHandshakeMessage {
+    return tlsHandshakeMessage(.Finished, verifyData)
+}
+
+// Whether `body` is the Finished `expected` names. The comparison visits
+// every byte whatever it finds, so its time does not tell an attacker how
+// much of a forged value was right.
+function tlsFinishedMatches(body: borrow [UN8], expected: borrow [UN8]) -> Bool {
+    if body.count != expected.count { return false }
+    var difference = 0
+    for index in 0..body.count {
+        difference = difference | (Number(body[index]) ^ Number(expected[index]))
+    }
+    return difference == 0
+}

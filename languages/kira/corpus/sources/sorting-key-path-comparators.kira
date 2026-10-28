@@ -1,0 +1,44 @@
+// Key paths are values naming the members they read: applied to a root they
+// read there, and two are equal when they read the same members. A
+// `KeyPathComparator` made from one, written with its root or with the
+// compared type given, sorts an array through `sorted(using:)` and
+// `sort(using:)`, the first comparator deciding unless two values stand the
+// same by it. `Identifiable` gives each value an `ID` its generic code names
+// as `Value.ID`.
+
+import Foundation
+
+struct Person: Identifiable {
+    let id: String
+    let given: String
+    let age: Int
+}
+
+function idOf<Value: Identifiable>(value: borrow Value) -> Value.ID {
+    return value.id
+}
+
+@Main
+function main() -> Int {
+    let people = [
+        Person { id: "a", given: "Zoe", age: 30 },
+        Person { id: "b", given: "Adam", age: 41 },
+        Person { id: "c", given: "Mia", age: 30 }
+    ]
+    let name = \Person.given
+    if name(people[0]) != "Zoe" { return 1 }
+    if name != \Person.given { return 2 }
+    if name.partial() == (\Person.id).partial() { return 3 }
+    let byAge = KeyPathComparator(\Person.age)
+    let byName = KeyPathComparator<Person>(\.given, order: .Reverse)
+    if byAge == byName { return 4 }
+    if byAge != KeyPathComparator(\Person.age) { return 5 }
+    let sorted = people.sorted(using: [byAge, byName])
+    if sorted[0].id != "a" || sorted[1].id != "c" || sorted[2].id != "b" { return 6 }
+    var mutable = people
+    mutable.sort(using: [KeyPathComparator(\Person.given)])
+    if mutable[0].given != "Adam" { return 7 }
+    if idOf(people[1]) != "b" { return 8 }
+    if byName.comparison(people[0], people[1]) != .OrderedAscending { return 9 }
+    return 42
+}

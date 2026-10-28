@@ -1,0 +1,30 @@
+import Foundation
+
+// A generic struct's field typed by a generic alias of a function type,
+// called in a method of the instance `@Instance` names. The instance's field
+// names the closure instance only once the alias is resolved, and nothing
+// else in the program writes it.
+type Reader<Root, Value> = (borrow Root) -> Value
+
+struct Values {
+    let answer: Int
+}
+
+@Instance(Int)
+struct Lens<Value> {
+    let read: Reader<Values, Value>
+
+    function get(from: Values) -> Value {
+        return self.read(from)
+    }
+}
+
+function answerOf(values: borrow Values) -> Int {
+    return values.answer
+}
+
+@Main
+function main() -> Int {
+    let lens = Lens<Int> { read = answerOf }
+    return lens.get(Values { answer = 42 })
+}

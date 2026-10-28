@@ -1,0 +1,135 @@
+// Memory handed out by bumping a cursor through large chunks, and given
+// back all at once: by `reset`, which keeps the first chunk for reuse, or
+// when the arena is let go. Nothing taken from an arena is freed on its own,
+// so nothing taken from one may outlive it or be passed to `deallocate`.
+//
+// Each chunk starts with a header holding the chunk made before it, so the
+// chunks form a list from the newest back to the first. A request past a
+// quarter of a chunk gets a block of its own, kept on a second list through
+// a header ahead of its bytes, and freed with the rest.
+struct Arena: Drop {
+    var current: RawPtr
+    var cursor: Int
+    var oversized: RawPtr
+    let chunkSize: Int
+
+    // A block of `layout.size` bytes on `layout.alignment`, its bytes left
+    // as they were.
+    function allocate(borrow mut self, layout: borrow MemoryLayout) -> RawPtr {
+        // Small enough that a fresh chunk always has room, however its
+        // start falls against the alignment.
+        if layout.size + layout.alignment > self.chunkSize / 4 {
+            return self.allocateOversized(layout)
+        }
+        let base = pointerAddress(self.current)
+        var offset = alignUp(base + self.cursor, layout.alignment) - base
+        if offset + layout.size > self.chunkSize {
+            let fresh = heapAllocateRaw(self.chunkSize, arenaHeaderBytes())
+            heapStore<RawPtr>(fresh, self.current)
+            self.current = fresh
+            let freshBase = pointerAddress(fresh)
+            offset = alignUp(freshBase + arenaHeaderBytes(), layout.alignment) - freshBase
+        }
+        self.cursor = offset + layout.size
+        return heapOffset(self.current, offset)
+    }
+
+    function allocateZeroed(borrow mut self, layout: borrow MemoryLayout) -> RawPtr {
+        let block = self.allocate(layout)
+        heapFillBytes(block, U8(0), layout.size)
+        return block
+    }
+
+    // A view of `count` zero bytes on `alignment`.
+    function zeroedView(borrow mut self, count: Int, alignment: Int) -> MemoryView {
+        let block = self.allocateZeroed(memoryLayout(count, alignment))
+        return MemoryView { start = block, count = count }
+    }
+
+    // Every block handed out given back at once. The first chunk stays for
+    // the arena's next use; the rest are freed.
+    function reset(borrow mut self) {
+        var chunk = self.current
+        var previous = heapLoad<RawPtr>(chunk)
+        while !isNull(previous) {
+            heapFreeRaw(chunk)
+            chunk = previous
+            previous = heapLoad<RawPtr>(chunk)
+        }
+        freeArenaList(self.oversized)
+        self.current = chunk
+        self.cursor = arenaHeaderBytes()
+        self.oversized = nullPointer()
+    }
+
+    // The blocks the arena holds: its chunks and its oversized blocks.
+    function blockCount(borrow self) -> Int {
+        return arenaListLength(self.current) + arenaListLength(self.oversized)
+    }
+
+    function drop(borrow mut self) {
+        freeArenaList(self.current)
+        freeArenaList(self.oversized)
+    }
+
+    // A block of its own, its header as wide as its alignment so the bytes
+    // after it fall on that alignment.
+    function allocateOversized(borrow mut self, layout: borrow MemoryLayout) -> RawPtr {
+        let header = layout.alignment > arenaHeaderBytes() ? layout.alignment : arenaHeaderBytes()
+        let whole = memoryLayout(header + layout.size, header)
+        let block = heapAllocateRaw(whole.size, whole.alignment)
+        heapStore<RawPtr>(block, self.oversized)
+        self.oversized = block
+        return heapOffset(block, header)
+    }
+}
+
+// An arena drawing from chunks of `chunkSize` bytes, at least 256.
+function makeArena(chunkSize: Int) -> Arena {
+    let size = chunkSize < 256 ? 256 : alignUp(chunkSize, arenaHeaderBytes())
+    let first = heapAllocateRaw(size, arenaHeaderBytes())
+    heapStore<RawPtr>(first, nullPointer())
+    return Arena {
+        current = first,
+        cursor = arenaHeaderBytes(),
+        oversized = nullPointer(),
+        chunkSize = size
+    }
+}
+
+// A copy of `value` placed in the arena, at its address.
+function arenaStore<T>(arena: borrow mut Arena, value: T) -> RawPtr {
+    let address = arena.allocate(layoutOf<T>())
+    heapStore<T>(address, value)
+    return address
+}
+
+// Room for `count` zeroed values of `T` end to end.
+function arenaArray<T>(arena: borrow mut Arena, count: Int) -> MemoryView {
+    let layout = arrayLayout<T>(count)
+    let block = arena.allocateZeroed(layout)
+    return MemoryView { start = block, count = layout.size }
+}
+
+function arenaHeaderBytes() -> Int {
+    return 16
+}
+
+function freeArenaList(head: RawPtr) {
+    var block = head
+    while !isNull(block) {
+        let next = heapLoad<RawPtr>(block)
+        heapFreeRaw(block)
+        block = next
+    }
+}
+
+function arenaListLength(head: RawPtr) -> Int {
+    var count: Int = 0
+    var block = head
+    while !isNull(block) {
+        count = count + 1
+        block = heapLoad<RawPtr>(block)
+    }
+    return count
+}

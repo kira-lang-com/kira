@@ -1,0 +1,96 @@
+import Foundation
+import Heap
+
+// Moving a value whose type runs `drop` out of a field, and refilling the
+// field, runs that `drop` once; an `Optional` of such a value answers its
+// queries without copying it, and its methods nobody calls (`or` copies)
+// are never checked for it.
+
+struct FmvGuard: Drop {
+    let cell: RawPtr
+
+    function drop(borrow mut self) {
+        heapStore<Int>(self.cell, heapLoad<Int>(self.cell) + 1)
+    }
+}
+
+class FmvClassHolder {
+    var held: FmvGuard? = .None
+
+    function takeAndRefill() -> Bool {
+        let taken: FmvGuard? = move self.held
+        self.held = .None
+        return taken.isSome()
+    }
+}
+
+struct FmvValueHolder {
+    var held: FmvGuard? = .None
+
+    function takeAndRefill(borrow mut self) -> Bool {
+        let taken: FmvGuard? = move self.held
+        self.held = .None
+        return taken.isSome()
+    }
+}
+
+struct FmvNested {
+    var inner: FmvValueHolder
+}
+
+function fmvCounter() -> RawPtr {
+    let cell = allocateBytes(8)
+    heapStore<Int>(cell, 0)
+    return cell
+}
+
+@Test
+function fmvClassFieldMoveDropsOnce() {
+    let cell = fmvCounter()
+    let holder = FmvClassHolder {}
+    holder.held = .Some(FmvGuard { cell = cell })
+    expect!(holder.takeAndRefill())
+    expect!(heapLoad<Int>(cell) == 1)
+    freeBytes(cell)
+}
+
+@Test
+function fmvStructFieldMoveDropsOnce() {
+    let cell = fmvCounter()
+    var holder = FmvValueHolder {}
+    holder.held = .Some(FmvGuard { cell = cell })
+    expect!(holder.takeAndRefill())
+    expect!(heapLoad<Int>(cell) == 1)
+    freeBytes(cell)
+}
+
+@Test
+function fmvNestedFieldMoveDropsOnce() {
+    let cell = fmvCounter()
+    var nested = FmvNested { inner = FmvValueHolder { held = .Some(FmvGuard { cell = cell }) } }
+    let taken: FmvGuard? = move nested.inner.held
+    nested.inner.held = .None
+    expect!(taken.isSome())
+    expect!(heapLoad<Int>(cell) == 0)
+    freeBytes(cell)
+}
+
+@Test
+function fmvReplacingAFieldStillDropsTheOldValue() {
+    let cell = fmvCounter()
+    var holder = FmvValueHolder { held = .Some(FmvGuard { cell = cell }) }
+    holder.held = .None
+    expect!(heapLoad<Int>(cell) == 1)
+    freeBytes(cell)
+}
+
+@Test
+function fmvOptionalOfDroppedValueAnswersQueries() {
+    let cell = fmvCounter()
+    let some: FmvGuard? = .Some(FmvGuard { cell = cell })
+    let none: FmvGuard? = .None
+    expect!(some.isSome())
+    expect!(none.isNone())
+    expect!(heapLoad<Int>(cell) == 0)
+    freeBytes(cell)
+}

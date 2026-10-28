@@ -1,0 +1,54 @@
+import Foundation
+
+// Which of two raced futures finished first, with its output.
+enum Raced<A, B> {
+    First(A)
+    Second(B)
+}
+
+// The future `select` answers: whichever of two futures finishes first. The
+// other is dropped at its await, which cancels it. Each poll tries `first`
+// before `second`, so when both are ready `first` wins.
+struct Select<A, B>: Future<Raced<A, B>> {
+    var first: Async<A>?
+    var second: Async<B>?
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Raced<A, B>> {
+        let one: Async<A>? = move self.first
+        self.first = .None
+        let two: Async<B>? = move self.second
+        self.second = .None
+        match move one {
+            Some(running) -> {
+                var left = move running
+                match left.poll(context) {
+                    Ready(value) -> return .Ready(.First(move value))
+                    Pending -> {}
+                }
+                match move two {
+                    Some(other) -> {
+                        var right = move other
+                        match right.poll(context) {
+                            Ready(value) -> return .Ready(.Second(move value))
+                            Pending -> {}
+                        }
+                        self.first = .Some(move left)
+                        self.second = .Some(move right)
+                        return .Pending
+                    }
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+        // Polled again after it was ready.
+        runtimeTrap()
+        return .Pending
+    }
+}
+
+// The first of two futures to finish: `select(read, sleep)` is `.First`
+// with what was read, or `.Second` once the time ran out.
+function select<A, B>(first: Async<A>, second: Async<B>) -> Select<A, B> {
+    return Select<A, B> { first = .Some(move first), second = .Some(move second) }
+}

@@ -1,0 +1,654 @@
+// The checked program: what analysis produces and lowering reads.
+//
+// Every name is resolved to an index, every expression carries its type, and
+// every implicit conversion is an explicit node, so lowering makes no
+// decision of its own. Expressions and statements live in arenas like the
+// syntax tree's; a function's locals are numbered within the function.
+
+struct CheckedProgram {
+    var structs: [StructType]
+    var enums: [EnumType]
+    var functions: [CheckedFunction]
+    var comptimeFunctions: [Int]
+    var dropFunctions: [Int]
+    // Assignments that refill a field moved out before them, so the value
+    // they replace is already gone (semantics/field-moves.klfd).
+    var refilledPlaces: [Int] = []
+    // Per function, whether it is a generic instance's method that nothing
+    // named, so it was never checked and is never lowered.
+    var uncheckedMinted: [Bool] = []
+    // Foundation's `typeName` type table, which a failed cast's report
+    // reads the name of the type an `Any` holds from.
+    var typeNames: Optional<Int> = .None
+    // Per function, whether it is a method of a class a package built apart
+    // declares, which the program's own unit dispatches for that package's
+    // units (`lowering/class-dispatch.klfd`).
+    var classFallbacks: [Bool] = []
+    // Per enum and case, whether the case's payload holds the enum in place.
+    var recursiveCases: [[Bool]]
+    var expressions: [TypedExpression]
+    var statements: [CheckedStatement]
+    let arrayFunctions: [Int]
+    let stringFunctions: [Int]
+    // The Foundation functions `Number` runs on, as `numberRuntimeFunctions`
+    // names them.
+    let numberFunctions: [Int]
+    // Foundation's `NumberWords`, the two words a `Number` lowers to, or -1.
+    var numberWords: Int = -1
+    let taskFunctions: [Int]
+    let channelFunctions: [Int]
+    var anyTypes: [Type]
+    // The number each of `anyTypes` is boxed under (`internAnyType`).
+    var anyTypeIds: [Int] = []
+    var globals: [CheckedGlobal]
+    var globalInitOrder: [Int]
+    var globalInitializer: Optional<Int>
+    // The initializers of the packages built apart that declare globals,
+    // dependencies first, which the program's runs before its own globals.
+    var apartInitializers: [String] = []
+    // The `@AtExit` functions, run in this order as the program ends.
+    var exitFunctions: [Int]
+    // Foundation's trace functions once a `traceText` needs them, and per
+    // struct and enum the `traced` function it conforms to `Traced` with, or
+    // -1.
+    var traceFunctions: [Int]
+    var tracedStructs: [Int]
+    var tracedEnums: [Int]
+    // Those functions and the `traced` functions a checked trace may run.
+    var traceRoots: [Int]
+    let library: Bool
+    let sources: [SourceUnit]
+    // Each file's first source, by file id, or -1.
+    let firstSources: [Int]
+    // The `@FFI` functions a `CheckedFunction.foreign` indexes, the Kira
+    // functions handed to C as callbacks, and the libraries they come from.
+    var foreignFunctions: [ForeignFunction]
+    var foreignCallbacks: [ForeignCallback]
+    // What the C seam calls into Foundation for, when the program crosses
+    // it: `stringFromCString`, `cStringKeptCopy` and `cStringKept`.
+    var foreignHelpers: [Int]
+    // Per struct, the parameter of an `@FFI.Callback` that carries its
+    // `context:`, or -1.
+    var callbackContexts: [Int]
+    // Per struct, each member's `@Bits(n)` width or 0, and nothing for a
+    // struct without bit-fields.
+    var fieldBits: [[Int]]
+    var variadicShapes: [VariadicShape]
+    // Per struct, the C function an owned `@FFI.Pointer` is freed with, or
+    // -1.
+    var pointerFrees: [Int]
+    let nativeLibraries: [NativeLink]
+    let resources: [String]
+    // The structs and enums written `public` in the package being built.
+    var surfaceTypes: [Type] = []
+    // The top-level `let`s written `public` in the package being built.
+    var surfaceGlobals: [Int] = []
+    // The `type` aliases written `public` in the package being built, by
+    // name, and the type each stands for (KLF-RIDL section 20.3).
+    var surfaceAliasNames: [String] = []
+    var surfaceAliasTypes: [Type] = []
+    // Per struct, per field, the default the contract writes, or empty
+    // (KLF-RIDL section 20.3).
+    var contractDefaults: [[String]] = []
+    // Per source function, per parameter after the receiver, the default
+    // the contract writes, or empty (KLF-RIDL section 20.3).
+    var parameterDefaults: [[String]] = []
+    // Per global, a public constant's value as its contract writes it when
+    // RIDL has no literal for it, or empty.
+    var contractConstants: [String] = []
+    // The generic declarations RIDL can write, which a surface declares for
+    // the named instances it spells (KLF-RIDL section 23.5).
+    var ridlTemplates: [RidlTemplate] = []
+    // The module being built: the name its RIDL surface goes by.
+    var moduleName: String = ""
+    // Every module's name, by its index, so a RIDL surface can tell which
+    // module declares a type it names.
+    var moduleNames: [String] = []
+    // The module of every package a unit of its own builds whose code boxes
+    // `Any`s (`any-cases.klfd`).
+    var boxingModules: [String] = []
+    // Per function, whether a package a unit of its own builds declares it
+    // (`separate-packages.klfd`).
+    var apart: [Bool] = []
+    // Per function, whether another unit defines it: one of `apart`, which
+    // this unit declares and calls but neither checks nor lowers.
+    var elsewhere: [Bool] = []
+    // Whether this is the unit of a package the program depends on, which
+    // leaves the globals' initialization and the entry to the program's.
+    var dependencyUnit: Bool = false
+    // Per struct, whether it is the trait object of a family a package built
+    // apart declares, and the members of those families the program's own
+    // unit defines (`family-dispatch.klfd`).
+    var dispatchedFamilies: [Bool] = []
+    var familyDispatches: [FamilyDispatch] = []
+    // The `@TypeTable` functions this unit defines for the units built apart.
+    var typeTableFunctions: [Int] = []
+
+    function classFallback(borrow self, index: Int) -> Bool {
+        return index < classFallbacks.count && classFallbacks[index]
+    }
+
+    function builtElsewhere(borrow self, index: Int) -> Bool {
+        return index < elsewhere.count && elsewhere[index]
+    }
+
+    // The type an `Any` numbered `id` holds.
+    function anyTypeOf(borrow self, id: Int) -> Type {
+        for index in 0..anyTypeIds.count {
+            if anyTypeIds[index] == id { return anyTypes[index] }
+        }
+        return Type.invalid()
+    }
+
+    function dispatchedFamily(borrow self, structure: Int) -> Bool {
+        return structure < dispatchedFamilies.count && dispatchedFamilies[structure]
+    }
+
+    function declaredApart(borrow self, index: Int) -> Bool {
+        return index < apart.count && apart[index]
+    }
+
+    // Whether a dependency unit roots function `index`: another unit may call
+    // anything it builds, except what runs only while a unit compiles and a
+    // foreign function, which each unit calling it binds itself.
+    function dependencyRoot(borrow self, index: Int) -> Bool {
+        if !dependencyUnit || functions[index].foreign.isSome() { return false }
+        for comptime in comptimeFunctions {
+            if comptime == index { return false }
+        }
+        return true
+    }
+
+    // A span as the kernel reads a name through it: negative, with the
+    // content hash of the span's file as the selector in the high bits, and
+    // the file itself, plus one, in the high bits of the end. The file names
+    // the source exactly; a hash alone can match two sources once `klist!`
+    // and other macros have spliced in tens of thousands.
+    function named(borrow self, span: Span) -> Span {
+        if span.file < 0 || span.file >= firstSources.count || firstSources[span.file] < 0 { return span }
+        let start = 0 - (sources[firstSources[span.file]].hash * 4294967296 + span.start)
+        return Span { file = span.file, start = start, end = (span.file + 1) * 4294967296 + span.end }
+    }
+
+    function addExpression(borrow mut self, move operation: Operation, valueType: Type, span: Span) -> Int {
+        expressions.append(TypedExpression { operation = move operation, valueType = valueType, span = span })
+        return expressions.count - 1
+    }
+
+    function addStatement(borrow mut self, move statement: CheckedStatement) -> Int {
+        statements.append(move statement)
+        return statements.count - 1
+    }
+
+    function typeOf(borrow self, expression: Int) -> Type {
+        return expressions[expression].valueType
+    }
+}
+
+struct Field {
+    let name: Identifier
+    var valueType: Type
+    let mutable: Bool
+    // The default, as a syntax expression analysed at each literal that
+    // leaves the field out.
+    let initial: Optional<Int>
+    // Typed by `initial` once declarations are known.
+    let inferred: Bool
+    // The sized number `valueType` was before `lowerNumberTypes` made it the
+    // words of a `Number`, which the RIDL surface still spells (KLF-RIDL
+    // section 27.5); empty for any other type.
+    var sizedName: String = ""
+}
+
+struct StructType {
+    let name: Identifier
+    var typeArguments: [Type]
+    let callableModes: [PassingMode]
+    let ancestors: [String]
+    let genericBase: String
+    let baseNameSpan: Span
+    let specialized: Bool
+    let typeSuffix: Int
+    var fields: [Field]
+    // What C storage an `@FFI.*` type form makes of it.
+    var shape: ForeignShape
+    // The sized number each type argument was, as `Field.sizedName` says.
+    var argumentSizedNames: [String] = []
+
+    function field(borrow self, name: String) -> Optional<Int> {
+        for index in 0..fields.count {
+            if fields[index].name.text == name { return .Some(index) }
+        }
+        if genericBase == "Class" {
+            var found: Optional<Int> = .None
+            for index in 0..fields.count {
+                if classFieldBaseName(fields[index].name.text) == name {
+                    if found.isSome() { return .None }
+                    found = .Some(index)
+                }
+            }
+            return found
+        }
+        return .None
+    }
+}
+
+struct Variant {
+    let name: Identifier
+    var payload: Optional<Type>
+    let initial: Optional<Int>
+    // The sized number `payload` was before `lowerNumberTypes` made it the
+    // words of a `Number`, which the RIDL surface still spells (KLF-RIDL
+    // section 27.5); empty for any other type.
+    var sizedName: String = ""
+    // Declared with a payload that names `Void` here, as `Poll<Void>`'s
+    // `Ready(Value)` does: it carries nothing, and an arm may still bind it.
+    var voided: Bool = false
+}
+
+struct EnumType {
+    var open: Bool
+    // An `@Open` enum with raw values tags each case with its raw value, and
+    // `code` and `fromCode` carry that value as `representation`.
+    var tags: [Int]
+    var representation: Optional<Type>
+    let name: Identifier
+    var typeArguments: [Type]
+    let baseNameSpan: Span
+    let specialized: Bool
+    let typeSuffix: Int
+    let existential: Bool
+    var variants: [Variant]
+    // The sized number each type argument was, as `Field.sizedName` says.
+    var argumentSizedNames: [String] = []
+
+    // The tag a case is stored with: its raw value, or else its position.
+    function tag(borrow self, variant: Int) -> Int {
+        if tags.count == 0 { return variant }
+        return tags[variant]
+    }
+
+    function variant(borrow self, name: String) -> Optional<Int> {
+        for index in 0..variants.count {
+            if variants[index].name.text == name { return .Some(index) }
+        }
+        return .None
+    }
+}
+
+// A parameter or binding. One passed `borrow mut`, or a method's mutable
+// receiver, is the address of the caller's storage rather than a copy.
+struct Local {
+    let name: String
+    var valueType: Type
+    let mutable: Bool
+    let byReference: Bool
+    var moved: Bool
+    var cell: Bool
+    let captured: Bool
+    var passingMode: PassingMode
+    // The sized number `valueType` was before `lowerNumberTypes` made it the
+    // words of a `Number`, which the RIDL surface still spells (KLF-RIDL
+    // section 27.5); empty for any other type.
+    var sizedName: String = ""
+}
+
+struct CheckedFunction {
+    // The KIR name: the source name, or `Owner.method` for a method, and
+    // where the source names it.
+    let symbol: String
+    let name: Span
+    var result: Type
+    let parameterCount: Int
+    // Parameters first, the receiver leading a method's, then every binding
+    // of the body in the order analysis met it.
+    var locals: [Local]
+    var body: [Int]
+    let entry: Bool
+    let lambda: Bool
+    // A kernel service the platform runtime implements, or a C function:
+    // declared, never lowered.
+    let service: Bool
+    // The C function it is, as `program.foreignFunctions` holds it.
+    var foreign: Optional<Int>
+    var captures: [CaptureSpec]
+    let globalInitializer: Bool
+    let memberName: String
+    // `public`: the declaration is part of its module's surface, so the engine
+    // emits a second entry under its mangled RIDL symbol (sections 20 and 24)
+    // for a caller reaching it through the RIDL ABI rather than by name. Defaults
+    // false, which is what a private declaration gets.
+    var exported: Bool = false
+    // The struct or enum a method belongs to.
+    var owner: Optional<Type> = .None
+    // For `@Ridl("Module")`, the module whose RIDL entry it calls, and its
+    // name there.
+    var ridlImport: String = ""
+    var ridlName: String = ""
+    // The part the function plays in a crossing family's witness tables
+    // (`witnessRole`), or nothing.
+    var witness: String = ""
+    // The sized number `result` was before `lowerNumberTypes` made it the
+    // words of a `Number`, which the RIDL surface still spells (KLF-RIDL
+    // section 27.5); empty for any other type.
+    var resultSizedName: String = ""
+    // An `async function`'s resume function: what its frame and result are
+    // (async.klfd).
+    var asyncResume: Optional<AsyncResume> = .None
+}
+
+struct CheckedGlobal {
+    let name: Identifier
+    var valueType: Type
+    let mutable: Bool
+    var initializer: Optional<Int>
+    // `@ThreadLocal`: each thread's copy is made on its first read, by
+    // `lazyInitializer`, a function of its own.
+    var threadLocal: Bool = false
+    var lazyInitializer: Optional<Int> = .None
+}
+
+struct CaptureSpec {
+    let name: Identifier
+    var valueType: Type
+    let cell: Bool
+}
+
+// How a value crosses the C seam (section 26.2).
+enum Seam {
+    // A scalar, as itself.
+    Word
+    // The one word a struct holds: a distinct's representation, or the
+    // address in a `CString`, an `@FFI.Pointer` or an `@FFI.Callback`.
+    Field
+    // An array, as the address of its elements.
+    Elements
+    // A payload-less enum, as its case's number in a C `int`.
+    Number
+    // A C struct or union by value, as its C image.
+    Image
+    // No value: a `Void` result.
+    Nothing
+}
+
+struct ForeignFunction {
+    // The C symbol.
+    let symbol: String
+    let library: Int
+    let parameters: [Seam]
+    let parameterTypes: [Type]
+    let result: Seam
+    // As declared: a `CString` result is one, which the call turns into the
+    // `String` Kira sees.
+    let resultType: Type
+    // Per parameter, whether C keeps its storage past the call.
+    let retained: [Bool]
+    // `@FFI.Address`: the symbol's address rather than a call.
+    let address: Bool
+    // `@FFI.Variadic`: a call passes arguments past `parameters`, each as C
+    // promotes it.
+    let variadic: Bool
+    // `@FFI.Syscall`: the `man 2` name of the system call made instead of a
+    // call to `symbol`, or "".
+    let syscall: String
+}
+
+// One shape of call to a variadic C function: what C reads past the fixed
+// parameters of `callee`, after the default promotions.
+struct VariadicShape {
+    let callee: Int
+    let extras: [Type]
+}
+
+// A Kira function C calls through an `@FFI.Callback` type: `callee` with
+// the platform convention and the callback's C signature.
+struct ForeignCallback {
+    let callee: Int
+    let callback: Int
+    // What C passes and expects back, as the callback declares them.
+    let parameters: [Type]
+    let result: Type
+    // The parameter C passes the context in, or -1, and whether `callee`
+    // is a lambda, which takes that context as its captures.
+    let context: Int
+    let closure: Bool
+}
+
+// Why a `RuntimeTrap` stops the program, which its report says
+// (`lowering/trap-reports.klfd`).
+enum TrapCause {
+    // The source calls `runtimeTrap()`.
+    Called
+    // An `as` on a family value whose declaration is another one.
+    FamilyCast(Type)
+    // A type table asked for a type id no row has.
+    TypeTableRow
+}
+
+enum Operation {
+    StringText(String)
+    Sequence([Int], Int)
+    Integer(Int)
+    FloatLiteral
+    BoxAny(Int, Int)
+    TypeIs(Int, Int)
+    // The `Any`, the id of the type it must hold, and for a tried cast the
+    // handler local a mismatch is written to; without one a mismatch traps.
+    UnboxAny(Int, Int, Optional<Int>)
+    FunctionReference(Int)
+    IndirectCall(Int, [Int])
+    MakeClosure(Int, [Int])
+    GlobalRead(Int)
+    TaskSpawn(Int, [Int], Type)
+    TaskReady(Int)
+    TaskAwait(Int, Int)
+    TaskCancel(Int)
+    TaskDetach(Int)
+    // A step of an `async function`'s state machine (async.klfd).
+    Async(AsyncStep)
+    RuntimeTrap(TrapCause)
+    Try(Int, Optional<Int>)
+    ChannelCreate
+    ChannelReceiver(Int)
+    ChannelSend(Int, Int)
+    ChannelClose(Int)
+    ClassView(Int)
+    ClassCall(Int, [Int])
+    Boolean(Bool)
+    StringLiteral
+    StringConcat(Int, Int)
+    // `traceText(value)`: the value as a trail shows it.
+    TraceText(Int)
+    HeapAllocateRaw(Int, Int)
+    HeapFreeRaw(Int)
+    // `print`: the string, then a newline, written to the program output.
+    Print(Int)
+    // A value read from or written to memory as C lays it out: the address,
+    // and for a write the value. The type is the read's own, or the value's.
+    HeapRead(Int)
+    HeapWrite(Int, Int)
+    Atomic(AtomicStep)
+    // `heapCopyBytes(destination, source, count)`: the bytes copied at once.
+    // `heapMoveBytes` copies between ranges that may overlap, marked here.
+    HeapCopy(Int, Int, Int, Bool)
+    // `heapFillBytes(destination, byte, count)`: every byte set to one value.
+    HeapFill(Int, Int, Int)
+    HeapOffset(Int, Int)
+    // `sizeOf<T>()` and `alignOf<T>()`: a constant of the type's C layout.
+    HeapLayout(Type, LayoutMeasure)
+    ArrayLiteral([Int])
+    ArrayIndex(Int, Int)
+    ArrayAppend(Int, Int)
+    Transfer(OwnershipMode, Int)
+    Read(Int)
+    Member(Int, Int)
+    Call(Int, [Int])
+    Construct([Int])
+    Tagged(Int, Optional<Int>)
+    Unary(UnaryOperator, Int)
+    Arithmetic(ArithmeticOperator, Int, Int)
+    Wrapping(ArithmeticOperator, Int, Int)
+    Compare(Comparison, Int, Int)
+    Logical(Connective, Int, Int)
+    Select(Int, Int, Int)
+    // A `match` used as a value: the subject and its arms.
+    Choice(Int, [CheckedArm])
+    Bitcast(Int)
+    Convert(Int)
+    // A C image of the struct value, by its address: the value an
+    // `@FFI.Pointer` takes when given its target. Whether C keeps it.
+    ForeignImage(Int, Bool)
+    // The address of an array's elements, where C reads a pointer, and
+    // whether C keeps it.
+    ForeignElements(Int, Bool)
+    // A `program.foreignCallbacks` entry, as the `@FFI.Callback` value C
+    // calls, the function it calls, and the lambda's closure, whose context
+    // the value keeps.
+    ForeignCallback(Int, Int, Optional<Int>)
+    // A member of the C struct an `@FFI.Pointer` points at, read through it.
+    ForeignRead(Int, Int)
+    // An `@FFI.Union` value: zero, with the one member a literal names
+    // written over it.
+    ForeignUnion(Int, Optional<Int>)
+    // `code(e)`: the declaration index of the enum value's variant.
+    EnumCode(Int)
+    // `fromCode<E>(n)`: the payload-less variant of the result's enum at index
+    // `n`, or its first variant for an index out of range.
+    EnumFromCode(Int)
+    // The structural three-way order of two values of one type: -1, 0 or 1.
+    Order(Int, Int)
+    // `hash(v)`: the structural FNV-1a fold of the value, as Kira's runtime
+    // folds it.
+    Hash(Int)
+}
+
+enum ArithmeticOperator {
+    Add
+    Subtract
+    Multiply
+    Divide
+    Remainder
+    BitAnd
+    BitOr
+    BitXor
+    ShiftLeft
+    ShiftRight
+}
+
+enum Comparison {
+    Equal
+    NotEqual
+    Less
+    LessEqual
+    Greater
+    GreaterEqual
+}
+
+enum Connective {
+    And
+    Or
+}
+
+// The family a binary operator belongs to, which decides how it is checked
+// and what it lowers to.
+enum OperatorClass {
+    Arithmetic(ArithmeticOperator)
+    Comparison(Comparison)
+    Connective(Connective)
+}
+
+function classify(operator: BinaryOperator) -> OperatorClass {
+    match operator {
+        Or -> return .Connective(.Or)
+        And -> return .Connective(.And)
+        BitOr -> return .Arithmetic(.BitOr)
+        BitXor -> return .Arithmetic(.BitXor)
+        BitAnd -> return .Arithmetic(.BitAnd)
+        Equal -> return .Comparison(.Equal)
+        NotEqual -> return .Comparison(.NotEqual)
+        Less -> return .Comparison(.Less)
+        LessEqual -> return .Comparison(.LessEqual)
+        Greater -> return .Comparison(.Greater)
+        GreaterEqual -> return .Comparison(.GreaterEqual)
+        ShiftLeft -> return .Arithmetic(.ShiftLeft)
+        ShiftRight -> return .Arithmetic(.ShiftRight)
+        Add -> return .Arithmetic(.Add)
+        Subtract -> return .Arithmetic(.Subtract)
+        Multiply -> return .Arithmetic(.Multiply)
+        Divide -> return .Arithmetic(.Divide)
+        Remainder -> return .Arithmetic(.Remainder)
+    }
+}
+
+struct Invocation {
+    let target: Int
+    let arguments: [Int]
+}
+
+struct ChoiceParts {
+    let subject: Int
+    let arms: [CheckedArm]
+}
+
+struct TypedExpression {
+    var operation: Operation
+    var valueType: Type
+    let span: Span
+}
+
+// An arm of a `match`: the variant it takes, or -1 for an arm testing an
+// integer or Bool against `literal` and for `else`, which has no literal and
+// takes every value no other arm does. A `match` used as a value gives each
+// arm that reaches its end a `value`. An arm with several patterns keeps the
+// further variants or literals in `also`, its integer ranges as low and high
+// pairs in `ranges`, and the string literals a `String` subject is compared
+// with in `texts`.
+struct CheckedArm {
+    let variant: Int
+    let binding: Optional<Int>
+    let body: [Int]
+    let literal: Optional<Int>
+    let value: Optional<Int>
+    let also: [Int]
+    let ranges: [Int]
+    let texts: [Int]
+    // A `Number` subject's literals and ranges, as the expressions that make
+    // the numbers, which are constants and so are built once per arm.
+    let decimals: [Int]
+    let decimalRanges: [Int]
+}
+
+enum CheckedStatement {
+    Declare(Int, Int)
+    InitializeGlobal(Int, Int)
+    Assign(Int, Int)
+    Evaluate(Int)
+    Branch(Int, [Int], [Int])
+    Loop(Int, [Int])
+    Count(Int, Int, Int, [Int])
+    Iterate(Int, Int, [Int])
+    Dispatch(Int, [CheckedArm])
+    Attempt([Int], Int, Int, [CheckedArm])
+    Return(Optional<Int>)
+    Break
+    Continue
+
+    // The value a `return` gives back.
+    function returned(borrow self) -> Optional<Int> {
+        match self {
+            Declare -> return .None
+            InitializeGlobal -> return .None
+            Assign -> return .None
+            Evaluate -> return .None
+            Branch -> return .None
+            Loop -> return .None
+            Count -> return .None
+            Iterate -> return .None
+            Dispatch -> return .None
+            Attempt -> return .None
+            Return(value) -> return value
+            Break -> return .None
+            Continue -> return .None
+        }
+    }
+}

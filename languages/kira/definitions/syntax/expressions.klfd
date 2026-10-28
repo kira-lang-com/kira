@@ -1,0 +1,606 @@
+// Expressions, by precedence climbing over C's ladder, loosest first:
+// `? :`, `||`, `&&`, `|`, `^`, `&`, `==` `!=`, the orderings, the shifts,
+// `+` `-`, then `*` `/` `%`. Binary operators associate to the left; the
+// conditional nests to the right because each branch is a full expression.
+
+// Whether a name is spelled as a type is, capitalized.
+function namesType(name: String) -> Bool {
+    if utf8Count(name) == 0 { return false }
+    let first = utf8Byte(name, 0)
+    return first >= 65 && first <= 90
+}
+
+// An operator and the power it binds with.
+struct Precedence {
+    let operator: BinaryOperator
+    let power: Int
+}
+
+function binaryOperator(kind: TokenKind) -> Optional<Precedence> {
+    if kind == .PipePipe { return .Some(Precedence { operator = .Or, power = 1 }) }
+    if kind == .AmpersandAmpersand { return .Some(Precedence { operator = .And, power = 2 }) }
+    if kind == .Pipe { return .Some(Precedence { operator = .BitOr, power = 3 }) }
+    if kind == .Caret { return .Some(Precedence { operator = .BitXor, power = 4 }) }
+    if kind == .Ampersand { return .Some(Precedence { operator = .BitAnd, power = 5 }) }
+    if kind == .EqualEqual { return .Some(Precedence { operator = .Equal, power = 6 }) }
+    if kind == .BangEqual { return .Some(Precedence { operator = .NotEqual, power = 6 }) }
+    if kind == .Less { return .Some(Precedence { operator = .Less, power = 7 }) }
+    if kind == .LessEqual { return .Some(Precedence { operator = .LessEqual, power = 7 }) }
+    if kind == .Greater { return .Some(Precedence { operator = .Greater, power = 7 }) }
+    if kind == .GreaterEqual { return .Some(Precedence { operator = .GreaterEqual, power = 7 }) }
+    if kind == .LessLess { return .Some(Precedence { operator = .ShiftLeft, power = 9 }) }
+    if kind == .GreaterGreater { return .Some(Precedence { operator = .ShiftRight, power = 9 }) }
+    if kind == .Plus { return .Some(Precedence { operator = .Add, power = 10 }) }
+    if kind == .Minus { return .Some(Precedence { operator = .Subtract, power = 10 }) }
+    if kind == .Star { return .Some(Precedence { operator = .Multiply, power = 11 }) }
+    if kind == .Slash { return .Some(Precedence { operator = .Divide, power = 11 }) }
+    if kind == .Percent { return .Some(Precedence { operator = .Remainder, power = 11 }) }
+    return .None
+}
+
+extend Parser {
+    function expression(borrow mut self) -> Result<Int, Failure> {
+        let condition = try binary(0)
+        if !eat(.Question) { return .Ok(condition) }
+        let whenTrue = try expression()
+        try expect(.Colon)
+        let whenFalse = try expression()
+        let span = tree.expressions[condition].span.to(tree.expressions[whenFalse].span)
+        return .Ok(tree.addExpression(.Conditional(condition, whenTrue, whenFalse), span))
+    }
+
+    function binary(borrow mut self, floor: Int) -> Result<Int, Failure> {
+        var left = try unary()
+        while true {
+            if at(.Is) || at(.As) {
+                if floor >= 12 { return .Ok(left) }
+                var mode: TypeQueryMode = .Is
+                if at(.As) { mode = .Cast }
+                advance()
+                let target = try typeReference()
+                let span = tree.expressions[left].span.to(tokens[position - 1].span)
+                left = tree.addExpression(.TypeQuery(mode, left, tree.addTypeReference(target)), span)
+                continue
+            }
+            match binaryOperator(current().kind) {
+                None -> { return .Ok(left) }
+                Some(precedence) -> {
+                    if precedence.power <= floor || compoundOperator().isSome() || stepOperator().isSome() || negativeArmAhead() { return .Ok(left) }
+                    advance()
+                    let right = try binary(precedence.power)
+                    let span = tree.expressions[left].span.to(tree.expressions[right].span)
+                    left = tree.addExpression(.Binary(precedence.operator, left, right), span)
+                }
+            }
+        }
+        return .Ok(left)
+    }
+
+    // A `-` written straight before an integer literal is part of the
+    // literal, so `-128` is one value that must fit its width.
+    function unary(borrow mut self) -> Result<Int, Failure> {
+        let start = current().span
+        if at(.Minus) && peek(1).kind == .IntegerLiteral {
+            advance()
+            let literal = advance()
+            if wideDecimal(text(literal.span)) {
+                let wide: ExpressionKind = .FloatLiteral(joinText(["-", text(literal.span)]))
+                return postfix(tree.addExpression(wide, spanFrom(start)))
+            }
+            let value = try integerValue(literal.span)
+            let negated: ExpressionKind = .IntegerLiteral(0 - value, isHexLiteral(text(literal.span)))
+            return postfix(tree.addExpression(negated, spanFrom(start)))
+        }
+        var operator: Optional<UnaryOperator> = .None
+        if at(.Minus) { operator = .Some(.Negate) }
+        if at(.Bang) { operator = .Some(.Not) }
+        if at(.Tilde) { operator = .Some(.Complement) }
+        match operator {
+            Some(applied) -> {
+                advance()
+                let operand = try unary()
+                return .Ok(tree.addExpression(.Unary(applied, operand), spanFrom(start)))
+            }
+            None -> {}
+        }
+        if (atWord("move") || atWord("copy")) && ownershipPrefixAhead() {
+            var mode: OwnershipMode = .Copy
+            if atWord("move") { mode = .Move }
+            advance()
+            let operand = try unary()
+            return .Ok(tree.addExpression(.Transfer(mode, operand), spanFrom(start)))
+        }
+        // `try` binds looser than `as`: `try boxed as T` tries the cast.
+        if eat(.Try) {
+            let tried = try binary(11)
+            if atWord("otherwise") { return otherwiseExpression(start, tried) }
+            return .Ok(tree.addExpression(.Try(tried), spanFrom(start)))
+        }
+        return postfix(try primary())
+    }
+
+    // `.field`, and `.method(arguments)` on the value before it.
+    function postfix(borrow mut self, base: Int) -> Result<Int, Failure> {
+        var node = base
+        while at(.Dot) || opensOnLine(node, .LeftBracket) || opensOnLine(node, .LeftParen)
+            || (structLiterals && at(.LeftBrace) && takesContent(node)) {
+            if at(.LeftBrace) && !lambdaAhead() {
+                node = try trailingContent(node)
+                continue
+            }
+            if at(.LeftBrace) {
+                let start = tree.expressions[node].span
+                let argument = try lambdaLiteral()
+                node = attachTrailingLambda(node, argument, spanFrom(start))
+                continue
+            }
+            if at(.LeftParen) {
+                let start = tree.expressions[node].span
+                let values = try arguments()
+                node = tree.addExpression(.IndirectCall(node, values), spanFrom(start))
+                continue
+            }
+            if eat(.LeftBracket) {
+                let start = tree.expressions[node].span
+                let index = try expressionWith(true)
+                try expect(.RightBracket)
+                node = tree.addExpression(.Index(node, index), spanFrom(start))
+                continue
+            }
+            advance()
+            // A number after the dot is a tuple element, `pair.0`, or a
+            // namespace segment, `GPT.5.6`.
+            var member = Identifier { text = "", span = current().span }
+            if at(.IntegerLiteral) || at(.FloatLiteral) {
+                let token = advance()
+                member = nameOf(token)
+            } else {
+                member = try identifier(.ExpectedFieldName)
+            }
+            let start = tree.expressions[node].span
+            if at(.LeftParen) && onSameLine(member.span, current().span) {
+                let arguments = try arguments()
+                node = tree.addExpression(.MethodCall(node, member, arguments), spanFrom(start))
+            } else {
+                node = tree.addExpression(.Member(node, member), spanFrom(start))
+            }
+        }
+        return .Ok(node)
+    }
+
+    // Whether a `(` or `[` continues `node` as a call or an index. Only on
+    // the line `node` ends on: on the next line it opens a tuple or an array,
+    // as the statement after a call does.
+    function opensOnLine(borrow self, node: Int, kind: TokenKind) -> Bool {
+        return at(kind) && onSameLine(tree.expressions[node].span, current().span)
+    }
+
+    function primary(borrow mut self) -> Result<Int, Failure> {
+        let start = current().span
+        if at(.IntegerLiteral) {
+            // A whole decimal past `Int` is a `Number`'s, read from its text as
+            // a fraction's is.
+            if wideDecimal(text(start)) {
+                advance()
+                return .Ok(tree.addExpression(.FloatLiteral(text(start)), start))
+            }
+            let value = try integerValue(advance().span)
+            return .Ok(tree.addExpression(.IntegerLiteral(value, isHexLiteral(text(start))), start))
+        }
+        if eat(.FloatLiteral) { return .Ok(tree.addExpression(.FloatLiteral(text(start)), start)) }
+        if eat(.True) { return .Ok(tree.addExpression(.BooleanLiteral(true), start)) }
+        if eat(.False) { return .Ok(tree.addExpression(.BooleanLiteral(false), start)) }
+        if eat(.StringLiteral) { return interpolatedString(start) }
+        if eat(.LeftBracket) {
+            var elements: [Int] = []
+            while !at(.RightBracket) {
+                elements.append(try expressionWith(true))
+                if !eat(.Comma) { break }
+            }
+            try expect(.RightBracket)
+            return .Ok(tree.addExpression(.ArrayLiteral(elements), spanFrom(start)))
+        }
+        // `type` names a value too: it is a keyword only where a declaration starts.
+        if at(.Identifier) || at(.Type) { return nameOrConstruction() }
+        if at(.Match) { return matchExpression() }
+        if at(.LeftBrace) { return lambdaLiteral() }
+        if at(.Backslash) { return keyPath() }
+        if at(.Dot) && peek(1).kind == .Identifier { return variant() }
+        if eat(.LeftParen) {
+            let inner = try expressionWith(true)
+            if !at(.Comma) {
+                try expect(.RightParen)
+                return .Ok(inner)
+            }
+            // `(a, b)` is a `Tuple2` literal, up to `Tuple4`.
+            var fields: [FieldValue] = [tupleItem(0, inner, tree.expressions[inner].span)]
+            while eat(.Comma) {
+                if at(.RightParen) { break }
+                let item = try expressionWith(true)
+                fields.append(tupleItem(fields.count, item, tree.expressions[item].span))
+            }
+            try expect(.RightParen)
+            if fields.count > 4 { return .Error(failure(.ExpectedExpression)) }
+            let name = Identifier { text = joinText(["Tuple", decimalText(fields.count)]), span = spanFrom(start) }
+            return .Ok(tree.addExpression(.StructLiteral(name, [], fields), spanFrom(start)))
+        }
+        return .Error(failure(.ExpectedExpression))
+    }
+
+    // A name, a call `f(...)`, or a struct literal `Point { x = 1 }` where
+    // struct literals are allowed.
+    function nameOrConstruction(borrow mut self) -> Result<Int, Failure> {
+        if quotes && atWord("quote") && peek(1).kind == .LeftBrace { return quoteExpression() }
+        let name = try identifier(.ExpectedExpression)
+        if eat(.Bang) {
+            let start = current().span.end
+            let values = try arguments()
+            let input = utf8Slice(source, start, tokens[position - 1].span.start)
+            return .Ok(tree.addExpression(.MacroCall(name, values, input), spanFrom(name.span)))
+        }
+        match name.text {
+            "Task" -> {
+                if structLiterals && at(.LeftBrace) {
+                    let body = try block()
+                    let span = spanFrom(name.span)
+                    return .Ok(tree.addExpression(.Task(TaskDeclaration { body = body, span = span, mainThread = .None, written = [] }), span))
+                }
+            }
+            "MainThread" -> {
+                if structLiterals && at(.Dot) && isMainThreadOperation(text(peek(1).span))
+                    && (peek(2).kind == .LeftBrace || peek(2).kind == .LeftParen) {
+                    advance()
+                    let operation = try identifier(.ExpectedExpression)
+                    var written: [Int] = []
+                    if at(.LeftParen) { written = try arguments() }
+                    let body = try block()
+                    let span = spanFrom(name.span)
+                    return .Ok(tree.addExpression(.Task(TaskDeclaration { body = body, span = span, mainThread = .Some(operation), written = written }), span))
+                }
+            }
+            else -> {}
+        }
+        if genericCallAhead() {
+            try expect(.Less)
+            var types: [TypeReference] = []
+            while !atAngleClose() {
+                types.append(try typeReference())
+                if !eat(.Comma) { break }
+            }
+            try closeAngle()
+            let values = try arguments()
+            return .Ok(tree.addExpression(.GenericCall(name, types, values), spanFrom(name.span)))
+        }
+        if structLiterals && genericLiteralAhead() {
+            let types = try typeArguments()
+            return structLiteral(name, types)
+        }
+        if structLiterals && lambdaAhead() {
+            let argument = try lambdaLiteral()
+            return .Ok(tree.addExpression(.Call(name, [argument]), spanFrom(name.span)))
+        }
+        if at(.LeftParen) {
+            let arguments = try arguments()
+            if name.text == "Trace" { return traceCall(name, arguments) }
+            return .Ok(tree.addExpression(.Call(macroName(name), arguments), spanFrom(name.span)))
+        }
+        if structLiterals && structLiteralAhead() {
+            return structLiteral(name, [])
+        }
+        // `Library.Point { ... }`: the qualifier names the module the type
+        // comes from, and the literal carries it in its name.
+        if structLiterals && at(.Dot) && peek(1).kind == .Identifier && namesType(text(peek(1).span)) && structLiteralAheadAt(2) {
+            advance()
+            let member = try identifier(.ExpectedTypeName)
+            let qualified = Identifier { text = joinText([name.text, ".", member.text]), span = name.span.to(member.span) }
+            return structLiteral(qualified, [])
+        }
+        return .Ok(tree.addExpression(.Name(macroName(name)), name.span))
+    }
+
+    // The `<A, B>` a braced literal names its instance by, up to the `>` that
+    // closes it; the `{` follows.
+    function typeArguments(borrow mut self) -> Result<[TypeReference], Failure> {
+        try expect(.Less)
+        var types: [TypeReference] = []
+        while !atAngleClose() {
+            types.append(try typeReference())
+            if !eat(.Comma) { break }
+        }
+        try closeAngle()
+        return .Ok(types)
+    }
+
+    function arguments(borrow mut self) -> Result<[Int], Failure> {
+        try expect(.LeftParen)
+        var values: [Int] = []
+        while !at(.RightParen) {
+            if (at(.Identifier) || at(.Type)) && (peek(1).kind == .Colon || peek(1).kind == .Equals) {
+                let label = try identifier(.ExpectedParameterName)
+                advance()
+                let value = try expressionWith(true)
+                values.append(tree.addExpression(.Labelled(label, value), spanFrom(label.span)))
+            } else {
+                values.append(try expressionWith(true))
+            }
+            if !eat(.Comma) { break }
+        }
+        try expect(.RightParen)
+        return .Ok(values)
+    }
+
+    // `=` is the canonical field binder; `:` is accepted too. `types` are the
+    // type arguments the name was written with, none for an ordinary literal.
+    function structLiteral(borrow mut self, name: Identifier, types: [TypeReference]) -> Result<Int, Failure> {
+        try expect(.LeftBrace)
+        var fields: [FieldValue] = []
+        while !at(.RightBrace) {
+            let binding = eat(.Let) || eat(.Var)
+            var field = try identifier(.ExpectedLiteralField)
+            // `let inner.x = 9` in an update replaces a nested field.
+            while binding && at(.Dot) {
+                advance()
+                let segment = try identifier(.ExpectedLiteralField)
+                field = Identifier { text = joinText([field.text, ".", segment.text]), span = spanFrom(field.span) }
+            }
+            if !eat(.Equals) && !eat(.Colon) {
+                return .Error(failure(.ExpectedLiteralEquals))
+            }
+            fields.append(FieldValue { name = field, value = try expressionWith(true) })
+            // A field may follow without a comma on the same line when it
+            // reads `name:` or `name =`: `Vec3 { x: 0.0 y: 1.0 z: 0.0 }`.
+            let nextField = (at(.Identifier) || at(.Type)) && (peek(1).kind == .Colon || peek(1).kind == .Equals)
+            if !eat(.Comma) && !binding && !nextField && continuesLine() { break }
+        }
+        try expect(.RightBrace)
+        return .Ok(tree.addExpression(.StructLiteral(name, types, fields), spanFrom(name.span)))
+    }
+
+    // `.Case` or `.Case(payload)`, resolved against the type the position
+    // expects.
+    function variant(borrow mut self) -> Result<Int, Failure> {
+        let start = try expect(.Dot)
+        let name = try identifier(.ExpectedVariantName)
+        var payload: Optional<Int> = .None
+        if eat(.LeftParen) {
+            // `.Ok(value: 1)`: the label names the payload and changes nothing.
+            if at(.Identifier) && (peek(1).kind == .Colon || peek(1).kind == .Equals) {
+                advance()
+                advance()
+            }
+            payload = .Some(try expressionWith(true))
+            try expect(.RightParen)
+        }
+        return .Ok(tree.addExpression(.Variant(name, payload), spanFrom(start.span)))
+    }
+
+    // Decimal literals fit a signed 64-bit integer, or are wide (see
+    // `wideDecimal`). A hexadecimal literal names up to 64 bits, so
+    // `0xffffffffffffffff` is the `U64` of those bits.
+    function integerValue(borrow self, span: Span) -> Result<Int, Failure> {
+        let digits = text(span)
+        let tooLarge = Failure { diagnostic = .IntegerTooLarge, span = span }
+        var value = 0
+        if isHexLiteral(digits) {
+            if utf8Count(digits) > 18 { return .Error(tooLarge) }
+            for index in 2..utf8Count(digits) {
+                value = (value << 4) | hexDigitValue(utf8Byte(digits, index))
+            }
+            return .Ok(value)
+        }
+        let maximum = 9223372036854775807
+        for index in 0..utf8Count(digits) {
+            let digit = utf8Byte(digits, index) - asciiZero
+            if value > (maximum - digit) / 10 { return .Error(tooLarge) }
+            value = value * 10 + digit
+        }
+        return .Ok(value)
+    }
+}
+
+extend Parser {
+    // The operator of a `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`
+    // or `>>=` at the current token: an arithmetic or bitwise operator with
+    // `=` written right after it.
+    function compoundOperator(borrow self) -> Optional<BinaryOperator> {
+        let next = peek(1)
+        if next.kind != .Equals || current().span.end != next.span.start { return .None }
+        match binaryOperator(current().kind) {
+            Some(precedence) -> {
+                if combinesInPlace(precedence.operator) { return .Some(precedence.operator) }
+                return .None
+            }
+            None -> return .None
+        }
+    }
+
+    // The operator of an `i++` or `i--` at the current token: two `+` or two
+    // `-` written together. `a--b` is `a - -b`, so a `--` written against
+    // what follows it is a subtraction of a negation, not a step.
+    function stepOperator(borrow self) -> Optional<BinaryOperator> {
+        if !at(.Plus) && !at(.Minus) { return .None }
+        let second = peek(1)
+        if second.kind != current().kind || current().span.end != second.span.start { return .None }
+        if at(.Minus) && peek(2).span.start == second.span.end { return .None }
+        if at(.Plus) { return .Some(.Add) }
+        return .Some(.Subtract)
+    }
+
+    // `-1 ->` begins the next arm of a `match`, which no expression can
+    // continue with.
+    function negativeArmAhead(borrow self) -> Bool {
+        return at(.Minus) && peek(1).kind == .IntegerLiteral && peek(2).kind == .Arrow
+    }
+
+    function ownershipPrefixAhead(borrow self) -> Bool {
+        let next = peek(1)
+        let adjacent = current().span.end == next.span.start
+        if adjacent && (next.kind == .Dot || next.kind == .LeftParen || next.kind == .LeftBracket) { return false }
+        let kind = next.kind
+        return kind == .Identifier || kind == .IntegerLiteral || kind == .FloatLiteral || kind == .StringLiteral
+            || kind == .True || kind == .False || kind == .Minus || kind == .Bang || kind == .Tilde
+            || kind == .LeftParen || kind == .LeftBracket || kind == .LeftBrace || kind == .Dot || kind == .Try
+            || kind == .Match
+    }
+
+    function genericCallAhead(borrow self) -> Bool {
+        if !at(.Less) { return false }
+        return angleClosesBefore(.LeftParen)
+    }
+
+    // `name<A, B> { ... }`: a braced literal of the instance those arguments
+    // name, which is how a generic struct is written with its arguments.
+    function genericLiteralAhead(borrow self) -> Bool {
+        if !at(.Less) { return false }
+        return angleClosesBefore(.LeftBrace)
+    }
+
+    // Whether the `<` at the cursor opens an argument list the token after the
+    // matching `>` starts. The list holds types alone, so a token no type is
+    // written with, a literal or an operator or a `:`, says the `<` is a
+    // comparison: `a < b ? 2 : (c >> 1)` compares.
+    function angleClosesBefore(borrow self, next: TokenKind) -> Bool {
+        var depth = 0
+        for index in position..tokens.count {
+            let kind = tokens[index].kind
+            if !writesType(kind) { return false }
+            if kind == .Less { depth += 1 }
+            if kind == .Greater || kind == .GreaterGreater {
+                depth -= 1
+                if kind == .GreaterGreater { depth -= 1 }
+                if depth == 0 {
+                    return index + 1 < tokens.count && tokens[index + 1].kind == next
+                }
+                if depth < 0 { return false }
+            }
+        }
+        return false
+    }
+}
+
+// Whether a type is written with tokens of `kind`: its names, the dots that
+// qualify them, the angles, brackets and parentheses that hold its arguments,
+// the commas between them, a callable's arrow, and an optional's mark.
+function writesType(kind: TokenKind) -> Bool {
+    return kind == .Identifier || kind == .Dot || kind == .Less || kind == .Greater || kind == .GreaterGreater
+        || kind == .Comma || kind == .LeftBracket || kind == .RightBracket || kind == .LeftParen || kind == .RightParen
+        || kind == .Arrow || kind == .Question
+}
+
+// Whether a decimal literal is past `Int`'s largest but within 2^64, the
+// magnitude a `Number`'s 65-bit mantissa holds: such a literal is every `U64`
+// and, negated, down to the mantissa's smallest.
+function wideDecimal(digits: String) -> Bool {
+    if isHexLiteral(digits) { return false }
+    let count = utf8Count(digits)
+    if count != 19 && count != 20 { return false }
+    let largest = "9223372036854775807"
+    let limit = "18446744073709551616"
+    if count == 19 { return digitsAbove(digits, largest) }
+    return !digitsAbove(digits, limit)
+}
+
+// Whether `digits` spells a larger number than `bound`, both the same length.
+function digitsAbove(digits: String, bound: String) -> Bool {
+    for index in 0..utf8Count(digits) {
+        let digit = utf8Byte(digits, index)
+        let limit = utf8Byte(bound, index)
+        if digit != limit { return digit > limit }
+    }
+    return false
+}
+
+// Whether a literal's text is digits alone, as a wide decimal's is, with no
+// `.` or exponent.
+function wholeText(text: String) -> Bool {
+    for index in 0..utf8Count(text) {
+        let byte = utf8Byte(text, index)
+        if byte != 45 && (byte < 48 || byte > 57) { return false }
+    }
+    return true
+}
+
+function isHexLiteral(digits: String) -> Bool {
+    if utf8Count(digits) < 3 { return false }
+    let marker = utf8Byte(digits, 1)
+    return marker == asciiLowerX || marker == asciiUpperX
+}
+
+function hexDigitValue(byte: Int) -> Int {
+    if isDigit(byte) { return byte - asciiZero }
+    if byte >= asciiLowerA { return byte - asciiLowerA + 10 }
+    return byte - asciiUpperA + 10
+}
+
+function isMainThreadOperation(word: String) -> Bool {
+    match word {
+        "invoke", "spawn", "post" -> return true
+        else -> return false
+    }
+}
+
+extend Parser {
+    // Whether a `{` after `node` belongs to it: a closure with parameters
+    // follows anything, and a block with none follows a name or a call.
+    function takesContent(borrow self, node: Int) -> Bool {
+        if lambdaAhead() { return true }
+        match tree.expressions[node].kind {
+            Name -> return true
+            Call -> return true
+            GenericCall -> return true
+            MethodCall -> return true
+            Member -> return true
+            IntegerLiteral -> return false
+            FloatLiteral -> return false
+            BooleanLiteral -> return false
+            StringLiteral -> return false
+            ArrayLiteral -> return false
+            Index -> return false
+            Transfer -> return false
+            Labelled -> return false
+            TypeQuery -> return false
+            ExpandedMacro -> return false
+            MacroCall -> return false
+            IndirectCall -> return false
+            Lambda -> return false
+            KeyPath -> return false
+            Task -> return false
+            Try -> return false
+            Variant -> return false
+            StructLiteral -> return false
+            Unary -> return false
+            Binary -> return false
+            Conditional -> return false
+            MatchValue -> return false
+            Content -> return false
+            Quote -> return false
+        }
+    }
+}
+
+function combinesInPlace(operator: BinaryOperator) -> Bool {
+    match operator {
+        Or -> return false
+        And -> return false
+        BitOr -> return true
+        BitXor -> return true
+        BitAnd -> return true
+        Equal -> return false
+        NotEqual -> return false
+        Less -> return false
+        LessEqual -> return false
+        Greater -> return false
+        GreaterEqual -> return false
+        ShiftLeft -> return true
+        ShiftRight -> return true
+        Add -> return true
+        Subtract -> return true
+        Multiply -> return true
+        Divide -> return true
+        Remainder -> return true
+    }
+}
+
+function tupleItem(index: Int, value: Int, span: Span) -> FieldValue {
+    return FieldValue { name = Identifier { text = joinText(["item", decimalText(index)]), span = span }, value = value }
+}

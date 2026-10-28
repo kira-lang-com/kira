@@ -1,0 +1,564 @@
+// `klist!` reads one value out of a `.klist` file, the property list format
+// of `docs/klist.md`.
+//
+//     klist!("Info.klist", "BundleVersion")
+//     klist!(TesseraConstants, "Paths.klist", "Applications")
+//
+// A path without a module is relative to the package root, as `ksl!`'s is. A
+// module name first reads the file from that dependency's root instead, so
+// one package can hold the lists several programs share. The key is a path of
+// dict keys and array indexes separated by dots: `DocumentTypes.0.Name`.
+//
+// A release build (`--release`) writes the value in as a literal. A debug
+// build writes a call to Foundation's `klist*` readers, which read the file
+// again while the program runs, so editing it needs no rebuild; the literal
+// is their fallback when the file is not there.
+
+struct KlistNode {
+    // The element: dict, array, string, number, true, false, date or data.
+    let kind: String
+    let key: String
+    // A scalar's text with its entities decoded. Empty for a container.
+    let text: String
+    let line: Int
+    // The index after this node's last descendant: its children are the
+    // nodes from here + 1 up to `end`, each one's own `end` leading to the next.
+    var end: Int
+}
+
+struct KlistReader {
+    let source: String
+    var position: Int
+    var nodes: [KlistNode]
+    var problem: String
+    var problemLine: Int
+    // The line `lineCountedTo` stands on. The reader only moves forward, so
+    // `line` counts on from here instead of from the start: counting from the
+    // start for every element made reading a list quadratic in its length.
+    var lineCounted: Int = 1
+    var lineCountedTo: Int = 0
+
+    function byte(borrow self, offset: Int) -> Int {
+        let at = position + offset
+        if at >= utf8Count(source) { return -1 }
+        return utf8Byte(source, at)
+    }
+
+    function line(borrow mut self) -> Int {
+        for index in lineCountedTo..position {
+            if utf8Byte(source, index) == 10 { lineCounted += 1 }
+        }
+        lineCountedTo = position
+        return lineCounted
+    }
+
+    function fail(borrow mut self, message: String) -> Bool {
+        if utf8Count(problem) == 0 {
+            problem = message
+            problemLine = line()
+        }
+        return false
+    }
+
+    function startsHere(borrow self, text: String) -> Bool {
+        let count = utf8Count(text)
+        if position + count > utf8Count(source) { return false }
+        return utf8Slice(source, position, position + count) == text
+    }
+
+    function skipSpace(borrow mut self) {
+        while klistSpace(byte(0)) { position += 1 }
+    }
+
+    // Space, comments and the `<?xml ...?>` declaration, between elements.
+    function skipMisc(borrow mut self) -> Bool {
+        while true {
+            skipSpace()
+            if startsHere("<!--") {
+                if !skipPast("-->") { return fail("a comment is not closed") }
+            } else if startsHere("<?") {
+                if !skipPast("?>") { return fail("a declaration is not closed") }
+            } else {
+                return true
+            }
+        }
+        return true
+    }
+
+    function skipPast(borrow mut self, marker: String) -> Bool {
+        while position < utf8Count(source) {
+            if startsHere(marker) {
+                position += utf8Count(marker)
+                return true
+            }
+            position += 1
+        }
+        return false
+    }
+
+    function name(borrow mut self) -> String {
+        let start = position
+        while byte(0) >= 97 && byte(0) <= 122 || byte(0) >= 65 && byte(0) <= 90 { position += 1 }
+        return utf8Slice(source, start, position)
+    }
+
+    // Text up to `stop`, its five entities decoded.
+    function text(borrow mut self, stop: Int) -> Optional<String> {
+        var parts: [String] = []
+        var run = position
+        while byte(0) != stop {
+            if byte(0) == -1 { return .None }
+            if byte(0) == 38 {
+                parts.append(utf8Slice(source, run, position))
+                let start = position
+                while byte(0) != 59 && byte(0) != -1 && position - start < 8 { position += 1 }
+                if byte(0) != 59 { return .None }
+                match utf8Slice(source, start, position + 1) {
+                    "&lt;" -> parts.append("<")
+                    "&gt;" -> parts.append(">")
+                    "&amp;" -> parts.append("&")
+                    "&quot;" -> parts.append("\"")
+                    "&apos;" -> parts.append("'")
+                    else -> return .None
+                }
+                position += 1
+                run = position
+                continue
+            }
+            position += 1
+        }
+        parts.append(utf8Slice(source, run, position))
+        return .Some(joinText(parts))
+    }
+
+    // `<klist version="1">`, one value, `</klist>`.
+    function document(borrow mut self) -> Bool {
+        if !skipMisc() { return false }
+        if !startsHere("<klist") { return fail("a klist starts with `<klist version=\"1\">`") }
+        position += 6
+        skipSpace()
+        if !startsHere("version=\"1\"") { return fail("this reader knows klist version 1 only") }
+        position += 11
+        skipSpace()
+        if byte(0) != 62 { return fail("`<klist` takes one attribute, `version`") }
+        position += 1
+        if !skipMisc() { return false }
+        if !value(false) { return false }
+        if !skipMisc() { return false }
+        if !startsHere("</klist>") { return fail("a klist holds one value and ends with `</klist>`") }
+        position += 8
+        if !skipMisc() { return false }
+        if position != utf8Count(source) { return fail("nothing may follow `</klist>`") }
+        return true
+    }
+
+    // One element. `keyed` is whether it stands in a dict, which is where a
+    // `key` belongs and the only place.
+    function value(borrow mut self, keyed: Bool) -> Bool {
+        let opened = line()
+        if byte(0) != 60 { return fail("a value is an element") }
+        position += 1
+        let kind = name()
+        if !klistKind(kind) { return fail(joinText(["`<", kind, ">` is not a klist element"])) }
+        var key = ""
+        var hasKey = false
+        skipSpace()
+        while byte(0) != 47 && byte(0) != 62 {
+            let attribute = name()
+            if attribute != "key" { return fail(joinText(["`<", kind, ">` takes no `", attribute, "` attribute"])) }
+            skipSpace()
+            if byte(0) != 61 { return fail("an attribute is `key=\"...\"`") }
+            position += 1
+            skipSpace()
+            let quote = byte(0)
+            if quote != 34 && quote != 39 { return fail("an attribute's value is quoted") }
+            position += 1
+            match text(quote) {
+                Some(written) -> key = written
+                None -> return fail("an attribute's value is not closed or holds an unknown entity")
+            }
+            position += 1
+            hasKey = true
+            skipSpace()
+        }
+        if keyed && !hasKey { return fail(joinText(["a `<", kind, ">` in a dict needs a key"])) }
+        if !keyed && hasKey { return fail(joinText(["a `<", kind, ">` outside a dict takes no key"])) }
+        let index = nodes.count
+        nodes.append(KlistNode { kind = kind, key = key, text = "", line = opened, end = index + 1 })
+        if byte(0) == 47 {
+            if byte(1) != 62 { return fail("`/` closes an element only as `/>`") }
+            position += 2
+            if kind == "number" || kind == "date" { return fail(joinText(["`<", kind, "/>` holds no value"])) }
+            return true
+        }
+        position += 1
+        if kind == "true" || kind == "false" { return fail(joinText(["write `<", kind, "/>`"])) }
+        if kind == "dict" || kind == "array" {
+            var keys: [String] = []
+            while true {
+                if !skipMisc() { return false }
+                if startsHere("</") { break }
+                let child = nodes.count
+                if !value(kind == "dict") { return false }
+                if kind == "dict" {
+                    for known in keys {
+                        if known == nodes[child].key { return fail(joinText(["the key `", known, "` is written twice"])) }
+                    }
+                    keys.append(nodes[child].key)
+                }
+            }
+        } else {
+            match text(60) {
+                Some(written) -> nodes[index] = KlistNode { kind = kind, key = key, text = written, line = opened, end = index + 1 }
+                None -> return fail(joinText(["`<", kind, ">` is not closed or holds an unknown entity"]))
+            }
+            if !klistScalar(kind, nodes[index].text) { return fail(joinText(["`", nodes[index].text, "` is not a klist ", kind])) }
+        }
+        position += 2
+        if name() != kind || byte(0) != 62 { return fail(joinText(["`<", kind, ">` ends with `</", kind, ">`"])) }
+        position += 1
+        nodes[index].end = nodes.count
+        return true
+    }
+}
+
+function klistSpace(byte: Int) -> Bool {
+    return byte == 32 || byte == 9 || byte == 10 || byte == 13
+}
+
+function klistKind(kind: String) -> Bool {
+    match kind {
+        "dict", "array", "string", "number", "true", "false", "date", "data" -> return true
+        else -> return false
+    }
+}
+
+function klistDigits(text: String, start: Int, end: Int) -> Bool {
+    if end <= start { return false }
+    for index in start..end {
+        if !isDigit(utf8Byte(text, index)) { return false }
+    }
+    return true
+}
+
+// Whether a scalar's text is what its element says: a number is decimal,
+// with digits on both sides of any point, or a whole `0x` hexadecimal of at
+// most sixteen digits, the bits of a `U64`; a date is `YYYY-MM-DDTHH:MM:SSZ`
+// and data is padded base64.
+function klistScalar(kind: String, text: String) -> Bool {
+    let count = utf8Count(text)
+    var start = 0
+    if count > 0 && (utf8Byte(text, 0) == 43 || utf8Byte(text, 0) == 45) { start = 1 }
+    match kind {
+        "number" -> {
+            if count > start + 2 && utf8Slice(text, start, start + 2) == "0x" {
+                for index in start + 2..count {
+                    if !isHexDigit(utf8Byte(text, index)) { return false }
+                }
+                return count - start - 2 <= 16
+            }
+            var point = count
+            for index in start..count {
+                if utf8Byte(text, index) == 46 { point = index }
+            }
+            if point == count { return klistDigits(text, start, count) }
+            return klistDigits(text, start, point) && klistDigits(text, point + 1, count)
+        }
+        "date" -> {
+            if count != 20 { return false }
+            for index in 0..20 {
+                let byte = utf8Byte(text, index)
+                var wanted = -1
+                if index == 4 || index == 7 { wanted = 45 }
+                if index == 10 { wanted = 84 }
+                if index == 13 || index == 16 { wanted = 58 }
+                if index == 19 { wanted = 90 }
+                if wanted >= 0 && byte != wanted { return false }
+                if wanted < 0 && !isDigit(byte) { return false }
+            }
+            return true
+        }
+        "data" -> {
+            var written = 0
+            for index in 0..count {
+                let byte = utf8Byte(text, index)
+                if klistSpace(byte) { continue }
+                if klistBase64(byte) < 0 && byte != 61 { return false }
+                written += 1
+            }
+            return written % 4 == 0
+        }
+        else -> return true
+    }
+}
+
+function klistBase64(byte: Int) -> Int {
+    if byte >= 65 && byte <= 90 { return byte - 65 }
+    if byte >= 97 && byte <= 122 { return byte - 71 }
+    if byte >= 48 && byte <= 57 { return byte + 4 }
+    if byte == 43 { return 62 }
+    if byte == 47 { return 63 }
+    return -1
+}
+
+// The bytes padded base64 `text` spells.
+function klistDecodeData(text: String) -> [Int] {
+    var bytes: [Int] = []
+    var group = 0
+    var held = 0
+    for index in 0..utf8Count(text) {
+        let digit = klistBase64(utf8Byte(text, index))
+        if digit < 0 { continue }
+        group = group * 64 + digit
+        held += 6
+        if held >= 8 {
+            held -= 8
+            bytes.append(group >> held & 255)
+            group = group & ((1 << held) - 1)
+        }
+    }
+    return bytes
+}
+
+// A number's text as a `Number` literal takes it: without a `+`. A
+// hexadecimal one stays hexadecimal, which a `Number` reads as a `U64`'s bits.
+function klistDecimal(text: String) -> String {
+    let count = utf8Count(text)
+    if count > 0 && utf8Byte(text, 0) == 43 { return utf8Slice(text, 1, count) }
+    return text
+}
+
+// The node `key` names under the root, or -1.
+function klistFind(nodes: [KlistNode], key: String) -> Int {
+    var current = 0
+    for part in splitText(key, 46) {
+        let node = nodes[current]
+        var found = -1
+        var child = current + 1
+        var position = 0
+        while child < node.end {
+            if node.kind == "dict" && nodes[child].key == part { found = child }
+            if node.kind == "array" && decimalText(position) == part { found = child }
+            child = nodes[child].end
+            position += 1
+        }
+        if found < 0 { return -1 }
+        current = found
+    }
+    return current
+}
+
+// The node at `index` as a Kira literal, when it has one.
+function klistLiteral(nodes: [KlistNode], index: Int) -> Optional<String> {
+    let node = nodes[index]
+    match node.kind {
+        "string", "date" -> return .Some(escapedSourceString(node.text))
+        "true", "false" -> return .Some(node.kind)
+        "number" -> return .Some(joinText(["Number(", klistDecimal(node.text), ")"]))
+        "data" -> {
+            var parts: [String] = ["["]
+            var first = true
+            for byte in klistDecodeData(node.text) {
+                if !first { parts.append(", ") }
+                first = false
+                parts.append(decimalText(byte))
+            }
+            parts.append("]")
+            return .Some(joinText(parts))
+        }
+        "array" -> {
+            var parts: [String] = ["["]
+            var child = index + 1
+            while child < node.end {
+                if child > index + 1 { parts.append(", ") }
+                match klistLiteral(nodes, child) {
+                    Some(written) -> parts.append(written)
+                    None -> return .None
+                }
+                child = nodes[child].end
+            }
+            parts.append("]")
+            return .Some(joinText(parts))
+        }
+        else -> return .None
+    }
+}
+
+// The Foundation reader a debug build calls for the node at `index`; empty
+// when the value is a literal in debug builds too: an array that is not of
+// strings, data, and anything nested.
+function klistReader(nodes: [KlistNode], index: Int) -> String {
+    match nodes[index].kind {
+        "string", "date" -> return "klistString"
+        "number" -> return "klistNumber"
+        "true", "false" -> return "klistBoolean"
+        "data" -> return "klistData"
+        "array" -> {
+            var child = index + 1
+            while child < nodes[index].end {
+                if nodes[child].kind != "string" && nodes[child].kind != "date" { return "" }
+                child = nodes[child].end
+            }
+            return "klistStrings"
+        }
+        else -> return ""
+    }
+}
+
+struct KlistCall {
+    let module: String
+    let path: String
+    let key: String
+}
+
+// `"path", "key"` or `Module, "path", "key"`.
+function klistArguments(input: String, origin: Span) -> Result<KlistCall, Failure> {
+    let tokens = try lex(input, origin.file)
+    var module = ""
+    var at = 0
+    if tokens.count == 6 && tokens[0].kind == .Identifier && tokens[1].kind == .Comma {
+        module = utf8Slice(input, tokens[0].span.start, tokens[0].span.end)
+        at = 2
+    }
+    if tokens.count != at + 4 || tokens[at].kind != .StringLiteral || tokens[at + 1].kind != .Comma || tokens[at + 2].kind != .StringLiteral {
+        return .Error(Failure { diagnostic = .KlistCall, span = origin })
+    }
+    return .Ok(KlistCall { module = module, path = klistStringToken(input, tokens[at].span), key = klistStringToken(input, tokens[at + 2].span) })
+}
+
+function klistStringToken(input: String, span: Span) -> String {
+    let raw = utf8Slice(input, span.start, span.end)
+    match stringLiteralText(raw) {
+        Some(text) -> return text
+        None -> return utf8Slice(raw, 1, utf8Count(raw) - 1)
+    }
+}
+
+// The root of the package the call reads from: its own, or the dependency
+// it names. A dependency the package lists but no source imports is not
+// loaded, and is found through the manifest instead.
+function klistRoot(session: Session, tree: SyntaxTree, module: Int, named: String) -> Optional<String> {
+    if utf8Count(named) == 0 { return .Some(tree.modules[module].root) }
+    for library in tree.modules[module].libraries {
+        if tree.modules[library].name == named { return .Some(tree.modules[library].root) }
+    }
+    match tree.modules[module].manifest {
+        Some(file) -> {
+            match readManifest(fileText(session, file as SourceFile), file) {
+                Ok(manifest) -> return listedDependencyRoot(session, tree.modules[module].root, manifest, named)
+                Error(_) -> return .None
+            }
+        }
+        None -> return .None
+    }
+}
+
+// Where the dependency `named` of `manifest` is checked out: the launcher's
+// fetched copy, else its path beside `root`.
+function listedDependencyRoot(session: Session, root: String, manifest: Manifest, named: String) -> Optional<String> {
+    for dependency in manifest.dependencies {
+        if dependency.name.text != named { continue }
+        let fetched = dependencyOverride(session, named)
+        if utf8Count(fetched) > 0 { return .Some(fetched) }
+        if dependency.source != .Path { return .None }
+        return .Some(joinPath(root, dependency.path))
+    }
+    return .None
+}
+
+function klistProblem(path: String, line: Int, message: String) {
+    if line > 0 {
+        writeDriverError(joinText(["klist: ", path, ":", decimalText(line), ": ", message, "\n"]))
+    } else {
+        writeDriverError(joinText(["klist: ", path, ": ", message, "\n"]))
+    }
+}
+
+// A `.klist` file read once, by the path a call names it with. A package
+// that reads many values from one list parses it once, not once per call.
+struct KlistDocument {
+    let path: String
+    let nodes: [KlistNode]
+}
+
+// The documents read so far in one round of expansion.
+struct KlistDocuments {
+    var read: [KlistDocument]
+
+    function find(borrow self, path: String) -> Int {
+        for index in 0..read.count {
+            if read[index].path == path { return index }
+        }
+        return -1
+    }
+
+    // Expands one `klist!` call, reading its file the first time a call
+    // names it.
+    function expand(borrow mut self, session: Session, tree: SyntaxTree, input: String, origin: Span) -> Result<Int, Failure> {
+        let call = try klistArguments(input, origin)
+        match macroSourceUnit(tree, origin.file) {
+            Some(context) -> {
+                var root = ""
+                match klistRoot(session, tree, context.module, call.module) {
+                    Some(found) -> root = found
+                    None -> {
+                        klistProblem(call.path, 0, joinText(["no dependency of this package is the module `", call.module, "`"]))
+                        return .Error(Failure { diagnostic = .KlistUnreadable, span = origin })
+                    }
+                }
+                let path = joinPath(root, call.path)
+                var held = find(path)
+                if held < 0 {
+                    let nodes = try readKlist(session, path, origin)
+                    read.append(KlistDocument { path = path, nodes = nodes })
+                    held = read.count - 1
+                }
+                return expandKlistValue(session, read[held].nodes, path, call.key, tree.release, origin)
+            }
+            None -> return .Error(Failure { diagnostic = .OutsideSubset, span = origin })
+        }
+    }
+}
+
+function emptyKlistDocuments() -> KlistDocuments {
+    return KlistDocuments { read = [] }
+}
+
+// The nodes of the `.klist` file at `path`.
+function readKlist(session: Session, path: String, origin: Span) -> Result<[KlistNode], Failure> {
+    let file = readFile(session, path)
+    if file < 0 {
+        klistProblem(path, 0, "cannot be read")
+        return .Error(Failure { diagnostic = .KlistUnreadable, span = origin })
+    }
+    var reader = KlistReader { source = fileText(session, file as SourceFile), position = 0, nodes = [], problem = "", problemLine = 0 }
+    if !reader.document() {
+        klistProblem(path, reader.problemLine, reader.problem)
+        return .Error(Failure { diagnostic = .KlistMalformed, span = origin })
+    }
+    return .Ok(reader.nodes)
+}
+
+// The source a call reading `key` out of the list at `path` expands to.
+function expandKlistValue(session: Session, nodes: [KlistNode], path: String, key: String, release: Bool, origin: Span) -> Result<Int, Failure> {
+    let found = klistFind(nodes, key)
+    if found < 0 {
+        klistProblem(path, 0, joinText(["holds no `", key, "`"]))
+        return .Error(Failure { diagnostic = .KlistNoValue, span = origin })
+    }
+    var source = ""
+    match klistLiteral(nodes, found) {
+        Some(literal) -> source = literal
+        None -> {
+            klistProblem(path, nodes[found].line, joinText(["`", key, "` is a dict, which is no one value"]))
+            return .Error(Failure { diagnostic = .KlistNoValue, span = origin })
+        }
+    }
+    let runtime = klistReader(nodes, found)
+    if !release && utf8Count(runtime) > 0 {
+        source = joinText([runtime, "(", escapedSourceString(path), ", ", escapedSourceString(key), ", ", source, ")"])
+    }
+    let expanded = addSource(session, origin.file as SourceFile, source)
+    if expanded < 0 { return .Error(Failure { diagnostic = .OutsideSubset, span = origin }) }
+    return .Ok(expanded)
+}

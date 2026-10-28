@@ -1,0 +1,216 @@
+// Functions and statements. A parameter the body writes is copied into a
+// local first; every other parameter, and every texture or sampler, is
+// used as the argument it is. `while c { body }` is a loop that breaks
+// when `c` does not hold.
+
+function isHandleType(value: ShaderType) -> Bool {
+    return !value.array && (value.shape == .Texture || value.shape == .Sampler)
+}
+
+extend Lowering {
+    function lowerCallees(borrow mut self, caller: Int) {
+        for callee in program.functions[caller].calls {
+            lowerFunction(callee)
+        }
+    }
+
+    function declareParameters(borrow mut self, callee: Int) -> Int {
+        let checked = program.functions[callee]
+        for position in 0..checked.parameters {
+            let parameter = checked.locals[position]
+            shader_param(module, parameter.name, typeHandle(parameter.localType), "")
+        }
+        if checked.result.isVoid() { return -1 }
+        return typeHandle(checked.result)
+    }
+
+    function lowerFunction(borrow mut self, callee: Int) -> Int {
+        if handles[callee] != -1 { return handles[callee] }
+        handles[callee] = -2
+        lowerCallees(callee)
+        let checked = program.functions[callee]
+        shader_span(module, checked.span.file, checked.span.start, checked.span.end)
+        let result = declareParameters(callee)
+        builder = shader_function(module, freshFunctionName(checked.name), result, "")
+        lowerBody(callee)
+        handles[callee] = shader_function_finish(module, builder)
+        return handles[callee]
+    }
+
+    // The entry index of a stage's entry point.
+    function lowerEntry(borrow mut self, stage: CheckedStage) -> Int {
+        lowerCallees(stage.entry)
+        let checked = program.functions[stage.entry]
+        shader_span(module, stage.span.file, stage.span.start, stage.span.end)
+        let result = declareParameters(stage.entry)
+        builder = shader_entry(module, freshFunctionName(checked.name), stage.stage.word(), result, "")
+        if stage.stage == .Compute && stage.threads.count == 3 {
+            shader_entry_workgroup(module, builder, stage.threads[0], stage.threads[1], stage.threads[2])
+            for axis in 0..3 {
+                let option = stage.optionExtents[axis]
+                if option >= 0 {
+                    let extent = shader_expr_override(module, -1, overrides[option])
+                    shader_entry_workgroup_override(module, builder, axis, extent)
+                }
+            }
+        }
+        lowerBody(stage.entry)
+        return shader_function_finish(module, builder)
+    }
+
+    function lowerBody(borrow mut self, callee: Int) {
+        let checked = program.functions[callee]
+        current = callee
+        places = []
+        direct = []
+        localNames = []
+        var written: [Bool] = []
+        for local in checked.locals {
+            places.append(-1)
+            direct.append(false)
+            written.append(false)
+        }
+        markWritten(checked.body, written)
+        for position in 0..checked.parameters {
+            localNames.append(checked.locals[position].name)
+        }
+        for position in 0..checked.parameters {
+            let parameter = checked.locals[position]
+            let argument = shader_expr_argument(module, builder, position)
+            if written[position] && !isHandleType(parameter.localType) {
+                let pointer = newLocal(parameter.name, parameter.localType)
+                shader_stmt_store(module, builder, pointer, argument)
+                places[position] = pointer
+            } else {
+                places[position] = argument
+                direct[position] = true
+            }
+        }
+        lowerBlock(checked.body)
+        if checked.result.isVoid() && !endsInReturn(checked.body) {
+            shader_stmt_return(module, builder, -1)
+        }
+    }
+
+    function markWritten(borrow self, body: [Int], written: borrow mut [Bool]) {
+        for index in body {
+            let statement = program.statements[index]
+            if statement.kind == .AssignPlace {
+                let root = rootLocal(statement.target)
+                if root >= 0 { written[root] = true }
+            }
+            markWritten(statement.body, written)
+            markWritten(statement.otherwise, written)
+        }
+    }
+
+    function rootLocal(borrow self, expression: Int) -> Int {
+        let checked = program.expressions[expression]
+        if checked.kind == .Local { return checked.target }
+        if checked.kind == .Field || checked.kind == .Swizzle || checked.kind == .Index {
+            return rootLocal(checked.left)
+        }
+        return -1
+    }
+
+    function endsInReturn(borrow self, body: [Int]) -> Bool {
+        if body.count == 0 { return false }
+        return program.statements[body[body.count - 1]].kind == .ReturnValue
+    }
+
+    // A function-space variable under a name no other local of this
+    // function has; the pointer naming it.
+    function newLocal(borrow mut self, name: String, localType: ShaderType) -> Int {
+        var candidate = name
+        var suffix = 1
+        while contains(localNames, candidate) {
+            candidate = joinText([name, "_", decimalText(suffix)])
+            suffix += 1
+        }
+        localNames.append(candidate)
+        let local = shader_local(module, builder, candidate, typeHandle(localType), -1)
+        return shader_expr_local(module, builder, local)
+    }
+
+    function lowerBlock(borrow mut self, body: [Int]) {
+        for index in body {
+            lowerStatement(index)
+        }
+    }
+
+    function lowerStatement(borrow mut self, index: Int) {
+        let statement = program.statements[index]
+        shader_span(module, statement.span.file, statement.span.start, statement.span.end)
+        match statement.kind {
+            LetLocal -> {
+                let local = program.functions[current].locals[statement.local]
+                if isHandleType(local.localType) {
+                    places[statement.local] = value(statement.value)
+                    direct[statement.local] = true
+                    return
+                }
+                let pointer = newLocal(local.name, local.localType)
+                places[statement.local] = pointer
+                if statement.value >= 0 { shader_stmt_store(module, builder, pointer, value(statement.value)) }
+            }
+            AssignPlace -> assign(statement.target, value(statement.value))
+            IfElse -> {
+                shader_stmt_if(module, builder, value(statement.value))
+                lowerBlock(statement.body)
+                if statement.hasElse {
+                    shader_stmt_else(module, builder)
+                    lowerBlock(statement.otherwise)
+                }
+                shader_stmt_end_if(module, builder)
+            }
+            WhileLoop -> {
+                shader_stmt_loop(module, builder)
+                let stop = shader_expr_unary(module, builder, "not", value(statement.value))
+                shader_stmt_if(module, builder, stop)
+                shader_stmt_break(module, builder)
+                shader_stmt_end_if(module, builder)
+                lowerBlock(statement.body)
+                shader_stmt_end_loop(module, builder, -1)
+            }
+            ReturnValue -> {
+                var returned = -1
+                if statement.value >= 0 { returned = value(statement.value) }
+                shader_stmt_return(module, builder, returned)
+            }
+            Nested -> lowerBlock(statement.body)
+            EvaluateValue -> value(statement.value)
+        }
+    }
+
+    // Writes `written` to the place `target` names. A swizzle of several
+    // lanes rebuilds the whole vector: the lanes it names from `written`,
+    // the rest from what the vector held.
+    function assign(borrow mut self, target: Int, written: Int) {
+        let pointer = place(target)
+        if pointer >= 0 {
+            shader_stmt_store(module, builder, pointer, written)
+            return
+        }
+        let checked = program.expressions[target]
+        let base = place(checked.left)
+        let vector = program.expressions[checked.left].expressionType
+        let old = shader_expr_load(module, builder, base)
+        var lanes: [Int] = []
+        for lane in 0..vector.width {
+            var from = -1
+            for position in 0..checked.components.count {
+                if checked.components[position] == lane { from = position }
+            }
+            if from >= 0 {
+                lanes.append(shader_expr_access_index(module, builder, written, from))
+            } else {
+                lanes.append(shader_expr_access_index(module, builder, old, lane))
+            }
+        }
+        for lane in lanes {
+            shader_push(module, lane)
+        }
+        let rebuilt = shader_expr_compose(module, builder, typeHandle(vector))
+        shader_stmt_store(module, builder, base, rebuilt)
+    }
+}

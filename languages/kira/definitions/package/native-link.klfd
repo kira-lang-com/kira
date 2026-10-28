@@ -1,0 +1,181 @@
+// What a native library brings to the link of a program built for one
+// target. Kira declares a row per target and spells triples its own way,
+// `arch-os-abi`; a row is the one whose triple names the target the session
+// builds for. A library with sources has them compiled for that target, as
+// Kira rebuilds its archive from them; one without links the row's archive
+// or shared library.
+
+// A C or C++ source compiled into the program, with its compile flags.
+struct CSource {
+    let path: String
+    let flags: [String]
+}
+
+// A native library as the program links it, every path absolute.
+struct NativeLink {
+    let name: Identifier
+    let header: String
+    // The archive or shared library linked, or empty.
+    let artifact: String
+    let linkerFlags: [String]
+    let sources: [CSource]
+    // An optional library with no row for the target: its bindings are left
+    // out and a call to one traps.
+    var excluded: Bool
+    // Kira's own runtime, `LinkMode.Runtime`, whose primitives lower in place.
+    let runtime: Bool
+}
+
+extend Loader {
+    function linkNativeLibrary(borrow self, root: String, library: NativeLibrary) -> Result<NativeLink, Failure> {
+        var header = ""
+        if utf8Count(library.header) > 0 { header = packagePath(root, library.header) }
+        var link = NativeLink { name = library.name, header = header, artifact = "", linkerFlags = [], sources = [], excluded = false, runtime = library.linkMode == .Runtime }
+        if library.linkMode == .Runtime { return .Ok(link) }
+        let triple = targetTriple(session)
+        if library.targets.count == 0 {
+            if utf8Count(library.binary) > 0 { link.artifact = try existingFile(root, library.binary, library.name.span) }
+            link.linkerFlags = library.linkerFlags
+            link.sources = librarySources(root, library, [], [], triple)
+            return .Ok(link)
+        }
+        let wanted = kiraTriple(triple)
+        for row in library.targets {
+            if rowTriple(row.triple) != wanted { continue }
+            var flags: [String] = []
+            for flag in library.linkerFlags { flags.append(flag) }
+            if library.sources.count > 0 && library.linkMode == .Static {
+                link.sources = librarySources(root, library, row.defines, row.compilerFlags, triple)
+            } else {
+                var declared = row.staticLib
+                if library.linkMode == .Dynamic { declared = row.dynamicLib }
+                if utf8Count(declared) > 0 {
+                    let path = packagePath(root, declared)
+                    if pathExists(session, path) {
+                        link.artifact = path
+                    } else if !library.optional {
+                        return .Error(Failure { diagnostic = .NativeFileMissing, span = row.span })
+                    }
+                }
+            }
+            for name in row.systemLibs { flags.append(joinText(["-l", name])) }
+            for name in row.frameworks { flags.append(joinText(["-Wl,-framework,", name])) }
+            for flag in row.linkerFlags { flags.append(flag) }
+            let bare = utf8Count(link.artifact) == 0 && row.systemLibs.count == 0 && row.frameworks.count == 0
+                && row.linkerFlags.count == 0
+            if library.linkMode == .Dynamic && bare { flags.append(joinText(["-l", library.name.text])) }
+            for file in row.runtimeFiles {
+                if !pathExists(session, packagePath(root, file)) && !library.optional {
+                    return .Error(Failure { diagnostic = .NativeFileMissing, span = row.span })
+                }
+            }
+            link.linkerFlags = flags
+            return .Ok(link)
+        }
+        link.excluded = library.optional
+        return .Ok(link)
+    }
+
+    function existingFile(borrow self, root: String, relative: String, span: Span) -> Result<String, Failure> {
+        let path = packagePath(root, relative)
+        if !pathExists(session, path) { return .Error(Failure { diagnostic = .NativeFileMissing, span = span }) }
+        return .Ok(path)
+    }
+}
+
+function packagePath(root: String, relative: String) -> String {
+    return normalizedPath(joinPath(root, relative))
+}
+
+// Each source of `library` with the flags it compiles with on `triple`: the
+// language its suffix names (C on Apple compiles as Objective-C, as Kira
+// does), position-independent code off Windows, the include directories and
+// the defines of the library and its row, and the row's compiler flags.
+function librarySources(root: String, library: NativeLibrary, rowDefines: [String], rowFlags: [String], triple: String) -> [CSource] {
+    let apple = isAppleTriple(triple)
+    var common: [String] = []
+    if !containsText(triple, "windows") { common.append("-fPIC") }
+    for directory in library.includeDirs { common.append(joinText(["-I", packagePath(root, directory)])) }
+    for define in library.defines { common.append(joinText(["-D", define])) }
+    for define in rowDefines { common.append(joinText(["-D", define])) }
+    for flag in rowFlags { common.append(flag) }
+    var sources: [CSource] = []
+    for source in library.sources {
+        var flags: [String] = ["-x", sourceLanguage(source, apple)]
+        for flag in common { flags.append(flag) }
+        sources.append(CSource { path = packagePath(root, source), flags = flags })
+    }
+    return sources
+}
+
+function sourceLanguage(source: String, apple: Bool) -> String {
+    let cxx = endsWithText(source, ".cc") || endsWithText(source, ".cpp") || endsWithText(source, ".cxx")
+        || endsWithText(source, ".mm")
+    if cxx && apple { return "objective-c++" }
+    if cxx { return "c++" }
+    if endsWithText(source, ".m") || apple { return "objective-c" }
+    return "c"
+}
+
+function isAppleTriple(triple: String) -> Bool {
+    return containsText(triple, "apple") || containsText(triple, "darwin") || containsText(triple, "macos")
+        || containsText(triple, "ios")
+}
+
+// Kira's spelling of a target triple: `arch-os-abi`, with `none` for an OS
+// that has no ABI to name.
+function kiraTriple(triple: String) -> String {
+    let parts = splitText(triple, 45)
+    let arch = parts[0]
+    let last = parts[parts.count - 1]
+    if containsText(triple, "darwin") || containsText(triple, "macos") { return joinText([arch, "-macos-none"]) }
+    if containsText(triple, "ios") {
+        if endsWithText(triple, "-sim") || endsWithText(triple, "-simulator") { return joinText([arch, "-ios-simulator"]) }
+        return joinText([arch, "-ios-none"])
+    }
+    if containsText(triple, "windows") { return joinText([arch, "-windows-", last]) }
+    if containsText(triple, "emscripten") { return joinText([arch, "-emscripten-unknown"]) }
+    // A Tessera triple keeps its own name, and only a row naming it applies
+    // (KLF-RIDL 5.8).
+    if endsWithText(triple, "-unknown-tessera") { return triple }
+    if containsText(triple, "linux") {
+        if last == "linux" { return joinText([arch, "-linux-gnu"]) }
+        return joinText([arch, "-linux-", last])
+    }
+    return triple
+}
+
+// A row's triple as `kiraTriple` spells it: Kira reads `aarch64-macos` as
+// `aarch64-macos-none`.
+function rowTriple(triple: String) -> String {
+    if splitText(triple, 45).count == 2 { return joinText([triple, "-none"]) }
+    return triple
+}
+
+function splitText(text: String, separator: Int) -> [String] {
+    var parts: [String] = []
+    var start = 0
+    for index in 0..utf8Count(text) {
+        if utf8Byte(text, index) == separator {
+            parts.append(utf8Slice(text, start, index))
+            start = index + 1
+        }
+    }
+    parts.append(utf8Slice(text, start, utf8Count(text)))
+    return parts
+}
+
+function containsText(text: String, part: String) -> Bool {
+    let count = utf8Count(part)
+    for start in 0..(utf8Count(text) - count + 1) {
+        var same = true
+        for offset in 0..count {
+            if utf8Byte(text, start + offset) != utf8Byte(part, offset) {
+                same = false
+                break
+            }
+        }
+        if same { return true }
+    }
+    return false
+}

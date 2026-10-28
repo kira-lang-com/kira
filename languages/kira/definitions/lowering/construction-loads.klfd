@@ -1,0 +1,100 @@
+struct ConstructionLoad {
+    let local: Int
+    let field: Int
+    let value: KirValue
+}
+
+extend FunctionLowering {
+    function pureConstructionValue(borrow self, index: Int) -> Bool {
+        if program.typeOf(index).isAggregate() { return false }
+        match program.expressions[index].operation {
+            Integer -> return true
+            FloatLiteral -> return true
+            Boolean -> return true
+            Read(local) -> return !checked.locals[local].cell
+            Member(base, field) -> {
+                if isClassType(program, program.typeOf(base)) { return false }
+                match program.expressions[base].operation.readLocal() {
+                    Some(local) -> return !checked.locals[local].cell
+                    None -> return false
+                }
+            }
+            Convert(operand) -> return pureConstructionValue(operand)
+            Unary(operator, operand) -> return pureConstructionValue(operand)
+            Arithmetic(operator, left, right) -> return pureConstructionValue(left) && pureConstructionValue(right)
+            Wrapping(operator, left, right) -> return pureConstructionValue(left) && pureConstructionValue(right)
+            Compare(operator, left, right) -> return pureConstructionValue(left) && pureConstructionValue(right)
+            StringText -> return false
+            Sequence -> return false
+            BoxAny -> return false
+            TypeIs -> return false
+            UnboxAny -> return false
+            FunctionReference -> return false
+            IndirectCall -> return false
+            MakeClosure -> return false
+            GlobalRead -> return false
+            TaskSpawn -> return false
+            TaskReady -> return false
+            TaskAwait -> return false
+            TaskCancel -> return false
+            TaskDetach -> return false
+            Async -> return false
+            RuntimeTrap -> return false
+            Try -> return false
+            ChannelCreate -> return false
+            ChannelReceiver -> return false
+            ChannelSend -> return false
+            ChannelClose -> return false
+            ClassView -> return false
+            ClassCall -> return false
+            StringLiteral -> return false
+            StringConcat -> return false
+            TraceText -> return false
+            HeapAllocateRaw -> return false
+            HeapFreeRaw -> return false
+            Print -> return false
+            HeapRead -> return false
+            HeapWrite -> return false
+            Atomic -> return false
+            HeapCopy -> return false
+            HeapFill -> return false
+            HeapOffset -> return false
+            HeapLayout -> return false
+            ArrayLiteral -> return false
+            ArrayIndex -> return false
+            ArrayAppend -> return false
+            Transfer -> return false
+            Call -> return false
+            Construct -> return false
+            Tagged -> return false
+            Logical -> return false
+            Select -> return false
+            Choice -> return false
+            Bitcast -> return false
+            ForeignImage -> return false
+            ForeignElements -> return false
+            ForeignCallback -> return false
+            ForeignRead -> return false
+            ForeignUnion -> return false
+            EnumCode -> return false
+            EnumFromCode -> return false
+            Order -> return false
+            Hash -> return false
+        }
+    }
+
+    function constructionMember(borrow mut self, index: Int, base: Int, field: Int) -> KirValue {
+        if !cachingConstruction { return kir.load(address(index)) }
+        var local = -1
+        match program.expressions[base].operation.readLocal() {
+            Some(found) -> local = found
+            None -> return kir.load(address(index))
+        }
+        for load in constructionLoads {
+            if load.local == local && load.field == field { return load.value }
+        }
+        let loaded = kir.load(address(index))
+        constructionLoads.append(ConstructionLoad { local = local, field = field, value = loaded })
+        return loaded
+    }
+}

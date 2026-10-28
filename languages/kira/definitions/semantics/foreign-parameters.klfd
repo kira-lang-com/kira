@@ -1,0 +1,43 @@
+struct ForeignParameterShape {
+    let clean: Bool
+    let retained: [Bool]
+    let seams: [Seam]
+    let types: [Type]
+}
+
+extend Checker {
+    function foreignParameterShape(borrow mut self, signature: Signature, retains: [Identifier]) -> ForeignParameterShape {
+        var clean = true
+        var retained: [Bool] = []
+        for parameter in signature.parameters { retained.append(false) }
+        for named in retains {
+            var found = false
+            for index in 0..signature.parameters.count {
+                if signature.parameters[index].name.text != named.text { continue }
+                found = true
+                if retained[index] {
+                    report(.ForeignRetainsTwice, named.span)
+                    clean = false
+                }
+                retained[index] = true
+            }
+            if !found {
+                report(.ForeignRetainsUnknown, named.span)
+                clean = false
+            }
+        }
+        var seams: [Seam] = []
+        var types: [Type] = []
+        for parameter in signature.parameters {
+            match seamOf(parameter.valueType, true) {
+                Some(seam) -> seams.append(seam)
+                None -> {
+                    report(.ForeignSeamType, parameter.name.span)
+                    clean = false
+                }
+            }
+            types.append(parameter.valueType)
+        }
+        return ForeignParameterShape { clean = clean, retained = retained, seams = seams, types = types }
+    }
+}

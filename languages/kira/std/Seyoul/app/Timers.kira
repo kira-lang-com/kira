@@ -1,0 +1,265 @@
+import Foundation
+
+// Seyoul's timers: a binary min-heap of deadlines over flat arrays.
+//
+// A timer is a slot holding the waker to call and a stamp; the heap holds
+// (deadline, slot, stamp) in three parallel arrays, so sifting walks three
+// dense runs of words. Cancelling a timer bumps its slot's stamp instead of
+// digging the entry out of the heap: the entry is stale from then on and is
+// skipped when it reaches the top. Slots are reused, so a busy server's
+// timers stay in the same few cache lines.
+
+// A point on the monotonic clock, in nanoseconds since some fixed moment.
+struct Instant {
+    let nanoseconds: UNumber
+
+    // The instant `seconds` after this one.
+    function after(borrow self, seconds: Number) -> Instant {
+        return Instant { nanoseconds = nanoseconds + nanosecondsIn(seconds) }
+    }
+
+    // Seconds from this instant to now, 0 when it is still to come.
+    function elapsed(borrow self) -> Number {
+        let current = now()
+        if current.nanoseconds <= nanoseconds { return 0 }
+        return Number(current.nanoseconds - nanoseconds) / TimerUnits.nanosecondsPerSecond
+    }
+}
+
+namespace TimerUnits {
+    let nanosecondsPerSecond: Number = 1000000000
+}
+
+function nanosecondsIn(seconds: Number) -> UNumber {
+    if seconds <= 0 { return 0 }
+    return UNumber(trunc(seconds * TimerUnits.nanosecondsPerSecond))
+}
+
+// Now, on the monotonic clock.
+function now() -> Instant {
+    return Instant { nanoseconds = UNumber(monotonicTicks()) }
+}
+
+// Names one armed timer: its slot and the stamp the slot had when armed.
+struct TimerKey {
+    let slot: Number
+    let stamp: UNumber
+}
+
+class TimerHeap {
+    // Per slot: the waker to call, and its stamp, bumped when the slot's
+    // timer fires or is cancelled.
+    var wakers: [Waker?] = []
+    var stamps: [UNumber] = []
+    var spare: [Number] = []
+    var spareCount: Number = 0
+    // Timers armed and neither fired nor cancelled.
+    var live: Number = 0
+    // The heap, `count` entries long: the earliest deadline first.
+    var deadlines: [UNumber] = []
+    var slots: [Number] = []
+    var entryStamps: [UNumber] = []
+    var count: Number = 0
+
+    // Arms a timer calling `waker` once `deadline` has passed.
+    function arm(deadline: UNumber, waker: Waker) -> TimerKey {
+        var slot = self.wakers.count
+        if self.spareCount > 0 {
+            self.spareCount -= 1
+            slot = self.spare[self.spareCount]
+            self.wakers[slot] = .Some(waker)
+        } else {
+            self.wakers.append(.Some(waker))
+            self.stamps.append(0)
+        }
+        self.live += 1
+        let stamp = self.stamps[slot]
+        self.push(deadline, slot, stamp)
+        return TimerKey { slot = slot, stamp = stamp }
+    }
+
+    // Whether `key`'s timer is still armed.
+    function isArmed(key: borrow TimerKey) -> Bool {
+        return self.stamps[key.slot] == key.stamp
+    }
+
+    // Has an armed timer call `waker` instead of the waker it was armed with.
+    function rearm(key: borrow TimerKey, waker: Waker) {
+        if self.isArmed(key) { self.wakers[key.slot] = .Some(waker) }
+    }
+
+    // Disarms `key`'s timer, if it has not fired.
+    function cancel(key: borrow TimerKey) {
+        if self.isArmed(key) { self.release(key.slot) }
+    }
+
+    // Wakes every timer whose deadline is `instant` or earlier; answers
+    // whether one fired.
+    function fire(instant: UNumber) -> Bool {
+        var fired = false
+        while self.count > 0 && self.deadlines[0] <= instant {
+            let slot = self.slots[0]
+            let stamp = self.entryStamps[0]
+            self.pop()
+            if self.stamps[slot] == stamp {
+                match self.wakers[slot] {
+                    Some(waker) -> waker.wakeUp()
+                    None -> {}
+                }
+                self.release(slot)
+                fired = true
+            }
+        }
+        return fired
+    }
+
+    // The earliest deadline of an armed timer.
+    function next() -> UNumber? {
+        while self.count > 0 {
+            if self.stamps[self.slots[0]] == self.entryStamps[0] { return .Some(self.deadlines[0]) }
+            self.pop()
+        }
+        return .None
+    }
+
+    function release(slot: Number) {
+        self.wakers[slot] = .None
+        self.stamps[slot] = self.stamps[slot] + 1
+        if self.spareCount < self.spare.count {
+            self.spare[self.spareCount] = slot
+        } else {
+            self.spare.append(slot)
+        }
+        self.spareCount += 1
+        self.live -= 1
+    }
+
+    function push(deadline: UNumber, slot: Number, stamp: UNumber) {
+        var at = self.count
+        if at < self.deadlines.count {
+            self.deadlines[at] = deadline
+            self.slots[at] = slot
+            self.entryStamps[at] = stamp
+        } else {
+            self.deadlines.append(deadline)
+            self.slots.append(slot)
+            self.entryStamps.append(stamp)
+        }
+        self.count += 1
+        while at > 0 {
+            let parent = (at - 1) >> 1
+            if self.deadlines[parent] <= deadline { break }
+            self.deadlines[at] = self.deadlines[parent]
+            self.slots[at] = self.slots[parent]
+            self.entryStamps[at] = self.entryStamps[parent]
+            at = parent
+        }
+        self.deadlines[at] = deadline
+        self.slots[at] = slot
+        self.entryStamps[at] = stamp
+    }
+
+    // Removes the top entry.
+    function pop() {
+        self.count -= 1
+        if self.count == 0 { return }
+        let deadline = self.deadlines[self.count]
+        let slot = self.slots[self.count]
+        let stamp = self.entryStamps[self.count]
+        var at: Number = 0
+        while true {
+            var child = at * 2 + 1
+            if child >= self.count { break }
+            if child + 1 < self.count && self.deadlines[child + 1] < self.deadlines[child] {
+                child += 1
+            }
+            if deadline <= self.deadlines[child] { break }
+            self.deadlines[at] = self.deadlines[child]
+            self.slots[at] = self.slots[child]
+            self.entryStamps[at] = self.entryStamps[child]
+            at = child
+        }
+        self.deadlines[at] = deadline
+        self.slots[at] = slot
+        self.entryStamps[at] = stamp
+    }
+}
+
+// The future `sleep` answers: ready once its deadline has passed. Dropping
+// it unfinished disarms its timer.
+struct Sleep: Future<Void>, Drop {
+    let deadline: UNumber
+    var key: TimerKey? = .None
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Void> {
+        match self.key {
+            Some(key) -> {
+                if !seyoul.timers.isArmed(key) {
+                    self.key = .None
+                    return .Ready
+                }
+                seyoul.timers.rearm(key, context.waker)
+                return .Pending
+            }
+            None -> {}
+        }
+        if now().nanoseconds >= self.deadline { return .Ready }
+        self.key = .Some(seyoul.timers.arm(self.deadline, context.waker))
+        return .Pending
+    }
+
+    function drop(borrow mut self) {
+        match self.key {
+            Some(key) -> seyoul.timers.cancel(key)
+            None -> {}
+        }
+        return
+    }
+}
+
+// Ready after `seconds`, a decimal: `sleep(0.25).await`.
+function sleep(seconds: Number) -> Sleep {
+    return Sleep { deadline = now().after(seconds).nanoseconds }
+}
+
+// Ready once `deadline` has passed.
+function sleepUntil(deadline: Instant) -> Sleep {
+    return Sleep { deadline = deadline.nanoseconds }
+}
+
+// The future `timeout` answers: the inner future's output, or nothing once
+// the time runs out first, when the inner future is dropped at its await.
+struct Timeout<Output>: Future<Output?> {
+    var inner: Async<Output>?
+    var timer: Sleep
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Output?> {
+        let taken: Async<Output>? = move self.inner
+        self.inner = .None
+        match move taken {
+            Some(running) -> {
+                var driven = move running
+                match driven.poll(context) {
+                    Ready(value) -> return .Ready(.Some(move value))
+                    Pending -> {}
+                }
+                match self.timer.poll(context) {
+                    Ready -> return .Ready(.None)
+                    Pending -> {}
+                }
+                self.inner = .Some(move driven)
+                return .Pending
+            }
+            None -> {}
+        }
+        // Polled again after it was ready.
+        runtimeTrap()
+        return .Pending
+    }
+}
+
+// `future`, given up after `seconds`: `timeout(2, fetch(url)).await` is
+// `.None` when the fetch took longer.
+function timeout<Output>(seconds: Number, future: Async<Output>) -> Timeout<Output> {
+    return Timeout<Output> { inner = .Some(move future), timer = sleep(seconds) }
+}

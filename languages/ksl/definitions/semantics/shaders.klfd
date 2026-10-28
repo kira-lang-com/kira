@@ -1,0 +1,198 @@
+// The `shader` block: at most one per compilation, its options, resource
+// groups and stages. Option and resource names bind for this shader's
+// bodies only.
+
+extend Checker {
+    function checkShader(borrow mut self, declared: ShaderDeclaration) {
+        if program.hasShader {
+            report(.ShaderCount, declared.span)
+            return
+        }
+        resourceNames = []
+        optionNames = []
+        program.hasShader = true
+        program.shaderName = declared.name.text
+        for option in declared.options {
+            checkOption(option)
+        }
+        for group in declared.groups {
+            checkGroup(group)
+        }
+        for stage in declared.stages {
+            checkStage(stage)
+        }
+        if declared.stages.count == 0 { report(.BadStage, declared.span) }
+    }
+
+    function checkOption(borrow mut self, declared: OptionDeclaration) {
+        let optionType = resolve(declared.typeReference)
+        match constant(declared.value, optionType) {
+            Some(value) -> {
+                program.options.append(CheckedOption { name = declared.name.text, optionType = optionType,
+                    value = value, span = declared.span })
+                optionNames.append(NamedIndex { name = declared.name.text, index = program.options.count - 1 })
+            }
+            None -> report(.BadOption, declared.span)
+        }
+    }
+
+    function checkGroup(borrow mut self, declared: GroupDeclaration) {
+        var resources: [Int] = []
+        for declaredResource in declared.resources {
+            let resource = checkResource(declaredResource)
+            if resource >= 0 { resources.append(resource) }
+        }
+        // A slot is the written `@binding(n)`, or the resource's place among
+        // the group's checked resources.
+        var slots: [Int] = []
+        for index in 0..resources.count {
+            var slot = program.resources[resources[index]].binding
+            if slot < 0 { slot = index }
+            var taken = false
+            for earlier in slots {
+                if earlier == slot { taken = true }
+            }
+            if taken {
+                var span = declared.span
+                if index < declared.resources.count { span = declared.resources[index].span }
+                report(.BadBinding, span)
+            } else {
+                slots.append(slot)
+            }
+        }
+        program.groups.append(CheckedGroup { name = declared.name.text, resources = resources })
+    }
+
+    function checkResource(borrow mut self, declared: ResourceDeclaration) -> Int {
+        let resourceType = resolve(declared.typeReference)
+        var legal = false
+        match declared.kind {
+            Uniform -> legal = resourceType.shape == .Struct && !resourceType.array
+            Storage -> legal = resourceType.array
+            Texture -> legal = resourceType.shape == .Texture && !resourceType.array
+            Sampler -> legal = resourceType.shape == .Sampler && !resourceType.array
+        }
+        if !legal {
+            report(.BadResourceType, declared.span)
+            return -1
+        }
+        program.resources.append(CheckedResource {
+            name = declared.name.text, kind = declared.kind, access = declared.access,
+            binding = declared.binding, resourceType = resourceType, span = declared.span
+        })
+        let index = program.resources.count - 1
+        resourceNames.append(NamedIndex { name = declared.name.text, index = index })
+        return index
+    }
+
+    function checkStage(borrow mut self, declared: StageDeclaration) {
+        let input = checkInterface(declared.input.text, declared.stage, true, declared.span)
+        let output = checkInterface(declared.output.text, declared.stage, false, declared.span)
+        var threads: [Int] = []
+        var optionExtents: [Int] = []
+        if declared.stage == .Compute {
+            if declared.threads.count == 0 {
+                report(.BadStage, declared.span)
+            } else {
+                // The first extent that does not fold is the one reported.
+                for extent in declared.threads {
+                    let folded = threadExtent(extent)
+                    if folded < 0 { break }
+                    threads.append(folded)
+                    optionExtents.append(extentOption(extent))
+                }
+            }
+            // A compute entry publishes through storage; it has no outputs.
+            if utf8Count(declared.output.text) > 0 { report(.BadStage, declared.span) }
+        } else if declared.threads.count > 0 {
+            report(.BadStage, declared.span)
+        }
+        // Every function of the stage is declared before any is checked, so
+        // a helper written below the entry is callable from it.
+        var functions: [Int] = []
+        for written in declared.functions {
+            let name = qualified(written.name.text)
+            var kslName = name
+            if written.name.text == "entry" {
+                kslName = joinText([declared.stage.word(), "_main"])
+            }
+            let index = newFunction(kslName, written)
+            functions.append(index)
+            signatures.append(signature(written.name.text, written, index))
+        }
+        var entry = -1
+        for position in 0..declared.functions.count {
+            let written = declared.functions[position]
+            checkFunction(written, functions[position])
+            if written.name.text == "entry" {
+                if entry >= 0 { report(.BadStage, written.span) }
+                entry = functions[position]
+            }
+        }
+        if entry < 0 { report(.BadStage, declared.span) }
+        program.stages.append(CheckedStage {
+            stage = declared.stage, input = input, output = output, threads = threads,
+            optionExtents = optionExtents, entry = entry, span = declared.span
+        })
+    }
+
+    // A whole positive extent known now, or -1 after reporting.
+    function threadExtent(borrow mut self, extent: Int) -> Int {
+        match constant(extent, scalarType(.UInt)) {
+            Some(value) -> {
+                let folded = extentValue(value)
+                if folded > 0 { return folded }
+            }
+            None -> {}
+        }
+        report(.BadStage, tree.expressions[extent].span)
+        return -1
+    }
+
+    // The option an extent names, or -1.
+    function extentOption(borrow self, extent: Int) -> Int {
+        let written = tree.expressions[extent]
+        if written.kind != .Name { return -1 }
+        return lastNamed(optionNames, written.text)
+    }
+
+    // The struct a stage's `input` or `output` names, or -1; each built-in
+    // field must be one the stage may carry in that direction.
+    function checkInterface(borrow mut self, name: String, stage: StageKind, input: Bool, span: Span) -> Int {
+        if utf8Count(name) == 0 { return -1 }
+        var index = structNamed(name)
+        if index < 0 { index = structNamed(qualified(name)) }
+        if index < 0 {
+            report(.UnknownType, span)
+            return -1
+        }
+        for field in program.structs[index].fields {
+            if utf8Count(field.builtin) > 0 && !builtinAllowed(field.builtin, stage, input) {
+                report(.BadBuiltin, span)
+            }
+        }
+        return index
+    }
+
+    function checkFunction(borrow mut self, declared: FunctionDeclaration, checkedFunction: Int) {
+        let declaredSignature = signature(program.functions[checkedFunction].name, declared, checkedFunction)
+        current = checkedFunction
+        locals = []
+        visible = []
+        scopes = []
+        calls = []
+        derivatives = []
+        result = declaredSignature.result
+        for position in 0..declared.parameters.count {
+            bind(declared.parameters[position].name.text, declaredSignature.parameters[position])
+        }
+        let body = checkBlock(declared.body)
+        if !result.isVoid() && !returnsOnEveryPath(body) { report(.MissingReturn, declared.span) }
+        program.functions[checkedFunction].locals = locals
+        program.functions[checkedFunction].result = declaredSignature.result
+        program.functions[checkedFunction].body = body
+        program.functions[checkedFunction].calls = calls
+        program.functions[checkedFunction].derivatives = derivatives
+        program.functions[checkedFunction].checked = true
+    }
+}

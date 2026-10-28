@@ -1,0 +1,47 @@
+extend Checker {
+    function checkFloatBits(borrow mut self, name: String, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 1 {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        var bits = 64
+        var toBits = false
+        match name {
+            "floatToBits" -> toBits = true
+            "floatToBits32" -> {
+                bits = 32
+                toBits = true
+            }
+            "bitsToFloat32" -> bits = 32
+            else -> {}
+        }
+        let integer = Type.integer(bits, false)
+        let floating = Type.floating(bits)
+        var source = integer
+        var target = floating
+        if toBits { source = floating target = integer }
+        let operand = coerce(expression(arguments[0], .Some(source)), source, .ArgumentTypeMismatch)
+        return add(.Bitcast(operand), target, span)
+    }
+
+    // `numberWords(n)`: the two words that hold a `Number`, as Foundation's
+    // `NumberWords`, and `numberFromWords(words)` the `Number` they hold, for
+    // Foundation to do the arithmetic on. The words must be canonical.
+    function checkNumberWords(borrow mut self, name: String, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 1 {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        if program.numberWords < 0 {
+            report(.UndefinedFunction, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let words = Type.structure(program.numberWords)
+        if name == "numberWords" {
+            let number = coerce(expression(arguments[0], .Some(Type.number())), Type.number(), .ArgumentTypeMismatch)
+            return add(.Bitcast(number), words, span)
+        }
+        let built = coerce(expression(arguments[0], .Some(words)), words, .ArgumentTypeMismatch)
+        return add(.Bitcast(built), Type.number(), span)
+    }
+}

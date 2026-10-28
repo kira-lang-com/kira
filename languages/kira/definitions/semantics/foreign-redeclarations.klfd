@@ -1,0 +1,77 @@
+// Generated C headers may repeat the same pointer typedef. Keep one identity
+// only when both declarations specify the same target and ownership. The
+// structs kept are filed by name and the foreign marks by the span of the
+// type they mark, so each struct reads one bucket of each.
+function coalesceForeignPointers(tree: SyntaxTree) -> SyntaxTree {
+    var marked = emptyNameIndex()
+    for index in 0..tree.foreignTypes.count { marked[spanBucket(tree.foreignTypes[index].name.span)].append(index) }
+    var result = tree
+    result.structs = []
+    result.foreignTypes = []
+    var kept = emptyNameIndex()
+    for declared in tree.structs {
+        let named = nameHash(declared.name.text) % functionBuckets
+        var repeated = false
+        for earlier in kept[named] {
+            if result.structs[earlier].name.text != declared.name.text { continue }
+            let first = pointerDeclarationMark(tree, marked, result.structs[earlier].name)
+            let second = pointerDeclarationMark(tree, marked, declared.name)
+            match first {
+                Some(left) -> {
+                    match second {
+                        Some(right) -> repeated = samePointerMark(left, right)
+                        None -> {}
+                    }
+                }
+                None -> {}
+            }
+        }
+        if repeated { continue }
+        kept[named].append(result.structs.count)
+        result.structs.append(declared)
+        for index in marked[spanBucket(declared.name.span)] {
+            if tree.foreignTypes[index].name.span.same(declared.name.span) { result.foreignTypes.append(tree.foreignTypes[index]) }
+        }
+    }
+    return result
+}
+
+function pointerDeclarationMark(tree: SyntaxTree, marked: [[Int]], name: Identifier) -> Optional<ForeignMark> {
+    for index in marked[spanBucket(name.span)] {
+        let foreign = tree.foreignTypes[index]
+        if foreign.name.span.same(name.span) && tree.foreignMarks[foreign.mark].form == .Pointer {
+            return .Some(tree.foreignMarks[foreign.mark])
+        }
+    }
+    return .None
+}
+
+function samePointerMark(left: ForeignMark, right: ForeignMark) -> Bool {
+    if left.fields.count != right.fields.count { return false }
+    for index in 0..left.fields.count {
+        let first = left.fields[index]
+        let second = right.fields[index]
+        if first.key.text != second.key.text { return false }
+        match first.value {
+            Word(word) -> {
+                match second.value {
+                    Word(other) -> { if word.text != other.text { return false } }
+                    Count -> return false
+                    Named -> return false
+                    Listed -> return false
+                }
+            }
+            Named(reference) -> {
+                match second.value {
+                    Named(other) -> { if reference.instanceName != other.instanceName { return false } }
+                    Word -> return false
+                    Count -> return false
+                    Listed -> return false
+                }
+            }
+            Count -> return false
+            Listed -> return false
+        }
+    }
+    return true
+}

@@ -1,0 +1,86 @@
+// Collector macros. Once every other macro has expanded, each collector runs
+// once over every declaration of the program's own modules, generated ones
+// included. What it produces names declarations from all of the program's
+// files, so it joins the program's module as a file of its own that sees
+// every import those files make, whichever library declares the collector.
+// Its output is not expanded further.
+
+function runCollectors(session: Session, unit: Unit, tree: SyntaxTree) -> Result<SyntaxTree, Failure> {
+    var collected = tree
+    var declarations = ""
+    for declared in tree.proceduralMacros {
+        match declared.kind {
+            MacroCollector -> {
+                if declarations == "" { declarations = collectedDeclarations(session, tree) }
+                let file = try evaluateSourceMacroArguments(session, unit, collected, declared, [declarations], declared.name.span)
+                collected = try parseCollected(session, collected, file, declared)
+            }
+            MacroFunction -> {}
+            MacroDerive -> {}
+            MacroAttribute -> {}
+            MacroWrapper -> {}
+        }
+    }
+    return .Ok(collected)
+}
+
+function parseCollected(session: Session, tree: SyntaxTree, file: Int, declared: ProceduralMacroDeclaration) -> Result<SyntaxTree, Failure> {
+    match programModule(tree) {
+        Some(module) -> {
+            var parsed = try parseFile(tree, fileText(session, file as SourceFile), file, module)
+            parsed.sources[parsed.sources.count - 1].imports = programImports(tree, module)
+            return .Ok(parsed)
+        }
+        None -> return parseGenerated(session, tree, file, declared.name.span)
+    }
+}
+
+// The program's own module: the first one loaded that is not a library.
+function programModule(tree: SyntaxTree) -> Optional<Int> {
+    for index in 0..tree.modules.count {
+        if ownModule(tree, index) { return .Some(index) }
+    }
+    return .None
+}
+
+// Whether a collector reads `module`: a module of the program, or, in a test
+// build of a library, the library itself, which is loaded first. Its cases
+// test what it does not export, so they live in its own `app/`.
+function ownModule(tree: SyntaxTree, module: Int) -> Bool {
+    return !tree.modules[module].library || (tree.testing && module == 0)
+}
+
+// Every import the files of `module` make, each once.
+function programImports(tree: SyntaxTree, module: Int) -> [Import] {
+    var imports: [Import] = []
+    for unit in tree.sources {
+        if unit.module != module { continue }
+        for imported in unit.imports {
+            var seen = false
+            for held in imports { if sameImport(held, imported) { seen = true } }
+            if !seen { imports.append(imported) }
+        }
+    }
+    return imports
+}
+
+function sameImport(left: Import, right: Import) -> Bool {
+    return left.name.text == right.name.text && left.alias.text == right.alias.text
+}
+
+// The `[Declaration]` a collector is handed, written as Kira source that
+// decodes it: each file of the program's own modules in the order it was
+// read, each declaration in the order its file writes it.
+function collectedDeclarations(session: Session, tree: SyntaxTree) -> String {
+    var parts: [String] = []
+    for unit in tree.sources {
+        if !ownModule(tree, unit.module) { continue }
+        var sites: [DeclarationSite] = []
+        for site in tree.declarationSites { if site.span.file == unit.file { sites.append(site) } }
+        if sites.count == 0 { continue }
+        let source = fileText(session, unit.file as SourceFile)
+        for site in sites { parts.append(encodedDeclaration(tree, source, site)) }
+    }
+    let encoded = joinText([encodedItem(decimalText(parts.count)), joinText(parts)])
+    return joinText(["reflectedDeclarations(", escapedSourceString(encoded), ")"])
+}

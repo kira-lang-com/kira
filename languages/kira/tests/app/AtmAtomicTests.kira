@@ -1,0 +1,80 @@
+import Foundation
+import Heap
+
+// The atomic builtins on a heap word: each answers what the word held, the
+// orderings are checked at the call, and pointers move whole.
+
+@Test
+function atmLoadAndStoreRoundTrip() {
+    let cell = Heap.allocateRaw(8, 8)
+    atomicStore<N32>(cell, 41, .Release)
+    expect!(atomicLoad<N32>(cell, .Acquire) == 41)
+    atomicStore<UN8>(cell, 7, .Relaxed)
+    expect!(atomicLoad<UN8>(cell, .SequentiallyConsistent) == 7)
+    Heap.freeRaw(cell)
+}
+
+@Test
+function atmReadModifyWritesAnswerTheValueBefore() {
+    let cell = Heap.allocateRaw(8, 8)
+    atomicStore<N32>(cell, 10, .Relaxed)
+    expect!(atomicAdd<N32>(cell, 5, .Relaxed) == 10)
+    expect!(atomicSubtract<N32>(cell, 3, .AcquireRelease) == 15)
+    expect!(atomicExchange<N32>(cell, 6, .SequentiallyConsistent) == 12)
+    expect!(atomicAnd<N32>(cell, 3, .Relaxed) == 6)
+    expect!(atomicOr<N32>(cell, 8, .Relaxed) == 2)
+    expect!(atomicXor<N32>(cell, 1, .Relaxed) == 10)
+    expect!(atomicLoad<N32>(cell, .Relaxed) == 11)
+    Heap.freeRaw(cell)
+}
+
+@Test
+function atmMaxAndMinCompareAsTheTypeIsSigned() {
+    let cell = Heap.allocateRaw(8, 8)
+    atomicStore<N32>(cell, -4, .Relaxed)
+    expect!(atomicMax<N32>(cell, 2, .Relaxed) == -4)
+    expect!(atomicLoad<N32>(cell, .Relaxed) == 2)
+    expect!(atomicMin<N32>(cell, -9, .Relaxed) == 2)
+    expect!(atomicLoad<N32>(cell, .Relaxed) == -9)
+    atomicStore<UN32>(cell, 5, .Relaxed)
+    expect!(atomicMax<UN32>(cell, 4000000000, .Relaxed) == 5)
+    expect!(atomicLoad<UN32>(cell, .Relaxed) == 4000000000)
+    Heap.freeRaw(cell)
+}
+
+@Test
+function atmCompareExchangeExchangesOnlyTheExpected() {
+    let cell = Heap.allocateRaw(8, 8)
+    atomicStore<N32>(cell, 1, .Relaxed)
+    expect!(atomicCompareExchange<N32>(cell, 2, 9, .AcquireRelease, .Acquire) == 1)
+    expect!(atomicLoad<N32>(cell, .Relaxed) == 1)
+    expect!(atomicCompareExchange<N32>(cell, 1, 9, .SequentiallyConsistent, .Relaxed) == 1)
+    expect!(atomicLoad<N32>(cell, .Relaxed) == 9)
+    var swapped = false
+    while !swapped {
+        swapped = atomicCompareExchangeWeak<N32>(cell, 9, 3, .Release, .Relaxed)
+    }
+    expect!(atomicLoad<N32>(cell, .Relaxed) == 3)
+    expect!(!atomicCompareExchangeWeak<N32>(cell, 9, 4, .Release, .Relaxed))
+    Heap.freeRaw(cell)
+}
+
+@Test
+function atmPointersMoveWhole() {
+    let cell = Heap.allocateRaw(8, 8)
+    let first = Heap.allocateRaw(8, 8)
+    let second = Heap.allocateRaw(8, 8)
+    atomicStore<RawPtr>(cell, first, .Release)
+    expect!(
+        Heap.pointerAddress(
+            atomicExchange<RawPtr>(cell, second, .AcquireRelease)
+        ) == Heap.pointerAddress(first)
+    )
+    let seen = atomicCompareExchange<RawPtr>(cell, second, first, .AcquireRelease, .Acquire)
+    expect!(Heap.pointerAddress(seen) == Heap.pointerAddress(second))
+    expect!(Heap.pointerAddress(atomicLoad<RawPtr>(cell, .Acquire)) == Heap.pointerAddress(first))
+    atomicFence(.SequentiallyConsistent)
+    Heap.freeRaw(second)
+    Heap.freeRaw(first)
+    Heap.freeRaw(cell)
+}

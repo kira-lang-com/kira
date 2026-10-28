@@ -1,0 +1,43 @@
+import Foundation
+
+// The file operations as this tool uses them. Every caller reports the path it
+// was working on rather than why the platform refused it, so a failure goes no
+// further than whether it happened.
+
+public function succeeded(result: Result<Void, FileFailure>) -> Bool {
+    match result {
+        Ok -> return true
+        Error(failure) -> return false
+    }
+}
+
+// The names in `path`, or none when it cannot be listed.
+public function entriesOf(path: borrow String) -> [String] {
+    match listDirectory(path) {
+        Ok(listing) -> return listing.entries
+        Error(failure) -> return []
+    }
+}
+
+// The text in `path`, or nothing when it cannot be read.
+public function textOf(path: borrow String) -> String? {
+    match readFile(path) {
+        Ok(contents) -> return .Some(contents.text)
+        Error(failure) -> return .None
+    }
+}
+
+public function sizeOf(path: borrow String) -> Number {
+    match fileSize(path) {
+        Ok(size) -> return size
+        Error(failure) -> return 0
+    }
+}
+
+// `count` bytes of `path` from `offset`, or none when they cannot be read.
+public function bytesOf(path: borrow String, offset: Number, count: Number) -> [UN8] {
+    match readFileRange(path, offset, count) {
+        Ok(bytes) -> return bytes
+        Error(failure) -> return []
+    }
+}

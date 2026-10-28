@@ -1,0 +1,49 @@
+import Foundation
+import Heap
+
+// `@ThreadLocal let`: each thread reads and changes a copy of its own, made
+// on the thread's first read.
+
+class TlsCounter {
+    var count: Number = 0
+}
+
+@ThreadLocal
+let tlsCounter = TlsCounter()
+
+@ThreadLocal
+var tlsTotal: Number = 40
+
+@Test
+function threadLocalLetGivesEachThreadItsOwnCopy() {
+    tlsCounter.count += 5
+    let cell = Heap.allocateRaw(8, 8)
+    atomicStore<N32>(cell, 0, .Relaxed)
+    var worker = spawnThread(
+        { in
+            tlsCounter.count += 1
+            atomicStore<N32>(cell, N32(tlsCounter.count), .Release)
+        }
+    )
+    worker.join()
+    expect!(Number(atomicLoad<N32>(cell, .Acquire)) == 1)
+    expect!(tlsCounter.count == 5)
+    Heap.freeRaw(cell)
+}
+
+@Test
+function threadLocalVarStartsFromItsInitializer() {
+    tlsTotal += 2
+    let cell = Heap.allocateRaw(8, 8)
+    atomicStore<N32>(cell, 0, .Relaxed)
+    var worker = spawnThread(
+        { in
+            tlsTotal += 1
+            atomicStore<N32>(cell, N32(tlsTotal), .Release)
+        }
+    )
+    worker.join()
+    expect!(Number(atomicLoad<N32>(cell, .Acquire)) == 41)
+    expect!(tlsTotal == 42)
+    Heap.freeRaw(cell)
+}

@@ -1,0 +1,120 @@
+import Foundation
+
+// Byte conversions: `String.utf8()` and the scalar serializers in
+// `Foundation/app/encoding/Bytes.kira`. The round trips exercise both
+// directions; the raw-byte reads pin the byte order.
+
+// A writer's bytes read back in the same order.
+function readerOf(writer: borrow ByteWriter) -> ByteReader {
+    return ByteReader { bytes = copy writer.bytes, order = writer.order }
+}
+
+@Test
+function stringUtf8IsItsBytesInOrder() {
+    let b = "Kira 1.9".utf8()
+    expect!((b.count) == (8))
+    expect!((Number(b[0])) == (75))
+    expect!((Number(b[4])) == (32))
+    expect!((Number(b[7])) == (57))
+}
+
+@Test
+function littleEndianU32IsWrittenLowByteFirst() {
+    var little = ByteWriter { order = .Little }
+    little.writeU32(U32(0x01020304))
+    expect!((Number(little.bytes[0])) == (4))
+    expect!((Number(little.bytes[3])) == (1))
+    var fromLittle = readerOf(little)
+    match fromLittle.readU32() {
+        Ok(value) -> expect!((Number(value)) == (16909060))
+        Error(failure) -> expect!(false)
+    }
+}
+
+@Test
+function bigEndianU32IsWrittenHighByteFirst() {
+    var big = ByteWriter { order = .Big }
+    big.writeU32(U32(0x01020304))
+    expect!((Number(big.bytes[0])) == (1))
+    expect!((Number(big.bytes[3])) == (4))
+    var fromBig = readerOf(big)
+    match fromBig.readU32() {
+        Ok(value) -> expect!((Number(value)) == (16909060))
+        Error(failure) -> expect!(false)
+    }
+}
+
+@Test
+function u16AndU64RoundTripAcrossOrders() {
+    var little = ByteWriter { order = .Little }
+    little.writeU16(U16(0x0a0b))
+    expect!((Number(little.bytes[0])) == (11))
+    var fromLittle = readerOf(little)
+    match fromLittle.readU16() {
+        Ok(value) -> expect!((Number(value)) == (2571))
+        Error(failure) -> expect!(false)
+    }
+
+    var big = ByteWriter { order = .Big }
+    big.writeU64(U64(0x1122334455))
+    expect!((Number(big.bytes[7])) == (85))
+    var fromBig = readerOf(big)
+    match fromBig.readU64() {
+        Ok(value) -> expect!((Number(value)) == (73588229205))
+        Error(failure) -> expect!(false)
+    }
+}
+
+@Test
+function signedAndIntRoundTripIncludingNegatives() {
+    for order in [ByteOrder.Little, ByteOrder.Big] {
+        var writer = ByteWriter { order = order }
+        writer.writeI32(I32(-2))
+        writer.writeInt(-100000)
+        var reader = readerOf(writer)
+        match reader.readI32() {
+            Ok(value) -> expect!((Number(value)) == (-2))
+            Error(failure) -> expect!(false)
+        }
+        match reader.readInt() {
+            Ok(value) -> expect!((value) == (-100000))
+            Error(failure) -> expect!(false)
+        }
+    }
+}
+
+@Test
+function floatsAreTheirExactIeeeBits() {
+    var little = ByteWriter { order = .Little }
+    little.writeF32(F32(2.5))
+    expect!((Number(little.bytes[3])) == (64))
+    var fromLittle = readerOf(little)
+    match fromLittle.readF32() {
+        Ok(value) -> expect!(value == F32(2.5))
+        Error(failure) -> expect!(false)
+    }
+
+    var big = ByteWriter { order = .Big }
+    big.writeF64(3.25)
+    var fromBig = readerOf(big)
+    match fromBig.readF64() {
+        Ok(value) -> expect!(value == 3.25)
+        Error(failure) -> expect!(false)
+    }
+}
+
+@Test
+function boolsReadBackInTheOrderWritten() {
+    var writer = ByteWriter { order = .Little }
+    writer.writeBool(true)
+    writer.writeBool(false)
+    var reader = readerOf(writer)
+    match reader.readBool() {
+        Ok(value) -> expect!(value)
+        Error(failure) -> expect!(false)
+    }
+    match reader.readBool() {
+        Ok(value) -> expect!(!value)
+        Error(failure) -> expect!(false)
+    }
+}

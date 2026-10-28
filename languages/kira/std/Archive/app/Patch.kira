@@ -1,0 +1,408 @@
+import Foundation
+
+// Unified diffs, as `diff -u` and `git diff` write them, applied to a
+// directory as `patch -p<strip>` applies them without fuzz: each hunk's
+// context and removed lines must be found whole, where the hunk says or the
+// nearest place after the hunk before it. A line is its bytes with its
+// newline, so a file of any encoding, and one ending without a newline,
+// patches exactly.
+
+/// One file's part of a patch.
+public struct PatchFile {
+    /// The path the patch reads, stripped and relative to the directory. Empty for `/dev/null`, which is how a patch makes a file.
+    let from: String
+    /// The path the patch writes, stripped and relative to the directory. Empty for `/dev/null`, which is how a patch removes a file.
+    let to: String
+    /// The permission bits a git patch gives the file it writes.
+    let mode: UNumber? = .None
+    /// The hunks of the file, in the order the patch gives them.
+    let hunks: [PatchHunk] = []
+}
+
+/// One hunk of a file's patch: a run of context, removed and added lines.
+public struct PatchHunk {
+    /// The line, counting from 1, the hunk starts at in the old file.
+    let start: Number
+    /// The start of the hunk in the new file, as the hunk writes it: 0 when the hunk empties the file.
+    let newStart: Number
+    /// The lines the hunk expects in the old file, context and removed lines, each with its newline.
+    let old: [[UN8]]
+    /// The lines the hunk writes in the new file, context and added lines, each with its newline.
+    let new: [[UN8]]
+}
+
+/// The files of the patch `bytes`, their paths stripped of `strip` leading parts.
+public function readPatch(
+    bytes: borrow [UN8],
+    strip: Number
+) -> Result<[PatchFile], ArchiveFailure> {
+    let lines = patchLines(bytes)
+    var files: [PatchFile] = []
+    var mode: UNumber? = .None
+    var at: Number = 0
+    while at < lines.count {
+        let line = lines[at]
+        if startsWithText(line, "diff --git ") {
+            mode = .None
+        } else if startsWithText(line, "new file mode ") || startsWithText(line, "new mode ") {
+            let digits = lineText(line).trim().split(" ")
+            mode = .Some(octalText(digits[digits.count - 1]) & 4095)
+        } else if startsWithText(line, "GIT binary patch") || startsWithText(
+            line,
+            "Binary files "
+        ) {
+            return .Error(.Unsupported("a binary patch"))
+        } else if startsWithText(line, "--- ") && at + 1 < lines.count
+            && startsWithText(lines[at + 1], "+++ ") {
+            let from = match patchPath(line, strip) {
+                Ok(path) -> path
+                Error(failure) -> return .Error(failure)
+            }
+            let to = match patchPath(lines[at + 1], strip) {
+                Ok(path) -> path
+                Error(failure) -> return .Error(failure)
+            }
+            at += 2
+            var hunks: [PatchHunk] = []
+            while at < lines.count && startsWithText(lines[at], "@@ ") {
+                let hunk = match readHunk(lines, at) {
+                    Ok(read) -> read
+                    Error(failure) -> return .Error(failure)
+                }
+                hunks.append(hunk.0)
+                at = hunk.1
+            }
+            if hunks.count == 0 { return .Error(.Malformed("the patch of \(to) has no hunks")) }
+            files.append(PatchFile { from: from, to: to, mode: mode, hunks: hunks })
+            mode = .None
+            continue
+        }
+        at += 1
+    }
+    return .Ok(files)
+}
+
+// The hunk whose `@@` line is at `at`, and where the lines after it start.
+function readHunk(lines: borrow [[UN8]], at: Number) -> Result<(
+    PatchHunk, Number
+), ArchiveFailure> {
+    let header = lineText(lines[at]).trim()
+    let parts = header.split(" ")
+    if parts.count < 4 || !parts[1].startsWith("-") || !parts[2].startsWith("+") {
+        return .Error(.Malformed("the hunk header \(header) does not read"))
+    }
+    let old = rangeOf(parts[1].substring(1, parts[1].count))
+    let new = rangeOf(parts[2].substring(1, parts[2].count))
+    if old.0 < 0 || new.0 < 0 {
+        return .Error(.Malformed("the hunk header \(header) does not read"))
+    }
+    var oldLines: [[UN8]] = []
+    var newLines: [[UN8]] = []
+    // Which side the last line went to, for a `\ No newline` after it.
+    var lastOld = false
+    var lastNew = false
+    var next = at + 1
+    while next < lines.count {
+        let line = lines[next]
+        let full = oldLines.count >= old.1 && newLines.count >= new.1
+        if line.count > 0 && line[0] == 92 {
+            if lastOld {
+                oldLines[oldLines.count - 1] = withoutNewline(oldLines[oldLines.count - 1])
+            }
+            if lastNew {
+                newLines[newLines.count - 1] = withoutNewline(newLines[newLines.count - 1])
+            }
+            next += 1
+            continue
+        }
+        if full { break }
+        // An empty line is context whose space an editor dropped.
+        let kind = line.count == 0 || line[0] == 10 ? 32 : Number(line[0])
+        var body: [UN8] = []
+        for index in min(1, line.count)..line.count { body.append(line[index]) }
+        if line.count == 0 || line[0] == 10 { body = [10] }
+        match kind {
+            32 -> {
+                oldLines.append(copy body)
+                newLines.append(body)
+                lastOld = true
+                lastNew = true
+            }
+            45 -> {
+                oldLines.append(body)
+                lastOld = true
+                lastNew = false
+            }
+            43 -> {
+                newLines.append(body)
+                lastOld = false
+                lastNew = true
+            }
+            else -> return .Error(.Malformed("the hunk \(header) ends early"))
+        }
+        next += 1
+    }
+    if oldLines.count != old.1 || newLines.count != new.1 {
+        return .Error(.Malformed("the hunk \(header) is cut off"))
+    }
+    // A hunk adding to an empty file says it starts at line 0.
+    let start = old.1 == 0 ? old.0 + 1 : old.0
+    return .Ok((PatchHunk { start: start, newStart: new.0, old: oldLines, new: newLines }, next))
+}
+
+// `<start>,<count>` or `<start>`, which counts one; a start of -1 when it
+// does not read.
+function rangeOf(text: borrow String) -> (Number, Number) {
+    let parts = text.split(",")
+    let start = tarDecimal(parts[0]).or(-1)
+    if parts.count == 1 { return (start, 1) }
+    return (start, tarDecimal(parts[1]).or(-1))
+}
+
+/// Applies the patch `file` in the directory `root`.
+public function applyPatchFile(
+    root: borrow String,
+    file: borrow PatchFile
+) -> Result<Void, ArchiveFailure> {
+    let target = file.to.count > 0 ? file.to : file.from
+    for path in [file.from, file.to] {
+        if path.count == 0 { continue }
+        match patchable(root, path) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+    }
+    // `diff -N` writes a missing file as an empty one, so a single hunk from
+    // nothing makes a file and one to nothing removes it, as `/dev/null`
+    // does.
+    let single = file.hunks.count == 1
+    let from = file.from.count > 0 && !(
+        single && file.hunks[0].old.count == 0 && !pathExists(underRoot(root, file.from))
+    ) ? copy file.from : ""
+    let removing = file.to.count == 0 || (
+        single && file.hunks[0].newStart == 0 && file.hunks[0].new.count == 0
+    )
+    var lines: [[UN8]] = []
+    var mode: UNumber = 420
+    if from.count > 0 {
+        let full = underRoot(root, from)
+        let bytes = match readArchiveFile(full) {
+            Ok(read) -> read
+            Error(failure) -> return .Error(
+                .Conflict("the patch of \(target) finds no file \(from)")
+            )
+        }
+        lines = patchLines(bytes)
+        mode = match fileStatus(full) {
+            Ok(status) -> status.mode
+            Error(failure) -> return .Error(.Files("cannot read \(full): \(traceText(failure))"))
+        }
+    } else if pathExists(underRoot(root, file.to)) {
+        return .Error(.Conflict("the patch makes \(file.to), which is there already"))
+    }
+    var result: [[UN8]] = []
+    var at: Number = 0
+    var shift: Number = 0
+    for (index, hunk) in file.hunks.enumerated() {
+        let wanted = max(hunk.start - 1 + shift, at)
+        let found = match hunkPlace(lines, hunk.old, wanted, at) {
+            Some(place) -> place
+            None -> return .Error(
+                .Conflict("hunk \(index + 1) of the patch of \(target) does not apply")
+            )
+        }
+        for line in at..found { result.append(lines[line]) }
+        for line in hunk.new { result.append(line) }
+        at = found + hunk.old.count
+        // Later hunks drift as this one did.
+        shift = found - (hunk.start - 1)
+    }
+    for line in at..lines.count { result.append(lines[line]) }
+    if from.count > 0 {
+        match removePath(underRoot(root, from)) {
+            Ok -> {}
+            Error(failure) -> return .Error(.Files("cannot replace \(from): \(traceText(failure))"))
+        }
+    }
+    if removing {
+        if result.count > 0 {
+            return .Error(.Conflict("the patch removes \(from), which holds more than it says"))
+        }
+        return removeEmptyAbove(root, from)
+    }
+    var bytes: [UN8] = []
+    for line in result { bytes.appendAll(line) }
+    let full = underRoot(root, file.to)
+    match writeFileBytes(full, bytes) {
+        Ok -> {}
+        Error(failure) -> return .Error(.Files("cannot write \(full): \(traceText(failure))"))
+    }
+    return match setFileMode(full, file.mode.or(mode) & 4095) {
+        Ok -> .Ok
+        Error(failure) -> .Error(.Files("cannot set the mode of \(full): \(traceText(failure))"))
+    }
+}
+
+// Whether `path` is one a patch may touch: no part of it above the file a
+// symbolic link, so the patch stays inside the directory, and the
+// directories above it there.
+function patchable(root: borrow String, path: borrow String) -> Result<Void, ArchiveFailure> {
+    let parts = path.split("/")
+    var above = copy root
+    for index in 0..(parts.count - 1) {
+        above = above + "/" + parts[index]
+        match linkStatus(above) {
+            Ok(status) -> match status.kind {
+                Directory -> {}
+                else -> return .Error(
+                    .Conflict("the patch of \(path) passes \(above), no directory")
+                )
+            }
+            Error(failure) -> {
+                absorb failure
+                match makeDirectory(above) {
+                    Ok -> {}
+                    Error(made) -> return .Error(.Files("cannot make \(above): \(traceText(made))"))
+                }
+            }
+        }
+    }
+    let full = underRoot(root, path)
+    match linkStatus(full) {
+        Ok(status) -> match status.kind {
+            File -> {}
+            else -> return .Error(.Conflict("the patch of \(path) finds no plain file there"))
+        }
+        Error(failure) -> absorb failure
+    }
+    return .Ok
+}
+
+// Where `old` lies in `lines`: at `wanted`, or the nearest place to it at
+// or after `floor`.
+function hunkPlace(
+    lines: borrow [[UN8]],
+    old: borrow [[UN8]],
+    wanted: Number,
+    floor: Number
+) -> Number? {
+    var distance: Number = 0
+    let last = lines.count - old.count
+    while wanted - distance >= floor || wanted + distance <= last {
+        if wanted + distance <= last && linesAt(lines, old, wanted + distance) {
+            return .Some(wanted + distance)
+        }
+        let below = wanted - distance
+        if distance > 0 && below >= floor && below <= last && linesAt(lines, old, below) {
+            return .Some(below)
+        }
+        distance += 1
+    }
+    return .None
+}
+
+function linesAt(lines: borrow [[UN8]], old: borrow [[UN8]], at: Number) -> Bool {
+    for index in 0..old.count {
+        if lines[at + index] != old[index] { return false }
+    }
+    return true
+}
+
+// The lines of `bytes`, each with its newline; the last without one when
+// the bytes end without one.
+function patchLines(bytes: borrow [UN8]) -> [[UN8]] {
+    var lines: [[UN8]] = []
+    var line: [UN8] = []
+    for byte in bytes {
+        line.append(byte)
+        if byte == 10 {
+            lines.append(move line)
+            line = []
+        }
+    }
+    if line.count > 0 { lines.append(line) }
+    return lines
+}
+
+function withoutNewline(line: borrow [UN8]) -> [UN8] {
+    if line.count == 0 || line[line.count - 1] != 10 { return copy line }
+    var kept: [UN8] = []
+    for index in 0..(line.count - 1) { kept.append(line[index]) }
+    return kept
+}
+
+function startsWithText(line: borrow [UN8], text: borrow String) -> Bool {
+    let wanted = text.utf8()
+    if line.count < wanted.count { return false }
+    for index in 0..wanted.count {
+        if line[index] != wanted[index] { return false }
+    }
+    return true
+}
+
+function lineText(line: borrow [UN8]) -> String {
+    return textFromBytes(line).or("")
+}
+
+// The path a `---` or `+++` line names, without its timestamp, quotes and
+// first `strip` parts; empty for `/dev/null`.
+function patchPath(line: borrow [UN8], strip: Number) -> Result<String, ArchiveFailure> {
+    var text = lineText(line)
+    text = text.substring(4, text.count)
+    match text.indexOf("\t") {
+        Some(tab) -> text = text.substring(0, tab)
+        None -> {}
+    }
+    text = text.trim()
+    if text.startsWith("\"") && text.endsWith("\"") && text.count >= 2 {
+        text = text.substring(1, text.count - 1)
+    }
+    if text == "/dev/null" { return .Ok("") }
+    var parts: [String] = []
+    for part in text.split("/") {
+        if part.count > 0 { parts.append(part) }
+    }
+    if parts.count <= strip {
+        return .Error(.Malformed("the patch path \(text) has no \(strip) parts to strip"))
+    }
+    var kept: [String] = []
+    for index in strip..parts.count {
+        if parts[index] == ".." {
+            return .Error(.Malformed("the patch path \(text) climbs out with .."))
+        }
+        if parts[index] != "." { kept.append(parts[index]) }
+    }
+    return .Ok(joined(kept, "/"))
+}
+
+function octalText(text: borrow String) -> UNumber {
+    var value: Number = 0
+    for byte in text.utf8() {
+        if byte < 48 || byte > 55 { return 420 }
+        value = value * 8 + Number(byte) - 48
+    }
+    return value
+}
+
+// The directories above `path` that its removal left empty, removed as
+// `patch` removes them.
+function removeEmptyAbove(
+    root: borrow String,
+    path: borrow String
+) -> Result<Void, ArchiveFailure> {
+    var parts = path.split("/")
+    while parts.count > 1 {
+        parts = parts.prefix(parts.count - 1)
+        let full = underRoot(root, joined(parts, "/"))
+        let empty = match listDirectory(full) {
+            Ok(listing) -> listing.entries.count == 0
+            Error(failure) -> return .Error(.Files("cannot list \(full): \(traceText(failure))"))
+        }
+        if !empty { return .Ok }
+        match removePath(full) {
+            Ok -> {}
+            Error(failure) -> return .Error(.Files("cannot remove \(full): \(traceText(failure))"))
+        }
+    }
+    return .Ok
+}

@@ -1,0 +1,96 @@
+// The defaults a framework exports for a family its contract declares
+// (`@Ridl` members, KLF-RIDL section 27.7) on a declaration's own value.
+//
+// The default is the framework's and takes the family's trait object, so a
+// declaration answers it through a method that boxes its value, runs the
+// default through the witness table, and, for a member that changes its
+// receiver, takes the value back out of the box:
+//
+//     function deliver(borrow mut self, arrived: borrow Message) {
+//         var __object: Any Platform = copy self
+//         let __result = __object.deliver(arrived)
+//         self = Mobile.__witness_unbox_Platform(move __object)
+//         return __result
+//     }
+//
+// `value.member(...)` then reads on the declaration as it does on `Any
+// Family`, and the members the default calls change the value in place.
+
+let witnessUnbox = "unbox"
+
+function witnessUnboxName(family: String) -> String {
+    return joinText(["__witness_unbox_", family])
+}
+
+// Whether a witness role is the function taking a value back out of a
+// trait object the declaration boxed.
+function unboxesWitness(role: String) -> Bool {
+    return role == witnessUnbox
+}
+
+// The crossing family `declared` is backed by, which its framework
+// defaults belong to.
+function backingWitness(declared: ConstructDeclaration, conforms: [Witnessing]) -> Optional<Witnessing> {
+    if declared.parents.count == 0 { return .None }
+    for witnessing in conforms {
+        if witnessing.family.text == declared.parents[0].name.text { return .Some(witnessing) }
+    }
+    return .None
+}
+
+// `__witness_unbox_Family(object) -> Declaration`, whose body lowering
+// writes (`lowerWitnessUnbox`).
+function witnessUnboxMethod(tree: borrow mut SyntaxTree, declared: ConstructDeclaration, family: Identifier) -> FunctionDeclaration {
+    let span = declared.name.span
+    let object = Parameter {
+        name = Identifier { text = "object", span = span }, mode = .Owned,
+        annotation = namedReference(Identifier { text = familyTypeName(family.text), span = family.span }), copies = false, initial = .None
+    }
+    return FunctionDeclaration {
+        name = Identifier { text = witnessUnboxName(family.text), span = span },
+        annotations = [implicitTextAnnotation(tree, .Witness, witnessUnbox, span)], receiver = .Static, parameters = [object],
+        result = .Some(selfReference(declared)), body = [], span = span, typeParameters = [], scope = GenericScope.none()
+    }
+}
+
+// The declaration's method answering the framework default `member` of
+// `family` through its trait object.
+function forwardedDefault(tree: borrow mut SyntaxTree, declared: ConstructDeclaration, family: Identifier, member: FunctionDeclaration) -> FunctionDeclaration {
+    // The body is the declaration's, and reads its names where it is.
+    let span = declared.name.span
+    let object = Identifier { text = "__object", span = span }
+    let changes = member.receiver == .MutablyBorrowed
+    var receiver: Receiver = .Borrowed
+    if changes { receiver = .MutablyBorrowed }
+    var body: [Int] = []
+    let boxed = tree.addExpression(.Transfer(.Copy, tree.addExpression(.Name(Identifier { text = "self", span = span }), span)), span)
+    let annotation = tree.addTypeReference(namedReference(Identifier { text = familyTypeName(family.text), span = family.span }))
+    body.append(tree.addStatement(.Binding(BindingStatement {
+        mutable = changes, name = object, annotation = .Some(annotation), prefix = .None, value = boxed
+    }), span))
+    var arguments: [Int] = []
+    for parameter in member.parameters { arguments.append(tree.addExpression(.Name(Identifier { text = parameter.name.text, span = span }), span)) }
+    let result = tree.addExpression(.MethodCall(tree.addExpression(.Name(object), span), Identifier { text = member.name.text, span = span }, arguments), span)
+    let kept = Identifier { text = "__result", span = span }
+    if member.result.isSome() {
+        body.append(tree.addStatement(.Binding(BindingStatement {
+            mutable = false, name = kept, annotation = .None, prefix = .None, value = result
+        }), span))
+    } else {
+        body.append(tree.addStatement(.Evaluation(result), span))
+    }
+    if changes {
+        let owner = tree.addExpression(.Name(declared.name), span)
+        let taken = tree.addExpression(.Transfer(.Move, tree.addExpression(.Name(object), span)), span)
+        let unboxed = tree.addExpression(.MethodCall(owner, Identifier { text = witnessUnboxName(family.text), span = span }, [taken]), span)
+        body.append(tree.addStatement(.Assignment(tree.addExpression(.Name(Identifier { text = "self", span = span }), span), unboxed), span))
+    }
+    if member.result.isSome() {
+        body.append(tree.addStatement(.Return(.Some(tree.addExpression(.Name(kept), span))), span))
+    }
+    return FunctionDeclaration {
+        name = Identifier { text = member.name.text, span = span }, annotations = [], receiver = receiver, parameters = member.parameters,
+        result = member.result,
+        body = body, span = span, typeParameters = [], scope = GenericScope.none()
+    }
+}

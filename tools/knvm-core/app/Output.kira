@@ -1,0 +1,91 @@
+import Foundation
+import Heap
+
+// What knvm says, and how it says it.
+//
+// Lines go out through the platform's own write services rather than through a
+// rendering of their contents: `print` renders a value and adds its newline,
+// which is right for a number and wrong for text the tool has already composed.
+
+// Every line this tool writes begins with its name, the way `kira:` and `cargo:`
+// do. Diagnostics go to standard error, so a script can take the output of a
+// verb apart without filtering its warnings out.
+public let toolName: String = "knvm"
+
+public struct Output {
+    // Whether to wrap names in ANSI attributes. Set once, from the host.
+    var color: Bool = false
+
+    // One line on standard output: what a verb did.
+    function report(borrow self, text: borrow String) {
+        print(text)
+    }
+
+    // One line on standard error: what went wrong, named the way every other
+    // tool names itself.
+    function fail(borrow self, text: borrow String) {
+        errorLine(toolName + ": " + text)
+    }
+
+    // One line on standard error that is advice rather than a failure.
+    function warn(borrow self, text: borrow String) {
+        errorLine(toolName + ": warning: " + text)
+    }
+
+    // `text` on standard error with its newline, byte for byte.
+    function errorLine(borrow self, text: borrow String) {
+        printError(text)
+    }
+
+    // `text` on standard error, byte for byte: a usage block that already
+    // carries its own newlines, which must not gain another.
+    function writeErrorText(borrow self, text: borrow String) {
+        printError(text.endsWith("\n") ? text.substring(0, text.count - 1) : text)
+    }
+
+    function paint(borrow self, text: borrow String, attribute: borrow String) -> String {
+        if !color { return text }
+        return attribute + text + "\e[0m"
+    }
+
+    function bold(borrow self, text: borrow String) -> String {
+        return paint(text, "\e[1m")
+    }
+
+    function cyan(borrow self, text: borrow String) -> String {
+        return paint(text, "\e[36m")
+    }
+
+    function dim(borrow self, text: borrow String) -> String {
+        return paint(text, "\e[2m")
+    }
+
+    function green(borrow self, text: borrow String) -> String {
+        return paint(text, "\e[32m")
+    }
+
+    function yellow(borrow self, text: borrow String) -> String {
+        return paint(text, "\e[33m")
+    }
+}
+
+// One line on standard error with its newline. For a program that has no
+// `Output` of its own — the launcher, which speaks for `kira` and carries no
+// verb machinery.
+public function errorLine(text: borrow String) {
+    printError(text)
+}
+
+// Whether to write color, decided from the environment rather than from what
+// standard output happens to be attached to.
+//
+// `NO_COLOR` wins outright, as it is meant to: a user who sets it wants plain
+// text from every tool. Beyond that, `TERM` unset means there is no terminal to
+// interpret the attributes, and `TERM=dumb` means the one there will not. That
+// leaves a shell whose own descriptor is redirected still getting color, which
+// is why `TERM=dumb` is honoured rather than left as the only signal.
+public function colorIsWanted() -> Bool {
+    if environmentIsSet("NO_COLOR") { return false }
+    if !environmentIsSet("TERM") { return false }
+    return environmentValue("TERM") != "dumb"
+}

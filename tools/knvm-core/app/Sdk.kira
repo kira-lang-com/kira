@@ -1,0 +1,522 @@
+import Foundation
+
+// Per-target package sources: which SDK a package builds against, and where
+// each dependency comes from on a target that has no such SDK.
+//
+// An SDK is a directory `<root>/<Name>/<version>/` holding `SDKSettings.json`
+// and `System/Library/Frameworks/` (KLF-RIDL 27.7, roadmap/18-components.md).
+// The roots are `KIRA_SDK_PATH` (a list separated by `:`, as `PATH` is, which
+// replaces the default when set), else `<klfd home>/sdks`, which is
+// `~/.klf/sdks`.
+//
+// A package names its SDK in its `package.kira` as `let sdk: String = "Tessera"`,
+// or else the nearest `kira-sdk.toml` above it names one (`name`, and an
+// optional `version`). A dependency declares the SDK case and the other case:
+//
+//     Dependency { name: "Ember", sdk: "Tessera", path: "../ember" }
+//     Dependency { name: "Ember", sdk: "Tessera", url: "git@github.com:kira-lang-com/ember.git", rev: "<commit>" }
+//
+// Selection is by what the SDK provides, deterministically: when the SDK is
+// resolved and holds `<Name>.framework`, the framework is the dependency. Else
+// the dependency is its `path`, or its `url` at `rev`, which the launcher
+// fetches into `<klfd home>/git/<Name>/<rev>`. A dependency with an `sdk` but
+// no other case fails with SDK0004. Without an `sdk` a dependency is as it
+// always was. Only compile verbs take these: the launcher passes `--sdk` and
+// `--dependency Name=<directory>;...`, and the compiler reads them.
+//
+// Diagnostics use the launcher's `SDK` codes:
+//   SDK0001 note   the named SDK is not installed; the other cases are used
+//   SDK0002 error  the name matches more than one installed SDK
+//   SDK0003 error  a `kira-sdk.toml` names no SDK
+//   SDK0004 error  a dependency has an `sdk` and no other case
+//   SDK0005 error  a git dependency could not be fetched
+//   SDK0006 note   a dependency is not in the SDK; its other case is used
+//   SDK0007 error  a git dependency names no `rev`
+
+// The variable listing the SDK roots, separated by `:`.
+public let sdkPathVariable: String = "KIRA_SDK_PATH"
+// The file a directory uses to name its default SDK.
+public let sdkPinFileName: String = "kira-sdk.toml"
+// The file an SDK directory holds to be recognised as one.
+public let sdkMarkerFileName: String = "SDKSettings.json"
+// The compile flag the launcher gives the compiler for fetched dependencies.
+public let dependencyFlag: String = "--dependency"
+
+// An SDK found on disk.
+public struct SdkCandidate {
+    let name: String
+    let version: String
+    let path: String
+}
+
+// A request for an SDK: the name, the version (empty for any), and the file
+// that named it, which the diagnostics point at.
+public struct SdkName {
+    let name: String
+    let version: String
+    let source: String
+}
+
+// What the package directory asks for.
+public enum SdkRequest {
+    NoSdk
+    Named(SdkName)
+    Unusable(String)
+}
+
+// What resolving a name produced.
+public enum SdkResolution {
+    Resolved(SdkCandidate)
+    Missing(String)
+    Ambiguous(String)
+}
+
+// A `Dependency { ... }` literal of a `package.kira`, as far as the launcher
+// reads it. A field the literal does not give is empty.
+public struct DependencySpec {
+    var name: String = ""
+    var sdk: String = ""
+    var path: String = ""
+    var url: String = ""
+    var rev: String = ""
+}
+
+// The roots an SDK is searched for in, in order.
+public function sdkSearchRoots() -> [String] {
+    let given = environmentValue(sdkPathVariable)
+    var roots: [String] = []
+    if !given.isEmpty() {
+        let parts = given.split(":")
+        for index in 0..parts.count {
+            if !parts[index].isEmpty() { roots.append(parts[index]) }
+        }
+        return roots
+    }
+    let home = klfHome()
+    if home.isEmpty() { return roots }
+    roots.append(joinPath(home, "sdks"))
+    return roots
+}
+
+// Every SDK named `name` under `roots`, in search order, that a version
+// directory holding the marker file makes one of.
+public function discoverSdks(name: borrow String, roots: borrow [String]) -> [SdkCandidate] {
+    var found: [SdkCandidate] = []
+    for root in roots {
+        let named = joinPath(root, name)
+        let versions = entriesOf(named)
+        for index in 0..versions.count {
+            let path = joinPath(named, versions[index])
+            if pathExists(joinPath(path, sdkMarkerFileName)) {
+                found.append(SdkCandidate { name: name, version: versions[index], path: path })
+            }
+        }
+    }
+    return found
+}
+
+// The SDK a request names, out of `candidates`, which were searched in
+// `roots`. Several matches are an error rather than a guess.
+public function resolveSdk(
+    request: borrow SdkName,
+    candidates: borrow [SdkCandidate],
+    roots: borrow [String]
+) -> SdkResolution {
+    var matching: [SdkCandidate] = []
+    for index in 0..candidates.count {
+        let candidate = candidates[index]
+        if candidate.name == request.name && (request.version.isEmpty() || candidate.version == request.version) {
+            matching.append(candidate)
+        }
+    }
+    if matching.count == 1 { return .Resolved(matching[0]) }
+    if matching.count == 0 { return .Missing(missingSdkText(request, roots)) }
+    return .Ambiguous(ambiguousSdkText(request, matching))
+}
+
+// The SDK for the package in `packageDirectory`, as its manifest or the
+// nearest `kira-sdk.toml` names it.
+public function sdkRequestFor(packageDirectory: borrow String) -> SdkRequest {
+    let manifest = joinPath(packageDirectory, "package.kira")
+    match textOf(manifest) {
+        Some(text) -> {
+            let named = sdkNameInManifest(text)
+            if !named.isEmpty() {
+                return .Named(SdkName { name: named, version: "", source: manifest })
+            }
+        }
+        None -> {}
+    }
+    var current = packageDirectory
+    while true {
+        let path = joinPath(current, sdkPinFileName)
+        if pathExists(path) {
+            match textOf(path) {
+                Some(text) -> return sdkRequestFromPin(path, text)
+                None -> return .Unusable(unreadableSdkText(path))
+            }
+        }
+        let parent = directoryOfPath(current)
+        if parent.isEmpty() || parent == current { return .NoSdk }
+        current = parent
+    }
+    return .NoSdk
+}
+
+// The name in a `package.kira`'s `let sdk: String = "..."`, or empty.
+public function sdkNameInManifest(text: borrow String) -> String {
+    let lines = text.split("\n")
+    for index in 0..lines.count {
+        let line = lines[index].trim()
+        if !line.startsWith("let sdk") { continue }
+        match line.indexOf("\"") {
+            Some(start) -> {
+                let rest = line.substring(start + 1, line.count)
+                match rest.indexOf("\"") {
+                    Some(end) -> return rest.substring(0, end)
+                    None -> return ""
+                }
+            }
+            None -> return ""
+        }
+    }
+    return ""
+}
+
+// The request a `kira-sdk.toml` makes. It needs a `name`.
+public function sdkRequestFromPin(path: borrow String, text: borrow String) -> SdkRequest {
+    let fields = tomlFields(text)
+    let name = textOrEmpty(fields.get("name"))
+    if name.isEmpty() { return .Unusable(unreadableSdkText(path)) }
+    let version = textOrEmpty(fields.get("version"))
+    return .Named(SdkName { name: name, version: version, source: path })
+}
+
+// The `Dependency { ... }` literals of a `package.kira`, in order.
+public function dependencySpecs(text: borrow String) -> [DependencySpec] {
+    var specs: [DependencySpec] = []
+    var rest = text
+    while true {
+        match rest.indexOf("Dependency {") {
+            None -> return specs
+            Some(start) -> {
+                let after = rest.substring(start + 12, rest.count)
+                match after.indexOf("}") {
+                    None -> return specs
+                    Some(end) -> {
+                        specs.append(dependencySpecFrom(after.substring(0, end)))
+                        rest = after.substring(end + 1, after.count)
+                    }
+                }
+            }
+        }
+    }
+    return specs
+}
+
+// One literal's fields: `key: "value"` or `key = "value"`, comma separated.
+public function dependencySpecFrom(body: borrow String) -> DependencySpec {
+    var spec = DependencySpec()
+    let fields = body.split(",")
+    for index in 0..fields.count {
+        let field = fields[index].trim()
+        var cut = field.indexOf(":")
+        match field.indexOf("=") {
+            Some(equals) -> {
+                match cut {
+                    Some(colon) -> { if equals < colon { cut = .Some(equals) } }
+                    None -> { cut = .Some(equals) }
+                }
+            }
+            None -> {}
+        }
+        match cut {
+            Some(position) -> {
+                let key = field.substring(0, position).trim()
+                let value = quotedText(field.substring(position + 1, field.count))
+                if key == "name" { spec.name = value }
+                if key == "sdk" { spec.sdk = value }
+                if key == "path" { spec.path = value }
+                if key == "url" { spec.url = value }
+                if key == "rev" { spec.rev = value }
+            }
+            None -> {}
+        }
+    }
+    return spec
+}
+
+// The text between the first pair of double quotes in `text`, or empty.
+public function quotedText(text: borrow String) -> String {
+    match text.indexOf("\"") {
+        Some(start) -> {
+            let rest = text.substring(start + 1, text.count)
+            match rest.indexOf("\"") {
+                Some(end) -> return rest.substring(0, end)
+                None -> return ""
+            }
+        }
+        None -> return ""
+    }
+    return ""
+}
+
+// Whether the SDK at `sdk` holds `<name>.framework`, in either place.
+public function sdkProvides(sdk: borrow String, name: borrow String) -> Bool {
+    if sdk.isEmpty() { return false }
+    let framework = name + ".framework"
+    return pathExists(joinPath(sdk, "System/Library/Frameworks/" + framework))
+        || pathExists(joinPath(sdk, "System/Library/PrivateFrameworks/" + framework))
+}
+
+// Whether a compile flag is in `arguments`, by name, with or without `=`.
+public function hasFlag(arguments: borrow [String], flag: borrow String) -> Bool {
+    for index in 0..arguments.count {
+        if arguments[index] == flag || arguments[index].startsWith(flag + "=") { return true }
+    }
+    return false
+}
+
+// Whether `verb` compiles a package, and so takes `--sdk` and `--dependency`.
+public function isCompileVerb(verb: borrow String) -> Bool {
+    for known in ["build", "check", "test", "run", "doc"] {
+        if verb == known { return true }
+    }
+    return false
+}
+
+// The arguments a compile verb needs for the package it names: `--sdk <path>`
+// when the package names an SDK that is installed, and
+// `--dependency Name=<dir>;...` for each git dependency fetched. Notes go to
+// standard error as the diagnostics name them. A missing SDK is a note, not an
+// error, because each dependency has its other case; an ambiguous one, a
+// dependency with no other case and a failed fetch are errors. The error is
+// the rendered diagnostic.
+public function withPackageArguments(arguments: borrow [String], start: borrow String) -> Result<[String], String> {
+    if arguments.count == 0 { return .Ok(arguments) }
+    if !isCompileVerb(arguments[0]) { return .Ok(arguments) }
+    if hasFlag(arguments, "--sdk") && hasFlag(arguments, dependencyFlag) { return .Ok(arguments) }
+    let directory = packageDirectoryFor(arguments, start)
+    let manifest = joinPath(directory, "package.kira")
+    var sdkPath = ""
+    match sdkRequestFor(directory) {
+        NoSdk -> {}
+        Unusable(text) -> { return .Error(text) }
+        Named(request) -> {
+            let roots = sdkSearchRoots()
+            match resolveSdk(request, discoverSdks(request.name, roots), roots) {
+                Resolved(found) -> {
+                    sdkPath = found.path
+                }
+                Missing(text) -> { errorLine(text) }
+                Ambiguous(text) -> { return .Error(text) }
+            }
+        }
+    }
+    var extended = arguments
+    if !hasFlag(arguments, "--sdk") && !sdkPath.isEmpty() {
+        extended.append("--sdk")
+        extended.append(sdkPath)
+    }
+    if hasFlag(arguments, dependencyFlag) { return .Ok(extended) }
+    match dependencyOverrides(directory, sdkPath) {
+        Ok(overrides) -> {
+            if !overrides.isEmpty() {
+                extended.append(dependencyFlag)
+                extended.append(overrides)
+            }
+        }
+        Error(text) -> { return .Error(text) }
+    }
+    return .Ok(extended)
+}
+
+// The `Name=directory;...` of every git dependency reachable from the package
+// in `directory`, walking path dependencies and fetched checkouts alike, each
+// name fetched once. A dependency the SDK provides is a framework: it is not
+// walked. The first reference to a name decides its checkout.
+public function dependencyOverrides(directory: borrow String, sdkPath: borrow String) -> Result<String, String> {
+    var pending: [String] = [directory]
+    var visited: [String] = []
+    var overrides = ""
+    var named: [String] = []
+    var index = 0
+    while index < pending.count {
+        let current = pending[index]
+        index += 1
+        if listHas(visited, current) { continue }
+        visited.append(current)
+        var text = ""
+        match textOf(joinPath(current, "package.kira")) {
+            Some(found) -> { text = found }
+            None -> { continue }
+        }
+        let specs = dependencySpecs(text)
+        for position in 0..specs.count {
+            let spec = specs[position]
+            if sdkProvides(sdkPath, spec.name) { continue }
+            if !spec.sdk.isEmpty() && spec.path.isEmpty() && spec.url.isEmpty() {
+                return .Error(noOtherCaseText(spec, current + "/package.kira"))
+            }
+            if !spec.path.isEmpty() {
+                pending.append(joinPath(current, spec.path))
+                continue
+            }
+            if spec.url.isEmpty() { continue }
+            if listHas(named, spec.name) { continue }
+            named.append(spec.name)
+            if !spec.sdk.isEmpty() {
+                errorLine("note[SDK0006]: dependency `" + spec.name + "` is not in SDK `" + spec.sdk + "` here; using its git " + spec.url + " at " + spec.rev)
+            }
+            match fetchDependency(spec, current + "/package.kira") {
+                Ok(fetched) -> {
+                    if !overrides.isEmpty() { overrides = overrides + ";" }
+                    overrides = overrides + spec.name + "=" + fetched
+                    pending.append(fetched)
+                }
+                Error(failure) -> { return .Error(failure) }
+            }
+        }
+    }
+    return .Ok(overrides)
+}
+
+// Whether `items` holds `text`.
+public function listHas(items: borrow [String], text: borrow String) -> Bool {
+    for index in 0..items.count {
+        if items[index] == text { return true }
+    }
+    return false
+}
+
+// The lines `knvm sdk list` prints: each SDK found under the roots, as
+// `<name> <version>  <path>`, or why there are none.
+public function sdkListingLines() -> [String] {
+    var lines: [String] = []
+    let roots = sdkSearchRoots()
+    if roots.count == 0 {
+        lines.append("no SDK root: " + sdkPathVariable + " is empty and no klfd home is set")
+        return lines
+    }
+    for root in roots {
+        let names = entriesOf(root)
+        for nameIndex in 0..names.count {
+            let named = joinPath(root, names[nameIndex])
+            let versions = entriesOf(named)
+            for versionIndex in 0..versions.count {
+                let path = joinPath(named, versions[versionIndex])
+                if pathExists(joinPath(path, sdkMarkerFileName)) {
+                    lines.append(names[nameIndex] + " " + versions[versionIndex] + "  " + path)
+                }
+            }
+        }
+    }
+    if lines.count == 0 {
+        lines.append("no SDKs installed; searched " + joinRoots(roots))
+    }
+    return lines
+}
+
+// `a:b:c` for the roots a listing names.
+public function joinRoots(roots: borrow [String]) -> String {
+    var text = ""
+    for index in 0..roots.count {
+        if index > 0 { text = text + ":" }
+        text = text + roots[index]
+    }
+    return text
+}
+
+// The directory of a git dependency at its `rev`, fetched once into
+// `<klfd home>/git/<name>/<rev>` and reused by every later compile, since a
+// rev names one immutable commit.
+public function fetchDependency(spec: borrow DependencySpec, manifest: borrow String) -> Result<String, String> {
+    if spec.rev.isEmpty() { return .Error(missingRevText(spec, manifest)) }
+    let home = klfHome()
+    if home.isEmpty() { return .Error(fetchFailedText(spec, manifest, "", "neither the klfd home nor HOME is set")) }
+    let directory = joinPath(joinPath(joinPath(home, "git"), spec.name), spec.rev)
+    if pathExists(joinPath(directory, ".git")) { return .Ok(directory) }
+    if !makeDirectoryTree(joinPath(joinPath(home, "git"), spec.name)) {
+        return .Error(fetchFailedText(spec, manifest, directory, "cannot create the cache directory"))
+    }
+    if runTool("git", ["clone", "--no-checkout", "--quiet", spec.url, directory]) != 0 {
+        removeTree(directory)
+        return .Error(fetchFailedText(spec, manifest, directory, "git clone failed"))
+    }
+    if runTool("git", ["-C", directory, "checkout", "--quiet", "--detach", spec.rev]) != 0 {
+        removeTree(directory)
+        return .Error(fetchFailedText(spec, manifest, directory, "git could not check out the rev"))
+    }
+    return .Ok(directory)
+}
+
+// The diagnostic for a name no installed SDK answers to.
+public function missingSdkText(request: borrow SdkName, roots: borrow [String]) -> String {
+    var searched = ""
+    for index in 0..roots.count {
+        if index > 0 { searched = searched + ", " }
+        searched = searched + joinPath(roots[index], request.name + "/<version>/")
+    }
+    if roots.count == 0 { searched = "no SDK root (" + sdkPathVariable + " is empty and no klfd home is set)" }
+    var versionText = ""
+    if !request.version.isEmpty() { versionText = " version `" + request.version + "`" }
+    return "note[SDK0001]: no SDK named `" + request.name + "`" + versionText
+        + " is installed\n"
+        + "  --> " + request.source + "\n"
+        + "   = searched: " + searched + "\n"
+        + "   = help: install the SDK under a searched root as `<root>/" + request.name
+        + "/<version>/` (it holds `" + sdkMarkerFileName + "`), or point `" + sdkPathVariable
+        + "` at a directory that holds it"
+}
+
+// The diagnostic for a name several installed SDKs answer to.
+public function ambiguousSdkText(request: borrow SdkName, matching: borrow [SdkCandidate]) -> String {
+    var listed = ""
+    for index in 0..matching.count {
+        if index > 0 { listed = listed + ", " }
+        listed = listed + matching[index].version + " (" + matching[index].path + ")"
+    }
+    return "error[SDK0002]: `" + request.name + "` matches more than one installed SDK: " + listed
+        + "\n  --> " + request.source + "\n"
+        + "   = help: name the version with `version = \"...\"` in `" + sdkPinFileName + "`, or remove the SDKs you do not use"
+}
+
+// The diagnostic for a `kira-sdk.toml` that cannot be read as a request.
+public function unreadableSdkText(path: borrow String) -> String {
+    return "error[SDK0003]: `" + path + "` names no SDK"
+        + "\n   = help: write `name = \"Tessera\"` (and optionally `version = \"0.1.0\"`) in it"
+}
+
+// The diagnostic for a dependency the SDK alone provides, on a target without it.
+public function noOtherCaseText(spec: borrow DependencySpec, manifest: borrow String) -> String {
+    return "error[SDK0004]: dependency `" + spec.name + "` is provided only by SDK `" + spec.sdk
+        + "`, which is not resolved here\n  --> " + manifest
+        + "\n   = help: add a non-SDK case to it, `path: \"../" + spec.name + "\"` or `url: \"<git url>\", rev: \"<commit>\"`"
+}
+
+// The diagnostic for a git dependency that names no `rev`.
+public function missingRevText(spec: borrow DependencySpec, manifest: borrow String) -> String {
+    return "error[SDK0007]: git dependency `" + spec.name + "` names no `rev`\n  --> " + manifest
+        + "\n   = help: pin it to a commit with `rev: \"<commit>\"` in the dependency"
+}
+
+// The diagnostic for a git dependency that could not be fetched.
+public function fetchFailedText(spec: borrow DependencySpec, manifest: borrow String, directory: borrow String, reason: borrow String) -> String {
+    return "error[SDK0005]: cannot fetch dependency `" + spec.name + "` from `" + spec.url + "` at `" + spec.rev
+        + "`: " + reason + "\n  --> " + manifest + "\n   = cache: " + directory
+        + "\n   = help: check the url, that the rev is a commit of it, and that git can reach it"
+}
+
+// The package a verb names: its first operand, resolved against the working
+// directory, else the working directory itself.
+public function packageDirectoryFor(arguments: borrow [String], start: borrow String) -> String {
+    for index in 1..arguments.count {
+        let operand = arguments[index]
+        if operand.startsWith("-") { continue }
+        var directory = operand
+        if !operand.startsWith("/") { directory = joinPath(start, operand) }
+        if pathExists(joinPath(directory, "package.kira")) { return directory }
+        break
+    }
+    return start
+}

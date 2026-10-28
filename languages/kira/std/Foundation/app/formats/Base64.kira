@@ -1,0 +1,98 @@
+// Base64 (RFC 4648 section 4): bytes written as text with sixty-four
+// characters, three bytes to four characters, padded with `=`.
+
+namespace Base64 {
+    let alphabet: String = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    // The bytes and characters of one group.
+    let groupBytes: Number = 3
+    let groupCharacters: Number = 4
+    let bitsPerCharacter: Number = 6
+    let bitsPerByte: Number = 8
+    let characterMask: Number = 63
+    let byteMask: Number = 255
+    // The bits a decoded run needs to keep: three bytes.
+    let groupMask: Number = 16777215
+    // The ASCII codes the alphabet is made of, and the padding.
+    let padding: Number = 61
+    let upperA: Number = 65
+    let upperEnd: Number = 91
+    let lowerA: Number = 97
+    let lowerEnd: Number = 123
+    let zero: Number = 48
+    let digitEnd: Number = 58
+    let plus: Number = 43
+    let slash: Number = 47
+    // Where each run of the alphabet starts among the sixty-four values.
+    let lowerStart: Number = 26
+    let digitStart: Number = 52
+    let plusValue: Number = 62
+    let slashValue: Number = 63
+}
+
+// `bytes` in base64, padded.
+function base64Text(bytes: borrow [UN8]) -> String {
+    let digits = Base64.alphabet.utf8()
+    var text: [UN8] = []
+    for start in 0..ceil(bytes.count / Base64.groupBytes) {
+        let at = start * Base64.groupBytes
+        let present = min(Base64.groupBytes, bytes.count - at)
+        var group: Number = 0
+        for index in 0..Base64.groupBytes {
+            let byte = index < present ? Number(bytes[at + index]) : 0
+            group = (group << Base64.bitsPerByte) | byte
+        }
+        for index in 0..Base64.groupCharacters {
+            let shift = Base64.bitsPerCharacter * (Base64.groupCharacters - 1 - index)
+            text.append(
+                index <= present ? digits[(group >> shift) & Base64.characterMask] : UN8(
+                    Base64.padding
+                )
+            )
+        }
+    }
+    return match textFromBytes(text) {
+        Some(written) -> written
+        // Every byte written is one of the alphabet's or the padding, all ASCII.
+        None -> ""
+    }
+}
+
+// The bytes the base64 `text` holds, padded or not; none when it is not base64.
+function base64Decoded(text: borrow String) -> [UN8]? {
+    var values: [Number] = []
+    for byte in text.utf8() {
+        let code = Number(byte)
+        if code == Base64.padding { break }
+        match base64Value(code) {
+            Some(value) -> values.append(value)
+            None -> return .None
+        }
+    }
+    if values.count % Base64.groupCharacters == 1 { return .None }
+    var bytes: [UN8] = []
+    var group: Number = 0
+    var bits: Number = 0
+    for value in values {
+        group = ((group << Base64.bitsPerCharacter) | value) & Base64.groupMask
+        bits += Base64.bitsPerCharacter
+        if bits >= Base64.bitsPerByte {
+            bits -= Base64.bitsPerByte
+            bytes.append(UN8((group >> bits) & Base64.byteMask))
+        }
+    }
+    return .Some(bytes)
+}
+
+// The value an alphabet character stands for; none for any other.
+function base64Value(code: Number) -> Number? {
+    if code >= Base64.upperA && code < Base64.upperEnd { return .Some(code - Base64.upperA) }
+    if code >= Base64.lowerA && code < Base64.lowerEnd {
+        return .Some(code - Base64.lowerA + Base64.lowerStart)
+    }
+    if code >= Base64.zero && code < Base64.digitEnd {
+        return .Some(code - Base64.zero + Base64.digitStart)
+    }
+    if code == Base64.plus { return .Some(Base64.plusValue) }
+    if code == Base64.slash { return .Some(Base64.slashValue) }
+    return .None
+}

@@ -1,0 +1,453 @@
+import Foundation
+
+// WebTransport sessions in the driver (DESIGN.md section 8.4). A client's
+// session is an extended CONNECT routed like a request over HTTP/3; a
+// server's arrives as `Incoming` with protocol "webtransport-h3" and is
+// taken with `acceptSession`, or refused with an ordinary response. Inside
+// a session either side opens streams and sends datagrams.
+
+distinct SessionId = Number
+
+// How a session's stream ended on the peer's side.
+enum StreamEnding {
+    Finished
+    // The peer reset it, with its application's code; none when the code
+    // was not one, as when the session went away.
+    Reset(Number?)
+    // The peer stopped reading it.
+    Stopped(Number?)
+}
+
+struct SessionStream {
+    let session: SessionId
+    let stream: QuicStreamNumber
+    let kind: QuicStreamKind
+}
+
+struct SessionBytes {
+    let session: SessionId
+    let stream: QuicStreamNumber
+    let bytes: [UN8]
+}
+
+struct StreamEnd {
+    let session: SessionId
+    let stream: QuicStreamNumber
+    let ending: StreamEnding
+}
+
+struct SessionDatagram {
+    let session: SessionId
+    let bytes: [UN8]
+}
+
+struct SessionClose {
+    let session: SessionId
+    // The code and message of the peer's WT_CLOSE_SESSION, 0 and empty
+    // for a plain end.
+    let error: Number = 0
+    let reason: String = ""
+    // The status of a CONNECT the server refused.
+    let status: Status? = .None
+    // What ended a session that did not close cleanly.
+    let failure: HttpFailure? = .None
+}
+
+struct WebSession {
+    // A client's is its CONNECT request's ID, a server's the served
+    // request's.
+    let id: SessionId
+    // The HTTP/3 session's key and the CONNECT stream, once known.
+    var session: Number? = .None
+    var stream: QuicStreamNumber? = .None
+    var open: Bool = false
+}
+
+// Where an open session lives.
+struct WebPlace {
+    let web: Number
+    let session: Number
+    let slot: Number
+    let connection: Number
+    let stream: QuicStreamNumber
+}
+
+extend Network {
+    // A session with the resource at `target`, over HTTP/3. It is ready on
+    // `SessionOpened`, or ends with `SessionClosed`.
+    function openSession(
+        borrow mut self,
+        target: borrow Target,
+        fields: borrow Fields
+    ) -> Result<SessionId, HttpFailure> {
+        let route = try routeFor(target, .Http3Only)
+        let id = takeRequestId()
+        let connect = Request {
+            method: .Connect,
+            target: copy target,
+            fields: copy fields,
+            protocolName: .Some(WebTransport.protocolName)
+        }
+        requests.append(ClientRequest { id: id, route: route, pending: .Some(connect) })
+        let session = SessionId(id.raw)
+        webSessions.append(WebSession { id: session })
+        routeRequest(id)
+        return .Ok(session)
+    }
+
+    // Accepts the session `request` asked for, answering 200 with
+    // `fields`. Only one session runs on a connection at a time.
+    function acceptSession(
+        borrow mut self,
+        request: RequestId,
+        fields: borrow Fields
+    ) -> Result<SessionId, HttpFailure> {
+        let index = try servedRequest(request)
+        if !served[index].connect { return .Error(.Protocol(code(Http3Error.MessageError))) }
+        let place = try servedPlace(index)
+        let stream = served[index].stream
+        let key = served[index].session
+        let accepted = sessions[place.session].http.acceptTransport(
+            slots[place.slot].endpoint.connections[place.connection].connection,
+            stream,
+            ResponseHead { status: .Ok, fields: copy fields }
+        )
+        dropServed(index)
+        try problemFailure(accepted)
+        let id = SessionId(request.raw)
+        webSessions.append(
+            WebSession { id: id, session: .Some(key), stream: .Some(stream), open: true }
+        )
+        return .Ok(id)
+    }
+
+    function openStream(
+        borrow mut self,
+        session: SessionId,
+        kind: QuicStreamKind
+    ) -> Result<QuicStreamNumber, HttpFailure> {
+        let place = try webPlace(session)
+        let opened = sessions[place.session].http.openTransportStream(
+            slots[place.slot].endpoint.connections[place.connection].connection,
+            place.stream,
+            kind
+        )
+        return match opened {
+            Ok(value) -> .Ok(value)
+            Error(problem) -> .Error(http3Failure(problem))
+        }
+    }
+
+    function writeStream(
+        borrow mut self,
+        session: SessionId,
+        stream: QuicStreamNumber,
+        bytes: borrow [UN8],
+        finish: Bool
+    ) -> Result<Void, HttpFailure> {
+        let place = try webPlace(session)
+        let sent = sessions[place.session].http.writeTransport(
+            slots[place.slot].endpoint.connections[place.connection].connection,
+            stream,
+            bytes,
+            finish
+        )
+        return problemFailure(sent)
+    }
+
+    // Abandons sending on a session's stream with the application's
+    // `error`, a 32-bit code.
+    function resetStream(
+        borrow mut self,
+        session: SessionId,
+        stream: QuicStreamNumber,
+        error: Number
+    ) -> Result<Void, HttpFailure> {
+        let place = try webPlace(session)
+        let reset = sessions[place.session].http.resetTransport(
+            slots[place.slot].endpoint.connections[place.connection].connection,
+            stream,
+            error
+        )
+        return problemFailure(reset)
+    }
+
+    // Asks the peer to stop sending on a session's stream.
+    function stopStream(
+        borrow mut self,
+        session: SessionId,
+        stream: QuicStreamNumber,
+        error: Number
+    ) -> Result<Void, HttpFailure> {
+        let place = try webPlace(session)
+        let stopped = sessions[place.session].http.stopTransport(
+            slots[place.slot].endpoint.connections[place.connection].connection,
+            stream,
+            error
+        )
+        return problemFailure(stopped)
+    }
+
+    // An unreliable datagram; one too large for the path is refused.
+    function sendDatagram(
+        borrow mut self,
+        session: SessionId,
+        bytes: borrow [UN8]
+    ) -> Result<Void, HttpFailure> {
+        let place = try webPlace(session)
+        let sent = sessions[place.session].http.sendTransportDatagram(
+            slots[place.slot].endpoint.connections[place.connection].connection,
+            place.stream,
+            bytes
+        )
+        return problemFailure(sent)
+    }
+
+    // Closes the session with the application's `error` and `reason`,
+    // which the peer gets in its `SessionClosed`.
+    function closeSession(
+        borrow mut self,
+        session: SessionId,
+        error: Number,
+        reason: borrow String
+    ) -> Result<Void, HttpFailure> {
+        let place = try webPlace(session)
+        let closed = sessions[place.session].http.closeTransport(
+            slots[place.slot].endpoint.connections[place.connection].connection,
+            place.stream,
+            error,
+            reason
+        )
+        dropWebSession(place.web)
+        return problemFailure(closed)
+    }
+
+    function webIndex(borrow self, id: SessionId) -> Number? {
+        for (index, web) in webSessions.enumerated() {
+            if web.id == id { return .Some(index) }
+        }
+        return .None
+    }
+
+    // The open session on HTTP/3 session `session` whose CONNECT stream is
+    // `stream`.
+    function webAt(borrow self, session: Number, stream: QuicStreamNumber) -> Number? {
+        let key = sessions[session].id
+        for (index, web) in webSessions.enumerated() {
+            if web.session == .Some(key) && web.stream == .Some(stream) && web.open {
+                return .Some(index)
+            }
+        }
+        return .None
+    }
+
+    function webPlace(borrow self, id: SessionId) -> Result<WebPlace, HttpFailure> {
+        let web = match webIndex(id) {
+            Some(value) -> value
+            None -> return .Error(.Closed)
+        }
+        if !webSessions[web].open { return .Error(.Closed) }
+        let key = match webSessions[web].session {
+            Some(value) -> value
+            None -> return .Error(.Closed)
+        }
+        let stream = match webSessions[web].stream {
+            Some(value) -> value
+            None -> return .Error(.Closed)
+        }
+        let session = match sessionIndex(key) {
+            Some(value) -> value
+            None -> return .Error(.Closed)
+        }
+        let connection = match connectionIndex(session) {
+            Some(value) -> value
+            None -> return .Error(.Closed)
+        }
+        return .Ok(
+            WebPlace {
+                web: web,
+                session: session,
+                slot: sessions[session].slot,
+                connection: connection,
+                stream: stream
+            }
+        )
+    }
+
+    function dropWebSession(borrow mut self, index: Number) {
+        var kept: [WebSession] = []
+        for (position, web) in webSessions.enumerated() {
+            if position != index { kept.append(copy web) }
+        }
+        webSessions = kept
+    }
+
+    // Session `index` ended: the program hears it once.
+    function closeWebSession(borrow mut self, index: Number, close: SessionClose) {
+        events.append(.SessionClosed(close))
+        dropWebSession(index)
+    }
+
+    // A session event from HTTP/3 session `session`.
+    function takeTransport(borrow mut self, session: Number, event: borrow Http3Event) {
+        match event {
+            TransportStream(opened) -> {
+                let web = match webAt(session, opened.session) {
+                    Some(value) -> value
+                    None -> return
+                }
+                events.append(
+                    .StreamOpened(
+                        SessionStream {
+                            session: webSessions[web].id,
+                            stream: opened.stream,
+                            kind: opened.stream.kind()
+                        }
+                    )
+                )
+            }
+            TransportData(data) -> {
+                let web = match webAt(session, data.session) {
+                    Some(value) -> value
+                    None -> return
+                }
+                let id = webSessions[web].id
+                if data.bytes.count > 0 {
+                    events.append(
+                        .StreamData(
+                            SessionBytes {
+                                session: id,
+                                stream: data.stream,
+                                bytes: copy data.bytes
+                            }
+                        )
+                    )
+                }
+                if data.finished {
+                    events.append(
+                        .StreamEnded(
+                            StreamEnd { session: id, stream: data.stream, ending: .Finished }
+                        )
+                    )
+                }
+            }
+            TransportReset(failure) -> streamFailed(session, failure, false)
+            TransportStopped(failure) -> streamFailed(session, failure, true)
+            TransportDatagram(datagram) -> {
+                match webAt(session, datagram.session) {
+                    Some(web) -> events.append(
+                        .Datagram(
+                            SessionDatagram {
+                                session: webSessions[web].id,
+                                bytes: copy datagram.bytes
+                            }
+                        )
+                    )
+                    None -> {}
+                }
+            }
+            TransportDraining(stream) -> {
+                match webAt(session, stream) {
+                    Some(web) -> events.append(.SessionDraining(webSessions[web].id))
+                    None -> {}
+                }
+            }
+            TransportClosed(close) -> {
+                let web = match webAt(session, close.session) {
+                    Some(value) -> value
+                    None -> return
+                }
+                let failure: HttpFailure? = match close.reset {
+                    Some(error) -> .Some(.Reset(error))
+                    None -> .None
+                }
+                closeWebSession(
+                    web,
+                    SessionClose {
+                        session: webSessions[web].id,
+                        error: close.error,
+                        reason: copy close.reason,
+                        failure: failure
+                    }
+                )
+            }
+            // The rest are not a session's.
+            Connected(_) -> {}
+            Head(_) -> {}
+            Body(_) -> {}
+            Ended(_) -> {}
+            Reset(_) -> {}
+            Stopped(_) -> {}
+            Goaway(_) -> {}
+            Closed(_) -> {}
+        }
+    }
+
+    function streamFailed(
+        borrow mut self,
+        session: Number,
+        failure: borrow TransportFailure,
+        stopped: Bool
+    ) {
+        let web = match webAt(session, failure.session) {
+            Some(value) -> value
+            None -> return
+        }
+        let error: Number? = match failure.error {
+            Some(value) -> .Some(value)
+            None -> .None
+        }
+        let ending: StreamEnding = stopped ? .Stopped(error) : .Reset(error)
+        events.append(
+            .StreamEnded(
+                StreamEnd { session: webSessions[web].id, stream: failure.stream, ending: ending }
+            )
+        )
+    }
+
+    // A client's CONNECT was answered: a 2xx opens the session, any other
+    // final status refuses it.
+    function settleSession(borrow mut self, session: Number, request: Number, status: Status) {
+        let id = SessionId(requests[request].id.raw)
+        let web = match webIndex(id) {
+            Some(value) -> value
+            None -> return
+        }
+        let stream = requests[request].stream
+        dropRequest(request)
+        if code(status) < WebTransport.successEnd {
+            webSessions[web].open = true
+            return events.append(.SessionOpened(id))
+        }
+        match stream {
+            Some(value) -> refuse(session, value, code(Http3Error.RequestCancelled))
+            None -> {}
+        }
+        closeWebSession(web, SessionClose { session: id, status: .Some(status) })
+    }
+
+    // The server's sessions whose CONNECT waited for the client's
+    // SETTINGS (draft-ietf-webtrans-http3 section 3.1).
+    function deliverConnects(borrow mut self, session: Number) {
+        if sessions[session].http.peerSettings.isNone() { return }
+        let server = match slots[sessions[session].slot].server {
+            Some(value) -> value
+            None -> return
+        }
+        let key = sessions[session].id
+        var waiting: [RequestId] = []
+        for request in served {
+            if request.session == key && request.connect && !request.received {
+                waiting.append(request.id)
+            }
+        }
+        for id in waiting {
+            for (index, request) in served.enumerated() {
+                if request.id == id {
+                    deliverIncoming(index, server, sessions[session].peer)
+                    break
+                }
+            }
+        }
+    }
+}

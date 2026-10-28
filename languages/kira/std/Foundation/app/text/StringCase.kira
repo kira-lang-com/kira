@@ -1,0 +1,107 @@
+import Heap
+
+// Text in one case, by Unicode's full case mapping, as Swift's `lowercased()`
+// and `uppercased()` give it: "Straße" uppercases to "STRASSE", and a sigma
+// that ends a word lowercases to its final form, "ΟΔΟΣ" to "οδος". The tables
+// are StringCaseTables.kira.
+extend String {
+    // The text lowercased.
+    function lowercased(borrow self) -> String {
+        var scalars: [Number] = []
+        var index: Number = 0
+        while index < count {
+            let width = scalarWidthAt(self, index)
+            let scalar = scalarAt(self, index, width)
+            if scalar == UnicodeCase.capitalSigma && endsWord(self, index, index + width) {
+                scalars.append(UnicodeCase.finalSigma)
+            } else {
+                match lowercaseExpansion(scalar) {
+                    Some(parts) -> {
+                        for part in parts { scalars.append(part) }
+                    }
+                    None -> scalars.append(lowercaseScalar(scalar))
+                }
+            }
+            index = index + width
+        }
+        return textOfScalars(scalars)
+    }
+
+    // The text uppercased.
+    function uppercased(borrow self) -> String {
+        var scalars: [Number] = []
+        var index: Number = 0
+        while index < count {
+            let width = scalarWidthAt(self, index)
+            let scalar = scalarAt(self, index, width)
+            match uppercaseExpansion(scalar) {
+                Some(parts) -> {
+                    for part in parts { scalars.append(part) }
+                }
+                None -> scalars.append(uppercaseScalar(scalar))
+            }
+            index = index + width
+        }
+        return textOfScalars(scalars)
+    }
+}
+
+namespace UnicodeCase {
+    // Σ, and the form it takes ending a word, ς.
+    let capitalSigma: Number = 0x3A3
+    let finalSigma: Number = 0x3C2
+}
+
+// Whether the sigma from `start` to `end` ends a word, as Unicode's
+// Final_Sigma rule reads one: a cased letter before it and none after it,
+// passing over the case-ignorable scalars either side.
+function endsWord(text: borrow String, start: Number, end: Number) -> Bool {
+    var before = start
+    var cased = false
+    while before > 0 {
+        let lead = scalarStartBefore(text, before)
+        let scalar = scalarAt(text, lead, before - lead)
+        before = lead
+        if isCaseIgnorableScalar(scalar) { continue }
+        cased = isCasedScalar(scalar)
+        break
+    }
+    if !cased { return false }
+    var after = end
+    while after < text.count {
+        let width = scalarWidthAt(text, after)
+        let scalar = scalarAt(text, after, width)
+        after = after + width
+        if isCaseIgnorableScalar(scalar) { continue }
+        return !isCasedScalar(scalar)
+    }
+    return true
+}
+
+// The text of `scalars`, each written as its UTF-8 bytes.
+function textOfScalars(scalars: borrow [Number]) -> String {
+    var bytes: [UN8] = []
+    for scalar in scalars {
+        if scalar < 0x80 {
+            bytes.append(UN8(scalar))
+            continue
+        }
+        var width = 4
+        var lead = 0xF0
+        if scalar < 0x800 {
+            width = 2
+            lead = 0xC0
+        } else if scalar < 0x10000 {
+            width = 3
+            lead = 0xE0
+        }
+        bytes.append(UN8(lead | (scalar >> ((width - 1) * 6))))
+        for index in 1..width {
+            bytes.append(UN8(0x80 | ((scalar >> ((width - index - 1) * 6)) & 0x3F)))
+        }
+    }
+    let empty = ""
+    let data = makeArrayData(bytes.count)
+    heapCopyBytes(data, bytes.data, bytes.count)
+    return String { data: data, count: bytes.count, capacity: bytes.count, ops: empty.ops }
+}

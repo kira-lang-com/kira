@@ -1,0 +1,132 @@
+// `trait Name<Parameters>: Supertraits { ... }`. A member without a body is a
+// requirement; one with a body is a default the conforming type inherits.
+//
+// Besides methods a trait may require properties and name associated types,
+// as Swift's protocols do:
+//
+//     trait Identifiable {
+//         associatedtype ID: Hashable
+//         var id: ID { get }
+//     }
+//
+// A property requirement is the getter (and, written `{ get set }`, the
+// setter) of a computed member; a stored field of the same name and type
+// satisfies it. An associated type is bound by each conforming type, from
+// the member that satisfies a requirement written with it.
+
+struct TraitDeclaration {
+    let name: Identifier
+    let genericParameters: [Identifier]
+    let supertraits: [TypeReference]
+    let methods: [FunctionDeclaration]
+    let associatedTypes: [AssociatedTypeDeclaration]
+}
+
+// `associatedtype Name: Bound = Default`.
+struct AssociatedTypeDeclaration {
+    let name: Identifier
+    let bound: Optional<TypeReference>
+    let initial: Optional<TypeReference>
+}
+
+// `Parameter: Trait` on the template called `template`; `parameter` is the
+// parameter's position.
+struct GenericBound {
+    let template: String
+    let parameter: Int
+    let traitName: TypeReference
+}
+
+extend Parser {
+    function traitDeclaration(borrow mut self) -> Result<Span, Failure> {
+        let start = try expect(.Trait)
+        let name = try identifier(.ExpectedTypeName)
+        let genericParameters = try genericParameters(name)
+        var supertraits: [TypeReference] = []
+        if eat(.Colon) {
+            supertraits.append(try typeReference())
+            while eat(.Comma) || eat(.Plus) { supertraits.append(try typeReference()) }
+        }
+        try expect(.LeftBrace)
+        var methods: [FunctionDeclaration] = []
+        var associatedTypes: [AssociatedTypeDeclaration] = []
+        while !at(.RightBrace) {
+            var annotations = try annotations()
+            annotations.append(implicitAnnotation(.Trait, current().span))
+            let memberDocs = try claimDocs()
+            if atWord("associatedtype") {
+                let declared = try associatedType()
+                recordDocs(memberDocs, "associatedtype", declared.name.text, name.text)
+                associatedTypes.append(declared)
+                continue
+            }
+            if at(.Var) || at(.Let) {
+                let property = try propertyRequirement()
+                recordDocs(memberDocs, "property", property[0].name.text, name.text)
+                for accessor in property { methods.append(accessor) }
+                continue
+            }
+            let method = try memberFunction(annotations)
+            recordDocs(memberDocs, "method", method.name.text, name.text)
+            methods.append(method)
+        }
+        try expect(.RightBrace)
+        tree.traits.append(TraitDeclaration {
+            name = name, genericParameters = genericParameters, supertraits = supertraits, methods = methods,
+            associatedTypes = associatedTypes
+        })
+        return .Ok(spanFrom(start.span))
+    }
+
+    // `associatedtype Name`, with an optional `: Bound` and `= Default`.
+    function associatedType(borrow mut self) -> Result<AssociatedTypeDeclaration, Failure> {
+        advance()
+        let name = try identifier(.ExpectedTypeName)
+        var bound: Optional<TypeReference> = .None
+        if eat(.Colon) { bound = .Some(try typeReference()) }
+        var initial: Optional<TypeReference> = .None
+        if eat(.Equals) { initial = .Some(try typeReference()) }
+        return .Ok(AssociatedTypeDeclaration { name = name, bound = bound, initial = initial })
+    }
+
+    // `var name: Type { get }`, `var name: Type { get set }` or `let name:
+    // Type`: the getter a conforming type answers the property with, and its
+    // setter when the property is settable. `var` without accessors is
+    // settable, as a stored `var` is.
+    function propertyRequirement(borrow mut self) -> Result<[FunctionDeclaration], Failure> {
+        let start = current().span
+        let mutable = at(.Var)
+        advance()
+        let name = try identifier(.ExpectedMemberName)
+        try expect(.Colon)
+        let annotation = try typeReference()
+        var settable = mutable
+        if eat(.LeftBrace) {
+            if !atWord("get") { return .Error(failure(.Expected)) }
+            advance()
+            settable = false
+            if atWord("set") {
+                if !mutable { return .Error(failure(.ComputedSetterOnLet)) }
+                advance()
+                settable = true
+            }
+            try expect(.RightBrace)
+        }
+        var accessors = [FunctionDeclaration {
+            name = name,
+            annotations = [implicitAnnotation(.Trait, name.span), implicitAnnotation(.Computed, name.span), implicitAnnotation(.Required, name.span)],
+            receiver = .Free, parameters = [], result = .Some(annotation),
+            body = [], span = spanFrom(start), typeParameters = [], scope = GenericScope.none()
+        }]
+        if settable {
+            accessors.append(FunctionDeclaration {
+                name = name,
+                annotations = [implicitAnnotation(.Trait, name.span), implicitAnnotation(.ComputedSetter, name.span), implicitAnnotation(.Required, name.span)],
+                receiver = .Free,
+                parameters = [Parameter { name = Identifier { text = "newValue", span = name.span }, mode = .Owned, annotation = annotation, copies = false, initial = .None }],
+                result = .None, body = [], span = spanFrom(start), typeParameters = [], scope = GenericScope.none()
+            })
+        }
+        return .Ok(accessors)
+    }
+}

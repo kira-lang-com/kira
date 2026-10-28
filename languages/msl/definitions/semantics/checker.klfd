@@ -1,0 +1,284 @@
+// Semantic analysis: the syntax tree to a checked program.
+//
+// Items are declared in the order the file writes them, so a name is
+// visible only after its declaration, as in C++. A function's body is
+// checked where it is defined; a template's for each list of argument
+// types a call deduces, once all items are declared. A mistake is reported
+// where it is found and its expression takes `void`, which every later
+// check accepts silently, so each independent mistake is reported once.
+
+function check(tree: SyntaxTree, shaderName: String) -> CheckedProgram {
+    var checker = Checker {
+        tree = tree,
+        program = CheckedProgram {
+            types = [], structs = [], globals = [], functions = [], expressions = [], statements = [],
+            entries = [], shaderName = shaderName
+        },
+        structNames = [], aliases = [], functionEntries = [], globalNames = [], folded = [], instances = [],
+        current = -1, prefix = "", locals = [], visible = [], scopes = [], calls = [], result = 0,
+        bindings = [], loops = 0, switches = 0, stage = .NoStage, handles = [], boundCalls = []
+    }
+    checker.voidType()
+    for item in tree.items {
+        match item.kind {
+            StructItem -> checker.declareStruct(item.index)
+            AliasItem -> checker.declareAlias(item.index)
+            GlobalItem -> checker.declareGlobal(item.index)
+            FunctionItem -> checker.declareFunction(item.index)
+        }
+    }
+    checker.checkInstances()
+    checker.checkStages()
+    checker.reportRecursion()
+    checker.markSamplers()
+    return checker.program
+}
+
+struct NamedIndex {
+    let name: String
+    let index: Int
+}
+
+struct NamedType {
+    let name: String
+    let named: Int
+}
+
+// A foldable integer a name stands for: a `constexpr` or `constant` of an
+// integral type whose initializer folds.
+struct NamedFold {
+    let name: String
+    let value: Int
+}
+
+// A function a call can name: its declaration, the checked function it
+// became (-1 for a template), and its parameter types.
+struct FunctionEntry {
+    let name: String
+    let declaration: Int
+    var routine: Int
+    let parameterTypes: [Int]
+}
+
+// A name an entry's resource parameter or a function's bound parameter
+// gives: the entry's global, or the function's parameter (-1 the other).
+struct HandleName {
+    let name: String
+    let global: Int
+    let parameter: Int
+}
+
+// A call that passes buffers, textures or samplers: its caller, its callee
+// and its checked arguments.
+struct BoundCall {
+    let caller: Int
+    let callee: Int
+    let arguments: [Int]
+}
+
+// One instantiation of a function template, and the function it became.
+struct Instance {
+    let declaration: Int
+    let arguments: [Int]
+    let routine: Int
+    var checked: Bool
+}
+
+struct Checker {
+    var tree: SyntaxTree
+    var program: CheckedProgram
+    var structNames: [NamedIndex]
+    var aliases: [NamedType]
+    var functionEntries: [FunctionEntry]
+    var globalNames: [NamedIndex]
+    var folded: [NamedFold]
+    var instances: [Instance]
+    var boundCalls: [BoundCall]
+    // The function being checked: its index and namespace, its locals,
+    // those in scope (innermost last), where each open scope starts, its
+    // callees, its result, its template's arguments, how many loops and
+    // switches enclose the statement being checked, its stage, and the
+    // names of its resources.
+    var current: Int
+    var prefix: String
+    var locals: [LocalVariable]
+    var visible: [Int]
+    var scopes: [Int]
+    var calls: [Int]
+    var result: Int
+    var bindings: [NamedType]
+    var loops: Int
+    var switches: Int
+    var stage: StageWord
+    var handles: [HandleName]
+
+    // The names an unqualified `name` written in `prefix` may mean, the
+    // innermost first: each enclosing namespace's, the file's, then each
+    // opened namespace's.
+    function candidates(borrow self, name: String) -> [String] {
+        var found: [String] = []
+        var scope = prefix
+        while utf8Count(scope) > 0 {
+            found.append(joinText([scope, "_", name]))
+            scope = parentOf(scope)
+        }
+        found.append(name)
+        for opened in tree.usings {
+            found.append(joinText([opened, "_", name]))
+        }
+        return found
+    }
+
+    function parentOf(borrow self, scope: String) -> String {
+        for opened in tree.namespaces {
+            if opened.prefix == scope { return opened.parent }
+        }
+        return ""
+    }
+
+    function lastNamed(borrow self, names: [NamedIndex], name: String) -> Int {
+        for candidate in candidates(name) {
+            var found = -1
+            for named in names {
+                if named.name == candidate { found = named.index }
+            }
+            if found >= 0 { return found }
+        }
+        return -1
+    }
+
+    function aliasNamed(borrow self, name: String) -> Int {
+        for binding in bindings {
+            if binding.name == name { return binding.named }
+        }
+        for candidate in candidates(name) {
+            for alias in aliases {
+                if alias.name == candidate { return alias.named }
+            }
+        }
+        return -1
+    }
+
+    function foldedNamed(borrow self, name: String) -> Optional<Int> {
+        for candidate in candidates(name) {
+            for known in folded {
+                if known.name == candidate { return .Some(known.value) }
+            }
+        }
+        let none: Optional<Int> = .None
+        return none
+    }
+
+    function attributeNamed(borrow self, attributes: [Attribute], name: String) -> Int {
+        for index in 0..attributes.count {
+            if attributes[index].name == name { return index }
+        }
+        return -1
+    }
+
+    function declareStruct(borrow mut self, index: Int) {
+        let declared = tree.structs[index]
+        if lastNamed(structNames, declared.name) >= 0 || aliasNamed(declared.name) >= 0 {
+            report(.Redeclared, declared.span)
+            return
+        }
+        let outer = prefix
+        prefix = declared.prefix
+        var members: [CheckedMember] = []
+        for member in declared.members {
+            for other in members {
+                if other.name == member.name { report(.Redeclared, member.span) }
+            }
+            members.append(checkStructMember(member))
+        }
+        prefix = outer
+        program.structs.append(CheckedStruct { name = declared.name, members = members, interface = false, span = declared.span })
+        structNames.append(NamedIndex { name = declared.name, index = program.structs.count - 1 })
+    }
+
+    function declareAlias(borrow mut self, index: Int) {
+        let declared = tree.aliases[index]
+        let outer = prefix
+        prefix = declared.prefix
+        let named = resolve(declared.typeSyntax)
+        prefix = outer
+        aliases.append(NamedType { name = declared.name, named = named })
+    }
+
+    // A program-scope `constant` or `constexpr` variable, or a function
+    // constant.
+    function declareGlobal(borrow mut self, index: Int) {
+        let declared = tree.globals[index]
+        let outer = prefix
+        prefix = declared.prefix
+        if lastNamed(globalNames, declared.name) >= 0 { report(.Redeclared, declared.span) }
+        let globalType = resolve(declared.typeSyntax)
+        let constant = attributeNamed(declared.attributes, "function_constant")
+        var kind: GlobalKind = .ConstantGlobal
+        var id = -1
+        var value = -1
+        if constant >= 0 {
+            kind = .FunctionConstant
+            id = attributeInteger(declared.attributes[constant], declared.span)
+            if id >= workgroupOverrideId { report(.UnsupportedAttribute, declared.attributes[constant].span) }
+            if declared.value >= 0 { report(.GatedParameter, declared.span) }
+            if !isScalar(globalType) { report(.TypeMismatch, declared.span) }
+        } else if declared.value < 0 {
+            report(.NotConstant, declared.span)
+        } else {
+            value = checkInitializer(declared.value, globalType, declared.span)
+            if !isConstantExpression(value) { report(.NotConstant, declared.span) }
+            if isIntegral(globalType) && isScalar(globalType) {
+                match fold(declared.value) {
+                    Some(known) -> folded.append(NamedFold { name = declared.name, value = known })
+                    None -> {}
+                }
+            }
+        }
+        program.globals.append(CheckedGlobal {
+            name = declared.name, kind = kind, globalType = globalType, device = false, readOnly = true,
+            slot = -1, value = value, id = id, plain = false, comparison = false, span = declared.span
+        })
+        globalNames.append(NamedIndex { name = declared.name, index = program.globals.count - 1 })
+        prefix = outer
+    }
+
+    // The integer an attribute's one argument folds to, or -1.
+    function attributeInteger(borrow mut self, attribute: Attribute, span: Span) -> Int {
+        if attribute.arguments.count != 1 {
+            report(.UnsupportedAttribute, attribute.span)
+            return -1
+        }
+        match fold(attribute.arguments[0]) {
+            Some(value) -> {
+                if value >= 0 { return value }
+            }
+            None -> {}
+        }
+        report(.NotConstant, attribute.span)
+        return -1
+    }
+
+    // A function that reaches itself through its calls, reported once per
+    // cycle at the function where the search closes it.
+    function reportRecursion(borrow mut self) {
+        var state: [Int] = []
+        for index in 0..program.functions.count {
+            state.append(0)
+        }
+        for index in 0..program.functions.count {
+            visitCalls(index, state)
+        }
+    }
+
+    // `state` is 0 for unvisited, 1 while on the search path, 2 when done.
+    function visitCalls(borrow mut self, caller: Int, state: borrow mut [Int]) {
+        if state[caller] != 0 { return }
+        state[caller] = 1
+        for callee in program.functions[caller].calls {
+            if state[callee] == 1 { report(.Recursion, program.functions[caller].span) }
+            visitCalls(callee, state)
+        }
+        state[caller] = 2
+    }
+}

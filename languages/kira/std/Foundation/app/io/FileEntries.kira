@@ -1,0 +1,185 @@
+import Heap
+
+// What a path is and how it is linked, on the kernel's `klf.fs` entry
+// services (framework D-386): its status, its permission bits, links to it,
+// copies of it, and files made to a length.
+
+@Service("klfsvc_fs_status")
+function kernelFileStatus(path: RawPtr, pathCount: Int, follow: Int, record: RawPtr) -> Int
+
+@Service("klfsvc_fs_set_mode")
+function kernelSetMode(path: RawPtr, pathCount: Int, bits: Int) -> Int
+
+@Service("klfsvc_fs_symbolic_link")
+function kernelSymbolicLink(target: RawPtr, targetCount: Int, path: RawPtr, pathCount: Int) -> Int
+
+@Service("klfsvc_fs_read_link")
+function kernelReadLink(path: RawPtr, pathCount: Int, destination: RawPtr, capacity: Int) -> Int
+
+@Service("klfsvc_fs_hard_link")
+function kernelHardLink(from: RawPtr, fromCount: Int, to: RawPtr, toCount: Int) -> Int
+
+@Service("klfsvc_fs_copy")
+function kernelCopyFile(from: RawPtr, fromCount: Int, to: RawPtr, toCount: Int) -> Int
+
+@Service("klfsvc_fs_set_length")
+function kernelSetLength(path: RawPtr, pathCount: Int, length: Int) -> Int
+
+namespace FileEntry {
+    // The words of a status record, each eight bytes.
+    let statusWords: Number = 6
+    let wordBytes: Number = 8
+    // What a link's target is first read into.
+    let linkRoom: Number = 4096
+    // The failure word of a path that names nothing.
+    let missing: Number = -1
+    // The kernel's flag word for a status that follows a link, and for one that does not.
+    let followWord: Number = 1
+    let keepWord: Number = 0
+}
+
+// What kind of entry a path names.
+enum FileEntryKind: UN8 {
+    File = 1
+    Directory = 2
+    Link = 3
+    Other = 4
+}
+
+// What a path is.
+struct FileStatus {
+    let kind: FileEntryKind
+    // Its length in bytes; a link's is the length of its target.
+    let size: UNumber
+    // Its permission bits: 493 is what `chmod 755` sets.
+    let mode: UNumber
+    // When its contents last changed, in nanoseconds since the Unix epoch.
+    let modified: Number
+    // The device and the inode on it: together they name the file, whatever
+    // path reaches it.
+    let device: Number
+    let inode: Number
+}
+
+// Whether a status follows a link to what it names, or reports the link itself.
+enum LinkPolicy {
+    Follow
+    Keep
+}
+
+// What `path` is, following a link to what it names.
+function fileStatus(path: borrow String) -> Result<FileStatus, FileFailure> {
+    return entryStatus(path, .Follow)
+}
+
+// What `path` is itself: a link is reported as a link.
+function linkStatus(path: borrow String) -> Result<FileStatus, FileFailure> {
+    return entryStatus(path, .Keep)
+}
+
+function setFileMode(path: borrow String, mode: UNumber) -> Result<Void, FileFailure> {
+    let answer = kernelSetMode(path.data, path.count, mode)
+    if answer < 0 { return .Error(entryFailure(answer, path, .WriteFailed(copy path))) }
+    return .Ok
+}
+
+// Makes `path` a symbolic link to `target`, which is kept as written.
+function makeSymbolicLink(target: borrow String, path: borrow String) -> Result<Void, FileFailure> {
+    let answer = kernelSymbolicLink(target.data, target.count, path.data, path.count)
+    if answer < 0 { return .Error(.CreateFailed(copy path)) }
+    return .Ok
+}
+
+// The target of the symbolic link at `path`, as it was written.
+function readSymbolicLink(path: borrow String) -> Result<String, FileFailure> {
+    var capacity = FileEntry.linkRoom
+    var buffer = allocateBytes(capacity)
+    var answer = kernelReadLink(path.data, path.count, buffer, capacity)
+    if answer > capacity {
+        freeBytes(buffer)
+        capacity = answer
+        buffer = allocateBytes(capacity)
+        answer = kernelReadLink(path.data, path.count, buffer, capacity)
+    }
+    if answer < 0 || answer > capacity {
+        freeBytes(buffer)
+        return .Error(entryFailure(answer, path, .ReadFailed(copy path)))
+    }
+    let empty = ""
+    let data = makeArrayData(answer)
+    heapCopyBytes(data, buffer, answer)
+    freeBytes(buffer)
+    return .Ok(String { data: data, count: answer, capacity: answer, ops: empty.ops })
+}
+
+// Gives the file at `existing` the second name `path`.
+function makeHardLink(existing: borrow String, path: borrow String) -> Result<Void, FileFailure> {
+    let answer = kernelHardLink(existing.data, existing.count, path.data, path.count)
+    if answer < 0 { return .Error(entryFailure(answer, existing, .CreateFailed(copy path))) }
+    return .Ok
+}
+
+// Copies the file at `from` to `to` with its permission bits, and answers the
+// bytes copied.
+function copyFile(from: borrow String, to: borrow String) -> Result<UNumber, FileFailure> {
+    let answer = kernelCopyFile(from.data, from.count, to.data, to.count)
+    if answer < 0 { return .Error(entryFailure(answer, from, .WriteFailed(copy to))) }
+    return .Ok(Number(answer))
+}
+
+// Makes `path` a file of `length` bytes, created when it is missing. Bytes it
+// gains read as zero and take no space where the filesystem allows holes.
+function setFileLength(path: borrow String, length: UNumber) -> Result<Void, FileFailure> {
+    let answer = kernelSetLength(path.data, path.count, length)
+    if answer < 0 { return .Error(.WriteFailed(copy path)) }
+    return .Ok
+}
+
+// The kernel's flag word for a link policy.
+function followWord(policy: LinkPolicy) -> Number {
+    match policy {
+        Follow -> return FileEntry.followWord
+        Keep -> return FileEntry.keepWord
+    }
+}
+
+function entryStatus(path: borrow String, follow: LinkPolicy) -> Result<FileStatus, FileFailure> {
+    let record = allocateBytes(FileEntry.statusWords * FileEntry.wordBytes)
+    let answer = kernelFileStatus(path.data, path.count, followWord(follow), record)
+    if answer < 0 {
+        freeBytes(record)
+        return .Error(entryFailure(answer, path, .ReadFailed(copy path)))
+    }
+    var words: [Number] = []
+    for index in 0..FileEntry.statusWords {
+        words.append(Number(heapReadInt(heapOffset(record, index * FileEntry.wordBytes))))
+    }
+    freeBytes(record)
+    return .Ok(
+        FileStatus {
+            kind: fromCode<FileEntryKind>(UN8(words[0])),
+            size: words[1],
+            mode: words[2],
+            modified: words[3],
+            device: words[4],
+            inode: words[5]
+        }
+    )
+}
+
+// `Missing` when the answer says `path` names nothing, `otherwise` else.
+function entryFailure(answer: Number, path: borrow String, otherwise: FileFailure) -> FileFailure {
+    if answer == FileEntry.missing { return .Missing(copy path) }
+    return otherwise
+}
+
+// The whole file at `path` as bytes.
+function readFileBytes(path: borrow String) -> Result<[UN8], FileFailure> {
+    return readFileRange(path, 0, sizeOfFile(bundledReadPath(path)))
+}
+
+// Writes `bytes` as the whole file at `path`.
+function writeFileBytes(path: borrow String, bytes: borrow [UN8]) -> Result<Void, FileFailure> {
+    if !writeChunks(path, bytes.data, bytes.count) { return .Error(.WriteFailed(copy path)) }
+    return .Ok
+}

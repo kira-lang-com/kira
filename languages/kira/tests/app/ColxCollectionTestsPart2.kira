@@ -1,0 +1,415 @@
+import Foundation
+
+// ColxCollectionTests.kira
+// Deep array test suite. All top-level names use colx / Colx prefix.
+// ~85 tests (including ~20 trap tests).
+
+// ---------------------------------------------------------------------------
+// GROUP E - Index reads / writes
+// ---------------------------------------------------------------------------
+@Test
+function colxIndexRead0() {
+    var xs: [Int] = []
+    xs.append(100)
+    xs.append(200)
+    xs.append(300)
+    expect!(xs[0] == 100)
+}
+
+@Test
+function colxIndexRead1() {
+    var xs: [Int] = []
+    xs.append(100)
+    xs.append(200)
+    xs.append(300)
+    expect!(xs[1] == 200)
+}
+
+@Test
+function colxIndexReadLast() {
+    var xs: [Int] = []
+    xs.append(100)
+    xs.append(200)
+    xs.append(300)
+    expect!(xs[2] == 300)
+}
+
+@Test
+function colxIndexWrite() {
+    var xs: [Int] = []
+    xs.append(1)
+    xs.append(2)
+    xs.append(3)
+    xs[1] = 42
+    expect!(xs[1] == 42)
+}
+
+// 5+20+50 = 75
+@Test
+function colxIndexWriteSum() {
+    var xs: [Int] = []
+    xs.append(10)
+    xs.append(20)
+    xs.append(30)
+    xs[0] = 5
+    xs[2] = 50
+    expect!(colxSum(xs) == 75)
+}
+
+// xs[0]=3, xs[2]=1 -> 31
+@Test
+function colxIndexSwap() {
+    var xs: [Int] = []
+    xs.append(1)
+    xs.append(2)
+    xs.append(3)
+    let tmp = xs[0]
+    xs[0] = xs[2]
+    xs[2] = tmp
+    expect!(xs[0] * 10 + xs[2] == 31)
+}
+
+// 3^2 = 9
+@Test
+function colxSquaresIndex3() {
+    let xs = colxBuildSquares(8)
+    expect!(xs[3] == 9)
+}
+
+// 7^2 = 49
+@Test
+function colxSquaresIndex7() {
+    let xs = colxBuildSquares(8)
+    expect!(xs[7] == 49)
+}
+
+// [0,3,6,9,12] -> 30
+@Test
+function colxModifyInLoop() {
+    var xs = colxBuildRange(5)
+    for j in 0..xs.count {
+        xs[j] = xs[j] * 3
+    }
+    expect!(colxSum(xs) == 30)
+}
+
+// 5+10+14 = 29
+@Test
+function colxBuildRangeMultiIndex() {
+    let xs = colxBuildRange(15)
+    expect!(xs[5] + xs[10] + xs[14] == 29)
+}
+
+// A trap test: `expectTrap!` names the trap it expects, and the body runs in a child that traps.
+@Test
+function colxTrapIndexJustPast() {
+    expectTrap!("")
+    var xs: [Int] = []
+    xs.append(10)
+    xs.append(20)
+    xs.append(30)
+    let _ = xs[3]
+}
+
+@Test
+function colxTrapIndexFarPast() {
+    expectTrap!("")
+    var xs: [Int] = []
+    xs.append(10)
+    xs.append(20)
+    xs.append(30)
+    let _ = xs[100]
+}
+
+// ---------------------------------------------------------------------------
+// GROUP F - Reverse
+// ---------------------------------------------------------------------------
+
+// reversed [0,1,2,3,4] -> [4,3,2,1,0], first=4
+@Test
+function colxReverseFirst() {
+    let xs = colxBuildRange(5)
+    let rev = colxReverse(xs)
+    expect!(rev[0] == 4)
+}
+
+// last=0
+@Test
+function colxReverseLast() {
+    let xs = colxBuildRange(5)
+    let rev = colxReverse(xs)
+    expect!(rev[4] == 0)
+}
+
+// same elements, sum=10
+@Test
+function colxReverseSum() {
+    let xs = colxBuildRange(5)
+    let rev = colxReverse(xs)
+    expect!(colxSum(rev) == 10)
+}
+
+@Test
+function colxReverseCount() {
+    let xs = colxBuildRange(5)
+    let rev = colxReverse(xs)
+    expect!(rev.count == 5)
+}
+
+// 3+1+4+1+5 = 14
+@Test
+function colxReverseSumManual() {
+    var xs: [Int] = []
+    xs.append(3)
+    xs.append(1)
+    xs.append(4)
+    xs.append(1)
+    xs.append(5)
+    let rev = colxReverse(xs)
+    expect!(colxSum(rev) == 14)
+}
+
+@Test
+function colxTrapReverseOOB() {
+    expectTrap!("")
+    let xs = colxBuildRange(3)
+    let rev = colxReverse(xs)
+    let _ = rev[3]
+}
+
+// ---------------------------------------------------------------------------
+// GROUP G - CountGt and Product
+// ---------------------------------------------------------------------------
+
+// elements 6,7,8,9 -> 4
+@Test
+function colxCountGtRange() {
+    let xs = colxBuildRange(10)
+    expect!(colxCountGt(xs, 5) == 4)
+}
+
+// [0,1,4,9,16,25,36,49,64,81] -> >30: 36,49,64,81 -> 4
+@Test
+function colxCountGtSquares() {
+    let xs = colxBuildSquares(10)
+    expect!(colxCountGt(xs, 30) == 4)
+}
+
+// 1,2,3 -> 3
+@Test
+function colxCountGtZero() {
+    var xs: [Int] = []
+    xs.append(1)
+    xs.append(2)
+    xs.append(0)
+    xs.append(3)
+    xs.append(0)
+    expect!(colxCountGt(xs, 0) == 3)
+}
+
+@Test
+function colxProductManual3() {
+    var xs: [Int] = []
+    xs.append(2)
+    xs.append(3)
+    xs.append(4)
+    expect!(colxProduct(xs) == 24)
+}
+
+@Test
+function colxProductManual5() {
+    var xs: [Int] = []
+    xs.append(1)
+    xs.append(2)
+    xs.append(3)
+    xs.append(4)
+    xs.append(5)
+    expect!(colxProduct(xs) == 120)
+}
+
+@Test
+function colxProductSingle() {
+    var xs: [Int] = []
+    xs.append(7)
+    expect!(colxProduct(xs) == 7)
+}
+
+@Test
+function colxProductEmpty() {
+    let xs: [Int] = []
+    expect!(colxProduct(xs) == 1)
+}
+
+// 1*1*2*3*5 = 30
+@Test
+function colxProductFibLike() {
+    var xs: [Int] = []
+    xs.append(1)
+    xs.append(1)
+    xs.append(2)
+    xs.append(3)
+    xs.append(5)
+    expect!(colxProduct(xs) == 30)
+}
+
+// ---------------------------------------------------------------------------
+// GROUP H - Arrays of structs
+// ---------------------------------------------------------------------------
+
+@Test
+function colxPtArrayCount() {
+    var pts: [ColxPt] = []
+    for i in 0..5 {
+        pts.append(ColxPt { x: i, y: i * 2 })
+    }
+    expect!(pts.count == 5)
+}
+
+// x=0+1+2+3+4 = 10
+@Test
+function colxPtSumX() {
+    var pts: [ColxPt] = []
+    for i in 0..5 {
+        pts.append(ColxPt { x: i, y: i * 2 })
+    }
+    var s = 0
+    for j in 0..pts.count {
+        s = s + pts[j].x
+    }
+    expect!(s == 10)
+}
+
+// y=0+2+4+6+8 = 20
+@Test
+function colxPtSumY() {
+    var pts: [ColxPt] = []
+    for i in 0..5 {
+        pts.append(ColxPt { x: i, y: i * 2 })
+    }
+    var s = 0
+    for j in 0..pts.count {
+        s = s + pts[j].y
+    }
+    expect!(s == 20)
+}
+
+// x: 0+1+2+3+4=10, y: 1+2+3+4+5=15, total=25
+@Test
+function colxPtSumBoth() {
+    var pts: [ColxPt] = []
+    for i in 0..5 {
+        pts.append(ColxPt { x: i, y: i + 1 })
+    }
+    var s = 0
+    for j in 0..pts.count {
+        s = s + pts[j].x + pts[j].y
+    }
+    expect!(s == 25)
+}
+
+@Test
+function colxPtMutateByIndex() {
+    var pts: [ColxPt] = []
+    pts.append(ColxPt { x: 1, y: 1 })
+    pts.append(ColxPt { x: 2, y: 2 })
+    pts.append(ColxPt { x: 3, y: 3 })
+    var local = pts[1]
+    local.x = 100
+    local.y = 200
+    pts[1] = local
+    expect!(pts[1].x + pts[1].y == 300)
+}
+
+// sum x=0+1+...+19=190, sum y=1+2+...+20=210, total=400
+@Test
+function colxPtBuildLarge() {
+    var pts: [ColxPt] = []
+    for i in 0..20 {
+        pts.append(ColxPt { x: i, y: i + 1 })
+    }
+    var s = 0
+    for j in 0..pts.count {
+        s = s + pts[j].x + pts[j].y
+    }
+    expect!(s == 400)
+}
+
+// sizes: 10+10+6 = 26
+@Test
+function colxBoxSumSizes() {
+    var boxes: [ColxBox] = []
+    boxes.append(ColxBox { lo: 0, hi: 10 })
+    boxes.append(ColxBox { lo: 5, hi: 15 })
+    boxes.append(ColxBox { lo: 2, hi: 8 })
+    var s = 0
+    for i in 0..boxes.count {
+        s = s + boxes[i].size()
+    }
+    expect!(s == 26)
+}
+
+// mids: (0+10)/2=5, (4+12)/2=8, (6+20)/2=13 -> 26
+@Test
+function colxBoxSumMids() {
+    var boxes: [ColxBox] = []
+    boxes.append(ColxBox { lo: 0, hi: 10 })
+    boxes.append(ColxBox { lo: 4, hi: 12 })
+    boxes.append(ColxBox { lo: 6, hi: 20 })
+    var s = 0
+    for i in 0..boxes.count {
+        s = s + boxes[i].mid()
+    }
+    expect!(s == 26)
+}
+
+// doubled x: 0+2+4+6+8=20, y unchanged: 0+1+2+3+4=10, total=30
+@Test
+function colxPtWritebackLoop() {
+    var pts: [ColxPt] = []
+    for i in 0..5 {
+        pts.append(ColxPt { x: i, y: i })
+    }
+    for j in 0..pts.count {
+        var local = pts[j]
+        local.x = local.x * 2
+        pts[j] = local
+    }
+    var s = 0
+    for k in 0..pts.count {
+        s = s + pts[k].x + pts[k].y
+    }
+    expect!(s == 30)
+}
+
+@Test
+function colxPtCount50() {
+    var pts: [ColxPt] = []
+    for i in 0..50 {
+        pts.append(ColxPt { x: i, y: i })
+    }
+    expect!(pts.count == 50)
+}
+
+// 0+1+...+19 = 190
+@Test
+function colxPtSumX20() {
+    var pts: [ColxPt] = []
+    for i in 0..20 {
+        pts.append(ColxPt { x: i, y: 0 })
+    }
+    var s = 0
+    for j in 0..pts.count {
+        s = s + pts[j].x
+    }
+    expect!(s == 190)
+}
+
+@Test
+function colxTrapPtArrayOOB() {
+    expectTrap!("")
+    var pts: [ColxPt] = []
+    pts.append(ColxPt { x: 1, y: 1 })
+    pts.append(ColxPt { x: 2, y: 2 })
+    pts.append(ColxPt { x: 3, y: 3 })
+    let _ = pts[5].x
+}

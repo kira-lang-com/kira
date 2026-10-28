@@ -1,0 +1,245 @@
+// The checked program: what `elaborate` hands to `lower`.
+//
+// Names are resolved to indices and every implicit conversion C++ performs
+// is an explicit node, so lowering decides nothing about meaning. Types are
+// indices into `types`; expressions and statements live in arenas.
+
+struct CheckedProgram {
+    var types: [TypeEntry]
+    var structs: [CheckedStruct]
+    var globals: [CheckedGlobal]
+    var functions: [CheckedFunction]
+    var expressions: [CheckedExpression]
+    var statements: [CheckedStatement]
+    var entries: [CheckedEntry]
+    var shaderName: String
+}
+
+// A folded scalar: its kind and the decimal text KSIR's literal reads.
+struct ConstValue {
+    let scalar: Scalar
+    let text: String
+}
+
+enum BindingKind {
+    Unbound
+    Attribute
+    User
+    Position
+    Color
+    Depth
+    SampleMask
+    ClipDistance
+}
+
+// What a struct member's attributes say about its place in a stage
+// interface: its kind and number, the name `[[user(name)]]` gives, and its
+// interpolation and sampling words.
+struct MemberBinding {
+    let kind: BindingKind
+    let index: Int
+    let name: String
+    let interpolation: String
+    let sampling: String
+}
+
+struct CheckedMember {
+    let name: String
+    let memberType: Int
+    let packed: Bool
+    let binding: MemberBinding
+}
+
+// A struct. `interface` is set when a stage passes it, which gives its
+// members their KSIR bindings.
+struct CheckedStruct {
+    let name: String
+    let members: [CheckedMember]
+    var interface: Bool
+    let span: Span
+}
+
+enum GlobalKind {
+    Buffer
+    Texture
+    SamplerGlobal
+    Threadgroup
+    ConstantGlobal
+    FunctionConstant
+}
+
+// A module-scope variable. A buffer is `constant` or `device` memory, of
+// `globalType` (a runtime array for a pointer); `slot` is its Metal index.
+// A constant has its initializer `value`, a function constant its `id`.
+// A sampler records whether a plain and a comparing sample read it, as
+// KSIR types the two apart.
+struct CheckedGlobal {
+    let name: String
+    let kind: GlobalKind
+    let globalType: Int
+    let device: Bool
+    let readOnly: Bool
+    let slot: Int
+    let value: Int
+    let id: Int
+    var plain: Bool
+    var comparison: Bool
+    let span: Span
+}
+
+enum ParameterMode {
+    ByValue
+    ThreadReference
+    ThreadgroupReference
+    Bound
+}
+
+// A parameter. A `Bound` one is a buffer, texture or sampler: the global
+// its caller passes replaces it, so it is no KSIR parameter. A bound
+// sampler records how it is sampled, as a global does.
+struct CheckedParameter {
+    let name: String
+    let parameterType: Int
+    let mode: ParameterMode
+    let readOnly: Bool
+    var plain: Bool
+    var comparison: Bool
+}
+
+// A variable of a function; `shared` marks a `threadgroup` reference.
+struct LocalVariable {
+    let name: String
+    let localType: Int
+    let readOnly: Bool
+    let shared: Bool
+}
+
+// A function. Its parameters are its first locals, in order; `calls`
+// holds the functions its body calls.
+struct CheckedFunction {
+    var name: String
+    var parameters: [CheckedParameter]
+    var locals: [LocalVariable]
+    var result: Int
+    var body: [Int]
+    var calls: [Int]
+    var stage: StageWord
+    let span: Span
+}
+
+// One argument of an entry point: parameter `parameter`, the stage-in
+// struct, or a built-in read as `builtin` (KSIR's name) of `ksirType` and
+// narrowed to the declared parameter's first `lanes` lanes. The built-in
+// `workgroup_size` is no KSIR built-in: lowering composes it from the
+// overrides that size the workgroup.
+struct EntryInput {
+    let parameter: Int
+    let builtin: String
+    let ksirType: Int
+    let lanes: Int
+}
+
+// An entry point: its function and inputs; when it returns a bare value,
+// that value's built-in or location (-1 when neither).
+struct CheckedEntry {
+    let routine: Int
+    let inputs: [EntryInput]
+    let resultBuiltin: String
+    let resultLocation: Int
+}
+
+enum CheckedKind {
+    Literal
+    Local
+    Global
+    BoundParameter
+    Member
+    Swizzle
+    Index
+    Construct
+    Splat
+    Zero
+    Convert
+    Bitcast
+    Call
+    Library
+    ImageCall
+    Atomic
+    Barrier
+    Discard
+    Unary
+    Binary
+    Select
+    Choose
+    ShortCircuit
+    Assign
+    Step
+    Sequence
+    Invalid
+}
+
+// One checked expression. `target` names the local, global, parameter,
+// member or function; `left`, `right` and `third` are operands;
+// `arguments` a construction's parts, a call's arguments or an image
+// operation's operands in KSIR's order (-1 for none); `components` a
+// swizzle's lanes. `name` is a library function's, image operation's or
+// atomic operation's KSIR name, or a barrier's flags; `detail` a sample's
+// level kind, a derivative's axis and control, or `prefix` for a prefix
+// step. `place` marks an expression that names memory, `readOnly` memory
+// that cannot be written.
+struct CheckedExpression {
+    var kind: CheckedKind
+    var expressionType: Int
+    var value: ConstValue
+    var target: Int
+    var left: Int
+    var right: Int
+    var third: Int
+    var arguments: [Int]
+    var components: [Int]
+    var operator: Operator
+    var name: String
+    var detail: String
+    var place: Bool
+    var readOnly: Bool
+    var span: Span
+}
+
+enum CheckedStatementKind {
+    DeclareLocal
+    EvaluateValue
+    IfElse
+    SwitchCases
+    LoopFor
+    BreakOut
+    ContinueOn
+    ReturnValue
+    Nested
+}
+
+// One case of a switch: its labels (`hasDefault` for `default`), the
+// statements after them, and whether control falls into the next case.
+struct CheckedCase {
+    let labels: [ConstValue]
+    let hasDefault: Bool
+    let body: [Int]
+    let fallsThrough: Bool
+}
+
+// One checked statement. `DeclareLocal` declares `local` from `value` (-1
+// leaves it zero); `EvaluateValue` and `ReturnValue` compute `value`;
+// `IfElse` tests `value`; `SwitchCases` selects on `value`; `LoopFor` runs
+// `initial`, then while `value` holds (-1 always) runs `body` and computes
+// `step`, testing at the end when `testAfter`.
+struct CheckedStatement {
+    let kind: CheckedStatementKind
+    let local: Int
+    let value: Int
+    let step: Int
+    let initial: [Int]
+    let body: [Int]
+    let otherwise: [Int]
+    let cases: [CheckedCase]
+    let testAfter: Bool
+    let span: Span
+}

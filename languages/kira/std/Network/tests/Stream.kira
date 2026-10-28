@@ -1,0 +1,81 @@
+import Foundation
+
+// A connected client and server TLS stream pair over record framing.
+function streamPair() -> Result<(TlsStream, TlsStream), TlsAlert> {
+    let server = try testServer(.Records)
+    let client = try testClient(.Records, "127.0.0.1")
+    return .Ok((TlsStream { handshake: move client }, TlsStream { handshake: move server }))
+}
+
+// Moves bytes both ways until neither side has any to send.
+function exchange(
+    client: borrow mut TlsStream,
+    server: borrow mut TlsStream
+) -> Result<Void, TlsAlert> {
+    try client.pump()
+    for _ in 0..6 {
+        let toServer = client.transmit()
+        try server.receive(toServer)
+        let toClient = server.transmit()
+        try client.receive(toClient)
+    }
+    return .Ok
+}
+
+function textOf(bytes: borrow [UN8]) -> String {
+    return match textFromBytes(bytes) {
+        Some(text) -> text
+        None -> "?"
+    }
+}
+
+// Data written on one side arrives on the other, including after a key
+// update, and a close is seen by the peer.
+@Test
+function tlsStreamCarriesDataBothWays() {
+    var (client, server) = match streamPair() {
+        Ok(pair) -> pair
+        Error(alert) -> {
+            expect!((traceText(alert)) == "")
+            return
+        }
+    }
+    match exchange(client, server) {
+        Ok -> {}
+        Error(alert) -> {
+            expect!(("handshake " + traceText(alert)) == "")
+            return
+        }
+    }
+    expect!((client.isOpen() && server.isOpen()) == (true))
+    absorb client.write(tlsTextBytes("ping"))
+    // A key update the server must follow and answer.
+    absorb client.updateKeys(true)
+    absorb client.write(tlsTextBytes(" again"))
+    absorb exchange(client, server)
+    expect!((textOf(server.read())) == "ping again")
+    absorb server.write(tlsTextBytes("pong"))
+    server.close()
+    expect!((traceText(exchange(client, server))) == "Ok")
+    expect!((textOf(client.read())) == "pong")
+    expect!((client.peerClosed) == (true))
+}
+
+// A flipped bit in a protected record fails it with bad_record_mac, and the
+// receiver answers with an alert.
+@Test
+function tamperedRecordsAreRefused() {
+    var (client, server) = match streamPair() {
+        Ok(pair) -> pair
+        Error(alert) -> {
+            expect!((traceText(alert)) == "")
+            return
+        }
+    }
+    absorb exchange(client, server)
+    absorb client.write(tlsTextBytes("secret"))
+    var wire = client.transmit()
+    wire[wire.count - 1] = UN8(Number(wire[wire.count - 1]) ^ 1)
+    expect!((traceText(server.receive(wire))) == "Error(TlsAlert.BadRecordMac)")
+    expect!((server.transmit().count > 0) == (true))
+}

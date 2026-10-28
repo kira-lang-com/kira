@@ -1,0 +1,26 @@
+import Heap
+
+// Whole-run copies of `[UN8]`, which every wire format and kernel buffer is
+// made of. A `UN8` is stored as one byte (framework section 21.1), so a run
+// moves with one copy instead of an element at a time.
+
+// The bytes from `start` up to `end`, clamped to the array.
+function byteRun(bytes: borrow [UN8], start: Number, end: Number) -> [UN8] {
+    let from = max(min(Number(start), bytes.count), 0)
+    let to = max(min(Number(end), bytes.count), from)
+    let count = to - from
+    let data = makeArrayData(max(count, 1))
+    heapCopyBytes(data, heapOffset(bytes.data, from), count)
+    let empty: [UN8] = []
+    return Array { data = data, count = count, capacity = max(count, 1), ops = empty.ops }
+}
+
+// `first`, then `second`, in one new array.
+function joinedBytes(first: borrow [UN8], second: borrow [UN8]) -> [UN8] {
+    let count = first.count + second.count
+    let data = makeArrayData(max(count, 1))
+    heapCopyBytes(data, first.data, first.count)
+    heapCopyBytes(heapOffset(data, first.count), second.data, second.count)
+    let empty: [UN8] = []
+    return Array { data = data, count = count, capacity = max(count, 1), ops = empty.ops }
+}

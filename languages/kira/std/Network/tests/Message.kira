@@ -1,0 +1,151 @@
+import Foundation
+
+function sampleHello() -> Result<TlsClientHello, TlsAlert> {
+    let name = try tlsServerNameExtension("example.com")
+    let protocols = try tlsProtocolList(["h3"])
+    let shares = try tlsOfferedShares([TlsKeyShare { group: .X25519, share: tlsZeroBytes(32) }])
+    return .Ok(
+        TlsClientHello {
+            random: tlsZeroBytes(Tls.randomBytes),
+            sessionId: [],
+            suites: [.Aes128GcmSha256, .ChaCha20Poly1305Sha256],
+            extensions: [tlsOfferedVersions(), name, protocols, shares, tlsGroupList([.X25519])]
+        }
+    )
+}
+
+// What the decoded hello says, one part each: whether it offers TLS 1.3, its
+// server name, its protocols, its key share count, and its suite count.
+function helloSummary(hello: borrow TlsClientHello) -> Result<[String], TlsAlert> {
+    let versions = try tlsRequireExtension(hello.extensions, .SupportedVersions)
+    let names = try tlsRequireExtension(hello.extensions, .ServerName)
+    let alpn = try tlsRequireExtension(hello.extensions, .ApplicationProtocols)
+    let keys = try tlsRequireExtension(hello.extensions, .KeyShare)
+    let offers = try tlsOffersVersion13(versions)
+    let name = try tlsReadServerName(names)
+    let protocols = try tlsReadProtocols(alpn)
+    let shares = try tlsReadOfferedShares(keys)
+    return .Ok([
+        "\(offers)",
+        traceText(name),
+        traceText(protocols),
+        "\(shares.count)",
+        "\(hello.suites.count)"
+    ])
+}
+
+// A ClientHello written, split across two arrivals and read back whole. The
+// parts are: the first arrival alone is not a message, the decoded summary,
+// and whether the buffer is empty and the bytes came back identical.
+function clientHelloWireRoundTripParts() -> Result<[String], String> {
+    let hello = match sampleHello() {
+        Ok(value) -> value
+        Error(alert) -> return .Error(traceText(alert))
+    }
+    let message = match tlsEncodeClientHello(hello) {
+        Ok(value) -> value
+        Error(alert) -> return .Error(traceText(alert))
+    }
+    var buffer = TlsMessageBuffer {}
+    buffer.add(byteRun(message.encoded, 0, 10))
+    let early = traceText(buffer.next())
+    buffer.add(byteRun(message.encoded, 10, message.encoded.count))
+    let arrived = match buffer.next() {
+        Ok(value) -> value
+        Error(alert) -> return .Error(traceText(alert))
+    }
+    let whole = match arrived {
+        Some(value) -> value
+        None -> return .Error("still waiting")
+    }
+    let decoded = match tlsDecodeClientHello(whole.body) {
+        Ok(value) -> value
+        Error(alert) -> return .Error(traceText(alert))
+    }
+    let summary = match helloSummary(decoded) {
+        Ok(parts) -> parts
+        Error(alert) -> return .Error(traceText(alert))
+    }
+    var parts = [early]
+    for part in summary { parts.append(part) }
+    parts.append(traceText(buffer.isEmpty() && whole.encoded == message.encoded))
+    return .Ok(parts)
+}
+
+// A ClientHello survives a wire round trip in pieces, and its contents decode.
+@Test
+function clientHelloSurvivesAWireRoundTrip() {
+    let parts = match clientHelloWireRoundTripParts() {
+        Ok(found) -> found
+        Error(text) -> {
+            expect!(text == "")
+            return
+        }
+    }
+    expect!((parts[0]) == "Ok(None)")
+    expect!((parts[1]) == "true")
+    expect!((parts[2]) == "Some(\"example.com\")")
+    expect!((parts[3]) == "[\"h3\"]")
+    expect!((parts[4]) == "1")
+    expect!((parts[5]) == "2")
+    expect!((parts[6]) == "true")
+}
+
+// The same extension twice is refused (RFC 8446 section 4.2).
+@Test
+function repeatedExtensionsAreIllegal() {
+    let hello = TlsClientHello {
+        random: tlsZeroBytes(Tls.randomBytes),
+        sessionId: [],
+        suites: [.Aes128GcmSha256],
+        extensions: [tlsOfferedVersions(), tlsOfferedVersions()]
+    }
+    let message = match tlsEncodeClientHello(hello) {
+        Ok(value) -> value
+        Error(alert) -> {
+            expect!((traceText(alert)) == "Error(TlsAlert.IllegalParameter)")
+            return
+        }
+    }
+    expect!((traceText(tlsDecodeClientHello(message.body))) == "Error(TlsAlert.IllegalParameter)")
+}
+
+// A certificate chain round trips with its certificates in order and an empty
+// request context.
+@Test
+function certificateChainsRoundTrip() {
+    let chain = TlsCertificateChain { certificates: [[1, 2, 3], [4]] }
+    let message = match tlsEncodeCertificate(chain) {
+        Ok(value) -> value
+        Error(alert) -> {
+            expect!(traceText(alert) == "")
+            return
+        }
+    }
+    let decoded = match tlsDecodeCertificate(message.body) {
+        Ok(value) -> value
+        Error(alert) -> {
+            expect!(traceText(alert) == "")
+            return
+        }
+    }
+    expect!((decoded.certificates) == (chain.certificates))
+    expect!((decoded.context.count) == (0))
+}
+
+// The signed content is a run of 0x20 padding, the server context string,
+// a zero byte, and the Finished verify data (RFC 8446 section 4.4.3).
+@Test
+function signedContentFollowsRfc8446() {
+    let content = tlsSignedContent(.Server, [9, 9])
+    let context = tlsTextBytes(Tls.serverContext)
+    let start = Tls.signaturePadding
+    let end = start + context.count
+    expect!("\(content.count)" == "\(end + 3)")
+    expect!((Number(content[0])) == (32))
+    expect!((Number(content[start - 1])) == (32))
+    expect!((byteRun(content, start, end) == context) == (true))
+    expect!((Number(content[end])) == (0))
+    expect!(tlsFinishedMatches(byteRun(content, end + 1, end + 3), [9, 9]) == (true))
+    expect!(tlsFinishedMatches([9, 8], [9, 9]) == (false))
+}

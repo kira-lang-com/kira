@@ -1,0 +1,303 @@
+// Lowering expressions.
+//
+// A scalar expression lowers to a KIR value. A struct or enum lowers to the
+// address of storage that holds it: a local's slot, a field inside another
+// value, or a temporary the expression fills. Writing one into a destination
+// copies it member by member, so a binding is a copy, as Kira requires.
+
+extend FunctionLowering {
+    function value(borrow mut self, index: Int) -> KirValue {
+        let expression = program.expressions[index]
+        let valueType = expression.valueType
+        kir.at(program.named(expression.span))
+        match expression.operation {
+            StringText -> return kir.load(address(index))
+            Sequence(body, result) -> return sequenceValue(body, result)
+            Integer(constant) -> return kir.integer(types.of(valueType), constant)
+            FloatLiteral -> return floatLiteralValue(valueType, expression.span)
+            BoxAny -> return kir.load(address(index))
+            TypeIs(operand, typeId) -> return typeIs(operand, typeId)
+            UnboxAny(operand, typeId, handler) -> return unboxValue(operand, typeId, handler, valueType, expression.span)
+            FunctionReference -> return kir.load(address(index))
+            IndirectCall(target, arguments) -> return indirectCall(target, arguments, valueType, .None)
+            MakeClosure -> return kir.load(address(index))
+            GlobalRead(global) -> return globalValue(index, global)
+            TaskSpawn -> return kir.load(address(index))
+            TaskReady -> return kir.load(address(index))
+            TaskAwait(task, typeId) -> return awaitedValue(task, typeId, valueType, expression.span)
+            TaskCancel(task) -> return taskEffect(3, task)
+            TaskDetach(task) -> return taskEffect(4, task)
+            Async(step) -> return asyncValue(step, index, valueType)
+            RuntimeTrap(cause) -> return trapValue(cause, expression.span)
+            Try(operand, destination) -> return triedValue(operand, destination, valueType)
+            ChannelCreate -> return kir.load(address(index))
+            ChannelReceiver -> return kir.load(address(index))
+            ChannelSend(channel, sent) -> return sendEffect(channel, sent)
+            ChannelClose(channel) -> return closeEffect(channel)
+            ClassView(operand) -> return value(operand)
+            ClassCall(target, arguments) -> return classCall(target, arguments, valueType, .None)
+            Boolean(truth) -> return kir.integer(types.boolean, truth ? 1 : 0)
+            StringLiteral -> return kir.load(address(index))
+            StringConcat -> return kir.load(address(index))
+            TraceText -> return kir.load(address(index))
+            HeapAllocateRaw(byteCount, alignment) -> return kir.allocateRaw(value(byteCount), value(alignment))
+            HeapFreeRaw(pointer) -> return freeEffect(pointer)
+            Print(text) -> return printEffect(text)
+            HeapRead(pointer) -> return heapReadValue(index, pointer, valueType, expression.span)
+            HeapWrite(pointer, stored) -> return heapWriteEffect(pointer, stored)
+            Atomic(step) -> return atomicValue(step, valueType)
+            HeapCopy(destination, source, count, overlapping) -> return heapCopyEffect(destination, source, count, overlapping)
+            HeapFill(destination, byte, count) -> return heapFillEffect(destination, byte, count)
+            HeapOffset(pointer, offset) -> return kir.offsetBytes(value(pointer), value(offset))
+            HeapLayout(measured, measure) -> return heapLayout(measured, measure)
+            ArrayLiteral -> return kir.load(address(index))
+            ArrayIndex -> return kir.load(address(index))
+            ArrayAppend(array, element) -> return appendEffect(array, element)
+            Transfer(mode, operand) -> return value(operand)
+            Read -> return kir.load(address(index))
+            Member(base, field) -> return constructionMember(index, base, field)
+            Call(target, arguments) -> return call(target, arguments, valueType)
+            Construct -> return kir.load(address(index))
+            Tagged -> return kir.load(address(index))
+            Unary(operator, operand) -> return unary(operator, operand, valueType)
+            Arithmetic(operator, left, right) -> return arithmetic(operator, left, right, expression.span)
+            Wrapping(operator, left, right) -> return wrappingValue(operator, left, right, valueType)
+            Compare(comparison, left, right) -> return compare(comparison, left, right)
+            EnumCode(operand) -> return kir.tag(address(operand))
+            EnumFromCode -> return kir.load(address(index))
+            Order(left, right) -> return orderValues(address(left), address(right), program.typeOf(left))
+            Hash(operand) -> return hashValue(kir.integer(types.integer64, fnvOffsetBasis()), address(operand), program.typeOf(operand))
+            Logical(connective, left, right) -> return logical(connective, left, right)
+            Select(condition, whenTrue, whenFalse) -> return selectValue(index, condition, whenTrue, whenFalse, valueType)
+            Choice -> return kir.load(address(index))
+            Bitcast(operand) -> return bitcastValue(operand, valueType)
+            Convert(operand) -> return convert(operand, valueType, expression.span)
+            ForeignImage -> return kir.load(address(index))
+            ForeignElements(array, retained) -> return elementsPointer(array, retained)
+            ForeignCallback -> return kir.load(address(index))
+            ForeignRead -> return kir.load(address(index))
+            ForeignUnion -> return kir.load(address(index))
+        }
+    }
+
+    // The storage of a struct or enum value, or of a place a write goes to.
+    function address(borrow mut self, index: Int) -> KirAddress {
+        let expression = program.expressions[index]
+        let valueType = expression.valueType
+        kir.at(program.named(expression.span))
+        match expression.operation {
+            StringText(text) -> return stringText(valueType, text)
+            Sequence(body, result) -> return sequenceAddress(body, result, valueType)
+            TaskSpawn(target, values, workType) -> return spawnTask(target, values, workType, valueType)
+            TaskReady(value) -> return readyTask(value, valueType)
+            TaskAwait(task, typeId) -> return valueType.isAggregate() ? awaitTask(task, typeId, valueType, expression.span) : spill(index)
+            TaskCancel -> return spill(index)
+            TaskDetach -> return spill(index)
+            Async(step) -> return asyncAddress(step, index, valueType)
+            RuntimeTrap -> return spill(index)
+            Try(operand, destination) -> return tryAddress(operand, destination, valueType)
+            ChannelCreate -> return createChannel(valueType)
+            ChannelReceiver(sender) -> return taskHandle(taskId(sender), valueType)
+            ChannelSend -> return spill(index)
+            ChannelClose -> return spill(index)
+            ClassView(operand) -> return address(operand)
+            ClassCall(target, arguments) -> return classCallAddress(index, target, arguments, valueType)
+            GlobalRead(global) -> return globalReadAddress(global)
+            BoxAny(operand, typeId) -> return boxAny(operand, typeId, valueType)
+            FunctionReference(target) -> return functionReference(target, valueType)
+            MakeClosure(target, captures) -> return makeClosure(target, captures, valueType)
+            IndirectCall(target, arguments) -> return indirectCallAddress(index, target, arguments, valueType)
+            TypeIs -> return spill(index)
+            UnboxAny(operand, typeId, handler) -> return valueType.isAggregate() ? unboxedAddress(operand, typeId, handler, expression.span) : spill(index)
+            StringLiteral -> return stringLiteral(valueType, expression.span)
+            StringConcat(left, right) -> return stringConcat(left, right, valueType)
+            TraceText(operand) -> return traceTextAddress(operand, valueType)
+            Read(local) -> return localAddress(local)
+            Member(base, field) -> return memberAddress(base, field)
+            ArrayLiteral(elements) -> return arrayLiteral(elements, valueType)
+            ArrayIndex(array, offset) -> return arrayIndex(array, offset, expression.span)
+            ArrayAppend -> return spill(index)
+            Transfer(mode, operand) -> return address(operand)
+            Call(target, arguments) -> return callAddress(target, arguments, valueType)
+            Construct(fields) -> return constructAddress(fields, valueType)
+            Tagged(variant, payload) -> return taggedAddress(variant, payload, valueType)
+            Select(condition, whenTrue, whenFalse) -> return selectInto(condition, whenTrue, whenFalse, valueType)
+            Choice(subject, arms) -> return choiceInto(subject, arms, valueType)
+            Integer -> return spill(index)
+            FloatLiteral -> return spill(index)
+            Boolean -> return spill(index)
+            HeapAllocateRaw -> return spill(index)
+            HeapFreeRaw -> return spill(index)
+            Print -> return spill(index)
+            HeapRead(pointer) -> return heapReadAddress(pointer, valueType, expression.span)
+            HeapWrite -> return spill(index)
+            Atomic -> return spill(index)
+            HeapCopy -> return spill(index)
+            HeapFill -> return spill(index)
+            HeapOffset -> return spill(index)
+            HeapLayout -> return spill(index)
+            Unary -> return spill(index)
+            Arithmetic -> return spill(index)
+            Wrapping -> return spill(index)
+            Compare -> return spill(index)
+            EnumCode -> return spill(index)
+            EnumFromCode(operand) -> return enumFromCode(value(operand), valueType)
+            Order -> return spill(index)
+            Hash -> return spill(index)
+            Logical -> return spill(index)
+            Bitcast(operand) -> return valueType.isAggregate() ? address(operand) : spill(index)
+            Convert -> return spill(index)
+            ForeignImage(operand, retained) -> return foreignImage(operand, retained, valueType)
+            ForeignElements -> return spill(index)
+            ForeignCallback(entry, _, closure) -> return foreignCallbackValue(entry, closure, valueType)
+            ForeignRead(base, field) -> return foreignRead(base, field, valueType, expression.span)
+            ForeignUnion(field, member) -> return foreignUnion(field, member, valueType)
+        }
+    }
+
+    // A scalar value given storage, for a place that is not a variable.
+    function spill(borrow mut self, index: Int) -> KirAddress {
+        let destination = temporary(program.typeOf(index))
+        kir.store(value(index), destination)
+        return destination
+    }
+
+    // `move name` hands the binding's value over. Moving a field leaves the
+    // field holding its value, so it is a copy, as Kira's is.
+    function movesBinding(borrow self, index: Int) -> Bool {
+        match program.expressions[index].operation.viewedClass() {
+            Some(operand) -> return movesBinding(operand)
+            None -> {}
+        }
+        match program.expressions[index].operation.movingOperand() {
+            Some(operand) -> return program.expressions[operand].operation.readLocal().isSome()
+            None -> return false
+        }
+    }
+
+    // Evaluates `index` into `destination`: a store for a scalar, a copy for a
+    // struct or enum.
+    function write(borrow mut self, index: Int, destination: KirAddress) {
+        if writeScalarConstruction(index, destination) { return }
+        let valueType = program.typeOf(index)
+        if valueType.isAggregate() {
+            let source = address(index)
+            if movesBinding(index) || isTemporaryAddress(source) {
+                moveValue(source, destination, valueType)
+                forgetTracked(source)
+            } else {
+                copyValue(source, destination, valueType)
+            }
+        } else {
+            kir.store(value(index), destination)
+        }
+        markInitialized(destination)
+    }
+
+    // An expression statement: its value, if any, is dropped.
+    function evaluate(borrow mut self, index: Int) {
+        let valueType = program.typeOf(index)
+        if valueType.equals(Type.void()) {
+            let operation = program.expressions[index].operation
+            match operation.invocation() {
+                Some(invocation) -> callVoid(invocation.target, invocation.arguments)
+                None -> {
+                    match operation.indirectInvocation() {
+                        Some(invocation) -> indirectCall(invocation.target, invocation.arguments, Type.void(), .None)
+                        None -> {
+                            match operation.choice() {
+                                // A Void `match` has no value to hold; its
+                                // arms run for their effects.
+                                Some(choice) -> dispatch(choice.subject, choice.arms, .None)
+                                None -> { value(index) }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if valueType.isAggregate() {
+            address(index)
+        } else {
+            value(index)
+        }
+    }
+
+    // Copies a value of `valueType` from one address to another. A value
+    // owning nothing is copied as its bits; an enum that owns something is
+    // copied by its type's copier, which switches on the source, copies that
+    // variant's payload, and sets the destination's tag.
+    function copyValue(borrow mut self, from: KirAddress, to: KirAddress, valueType: Type) {
+        if !needsArrayCleanup(program, valueType) {
+            if valueType.kind == .Structure || valueType.kind == .Enumeration {
+                kir.copyBytes(from, to, kir.integer(types.integer64, types.byteSize(valueType)), types.pointer)
+            } else {
+                kir.store(kir.load(from), to)
+            }
+            return
+        }
+        if isClassType(program, valueType) { copyClass(from, to) return }
+        if isAnyType(program, valueType) { copyAny(from, to) return }
+        if isClosureType(program, valueType) || isContextCallbackType(program, valueType) { copyClosure(from, to) return }
+        if isWitnessedType(program, valueType) { copyWitnessed(from, to) return }
+        if isArrayType(program, valueType) || isStringType(program, valueType) {
+            copyArray(from, to, valueType)
+            return
+        }
+        if valueType.kind == .Structure {
+            let owner = program.structs[valueType.declaration]
+            if owner.genericBase == "NativeState" {
+                let slot = kir.load(kir.field(from, 0, types.integer64))
+                for index in 0..program.functions.count {
+                    if program.functions[index].symbol != "nativeStateRetain" { continue }
+                    kir.argument(slot)
+                    kir.callVoid(functions[index])
+                }
+                kir.store(slot, kir.field(to, 0, types.integer64))
+                return
+            }
+            for field in 0..owner.fields.count {
+                let fieldType = owner.fields[field].valueType
+                let kirField = types.of(fieldType)
+                copyValue(kir.field(from, field, kirField), kir.field(to, field, kirField), fieldType)
+            }
+            return
+        }
+        if valueType.kind == .Enumeration {
+            match types.copiers[valueType.declaration] {
+                Some(copier) -> {
+                    kir.argument(kir.pointer(from))
+                    kir.argument(kir.pointer(to))
+                    kir.callVoid(copier)
+                }
+                None -> abort()
+            }
+            return
+        }
+        kir.store(kir.load(from), to)
+    }
+
+    function copyEnum(borrow mut self, from: KirAddress, to: KirAddress, valueType: Type) {
+        let variants = program.enums[valueType.declaration].variants
+        let join = kir.block()
+        var blocks: [KirBlockBuilder] = []
+        for variant in 0..variants.count {
+            let block = kir.block()
+            kir.switchCase(variant, block)
+            blocks.append(block)
+        }
+        kir.switchEnum(from)
+        for variant in 0..variants.count {
+            enter(blocks[variant])
+            match variants[variant].payload {
+                Some(payloadType) -> {
+                    let source = payloadPlace(from, valueType, variant)
+                    copyValue(source, newPayloadPlace(to, valueType, variant), payloadType)
+                }
+                None -> {}
+            }
+            kir.inject(to, variant)
+            flowInto(join)
+        }
+        enter(join)
+    }
+}

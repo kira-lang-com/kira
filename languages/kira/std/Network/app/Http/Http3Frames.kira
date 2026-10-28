@@ -1,0 +1,142 @@
+import Foundation
+
+// HTTP/3 frames (RFC 9114 section 7): a type and a length as variable-length
+// integers, then the payload. DATA payloads are handed on as they arrive;
+// every other frame is read whole, within a limit.
+
+function writeHttp3Frame(
+    writer: borrow mut WireWriter,
+    kind: Http3FrameType,
+    payload: borrow [UN8]
+) {
+    writer.writeVarint(code(kind))
+    writer.writeVarint(payload.count)
+    writer.writeBytes(payload)
+}
+
+function http3Frame(kind: Http3FrameType, payload: borrow [UN8]) -> [UN8] {
+    var writer = WireWriter {}
+    writeHttp3Frame(writer, kind, payload)
+    return writer.bytes
+}
+
+// The start of a frame: its type, its length, and where its payload begins.
+struct FrameStart {
+    let kind: Http3FrameType
+    let length: Number
+    let payloadAt: Number
+}
+
+// The frame header at the start of `bytes`, none until all of it arrived.
+function readFrameStart(bytes: borrow [UN8]) -> FrameStart? {
+    var reader = WireReader { bytes: copy bytes }
+    let kind: Number = try reader.readVarint() otherwise return .None
+    let length: Number = try reader.readVarint() otherwise return .None
+    return .Some(
+        FrameStart { kind: fromCode<Http3FrameType>(kind), length: length, payloadAt: reader.at }
+    )
+}
+
+// Settings a peer announced (RFC 9114 section 7.2.4.1), with the defaults
+// that hold until its SETTINGS frame arrives.
+struct Http3Settings {
+    // None is unlimited.
+    var maxFieldSectionSize: Number? = .None
+    var qpackMaxTableCapacity: Number = 0
+    var qpackBlockedStreams: Number = 0
+    var enableConnectProtocol: Bool = false
+    var datagrams: Bool = false
+    var webTransport: Bool = false
+}
+
+// What this endpoint announces: no dynamic table, extended CONNECT and
+// datagrams for WebTransport (RFC 9220, RFC 9297), and WebTransport itself
+// from both sides, as the drafts ask (draft-ietf-webtrans-http3 section
+// 3.1). No WebTransport flow control is announced, so a connection carries
+// one session.
+function settingsPayload(limits: borrow FieldLimits, server: Bool) -> [UN8] {
+    var writer = WireWriter {}
+    writer.writeVarint(code(Http3Setting.MaxFieldSectionSize))
+    writer.writeVarint(limits.sectionSize)
+    writer.writeVarint(code(Http3Setting.H3Datagram))
+    writer.writeVarint(1)
+    writer.writeVarint(code(Http3Setting.WtEnabled))
+    writer.writeVarint(1)
+    if server {
+        writer.writeVarint(code(Http3Setting.EnableConnectProtocol))
+        writer.writeVarint(1)
+    }
+    return writer.bytes
+}
+
+function readSettings(payload: borrow [UN8]) -> Result<Http3Settings, Http3Error> {
+    var reader = WireReader { bytes: copy payload }
+    var settings = Http3Settings {}
+    var seen: [Number] = []
+    while !reader.atEnd() {
+        let id: Number = try reader.readVarint() otherwise return .Error(.FrameError)
+        let value: Number = try reader.readVarint() otherwise return .Error(.FrameError)
+        if seen.contains(id) || Http3.http2Settings.contains(id) { return .Error(.SettingsError) }
+        seen.append(id)
+        try applySetting(settings, fromCode<Http3Setting>(id), value)
+    }
+    return .Ok(settings)
+}
+
+function applySetting(
+    settings: borrow mut Http3Settings,
+    id: Http3Setting,
+    value: Number
+) -> Result<Void, Http3Error> {
+    match id {
+        QpackMaxTableCapacity -> settings.qpackMaxTableCapacity = value
+        MaxFieldSectionSize -> settings.maxFieldSectionSize = .Some(value)
+        QpackBlockedStreams -> settings.qpackBlockedStreams = value
+        EnableConnectProtocol -> {
+            if value > 1 { return .Error(.SettingsError) }
+            settings.enableConnectProtocol = value == 1
+        }
+        H3Datagram -> {
+            if value > 1 { return .Error(.SettingsError) }
+            settings.datagrams = value == 1
+        }
+        WtEnabled -> settings.webTransport = value == 1
+        // Unknown settings are ignored (RFC 9114 section 7.2.4).
+        else -> {}
+    }
+    return .Ok
+}
+
+// Whether a frame type may appear on a request stream (RFC 9114 section
+// 7.2): DATA, HEADERS and unknown types may; the rest belong to the control
+// stream or to HTTP/2.
+function requestFrameAllowed(kind: Http3FrameType) -> Bool {
+    if Http3.http2Frames.contains(code(kind)) { return false }
+    return match kind {
+        Data -> true
+        Headers -> true
+        CancelPush -> false
+        Settings -> false
+        PushPromise -> false
+        Goaway -> false
+        MaxPushId -> false
+        // Only as a stream's first bytes, which are read apart.
+        WtStream -> false
+        else -> true
+    }
+}
+
+function controlFrameAllowed(kind: Http3FrameType) -> Bool {
+    if Http3.http2Frames.contains(code(kind)) { return false }
+    return match kind {
+        Data -> false
+        Headers -> false
+        PushPromise -> false
+        CancelPush -> true
+        Settings -> true
+        Goaway -> true
+        MaxPushId -> true
+        WtStream -> false
+        else -> true
+    }
+}

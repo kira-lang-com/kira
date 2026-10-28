@@ -1,0 +1,76 @@
+extend Checker {
+    function checkQuote(borrow mut self, parts: [QuotePart], span: Span) -> Int {
+        match declarations.typeNamed("Syntax") {
+            Some(syntaxType) -> {
+                if syntaxType.kind != .Structure || program.structs[syntaxType.declaration].fields.count != 1 {
+                    report(.OutsideSubset, span)
+                    return add(.Integer(0), Type.invalid(), span)
+                }
+                let stringType = program.structs[syntaxType.declaration].fields[0].valueType
+                if !isStringType(program, stringType) {
+                    report(.OutsideSubset, span)
+                    return add(.Integer(0), Type.invalid(), span)
+                }
+                var text = add(.StringText(""), stringType, span)
+                for part in parts {
+                    var next = 0
+                    match part {
+                        Text(value) -> next = add(.StringText(value), stringType, span)
+                        Splice(value) -> next = quoteSplice(expression(value, .None), stringType, span)
+                    }
+                    text = add(.StringConcat(text, next), stringType, span)
+                }
+                return add(.Construct([text]), syntaxType, span)
+            }
+            None -> {
+                report(.UnknownType, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+
+    function quoteSplice(borrow mut self, value: Int, stringType: Type, span: Span) -> Int {
+        let valueType = typeOf(value)
+        match valueType.kind {
+            Integer -> return add(.Call(program.stringFunctions[2], [coerce(value, Type.int(), .ArgumentTypeMismatch)]), stringType, span)
+            Boolean -> return add(.Call(program.stringFunctions[3], [value]), stringType, span)
+            Structure -> {
+                let structure = program.structs[valueType.declaration]
+                if isStringType(program, valueType) {
+                    match declarations.findFunction(.None, "quoteString") {
+                        Some(target) -> return add(.Call(target, [value]), stringType, span)
+                        None -> report(.UndefinedFunction, span)
+                    }
+                } else if isSyntaxText(structure.name.text) {
+                    if structure.fields.count == 1 && structure.fields[0].valueType.equals(stringType) {
+                        return add(.Member(value, 0), stringType, span)
+                    }
+                } else if isArrayType(program, valueType) {
+                    let element = structure.typeArguments[0]
+                    if element.kind == .Structure && program.structs[element.declaration].name.text == "Syntax" {
+                        match declarations.findFunction(.None, "joinQuotedSyntax") {
+                            Some(target) -> return add(.Call(target, [value]), stringType, span)
+                            None -> report(.UndefinedFunction, span)
+                        }
+                    }
+                }
+            }
+            Decimal -> return renderedString(value, span)
+            Floating -> {}
+            Pointer -> {}
+            Void -> {}
+            Enumeration -> {}
+            Invalid -> return value
+        }
+        report(.OutsideSubset, span)
+        return add(.Integer(0), Type.invalid(), span)
+    }
+}
+
+// Whether a struct named `name` is syntax that holds only its text.
+function isSyntaxText(name: String) -> Bool {
+    match name {
+        "Syntax", "Identifier" -> return true
+        else -> return false
+    }
+}

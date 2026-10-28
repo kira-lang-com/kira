@@ -1,0 +1,147 @@
+// `hash(v)`: the 64-bit FNV-1a fold of the byte stream Kira's runtime feeds,
+// so both answer the same number. An integer feeds its eight little-endian
+// bytes, widened by its signedness first, a boolean one byte and a string its
+// bytes. A struct feeds its fields in order, an array its length as a word
+// and then its elements, and an enum its variant index as a word and then its
+// payload, where a scalar payload is always a whole word. A struct or an enum
+// folds in its own helper, so a recursive type is walked by calls.
+
+function fnvOffsetBasis() -> Int {
+    return -3750763034362895579
+}
+
+function fnvPrime() -> Int {
+    return 1099511628211
+}
+
+extend FunctionLowering {
+    function hashValue(borrow mut self, accumulator: KirValue, at: KirAddress, valueType: Type) -> KirValue {
+        match valueType.kind {
+            Integer -> return hashWord(accumulator, wordOf(kir.load(at), valueType))
+            Boolean -> return hashByte(accumulator, kir.convert(convertZeroExtend, kir.load(at), types.integer64))
+            // A `Number` word is canonical, so equal values hash alike.
+            Decimal -> return hashWord(accumulator, kir.load(at))
+            Floating -> return accumulator
+            Pointer -> return accumulator
+            Void -> return accumulator
+            Invalid -> return accumulator
+            Enumeration -> return hashingHelperCall(accumulator, at, valueType)
+            Structure -> return hashingHelperCall(accumulator, at, valueType)
+        }
+    }
+
+    function hashingHelperCall(borrow mut self, accumulator: KirValue, at: KirAddress, valueType: Type) -> KirValue {
+        kir.argument(accumulator)
+        kir.argument(kir.pointer(at))
+        return kir.call(types.hashers[types.helperIndex(program, valueType)], types.integer64)
+    }
+
+    function wordOf(borrow mut self, value: KirValue, valueType: Type) -> KirValue {
+        if valueType.bits >= 64 { return value }
+        return kir.convert(valueType.signed ? convertSignExtend : convertZeroExtend, value, types.integer64)
+    }
+
+    function hashByte(borrow mut self, accumulator: KirValue, byte: KirValue) -> KirValue {
+        let mixed = kir.binary(kirOperator(.BitXor, false), false, false, accumulator, byte)
+        return kir.binary(kirOperator(.Multiply, false), false, false, mixed, kir.integer(types.integer64, fnvPrime()))
+    }
+
+    function hashWord(borrow mut self, accumulator: KirValue, word: KirValue) -> KirValue {
+        var folded = accumulator
+        for index in 0..8 {
+            let shifted = kir.binary(kirOperator(.ShiftRight, false), false, false, word, kir.integer(types.integer64, index * 8))
+            folded = hashByte(folded, kir.binary(kirOperator(.BitAnd, false), false, false, shifted, kir.integer(types.integer64, 255)))
+        }
+        return folded
+    }
+
+    function hashNominalBody(borrow mut self, accumulator: KirValue, at: KirAddress, valueType: Type) -> KirValue {
+        if isStringType(program, valueType) {
+            kir.argument(accumulator)
+            kir.argument(kir.pointer(at))
+            return kir.call(functions[program.stringFunctions[7]], types.integer64)
+        }
+        if isArrayType(program, valueType) { return hashArrayBody(accumulator, at, valueType) }
+        if valueType.kind == .Enumeration { return hashEnumBody(accumulator, at, valueType) }
+        var folded = accumulator
+        let fields = program.structs[valueType.declaration].fields
+        for index in 0..comparedFields(program, valueType) {
+            let fieldType = fields[index].valueType
+            folded = hashValue(folded, kir.field(at, index, types.of(fieldType)), fieldType)
+        }
+        return folded
+    }
+
+    function hashArrayBody(borrow mut self, accumulator: KirValue, at: KirAddress, arrayType: Type) -> KirValue {
+        let length = kir.load(kir.field(at, 1, types.integer64))
+        let folded = temporary(Type.int())
+        kir.store(hashWord(accumulator, length), folded)
+        let counter = temporary(Type.int())
+        kir.store(kir.integer(types.integer64, 0), counter)
+        let test = kir.block()
+        let body = kir.block()
+        let done = kir.block()
+        flowInto(test)
+        enter(test)
+        let index = kir.load(counter)
+        kir.branchIf(kir.compare(kirPredicate(.Less, true), index, length), body, done)
+        enter(body)
+        let elementType = program.structs[arrayType.declaration].typeArguments[0]
+        kir.store(hashValue(kir.load(folded), arrayElement(at, arrayType, index), elementType), folded)
+        kir.store(kir.binary(kirOperator(.Add, true), false, true, index, kir.integer(types.integer64, 1)), counter)
+        flowInto(test)
+        enter(done)
+        return kir.load(folded)
+    }
+
+    function hashEnumBody(borrow mut self, accumulator: KirValue, at: KirAddress, valueType: Type) -> KirValue {
+        let folded = temporary(Type.int())
+        kir.store(hashWord(accumulator, kir.tag(at)), folded)
+        if !carriesPayload(program, valueType) { return kir.load(folded) }
+        let variants = program.enums[valueType.declaration].variants
+        let done = kir.block()
+        var blocks: [KirBlockBuilder] = []
+        for index in 0..variants.count {
+            let block = kir.block()
+            blocks.append(block)
+            kir.switchCase(index, block)
+        }
+        kir.switchEnum(at)
+        for index in 0..variants.count {
+            enter(blocks[index])
+            match variants[index].payload {
+                Some(payload) -> kir.store(hashPayload(kir.load(folded), payloadPlace(at, valueType, index), payload), folded)
+                None -> {}
+            }
+            flowInto(done)
+        }
+        enter(done)
+        return kir.load(folded)
+    }
+
+    // An enum's scalar payload is a whole word, a boolean and a distinct
+    // value's representation too.
+    function hashPayload(borrow mut self, accumulator: KirValue, at: KirAddress, payloadType: Type) -> KirValue {
+        if payloadType.kind == .Boolean { return hashWord(accumulator, kir.convert(convertZeroExtend, kir.load(at), types.integer64)) }
+        if isDistinctType(program, payloadType) {
+            let representation = program.structs[payloadType.declaration].fields[0].valueType
+            return hashPayload(accumulator, kir.field(at, 0, types.of(representation)), representation)
+        }
+        return hashValue(accumulator, at, payloadType)
+    }
+}
+
+function lowerHashingHelper(program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder], valueType: Type) {
+    let helper = types.hashers[types.helperIndex(program, valueType)]
+    var hashing = FunctionLowering.startChecked(program, types, functions, helperChecked(helperSpan(program, valueType), Type.int()), helper)
+    let body = hashing.kir.block()
+    hashing.enter(body)
+    if uninhabited(program, valueType) {
+        hashing.kir.unreachable()
+    } else {
+        let at = hashing.kir.memory(hashing.kir.parameter(1), types.of(valueType))
+        hashing.kir.returnValue(hashing.hashNominalBody(hashing.kir.parameter(0), at, valueType))
+    }
+    hashing.kir.switchTo(hashing.entry)
+    hashing.kir.branch(body)
+}

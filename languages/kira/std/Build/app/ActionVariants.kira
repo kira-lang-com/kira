@@ -1,0 +1,138 @@
+import Foundation
+import Kten
+
+// Discovered inputs can differ between workspaces with identical declared
+// inputs. Keep each live dependency variant under its own final action key.
+struct CachedAction {
+    let key: String
+    let record: ActionRecord
+}
+
+extend ContentStore {
+    function variantDirectory(borrow self, base: borrow String) -> String {
+        return joinPath(joinPath(root, "variants"), base)
+    }
+
+    function hasVariant(borrow self, base: borrow String, key: borrow String) -> Bool {
+        return snapshotDigestValid(key) && fileExists(joinPath(variantDirectory(base), key))
+    }
+
+    function variantKeys(borrow self, base: borrow String) -> [String] {
+        let directory = variantDirectory(base)
+        if !isDirectory(directory) { return [] }
+        return match listDirectory(directory) {
+            Ok(listing) -> listing.entries
+            Error(failure) -> {
+                absorb failure
+                []
+            }
+        }
+    }
+}
+
+extend Engine {
+    function cachedAction(
+        borrow mut self,
+        graph: borrow Graph,
+        action: Number,
+        base: borrow String
+    ) -> CachedAction? {
+        // Old records and actions without discovered inputs use the base key.
+        match store.record(base) {
+            Some(record) -> {
+                if discoveredHold(graph, action, record) {
+                    return .Some(CachedAction { key: copy base, record: record })
+                }
+            }
+            None -> {}
+        }
+        for key in store.variantKeys(base) {
+            if !snapshotDigestValid(key) { continue }
+            match store.record(key) {
+                Some(record) -> {
+                    if discoveredHold(graph, action, record) {
+                        return .Some(CachedAction { key: copy key, record: record })
+                    }
+                }
+                None -> {}
+            }
+        }
+        return .None
+    }
+
+    function keepActionVariant(
+        borrow self,
+        base: borrow String,
+        record: borrow ActionRecord
+    ) -> Result<String, BuildFailure> {
+        if record.discovered.count == 0 {
+            try store.keepRecord(base, record)
+            return .Ok(copy base)
+        }
+        var discovered: [Kten] = []
+        for found in record.discovered {
+            discovered.append(ktenBare([
+                ktenField("path", .Text(copy found.path)),
+                ktenField("relative", .Text(found.relative ? "yes" : "no")),
+                ktenField("digest", .Text(copy found.digest))
+            ]))
+        }
+        let value = ktenObject("DiscoveredAction", [
+            ktenField("base", .Text(copy base)),
+            ktenField("inputs", .List(discovered))
+        ])
+        let key = try sha256Hex(value.encoded())
+        try store.keepRecord(key, record)
+        let directory = store.variantDirectory(base)
+        try makePathTree(directory)
+        let empty: [UN8] = []
+        match writeFileBytes(joinPath(directory, key), empty) {
+            Ok -> return .Ok(key)
+            Error(failure) -> return .Error(.Files("cannot index discovered inputs: \(traceText(failure))"))
+        }
+    }
+}
+
+// The project and snapshot roots retain final variant keys. Drop only index
+// entries whose final action record no live project or snapshot needs.
+function removeActionVariants(root: borrow String, kept: borrow Map<String, Bool>) {
+    let directory = joinPath(root, "variants")
+    if !isDirectory(directory) { return }
+    let bases = match listDirectory(directory) {
+        Ok(listing) -> listing.entries
+        Error(failure) -> {
+            absorb failure
+            return
+        }
+    }
+    for base in bases {
+        let path = joinPath(directory, base)
+        let variants = match listDirectory(path) {
+            Ok(listing) -> listing.entries
+            Error(failure) -> {
+                absorb failure
+                continue
+            }
+        }
+        var remaining = 0
+        for key in variants {
+            if kept.value(key).or(false) {
+                remaining += 1
+                continue
+            }
+            match removePath(joinPath(path, key)) {
+                Ok -> {}
+                Error(failure) -> {
+                    absorb failure
+                    remaining += 1
+                }
+            }
+        }
+        if remaining == 0 {
+            match removePath(path) {
+                Ok -> {}
+                Error(failure) -> absorb failure
+            }
+        }
+    }
+}

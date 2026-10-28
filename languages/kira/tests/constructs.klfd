@@ -1,0 +1,34 @@
+import Testing
+
+// The programs of `corpus/constructs.klfd` without Foundation.
+
+@Test
+function callsRequiredStaticMethods() {
+    expect!(runPath("corpus/sources/construct-required.kira") == 42)
+}
+
+@Test
+function reportsInferredMemberErrorsOnce() {
+    expect!(!compiles("""
+        // An initializer that does not check is reported once, where it is written,
+        // however many literals leave its member out.
+
+        construct Guide {
+            let broken = .Horizontal
+            let wrong: Int = 1
+        }
+
+        construct Leading() extends Guide {
+            let typo = missing + 1
+        }
+
+        @Main
+        function main() -> Int {
+            let l = Leading()
+            let m = Leading()
+            return l.wrong + m.wrong
+        }
+        """))
+    expect!(diagnosed(3060, 10, 0))
+    expect!(diagnosed(3119, 5, 0))
+}

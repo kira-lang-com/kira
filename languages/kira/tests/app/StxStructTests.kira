@@ -1,0 +1,497 @@
+import Foundation
+
+// StxStructTests: deep struct tests — construction, field access, methods,
+// borrow-mut writeback, value-copy independence, arrays of structs, and traps.
+//
+// All top-level names use the Stx/stx prefix to avoid harness namespace collisions.
+// This file imports Foundation explicitly because imports are file-scoped.
+
+// ---------------------------------------------------------------------------
+// Struct definitions
+// ---------------------------------------------------------------------------
+
+struct StxPoint {
+    var x: Int
+    var y: Int
+
+    function sum() -> Int { return self.x + self.y }
+    function scale(k: Int) -> StxPoint { return StxPoint { x: self.x * k, y: self.y * k } }
+    function product() -> Int { return self.x * self.y }
+    function max() -> Int { return self.x > self.y ? self.x : self.y }
+    function min() -> Int { return self.x < self.y ? self.x : self.y }
+}
+
+struct StxRect {
+    var origin: StxPoint
+    var size: StxPoint
+    var label: Int
+
+    function area() -> Int { return self.size.x * self.size.y }
+    function perimeter() -> Int { return 2 * (self.size.x + self.size.y) }
+    function labelPlusArea() -> Int { return self.label + self.area() }
+}
+
+struct StxCube {
+    var lo: StxPoint
+    var hi: StxPoint
+    var depth: Int
+
+    function volume() -> Int {
+        return (self.hi.x - self.lo.x) * (self.hi.y - self.lo.y) * self.depth
+    }
+    function span() -> Int {
+        return (self.hi.x - self.lo.x) + (self.hi.y - self.lo.y) + self.depth
+    }
+}
+
+struct StxBag {
+    var items: [Int]
+    var tag: Int
+
+    function total() -> Int {
+        var s = self.tag
+        for i in 0..self.items.count {
+            s = s + self.items[i]
+        }
+        return s
+    }
+    function count() -> Int { return self.items.count }
+}
+
+// ---------------------------------------------------------------------------
+// Top-level helper functions
+// ---------------------------------------------------------------------------
+
+function stxBumpX(p: borrow mut StxPoint) {
+    p.x = p.x + 1
+}
+
+function stxBumpY(p: borrow mut StxPoint) {
+    p.y = p.y + 1
+}
+
+function stxBumpBoth(p: borrow mut StxPoint) {
+    p.x = p.x + 1
+    p.y = p.y + 1
+}
+
+function stxAddN(p: borrow mut StxPoint, n: Int) {
+    p.x = p.x + n
+    p.y = p.y + n
+}
+
+function stxBumpRect(r: borrow mut StxRect) {
+    r.label = r.label + 1
+    r.origin.x = r.origin.x + 2
+    r.size.y = r.size.y + 3
+}
+
+function stxBumpCube(c: borrow mut StxCube) {
+    c.depth = c.depth + 5
+    c.lo.x = c.lo.x + 1
+}
+
+function stxMakeBag(n: Int) -> StxBag {
+    var xs: [Int] = []
+    for i in 0..n {
+        xs.append(i + 1)
+    }
+    return StxBag { items: move xs, tag: n }
+}
+
+function stxPointSum(p: borrow StxPoint) -> Int {
+    return p.x + p.y
+}
+
+// ---------------------------------------------------------------------------
+// Group 1: Basic construction + field access
+// ---------------------------------------------------------------------------
+
+@Test
+function stxConstX() {
+    let p = StxPoint { x: 3, y: 7 }
+    expect!(p.x == 3)
+}
+
+@Test
+function stxConstY() {
+    let p = StxPoint { x: 3, y: 7 }
+    expect!(p.y == 7)
+}
+
+@Test
+function stxFieldAdd() {
+    let p = StxPoint { x: 5, y: 8 }
+    expect!(p.x + p.y == 13)
+}
+
+@Test
+function stxFieldMul() {
+    let p = StxPoint { x: 4, y: 6 }
+    expect!(p.x * p.y == 24)
+}
+
+@Test
+function stxFieldSub() {
+    let p = StxPoint { x: 10, y: 3 }
+    expect!(p.x - p.y == 7)
+}
+
+@Test
+function stxMutateX() {
+    var p = StxPoint { x: 1, y: 2 }
+    p.x = 99
+    expect!(p.x == 99)
+}
+
+@Test
+function stxMutateY() {
+    var p = StxPoint { x: 1, y: 2 }
+    p.y = 77
+    expect!(p.y == 77)
+}
+
+@Test
+function stxRectOriginX() {
+    let r = StxRect { origin: StxPoint { x: 10, y: 20 }, size: StxPoint { x: 5, y: 8 }, label: 3 }
+    expect!(r.origin.x == 10)
+}
+
+@Test
+function stxRectOriginY() {
+    let r = StxRect { origin: StxPoint { x: 10, y: 20 }, size: StxPoint { x: 5, y: 8 }, label: 3 }
+    expect!(r.origin.y == 20)
+}
+
+@Test
+function stxRectSizeY() {
+    let r = StxRect { origin: StxPoint { x: 10, y: 20 }, size: StxPoint { x: 5, y: 8 }, label: 3 }
+    expect!(r.size.y == 8)
+}
+
+@Test
+function stxRectLabel() {
+    let r = StxRect { origin: StxPoint { x: 10, y: 20 }, size: StxPoint { x: 5, y: 8 }, label: 3 }
+    expect!(r.label == 3)
+}
+
+@Test
+function stxCubeLoX() {
+    let c = StxCube { lo: StxPoint { x: 1, y: 2 }, hi: StxPoint { x: 10, y: 20 }, depth: 5 }
+    expect!(c.lo.x == 1)
+}
+
+@Test
+function stxCubeHiY() {
+    let c = StxCube { lo: StxPoint { x: 1, y: 2 }, hi: StxPoint { x: 10, y: 20 }, depth: 5 }
+    expect!(c.hi.y == 20)
+}
+
+@Test
+function stxCubeDepth() {
+    let c = StxCube { lo: StxPoint { x: 1, y: 2 }, hi: StxPoint { x: 10, y: 20 }, depth: 5 }
+    expect!(c.depth == 5)
+}
+
+@Test
+function stxZeroStruct() {
+    let p = StxPoint { x: 0, y: 0 }
+    expect!(p.sum() == 0)
+}
+
+// ---------------------------------------------------------------------------
+// Group 2: Methods
+// ---------------------------------------------------------------------------
+
+@Test
+function stxMethodSum() {
+    let p = StxPoint { x: 3, y: 7 }
+    expect!(p.sum() == 10)
+}
+
+@Test
+function stxMethodProduct() {
+    let p = StxPoint { x: 4, y: 6 }
+    expect!(p.product() == 24)
+}
+
+@Test
+function stxMethodMax() {
+    let p = StxPoint { x: 3, y: 7 }
+    expect!(p.max() == 7)
+}
+
+@Test
+function stxMethodMin() {
+    let p = StxPoint { x: 3, y: 7 }
+    expect!(p.min() == 3)
+}
+
+@Test
+function stxMethodScaleX() {
+    let p = StxPoint { x: 3, y: 7 }
+    let q = p.scale(2)
+    expect!(q.x == 6)
+}
+
+@Test
+function stxMethodScaleY() {
+    let p = StxPoint { x: 3, y: 7 }
+    let q = p.scale(3)
+    expect!(q.y == 21)
+}
+
+// p={3,7}, scale(2) → {6,14}, sum=20
+@Test
+function stxMethodScaleSum() {
+    let p = StxPoint { x: 3, y: 7 }
+    let q = p.scale(2)
+    expect!(q.sum() == 20)
+}
+
+// p={2,3}, scale(3)→{6,9}, scale(4)→{24,36}, x=24
+@Test
+function stxMethodScaleChain() {
+    let p = StxPoint { x: 2, y: 3 }
+    let q1 = p.scale(3)
+    let q2 = q1.scale(4)
+    expect!(q2.x == 24)
+}
+
+// size={6,7}, area=42
+@Test
+function stxRectArea() {
+    let r = StxRect { origin: StxPoint { x: 0, y: 0 }, size: StxPoint { x: 6, y: 7 }, label: 0 }
+    expect!(r.area() == 42)
+}
+
+// size={6,7}, perimeter=2*(6+7)=26
+@Test
+function stxRectPerimeter() {
+    let r = StxRect { origin: StxPoint { x: 0, y: 0 }, size: StxPoint { x: 6, y: 7 }, label: 0 }
+    expect!(r.perimeter() == 26)
+}
+
+// label=5, size={4,5}, area=20, labelPlusArea=25
+@Test
+function stxRectLabelPlusArea() {
+    let r = StxRect { origin: StxPoint { x: 0, y: 0 }, size: StxPoint { x: 4, y: 5 }, label: 5 }
+    expect!(r.labelPlusArea() == 25)
+}
+
+// lo={0,0}, hi={4,5}, depth=3, volume=4*5*3=60
+@Test
+function stxCubeVolume() {
+    let c = StxCube { lo: StxPoint { x: 0, y: 0 }, hi: StxPoint { x: 4, y: 5 }, depth: 3 }
+    expect!(c.volume() == 60)
+}
+
+// lo={0,0}, hi={4,5}, depth=3, span=(4-0)+(5-0)+3=12
+@Test
+function stxCubeSpan() {
+    let c = StxCube { lo: StxPoint { x: 0, y: 0 }, hi: StxPoint { x: 4, y: 5 }, depth: 3 }
+    expect!(c.span() == 12)
+}
+
+// i=0..9: p={x:i, y:i+1}, p.sum()=2i+1; sum=1+3+5+7+9+11+13+15+17+19=100
+@Test
+function stxMethodLoop() {
+    var acc = 0
+    for i in 0..10 {
+        let p = StxPoint { x: i, y: i + 1 }
+        acc = acc + p.sum()
+    }
+    expect!(acc == 100)
+}
+
+// p={5,3}, sum=8, max=5, min=3, 8*5-3=37
+@Test
+function stxMethodArith() {
+    let p = StxPoint { x: 5, y: 3 }
+    expect!(p.sum() * p.max() - p.min() == 37)
+}
+
+@Test
+function stxPointSumHelper() {
+    let p = StxPoint { x: 4, y: 6 }
+    expect!(stxPointSum(p) == 10)
+}
+
+// p={7,4}, max=7, min=4, diff=3
+@Test
+function stxMethodMaxMin() {
+    let p = StxPoint { x: 7, y: 4 }
+    expect!(p.max() - p.min() == 3)
+}
+
+// p={3,2}, scale(5)={15,10}, max=15, min=10, diff=5
+@Test
+function stxScaleMaxMin() {
+    let p = StxPoint { x: 3, y: 2 }
+    let q = p.scale(5)
+    expect!(q.max() - q.min() == 5)
+}
+
+// size={3,4}, area=12, perimeter=2*(3+4)=14, total=26
+@Test
+function stxAreaPerimeterSum() {
+    let r = StxRect { origin: StxPoint { x: 0, y: 0 }, size: StxPoint { x: 3, y: 4 }, label: 0 }
+    expect!(r.area() + r.perimeter() == 26)
+}
+
+// lo={1,2}, hi={5,6}, depth=2; volume=(4)*(4)*2=32; span=4+4+2=10; total=42
+@Test
+function stxCubeVolumeSpan() {
+    let c = StxCube { lo: StxPoint { x: 1, y: 2 }, hi: StxPoint { x: 5, y: 6 }, depth: 2 }
+    expect!(c.volume() + c.span() == 42)
+}
+
+// i=0..4: p={x:i+1, y:i+1}, q=p.scale(i+1), q.sum()=2*(i+1)^2
+// i=0: 2*1=2; i=1: 2*4=8; i=2: 2*9=18; i=3: 2*16=32; i=4: 2*25=50 → total=110
+@Test
+function stxScaleLoopAcc() {
+    var acc = 0
+    for i in 0..5 {
+        let p = StxPoint { x: i + 1, y: i + 1 }
+        let q = p.scale(i + 1)
+        acc = acc + q.sum()
+    }
+    expect!(acc == 110)
+}
+
+// ---------------------------------------------------------------------------
+// Group 3: borrow mut writeback
+// ---------------------------------------------------------------------------
+
+@Test
+function stxBorrowBumpX() {
+    var p = StxPoint { x: 5, y: 3 }
+    stxBumpX(p)
+    expect!(p.x == 6)
+}
+
+// p={5,3}, bumpBoth → {6,4}, sum=10
+@Test
+function stxBorrowBumpBoth() {
+    var p = StxPoint { x: 5, y: 3 }
+    stxBumpBoth(p)
+    expect!(p.x + p.y == 10)
+}
+
+// p={0,0}, 10x bumpBoth → {10,10}, return p.x=10
+@Test
+function stxBorrowBumpLoop() {
+    var p = StxPoint { x: 0, y: 0 }
+    for i in 0..10 {
+        stxBumpBoth(p)
+    }
+    expect!(p.x == 10)
+}
+
+// p={5,3}, 5x bumpY → y=8
+@Test
+function stxBorrowBumpYSum() {
+    var p = StxPoint { x: 5, y: 3 }
+    for i in 0..5 {
+        stxBumpY(p)
+    }
+    expect!(p.y == 8)
+}
+
+// p={1,2}, addN(7) → {8,9}, sum=17
+@Test
+function stxBorrowAddN() {
+    var p = StxPoint { x: 1, y: 2 }
+    stxAddN(p, 7)
+    expect!(p.x + p.y == 17)
+}
+
+// p={0,0}, 5x addN(3) → x=15
+@Test
+function stxBorrowAddNLoop() {
+    var p = StxPoint { x: 0, y: 0 }
+    for i in 0..5 {
+        stxAddN(p, 3)
+    }
+    expect!(p.x == 15)
+}
+
+// r.label=1, bumpRect → label=2
+@Test
+function stxBorrowRectLabel() {
+    var r = StxRect { origin: StxPoint { x: 10, y: 10 }, size: StxPoint { x: 5, y: 7 }, label: 1 }
+    stxBumpRect(r)
+    expect!(r.label == 2)
+}
+
+// r.origin.x=10, bumpRect → origin.x=12
+@Test
+function stxBorrowRectOriginX() {
+    var r = StxRect { origin: StxPoint { x: 10, y: 10 }, size: StxPoint { x: 5, y: 7 }, label: 1 }
+    stxBumpRect(r)
+    expect!(r.origin.x == 12)
+}
+
+// r.size.y=7, bumpRect → size.y=10
+@Test
+function stxBorrowRectSizeY() {
+    var r = StxRect { origin: StxPoint { x: 10, y: 10 }, size: StxPoint { x: 5, y: 7 }, label: 1 }
+    stxBumpRect(r)
+    expect!(r.size.y == 10)
+}
+
+// r.label=0, origin.x=0, size.y=3, 10x bumpRect → label=10, origin.x=20, size.y=33
+@Test
+function stxBorrowRectLoop() {
+    var r = StxRect { origin: StxPoint { x: 0, y: 0 }, size: StxPoint { x: 3, y: 3 }, label: 0 }
+    for i in 0..10 {
+        stxBumpRect(r)
+    }
+    expect!(r.label == 10)
+}
+
+// r.size.y=3, 10x bumpRect → size.y=3+30=33
+@Test
+function stxBorrowRectLoopSizeY() {
+    var r = StxRect { origin: StxPoint { x: 0, y: 0 }, size: StxPoint { x: 3, y: 3 }, label: 0 }
+    for i in 0..10 {
+        stxBumpRect(r)
+    }
+    expect!(r.size.y == 33)
+}
+
+// c.depth=10, bumpCube → depth=15
+@Test
+function stxBorrowCubeDepth() {
+    var c = StxCube { lo: StxPoint { x: 1, y: 2 }, hi: StxPoint { x: 5, y: 5 }, depth: 10 }
+    stxBumpCube(c)
+    expect!(c.depth == 15)
+}
+
+// c.lo.x=1, bumpCube → lo.x=2
+@Test
+function stxBorrowCubeLoX() {
+    var c = StxCube { lo: StxPoint { x: 1, y: 2 }, hi: StxPoint { x: 5, y: 5 }, depth: 10 }
+    stxBumpCube(c)
+    expect!(c.lo.x == 2)
+}
+
+// c.depth=0, lo.x=0, 20x bumpCube → depth=100
+@Test
+function stxBorrowCubeLoop() {
+    var c = StxCube { lo: StxPoint { x: 0, y: 0 }, hi: StxPoint { x: 10, y: 10 }, depth: 0 }
+    for i in 0..20 {
+        stxBumpCube(c)
+    }
+    expect!(c.depth == 100)
+}
+
+// p={0,0}, 25x bumpBoth → y=25
+@Test
+function stxBorrowBumpBothLoop25() {
+    var p = StxPoint { x: 0, y: 0 }
+    for i in 0..25 {
+        stxBumpBoth(p)
+    }
+    expect!(p.y == 25)
+}

@@ -1,0 +1,597 @@
+import Foundation
+
+// SquashFS 4.0, the read-only file system Linux mounts from an image: a
+// 96-byte superblock, every file's data in blocks, then the inode table and
+// the directory table in metadata blocks of 8 KiB, and the table of owner
+// ids. This writer compresses with zlib, keeps no fragments, extended
+// attributes or export table, owns every entry by id 0, dates it 0, and lays
+// the same entries out the same way every time.
+
+namespace SquashfsFormat {
+    // `hsqs`, read as a little-endian word.
+    let magic: Number = 1936814952
+    let superblock: Number = 96
+    let major: Number = 4
+    let blockSize: Number = 131072
+    let blockLog: Number = 17
+    let metadata: Number = 8192
+    // A metadata block's header bit for a block stored as it is.
+    let storedMetadata: Number = 32768
+    // A data block size's bit for a block stored as it is.
+    let storedData: Number = 16777216
+    let zlib: Number = 1
+    // The superblock flags: no fragments, and no extended attributes; then
+    // those that say inodes, data and identifiers are stored as they are.
+    let flags: Number = 528
+    let storedFlags: Number = 2051
+    // A 32-bit field naming nothing.
+    let none: Number = 4294967295
+    // Where a 32-bit start or size stops fitting.
+    let wide: Number = 4294967296
+    // The inode types, and the long forms of a directory and a file.
+    let directory: Number = 1
+    let file: Number = 2
+    let link: Number = 3
+    let longDirectory: Number = 8
+    let longFile: Number = 9
+    // The bits of a mode an inode keeps: Linux refuses one carrying the
+    // file type, which the inode type says.
+    let permissionBits: Number = 4095
+    // How many entries one directory header lists, how far an entry's inode
+    // number may lie from its header's, and the longest name.
+    let listed: Number = 256
+    let reach: Number = 32767
+    let longestName: Number = 256
+    // The largest listing a short directory inode holds, plus 3.
+    let shortListing: Number = 65535
+    // The image is padded to a multiple of this.
+    let padding: Number = 4096
+}
+
+// One entry of the image. A file's data is written when it is added; the
+// file keeps where its blocks start and their sizes in the writer's list.
+struct SquashfsNode {
+    let parent: Number
+    let name: String
+    let kind: ArchiveEntryKind
+    let mode: UNumber
+    let target: String = ""
+    let start: Number = 0
+    let size: Number = 0
+    let firstBlock: Number = 0
+    let blocks: Number = 0
+}
+
+// A table of metadata blocks: bytes gather, and each 8 KiB of them becomes
+// a block, compressed where that makes it smaller.
+struct MetadataTable {
+    let level: Number
+    // The blocks sealed so far.
+    var sealed: [UN8] = []
+    var pending: [UN8] = []
+
+    // Where the next byte lands: the start of its block in the table, and
+    // its offset in the block once unpacked.
+    function reference(borrow self) -> Number {
+        return (sealed.count << 16) | pending.count
+    }
+
+    function append(borrow mut self, bytes: borrow [UN8]) {
+        pending.appendAll(bytes)
+        let size = SquashfsFormat.metadata
+        while pending.count >= size {
+            var block: [UN8] = []
+            var rest: [UN8] = []
+            for index in 0..size { block.append(pending[index]) }
+            for index in size..pending.count { rest.append(pending[index]) }
+            seal(block)
+            pending = rest
+        }
+    }
+
+    // Seals what is left.
+    function finish(borrow mut self) {
+        if pending.count == 0 { return }
+        let block = pending
+        pending = []
+        seal(block)
+    }
+
+    function seal(borrow mut self, block: borrow [UN8]) {
+        let empty: [UN8] = []
+        let packed = level == 0 ? empty : zlibCompress(block, level)
+        if level > 0 && packed.count < block.count {
+            appendLittle(sealed, packed.count, 2)
+            sealed.appendAll(packed)
+        } else {
+            appendLittle(sealed, block.count | SquashfsFormat.storedMetadata, 2)
+            sealed.appendAll(block)
+        }
+    }
+}
+
+/// A writer of a SquashFS 4 image: a read-only compressed file system holding a tree's directories, links and files.
+public struct SquashfsWriter {
+    /// Where the image's bytes go.
+    var sink: ArchiveSink
+    /// How hard zlib looks for matches, from 1 to 9. 0 stores every block as it is.
+    let level: Number
+    /// Every entry added so far. The root comes first.
+    var nodes: [SquashfsNode] = [
+        SquashfsNode { parent: 0, name: "", kind: .Directory, mode: 493 }
+    ]
+    /// Each path's place in `nodes`.
+    var places: Map<String, Number> = Map<String, Number>()
+    /// Every file's block sizes, in the order the files were added.
+    var blockSizes: [Number] = []
+    /// Filled by `finish`: each node's inode number.
+    var numbers: [Number] = []
+    /// Filled by `finish`: each node's inode reference in the inode table.
+    var references: [Number] = []
+    /// The inode table, written as metadata blocks.
+    var inodes: MetadataTable
+    /// The directory listings, written as metadata blocks.
+    var listings: MetadataTable
+
+    /// A directory at `path` with permission bits `mode`. The path "" is the root, whose mode this sets.
+    function addDirectory(
+        borrow mut self,
+        path: borrow String,
+        mode: UNumber
+    ) -> Result<Void, ArchiveFailure> {
+        if path.count == 0 {
+            nodes[0] = SquashfsNode { parent: 0, name: "", kind: .Directory, mode: mode }
+            return .Ok
+        }
+        let parent = match placeOf(path) {
+            Ok(found) -> found
+            Error(failure) -> return .Error(failure)
+        }
+        return addNode(
+            path,
+            SquashfsNode { parent: parent, name: squashfsName(path), kind: .Directory, mode: mode }
+        )
+    }
+
+    /// A file at `path` holding `bytes`, with permission bits `mode`. Its blocks are written now.
+    function addFile(
+        borrow mut self,
+        path: borrow String,
+        mode: UNumber,
+        bytes: borrow [UN8]
+    ) -> Result<Void, ArchiveFailure> {
+        let parent = match placeOf(path) {
+            Ok(found) -> found
+            Error(failure) -> return .Error(failure)
+        }
+        let start: Number = sink.count()
+        let firstBlock = blockSizes.count
+        let size = SquashfsFormat.blockSize
+        var at: Number = 0
+        while at < bytes.count {
+            let end = min(at + size, bytes.count)
+            match writeBlock(byteRun(bytes, at, end)) {
+                Ok -> {}
+                Error(failure) -> return .Error(failure)
+            }
+            at = end
+        }
+        return addNode(path, fileNode(parent, path, mode, start, bytes.count, firstBlock))
+    }
+
+    /// The file at `source` added as `path`, read and written a block at a time, so the whole file is never held.
+    function addFileFrom(
+        borrow mut self,
+        path: borrow String,
+        mode: UNumber,
+        source: borrow String
+    ) -> Result<Void, ArchiveFailure> {
+        let parent = match placeOf(path) {
+            Ok(found) -> found
+            Error(failure) -> return .Error(failure)
+        }
+        let file = match openFileHandle(source, .Read) {
+            Ok(opened) -> opened
+            Error(failure) -> return .Error(.Files("cannot open \(source): \(traceText(failure))"))
+        }
+        let start: Number = sink.count()
+        let firstBlock = blockSizes.count
+        let size = SquashfsFormat.blockSize
+        var total: Number = 0
+        var failed: ArchiveFailure? = .None
+        while true {
+            let block = match file.read(total, size) {
+                Ok(read) -> read
+                Error(failure) -> {
+                    failed = .Some(.Files("cannot read \(source): \(traceText(failure))"))
+                    break
+                }
+            }
+            if block.count == 0 { break }
+            total += block.count
+            match writeBlock(block) {
+                Ok -> {}
+                Error(failure) -> {
+                    failed = .Some(failure)
+                    break
+                }
+            }
+            if block.count < size { break }
+        }
+        match file.close() {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+        match failed {
+            Some(failure) -> return .Error(failure)
+            None -> {}
+        }
+        return addNode(path, fileNode(parent, path, mode, start, total, firstBlock))
+    }
+
+    /// Writes one data block, compressed when that is shorter, and notes its size.
+    function writeBlock(borrow mut self, block: borrow [UN8]) -> Result<Void, ArchiveFailure> {
+        if level > 0 {
+            let packed = zlibCompress(block, level)
+            if packed.count < block.count {
+                sink.append(packed)
+                blockSizes.append(packed.count)
+                return sink.spill()
+            }
+        }
+        blockSizes.append(block.count | SquashfsFormat.storedData)
+        return sink.write(block)
+    }
+
+    /// The node of a file of `size` bytes whose blocks start at `start`, the first of them `firstBlock`.
+    function fileNode(
+        borrow self,
+        parent: Number,
+        path: borrow String,
+        mode: UNumber,
+        start: Number,
+        size: Number,
+        firstBlock: Number
+    ) -> SquashfsNode {
+        return SquashfsNode {
+            parent: parent,
+            name: squashfsName(path),
+            kind: .File,
+            mode: mode,
+            start: start,
+            size: size,
+            firstBlock: firstBlock,
+            blocks: blockSizes.count - firstBlock
+        }
+    }
+
+    /// A symbolic link at `path` pointing to `target`.
+    function addLink(
+        borrow mut self,
+        path: borrow String,
+        target: borrow String
+    ) -> Result<Void, ArchiveFailure> {
+        let parent = match placeOf(path) {
+            Ok(found) -> found
+            Error(failure) -> return .Error(failure)
+        }
+        return addNode(
+            path,
+            SquashfsNode {
+                parent: parent,
+                name: squashfsName(path),
+                kind: .Link,
+                mode: 511,
+                target: copy target
+            }
+        )
+    }
+
+    /// Writes the tables and the superblock and closes the file, answering the image's length.
+    function finish(borrow mut self) -> Result<UNumber, ArchiveFailure> {
+        let count = nodes.count
+        let listed = nodes
+        var indices: [Number] = []
+        for index in 0..count { indices.append(index) }
+        let order = indices.sorted(
+            { left, right in
+                let first = listed[left]
+                let second = listed[right]
+                if first.parent != second.parent { return first.parent < second.parent }
+                return orderStrings(first.name, second.name) < 0
+            }
+        )
+        var firstChild: [Number] = []
+        var children: [Number] = []
+        for index in 0..count {
+            firstChild.append(0)
+            children.append(0)
+            numbers.append(0)
+            references.append(0)
+        }
+        for (position, index) in order.enumerated() {
+            if index == 0 { continue }
+            let parent = nodes[index].parent
+            if children[parent] == 0 { firstChild[parent] = position }
+            children[parent] += 1
+        }
+        var next: Number = 1
+        numberTree(0, order, firstChild, children, next)
+        writeTree(0, order, firstChild, children, next)
+        inodes.finish()
+        listings.finish()
+        let inodeStart: Number = sink.count()
+        sink.append(inodes.sealed)
+        let listingStart: Number = sink.count()
+        sink.append(listings.sealed)
+        let idBlock: Number = sink.count()
+        var ids: [UN8] = []
+        appendLittle(ids, 4 | SquashfsFormat.storedMetadata, 2)
+        appendLittle(ids, 0, 4)
+        sink.append(ids)
+        let idStart: Number = sink.count()
+        var index: [UN8] = []
+        appendLittle(index, idBlock, 8)
+        sink.append(index)
+        let used: Number = sink.count()
+        let padding = SquashfsFormat.padding
+        var tail: [UN8] = []
+        for at in 0..((padding - used % padding) % padding) { tail.append(0) }
+        sink.append(tail)
+        var header: [UN8] = []
+        appendLittle(header, SquashfsFormat.magic, 4)
+        appendLittle(header, count, 4)
+        appendLittle(header, 0, 4)
+        appendLittle(header, SquashfsFormat.blockSize, 4)
+        appendLittle(header, 0, 4)
+        appendLittle(header, SquashfsFormat.zlib, 2)
+        appendLittle(header, SquashfsFormat.blockLog, 2)
+        let stored = level == 0 ? SquashfsFormat.storedFlags : 0
+        appendLittle(header, SquashfsFormat.flags + stored, 2)
+        appendLittle(header, 1, 2)
+        appendLittle(header, SquashfsFormat.major, 2)
+        appendLittle(header, 0, 2)
+        appendLittle(header, references[0], 8)
+        appendLittle(header, used, 8)
+        appendLittle(header, idStart, 8)
+        appendLittle(header, -1, 8)
+        appendLittle(header, inodeStart, 8)
+        appendLittle(header, listingStart, 8)
+        appendLittle(header, -1, 8)
+        appendLittle(header, -1, 8)
+        match sink.flush() {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        match sink.file.write(0, header) {
+            Ok -> {}
+            Error(failure) -> return .Error(
+                .Files("cannot write \(sink.path): \(traceText(failure))")
+            )
+        }
+        return sink.finish()
+    }
+
+    /// The node of the directory holding `path`. Fails when `path` is already in the image or is not a usable path inside it.
+    function placeOf(borrow self, path: borrow String) -> Result<Number, ArchiveFailure> {
+        if places.contains(path) {
+            return .Error(.Malformed("the squashfs image holds \(path) twice"))
+        }
+        let name = squashfsName(path)
+        if name.count == 0 || name == "." || name == ".." || path.startsWith("/") {
+            return .Error(.Malformed("\(path) is no path inside a squashfs image"))
+        }
+        if name.utf8().count > SquashfsFormat.longestName {
+            return .Error(.Malformed("the name of \(path) is too long for squashfs"))
+        }
+        if name.count == path.count { return .Ok(0) }
+        let directory = path.substring(0, path.count - name.count - 1)
+        let parent = match places.value(directory) {
+            Some(found) -> found
+            None -> return .Error(.Malformed("\(path) comes before its directory"))
+        }
+        return match nodes[parent].kind {
+            Directory -> .Ok(parent)
+            File, Link -> .Error(.Malformed("\(path) is under \(directory), which is no directory"))
+        }
+    }
+
+    /// Adds `node` at `path`, recording the path's place in `places`.
+    function addNode(
+        borrow mut self,
+        path: borrow String,
+        node: SquashfsNode
+    ) -> Result<Void, ArchiveFailure> {
+        places.set(copy path, nodes.count)
+        nodes.append(move node)
+        return .Ok
+    }
+
+    /// Numbers the tree under `index` children first, the directory last, as the inodes are written.
+    function numberTree(
+        borrow mut self,
+        index: Number,
+        order: borrow [Number],
+        firstChild: borrow [Number],
+        children: borrow [Number],
+        next: borrow mut Number
+    ) {
+        for position in firstChild[index]..(firstChild[index] + children[index]) {
+            let child = order[position]
+            match nodes[child].kind {
+                Directory -> numberTree(child, order, firstChild, children, next)
+                File, Link -> {
+                    numbers[child] = next
+                    next += 1
+                }
+            }
+        }
+        numbers[index] = next
+        next += 1
+    }
+
+    /// Writes the inodes under `index` and the directory's listing, then the directory's own inode. `last` is the largest inode number.
+    function writeTree(
+        borrow mut self,
+        index: Number,
+        order: borrow [Number],
+        firstChild: borrow [Number],
+        children: borrow [Number],
+        last: Number
+    ) {
+        let from = firstChild[index]
+        let to = from + children[index]
+        var subdirectories: Number = 0
+        for position in from..to {
+            let child = order[position]
+            match nodes[child].kind {
+                Directory -> {
+                    writeTree(child, order, firstChild, children, last)
+                    subdirectories += 1
+                }
+                File, Link -> writeInode(child)
+            }
+        }
+        var listing: [UN8] = []
+        var at = from
+        while at < to {
+            let first = order[at]
+            let block = references[first] >> 16
+            var end = at
+            while end < to && end - at < SquashfsFormat.listed {
+                let child = order[end]
+                if references[child] >> 16 != block { break }
+                if abs(numbers[child] - numbers[first]) > SquashfsFormat.reach { break }
+                end += 1
+            }
+            appendLittle(listing, end - at - 1, 4)
+            appendLittle(listing, block, 4)
+            appendLittle(listing, numbers[first], 4)
+            for position in at..end {
+                let child = order[position]
+                let name = nodes[child].name.utf8()
+                appendLittle(listing, references[child] & 65535, 2)
+                appendLittle(listing, (numbers[child] - numbers[first]) & 65535, 2)
+                appendLittle(listing, squashfsType(nodes[child].kind), 2)
+                appendLittle(listing, name.count - 1, 2)
+                listing.appendAll(name)
+            }
+            at = end
+        }
+        let place = listings.reference()
+        listings.append(listing)
+        let parent = index == 0 ? last + 1 : numbers[nodes[index].parent]
+        let size = listing.count + 3
+        let long = size > SquashfsFormat.shortListing
+        var inode = inodeBase(index, long ? SquashfsFormat.longDirectory : SquashfsFormat.directory)
+        if long {
+            appendLittle(inode, 2 + subdirectories, 4)
+            appendLittle(inode, size, 4)
+            appendLittle(inode, place >> 16, 4)
+            appendLittle(inode, parent, 4)
+            appendLittle(inode, 0, 2)
+            appendLittle(inode, place & 65535, 2)
+            appendLittle(inode, SquashfsFormat.none, 4)
+        } else {
+            appendLittle(inode, place >> 16, 4)
+            appendLittle(inode, 2 + subdirectories, 4)
+            appendLittle(inode, size, 2)
+            appendLittle(inode, place & 65535, 2)
+            appendLittle(inode, parent, 4)
+        }
+        references[index] = inodes.reference()
+        inodes.append(inode)
+    }
+
+    /// Writes the inode of the file or link `index`.
+    function writeInode(borrow mut self, index: Number) {
+        let node = nodes[index]
+        let short = node.start < SquashfsFormat.wide && node.size < SquashfsFormat.wide
+        let type = match node.kind {
+            Link -> SquashfsFormat.link
+            Directory, File -> short ? SquashfsFormat.file : SquashfsFormat.longFile
+        }
+        var inode = inodeBase(index, type)
+        match node.kind {
+            Link -> {
+                let target = node.target.utf8()
+                appendLittle(inode, 1, 4)
+                appendLittle(inode, target.count, 4)
+                inode.appendAll(target)
+            }
+            Directory, File -> {
+                if short {
+                    appendLittle(inode, node.start, 4)
+                    appendLittle(inode, SquashfsFormat.none, 4)
+                    appendLittle(inode, 0, 4)
+                    appendLittle(inode, node.size, 4)
+                } else {
+                    appendLittle(inode, node.start, 8)
+                    appendLittle(inode, node.size, 8)
+                    appendLittle(inode, 0, 8)
+                    appendLittle(inode, 1, 4)
+                    appendLittle(inode, SquashfsFormat.none, 4)
+                    appendLittle(inode, 0, 4)
+                    appendLittle(inode, SquashfsFormat.none, 4)
+                }
+                for block in node.firstBlock..(node.firstBlock + node.blocks) {
+                    appendLittle(inode, blockSizes[block], 4)
+                }
+            }
+        }
+        references[index] = inodes.reference()
+        inodes.append(inode)
+    }
+
+    /// The fields every inode starts with: its type `type`, mode, owner and group ids, time and number.
+    function inodeBase(borrow self, index: Number, type: Number) -> [UN8] {
+        let node = nodes[index]
+        var base: [UN8] = []
+        appendLittle(base, type, 2)
+        appendLittle(base, Number(node.mode) & SquashfsFormat.permissionBits, 2)
+        appendLittle(base, 0, 2)
+        appendLittle(base, 0, 2)
+        appendLittle(base, 0, 4)
+        appendLittle(base, numbers[index], 4)
+        return base
+    }
+}
+
+/// A SquashFS writer writing the file `path`, which must not exist yet.
+public function createSquashfsWriter(
+    path: borrow String,
+    level: Number
+) -> Result<SquashfsWriter, ArchiveFailure> {
+    var sink = match createArchiveSink(path) {
+        Ok(created) -> created
+        Error(failure) -> return .Error(failure)
+    }
+    var reserved: [UN8] = []
+    for index in 0..SquashfsFormat.superblock { reserved.append(0) }
+    sink.append(reserved)
+    return .Ok(
+        SquashfsWriter {
+            sink: sink,
+            level: level,
+            inodes: MetadataTable { level: level },
+            listings: MetadataTable { level: level }
+        }
+    )
+}
+
+// The last part of `path`.
+function squashfsName(path: borrow String) -> String {
+    return match path.lastIndexOf("/") {
+        Some(slash) -> path.substring(slash + 1, path.count)
+        None -> copy path
+    }
+}
+
+// The type a directory listing gives an entry, the short one always.
+function squashfsType(kind: ArchiveEntryKind) -> Number {
+    return match kind {
+        Directory -> SquashfsFormat.directory
+        File -> SquashfsFormat.file
+        Link -> SquashfsFormat.link
+    }
+}

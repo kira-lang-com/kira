@@ -1,0 +1,278 @@
+// The syntax tree: what the parser builds and semantic analysis reads.
+//
+// One tree holds the file being compiled and the files it imports.
+// Expressions, statements and written types live in arenas shared by every
+// file and name each other by index; declarations are kept per file, with
+// `items` recording the order the file writes them in, which is the order
+// they are declared in.
+
+struct SyntaxTree {
+    var expressions: [Expression]
+    var statements: [Statement]
+    var typeReferences: [TypeReference]
+    // The compiled file first, then each import that resolved.
+    var files: [SyntaxFile]
+
+    function empty() -> SyntaxTree {
+        return SyntaxTree { expressions = [], statements = [], typeReferences = [], files = [] }
+    }
+
+    function addExpression(borrow mut self, expression: Expression) -> Int {
+        expressions.append(expression)
+        return expressions.count - 1
+    }
+
+    function addStatement(borrow mut self, statement: Statement) -> Int {
+        statements.append(statement)
+        return statements.count - 1
+    }
+
+    function addTypeReference(borrow mut self, reference: TypeReference) -> Int {
+        typeReferences.append(reference)
+        return typeReferences.count - 1
+    }
+}
+
+struct Identifier {
+    let text: String
+    let span: Span
+}
+
+function noIdentifier(span: Span) -> Identifier {
+    return Identifier { text = "", span = span }
+}
+
+// One parsed file. `alias` is the name its importer reaches it by, empty
+// for the file being compiled.
+struct SyntaxFile {
+    let file: Int
+    var alias: String
+    var items: [Item]
+    var imports: [ImportDeclaration]
+    var types: [TypeDeclaration]
+    var constants: [ConstDeclaration]
+    var enums: [EnumDeclaration]
+    var functions: [FunctionDeclaration]
+    var shaders: [ShaderDeclaration]
+}
+
+enum ItemKind {
+    ImportItem
+    TypeItem
+    ConstItem
+    EnumItem
+    FunctionItem
+    ShaderItem
+}
+
+// A top-level declaration: its kind and its index in that kind's list.
+struct Item {
+    let kind: ItemKind
+    let index: Int
+}
+
+struct ImportDeclaration {
+    let path: [Identifier]
+    let alias: String
+    let span: Span
+}
+
+struct TypeDeclaration {
+    let name: Identifier
+    let fields: [FieldDeclaration]
+    let span: Span
+}
+
+// `let name: Type` in a `type` block. An absent annotation is an empty
+// identifier.
+struct FieldDeclaration {
+    let name: Identifier
+    let typeReference: Int
+    let builtin: Identifier
+    let interpolation: Identifier
+    let span: Span
+}
+
+struct ConstDeclaration {
+    let name: Identifier
+    let typeReference: Int
+    let value: Int
+    let span: Span
+}
+
+struct EnumDeclaration {
+    let name: Identifier
+    let variants: [EnumVariant]
+    let span: Span
+}
+
+struct EnumVariant {
+    let name: Identifier
+    let value: Int
+    let span: Span
+}
+
+struct FunctionDeclaration {
+    let name: Identifier
+    let parameters: [Parameter]
+    // -1 when the function returns nothing.
+    let result: Int
+    let body: [Int]
+    let span: Span
+}
+
+struct Parameter {
+    let name: Identifier
+    let typeReference: Int
+    let span: Span
+}
+
+struct ShaderDeclaration {
+    let name: Identifier
+    let options: [OptionDeclaration]
+    let groups: [GroupDeclaration]
+    let stages: [StageDeclaration]
+    let span: Span
+}
+
+struct OptionDeclaration {
+    let name: Identifier
+    let typeReference: Int
+    let value: Int
+    let span: Span
+}
+
+struct GroupDeclaration {
+    let name: Identifier
+    let resources: [ResourceDeclaration]
+    let span: Span
+}
+
+enum ResourceKind {
+    Uniform
+    Storage
+    Texture
+    Sampler
+}
+
+enum Access {
+    Unwritten
+    Read
+    ReadWrite
+    Write
+}
+
+struct ResourceDeclaration {
+    let kind: ResourceKind
+    let access: Access
+    let name: Identifier
+    // The slot `@binding(n)` writes, -1 when the group position decides.
+    let binding: Int
+    let typeReference: Int
+    let span: Span
+}
+
+enum StageKind {
+    Vertex
+    Fragment
+    Compute
+
+    function word(borrow self) -> String {
+        match self {
+            Vertex -> return "vertex"
+            Fragment -> return "fragment"
+            Compute -> return "compute"
+        }
+    }
+}
+
+struct StageDeclaration {
+    let stage: StageKind
+    let input: Identifier
+    let output: Identifier
+    // The three extents of `threads(x, y, z)`, empty when it is not written.
+    let threads: [Int]
+    let functions: [FunctionDeclaration]
+    let span: Span
+}
+
+// A written type: a dotted path, or `[element]`.
+struct TypeReference {
+    let path: [Identifier]
+    // The element's reference for `[T]`, -1 for a path.
+    let element: Int
+    let span: Span
+}
+
+enum StatementKind {
+    Let
+    Assign
+    If
+    While
+    Return
+    Block
+    Evaluate
+}
+
+// One statement. `Let` uses `name`, `typeReference` and `value`; `Assign`
+// `target` and `value`; `If` `value` as its condition, `body` and
+// `otherwise`; `While` `value` and `body`; `Return` `value`; `Block` `body`;
+// `Evaluate` `value`. An absent part is -1.
+struct Statement {
+    let kind: StatementKind
+    let name: Identifier
+    let typeReference: Int
+    let target: Int
+    let value: Int
+    let body: [Int]
+    let otherwise: Int
+    let span: Span
+}
+
+enum ExpressionKind {
+    IntegerLiteral
+    FloatLiteral
+    BooleanLiteral
+    Name
+    Field
+    Index
+    Call
+    Unary
+    Binary
+}
+
+enum Operator {
+    Add
+    Subtract
+    Multiply
+    Divide
+    Remainder
+    Equal
+    NotEqual
+    Less
+    LessEqual
+    Greater
+    GreaterEqual
+    LogicalAnd
+    LogicalOr
+    BitAnd
+    BitOr
+    BitXor
+    ShiftLeft
+    ShiftRight
+    Negate
+    Not
+}
+
+// One expression. A literal, name or field keeps its written `text`;
+// `Field`, `Index`, `Call` and `Unary` read `left`; `Index` and `Binary`
+// read `right` too, and a call its `arguments`.
+struct Expression {
+    let kind: ExpressionKind
+    let text: String
+    let operator: Operator
+    let left: Int
+    let right: Int
+    let arguments: [Int]
+    let span: Span
+}

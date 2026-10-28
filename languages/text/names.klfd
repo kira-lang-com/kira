@@ -1,0 +1,179 @@
+// Identifier choice (section 19.1 rule 6). A name keeps its source spelling
+// with every byte an identifier cannot hold as `_`. One that is reserved, or
+// starts with a prefix a target keeps for itself, takes `_` until it is
+// unique. Names the out makes up start with `_ksir_`.
+
+function identifierByte(byte: Int) -> Bool {
+    return (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+}
+
+// `wanted` with each character an identifier cannot hold as one `_`, and
+// `_ksir_` before an empty name or a leading digit.
+function sanitizedName(wanted: String) -> String {
+    var pieces: [String] = []
+    var start = 0
+    let length = utf8Count(wanted)
+    for at in 0..length {
+        let byte = utf8Byte(wanted, at)
+        if !identifierByte(byte) {
+            pieces.append(utf8Slice(wanted, start, at))
+            // A character of several bytes becomes one `_`, at its first.
+            if byte < 128 || byte >= 192 { pieces.append("_") }
+            start = at + 1
+        }
+    }
+    pieces.append(utf8Slice(wanted, start, length))
+    let name = joinText(pieces)
+    if utf8Count(name) == 0 { return "_ksir_" }
+    let first = utf8Byte(name, 0)
+    if first >= 48 && first <= 57 { return joinText(["_ksir_", name]) }
+    return name
+}
+
+function targetPrefixed(name: String) -> Bool {
+    return startsWithText(name, "gl_") || startsWithText(name, "__") || startsWithText(name, "_ksir_")
+        || startsWithText(name, "SV_")
+}
+
+extend TextOut {
+    function takenIn(borrow self, names: [String], name: String) -> Bool {
+        return hasText(reserved, name) || hasText(names, name)
+    }
+
+    // The name `wanted` takes beside `names`.
+    function availableName(borrow self, wanted: String, names: [String]) -> String {
+        var name = sanitizedName(wanted)
+        if targetPrefixed(name) && !startsWithText(wanted, "_ksir_") { name = joinText([name, "_"]) }
+        while takenIn(names, name) {
+            name = joinText([name, "_"])
+        }
+        return name
+    }
+
+    // A made-up name beside `names`: `_ksir_base`, then numbered.
+    function availableFresh(borrow self, base: String, names: [String]) -> String {
+        var name = joinText(["_ksir_", base])
+        var index = 0
+        while takenIn(names, name) {
+            index += 1
+            name = joinText(["_ksir_", base, decimalText(index)])
+        }
+        return name
+    }
+
+    function moduleName(borrow mut self, wanted: String) -> String {
+        let name = availableName(wanted, used)
+        used.append(name)
+        return name
+    }
+
+    function moduleFresh(borrow mut self, base: String) -> String {
+        let name = availableFresh(base, used)
+        used.append(name)
+        return name
+    }
+
+    function scopeName(borrow mut self, wanted: String) -> String {
+        let name = availableName(wanted, scope)
+        scope.append(name)
+        return name
+    }
+
+    function scopeFresh(borrow mut self, base: String) -> String {
+        let name = availableFresh(base, scope)
+        scope.append(name)
+        return name
+    }
+
+    // Names every module-scope entity, in the order the Rust backends did:
+    // entry points, the globals a host names, structs, then constants,
+    // overrides, globals and functions. Members are named per struct.
+    // `fixed` takes each global's `slot_name` as its name when it has one.
+    function prepareNames(borrow mut self, words: [String], fixed: Bool) {
+        reserved = words
+        let functions = count("functions", -1)
+        for which in 0..functions {
+            if isEntry(which) { entryNames.append(moduleName(text("functions", -1, which, "name"))) }
+        }
+        let globals = count("globals", -1)
+        var fixedNames: [String] = []
+        for global in 0..globals {
+            var name = ""
+            if fixed { name = text("globals", -1, global, "slot_name") }
+            fixedNames.append(name)
+            if utf8Count(name) > 0 { used.append(name) }
+        }
+        let types = count("types", -1)
+        for typeIndex in 0..types {
+            if typeKind(typeIndex) == "struct" {
+                if textCount("types", -1, typeIndex, "name") == 0 {
+                    typeNames.append(moduleFresh("Struct"))
+                } else {
+                    typeNames.append(moduleName(typeText(typeIndex, "name")))
+                }
+            } else {
+                typeNames.append("")
+            }
+        }
+        for typeIndex in 0..types {
+            var members: [String] = []
+            if typeKind(typeIndex) == "struct" {
+                let memberCount = count("members", typeIndex)
+                for member in 0..memberCount {
+                    members.append(availableName(text("members", typeIndex, member, "name"), members))
+                }
+            }
+            memberNames.append(members)
+        }
+        let constants = count("constants", -1)
+        for constant in 0..constants {
+            constantNames.append(moduleName(text("constants", -1, constant, "name")))
+        }
+        let overrides = count("overrides", -1)
+        for item in 0..overrides {
+            overrideNames.append(moduleName(text("overrides", -1, item, "name")))
+        }
+        for global in 0..globals {
+            if utf8Count(fixedNames[global]) > 0 {
+                globalNames.append(fixedNames[global])
+            } else {
+                globalNames.append(moduleName(text("globals", -1, global, "name")))
+            }
+        }
+        for which in 0..functions {
+            if !isEntry(which) { functionNames.append(moduleName(text("functions", -1, which, "name"))) }
+        }
+    }
+
+    // Starts function number `which`: its own scope over the module's, and
+    // the names of its arguments and locals.
+    function prepareBody(borrow mut self, which: Int) {
+        current = which
+        scope = copiedTexts(used)
+        argumentNames = []
+        localNames = []
+        baked = []
+        lastFile = -1
+        lastLine = -1
+        let arguments = count("arguments", which)
+        for argument in 0..arguments {
+            if textCount("arguments", which, argument, "name") > 0 {
+                argumentNames.append(scopeName(text("arguments", which, argument, "name")))
+            } else {
+                argumentNames.append(scopeFresh(joinText(["arg", decimalText(argument)])))
+            }
+        }
+        let locals = count("locals", which)
+        for local in 0..locals {
+            if textCount("locals", which, local, "name") > 0 {
+                localNames.append(scopeName(text("locals", which, local, "name")))
+            } else {
+                localNames.append(scopeFresh(joinText(["local", decimalText(local)])))
+            }
+        }
+        let expressions = count("expressions", which)
+        for expression in 0..expressions {
+            baked.append("")
+        }
+    }
+}

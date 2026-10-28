@@ -1,0 +1,182 @@
+import Foundation
+import Heap
+
+// Running the tools this one leans on: `tar` to unpack, `curl` to download,
+// `klf` and `kira` to build, and the selected toolchain's own driver to
+// dispatch to.
+//
+// Nothing above this file knows how a child process is made. Each of those
+// tools is a program that already does its job, and reimplementing `tar` or an
+// HTTP client here would be a worse answer than running the one that ships.
+//
+// Every operation is Foundation's process API over the platform's own
+// `klf.process` services, not a raw system call: a program here reaches the
+// kernel through services, and a tool that reaches past them is a tool that
+// only runs where the kernel spells things the way it assumes.
+
+// The answer `run` gives for a tool that could not start. It is also how a
+// tool is found: a program named without a directory is searched for on
+// `PATH`, and this is what it says when nothing there is it.
+public let toolNotRunnable: Number = -2
+
+// The answer for a tool a signal stopped.
+public let toolStopped: Number = -1
+
+// What a child process left behind.
+public struct ProcessResult {
+    var status: Number = 0
+    var output: String = ""
+    var errors: String = ""
+
+    // Whether the tool could not be started at all, which is what "it is not
+    // installed" looks like from here.
+    function missing() -> Bool {
+        return status == toolNotRunnable
+    }
+
+    // Whether the tool ran and reported success.
+    function succeeded() -> Bool {
+        return status == 0
+    }
+}
+
+// How a child is started, and what its output is collected into.
+public struct ProcessRequest {
+    var tool: String = ""
+    var arguments: [String] = []
+    // Whether its output is collected rather than left on this program's streams.
+    var captureOutput: Bool = false
+}
+
+// Runs `tool` to its end with its output left on this program's own streams, and
+// answers its exit status.
+//
+// The arguments are the tool's own: the first is the tool again, which is what
+// a process reads as its own name. A build's diagnostics land in front of the
+// user rather than in a captured buffer.
+public function runTool(tool: borrow String, arguments: borrow [String]) -> Number {
+    let request = ProcessRequest { tool: tool, arguments: copy arguments, captureOutput: false }
+    return run(request).status
+}
+
+// Runs `tool` in `directory`, with `environment` set over this program's own,
+// to its end with its output left on this program's streams, and answers its
+// exit status: a build whose progress the user watches.
+public function runToolIn(
+    tool: borrow String,
+    arguments: borrow [String],
+    directory: borrow String,
+    environment: borrow [EnvironmentEntry]
+) -> Number {
+    let command = ProcessCommand {
+        program: copy tool,
+        arguments: copy arguments,
+        environment: copy environment,
+        directory: copy directory
+    }
+    let child = match command.start() {
+        Ok(started) -> started
+        Error(failure) -> return toolNotRunnable
+    }
+    let ended = child.wait()
+    match child.release() {
+        Ok -> {}
+        Error(failure) -> absorb failure
+    }
+    return match ended {
+        Ok(exit) -> exitStatus(exit)
+        Error(failure) -> toolNotRunnable
+    }
+}
+
+// Runs `tool` and collects what it wrote to its output and its errors.
+public function captureTool(tool: borrow String, arguments: borrow [String]) -> ProcessResult {
+    let request = ProcessRequest { tool: tool, arguments: copy arguments, captureOutput: true }
+    return run(request)
+}
+
+// Runs `request` and answers what it left behind.
+public function run(request: borrow ProcessRequest) -> ProcessResult {
+    let command = ProcessCommand { program: copy request.tool, arguments: copy request.arguments }
+    if !request.captureOutput {
+        let child = match command.start() {
+            Ok(started) -> started
+            Error(failure) -> return missingResult()
+        }
+        let ended = child.wait()
+        match child.release() {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+        return match ended {
+            Ok(exit) -> ProcessResult { status: exitStatus(exit), output: "", errors: "" }
+            Error(failure) -> missingResult()
+        }
+    }
+    let none: [UN8] = []
+    return match command.run(none) {
+        Ok(result) -> ProcessResult {
+            status: exitStatus(result.exit),
+            output: textOrEmpty(result.output),
+            errors: textOrEmpty(result.errors)
+        }
+        Error(failure) -> missingResult()
+    }
+}
+
+public function exitStatus(exit: borrow ChildExit) -> Number {
+    return match exit {
+        Status(status) -> Number(status)
+        Signalled(_) -> toolStopped
+    }
+}
+
+public function textOrEmpty(bytes: borrow [UN8]) -> String {
+    return match textFromBytes(bytes) {
+        Some(text) -> text
+        None -> ""
+    }
+}
+
+public function missingResult() -> ProcessResult {
+    return ProcessResult { status: toolNotRunnable, output: "", errors: "" }
+}
+
+// This process's own arguments, the executable path excluded.
+public function commandLineArguments() -> [String] {
+    var arguments: [String] = []
+    for index in 0..processArgumentCount() {
+        match processArgument(index) {
+            Some(argument) -> arguments.append(argument)
+            None -> {}
+        }
+    }
+    return arguments
+}
+
+// The path this process was started as, its `argv[0]`.
+//
+// Distinct from every argument: `klf.process.argument` excludes it, which is
+// right for a program reading its command line and wrong for the launcher, whose
+// one question is which name it was run under.
+@Service("klfsvc_process_invoked_as")
+public function invokedAsCopy(destination: RawPtr, capacity: Int) -> Int
+
+// What it was invoked under, which is not necessarily its own name and is not
+// necessarily absolute.
+public function commandLineExecutable() -> String {
+    let needed = Number(invokedAsCopy(RawPtr(0), 0))
+    if needed <= 0 { return "" }
+    let buffer = allocateRaw(needed, 8)
+    let copied = Number(invokedAsCopy(buffer, needed))
+    if copied <= 0 { return "" }
+    return textOfRaw(buffer, copied)
+}
+
+// `count` bytes at `buffer`, as a string that owns its own copy.
+public function textOfRaw(buffer: RawPtr, count: Number) -> String {
+    let data = makeArrayData(count)
+    heapCopyBytes(data, buffer, count)
+    let empty: String = ""
+    return String { data: data, count: count, capacity: count, ops: empty.ops }
+}

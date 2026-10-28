@@ -1,0 +1,198 @@
+import Foundation
+
+function testServer(carrier: TlsCarrier) -> Result<TlsHandshake, TlsAlert> {
+    let key = try loadSigningKey(QuicTestPki.leafKey) otherwise return .Error(.InternalError)
+    let identity = TlsServerIdentity {
+        certificates: [QuicTestPki.leaf],
+        key: key,
+        scheme: .EcdsaSecp256r1Sha256
+    }
+    return .Ok(
+        tlsStartServer(
+            TlsServerSettings {
+                carrier: carrier,
+                identity: identity,
+                protocols: ["h3", "h2"],
+                transportParameters: [1, 2, 3]
+            }
+        )
+    )
+}
+
+function testClient(carrier: TlsCarrier, name: String) -> Result<TlsHandshake, TlsAlert> {
+    return tlsStartClient(
+        TlsClientSettings {
+            carrier: carrier,
+            serverName: name,
+            protocols: ["h3"],
+            seconds: QuicTestPki.seconds,
+            anchors: NetworkTesting.anchors(),
+            transportParameters: [4, 5]
+        }
+    )
+}
+
+// What one side reported, as text the expectation names.
+struct Observed {
+    var notes: [String] = []
+    var applicationClient: [UN8] = []
+}
+
+// Every event `from` has queued: bytes go to `to`, the rest is noted.
+function relay(
+    from: borrow mut TlsHandshake,
+    to: borrow mut TlsHandshake,
+    seen: borrow mut Observed
+) -> Result<Void, TlsAlert> {
+    while true {
+        let next = from.event()
+        let event = match next {
+            Some(value) -> value
+            None -> return .Ok
+        }
+        match event {
+            Send(bytes) -> try to.receive(bytes.level, bytes.bytes)
+            Secrets(secrets) -> {
+                seen.notes.append(traceText(secrets.level))
+                if secrets.level == .Application { seen.applicationClient = secrets.client }
+            }
+            Complete(agreement) -> {
+                let protocolName = traceText(agreement.applicationProtocol)
+                let transport = traceText(agreement.peerTransportParameters)
+                seen.notes.append(
+                    "done \(protocolName) \(transport) \(agreement.peerCertificates.count)"
+                )
+            }
+            PeerUpdatedKeys(_) -> seen.notes.append("update")
+        }
+    }
+    return .Ok
+}
+
+// Both sides' events until neither has any left, then what each saw.
+// Runs the handshake to completion and answers the client's notes, the
+// server's notes, and whether both sides derived the same application secret.
+function converseParts(
+    client: borrow mut TlsHandshake,
+    server: borrow mut TlsHandshake
+) -> Result<[String], TlsAlert> {
+    var clientSeen = Observed {}
+    var serverSeen = Observed {}
+    for _ in 0..4 {
+        try relay(client, server, clientSeen)
+        try relay(server, client, serverSeen)
+    }
+    let same = clientSeen.applicationClient == serverSeen.applicationClient
+        && clientSeen.applicationClient.count == 32
+    return .Ok([traceText(clientSeen.notes), traceText(serverSeen.notes), "\(same)"])
+}
+
+function converse(
+    client: borrow mut TlsHandshake,
+    server: borrow mut TlsHandshake
+) -> Result<String, TlsAlert> {
+    let parts = try converseParts(client, server)
+    return .Ok("client \(parts[0]) server \(parts[1]) same \(parts[2])")
+}
+
+@Test
+function quicHandshakeCompletesInMemory() {
+    let expected: String = "client [\"TlsEncryptionLevel.Handshake\", \"TlsEncryptionLevel.Application\", \"done Some(\\\"h3\\\") Some([1, 2, 3]) 1\"] server [\"TlsEncryptionLevel.Handshake\", \"TlsEncryptionLevel.Application\", \"done Some(\\\"h3\\\") Some([4, 5]) 0\"] same true"
+    var server = match testServer(.Quic) {
+        Ok(value) -> value
+        Error(alert) -> {
+            expect!((traceText(alert)) == expected)
+            return
+        }
+    }
+    var client = match testClient(.Quic, "localhost") {
+        Ok(value) -> value
+        Error(alert) -> {
+            expect!((traceText(alert)) == expected)
+            return
+        }
+    }
+    let parts = match converseParts(client, server) {
+        Ok(found) -> found
+        Error(alert) -> {
+            expect!((traceText(alert)) == "")
+            return
+        }
+    }
+    expect!((parts[0]) == "[\"TlsEncryptionLevel.Handshake\", \"TlsEncryptionLevel.Application\", \"done Some(\\\"h3\\\") Some([1, 2, 3]) 1\"]")
+    expect!((parts[1]) == "[\"TlsEncryptionLevel.Handshake\", \"TlsEncryptionLevel.Application\", \"done Some(\\\"h3\\\") Some([4, 5]) 0\"]")
+    expect!((parts[2]) == "true")
+}
+
+
+// A client whose only share is of a group the server lacks is asked again
+// for X25519, and the handshake then completes over TCP records.
+@Test
+function helloRetryRequestLeadsToAHandshake() {
+    var server = match testServer(.Records) {
+        Ok(value) -> value
+        Error(alert) -> {
+            expect!(traceText(traceText(alert)) == "")
+            return
+        }
+    }
+    var client = match testClient(.Records, "localhost") {
+        Ok(value) -> value
+        Error(alert) -> {
+            expect!(traceText(traceText(alert)) == "")
+            return
+        }
+    }
+    // X448's code point, which neither side speaks, on an X25519 share.
+    let unknown: KeyGroup = fromCode<KeyGroup>(30)
+    for offer in client.offers { absorb offer.agreement.release() }
+    let agreement = match startKeyAgreement(.X25519) {
+        Ok(value) -> value
+        Error(failure) -> {
+            expect!(traceText(traceText(failure)) == "")
+            return
+        }
+    }
+    client.offers = [TlsShareOffer { group: unknown, agreement: agreement }]
+    client.events = []
+    client.transcript = TlsTranscript {}
+    match client.sendClientHello() {
+        Ok -> {}
+        Error(alert) -> {
+            expect!(traceText(traceText(alert)) == "")
+            return
+        }
+    }
+    let text = match converse(client, server) {
+        Ok(value) -> value
+        Error(alert) -> traceText(alert)
+    }
+    // The notes are traced twice over, so the protocol's quotes arrive
+    // escaped; its name and the chain count are enough.
+    expect!((text.contains("h3") && text.contains("None 1") && text.contains("same true")) == (true))
+}
+
+
+// A certificate for another name ends the handshake with bad_certificate.
+@Test
+function wrongServerNameFailsClosed() {
+    let expected: String = "Error(TlsAlert.BadCertificate) TlsHandshakeStage.Failed"
+    var server = match testServer(.Quic) {
+        Ok(value) -> value
+        Error(alert) -> {
+            expect!((traceText(alert)) == expected)
+            return
+        }
+    }
+    var client = match testClient(.Quic, "example.com") {
+        Ok(value) -> value
+        Error(alert) -> {
+            expect!((traceText(alert)) == expected)
+            return
+        }
+    }
+    let outcome = traceText(converse(client, server))
+    expect!((outcome) == ("Error(TlsAlert.BadCertificate)"))
+    expect!((traceText(client.stage)) == ("TlsHandshakeStage.Failed"))
+}
+

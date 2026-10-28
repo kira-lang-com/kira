@@ -1,0 +1,31 @@
+// A program's own `typeName` keeps its body: the compiler writes the type
+// table into Foundation's `@TypeTable` declarations only, and a descriptor's
+// `name` still reads the table.
+
+import Foundation
+
+enum Kind {
+    First
+    Second
+}
+
+struct Holder {
+    let type: Kind
+}
+
+function typeName(kind: borrow Kind) -> String {
+    return match kind {
+        First -> "first"
+        Second -> "second"
+    }
+}
+
+@Main
+function main() -> Int {
+    var failures = 0
+    let holder = Holder { type: .Second }
+    if typeName(holder.type) != "second" { failures += 1 }
+    let described: Any = 7
+    if described.type.name.count == 0 { failures += 1 }
+    return 42 + failures
+}

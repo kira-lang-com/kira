@@ -1,0 +1,233 @@
+// WGSL spellings of types, and the member attributes that realize a
+// recorded struct layout (section 19.7 rule 2).
+
+function wgslScalar(scalar: String) -> String {
+    match scalar {
+        "bool" -> return "bool"
+        "i32" -> return "i32"
+        "u32" -> return "u32"
+        "f32" -> return "f32"
+        "f16" -> return "f16"
+        else -> return typeFailure(joinText(["WGSL has no ", scalar]))
+    }
+}
+
+function wgslFormat(format: String) -> String {
+    match format {
+        "rgba8unorm" -> return format
+        "rgba8snorm" -> return format
+        "rgba8uint" -> return format
+        "rgba8sint" -> return format
+        "bgra8unorm" -> return format
+        "rgba16float" -> return format
+        "rgba16uint" -> return format
+        "rgba16sint" -> return format
+        "r32float" -> return format
+        "r32uint" -> return format
+        "r32sint" -> return format
+        "rg32float" -> return format
+        "rg32uint" -> return format
+        "rg32sint" -> return format
+        "rgba32float" -> return format
+        "rgba32uint" -> return format
+        "rgba32sint" -> return format
+        else -> return typeFailure(joinText(["WGSL has no storage format ", format]))
+    }
+}
+
+// `read_write` for an access that stores, else `read`.
+function storageAccess(access: String) -> String {
+    if containsWord(access, "store") { return "read_write" }
+    return "read"
+}
+
+extend TextOut {
+    function wgslImage(borrow self, typeIndex: Int) -> String {
+        let dimension = typeText(typeIndex, "dimension")
+        var dim = dimension
+        if flag("types", -1, typeIndex, "arrayed") {
+            if dimension == "1d" || dimension == "3d" {
+                return typeFailure(joinText(["an arrayed ", dimension, " image"]))
+            }
+            dim = joinText([dimension, "_array"])
+        }
+        let imageClass = typeText(typeIndex, "class")
+        let multisampled = flag("types", -1, typeIndex, "multisampled")
+        if imageClass == "depth" && multisampled { return joinText(["texture_depth_multisampled_", dim]) }
+        if imageClass == "depth" { return joinText(["texture_depth_", dim]) }
+        if imageClass == "storage" {
+            let format = wgslFormat(typeText(typeIndex, "format"))
+            if failedText(format) { return format }
+            let access = typeText(typeIndex, "access")
+            var mode = "write"
+            if containsWord(access, "load") && containsWord(access, "store") {
+                mode = "read_write"
+            } else if containsWord(access, "load") {
+                mode = "read"
+            }
+            return joinText(["texture_storage_", dim, "<", format, ", ", mode, ">"])
+        }
+        let scalar = typeText(typeIndex, "scalar")
+        if scalar == "bool" { return typeFailure("a texture of bool") }
+        if multisampled { return joinText(["texture_multisampled_", dim, "<", scalar, ">"]) }
+        return joinText(["texture_", dim, "<", scalar, ">"])
+    }
+
+    // A type's text, or a failure.
+    function wgslType(borrow self, typeIndex: Int) -> String {
+        let shape = typeKind(typeIndex)
+        let scalar = wgslScalar(typeText(typeIndex, "scalar"))
+        match shape {
+            "struct" -> return structName(typeIndex)
+            "scalar" -> return scalar
+            "vector" -> {
+                if failedText(scalar) { return scalar }
+                return joinText(["vec", decimalText(typeField(typeIndex, "lanes")), "<", scalar, ">"])
+            }
+            "matrix" -> {
+                if failedText(scalar) { return scalar }
+                return joinText(["mat", decimalText(typeField(typeIndex, "columns")), "x",
+                    decimalText(typeField(typeIndex, "rows")), "<", scalar, ">"])
+            }
+            "atomic" -> {
+                if failedText(scalar) { return scalar }
+                return joinText(["atomic<", scalar, ">"])
+            }
+            "pointer" -> {
+                let space = typeText(typeIndex, "space")
+                var held = space
+                if space == "storage" {
+                    held = joinText(["storage, ", storageAccess(typeText(typeIndex, "access"))])
+                } else if space == "handle" {
+                    return typeFailure("a pointer to a handle")
+                } else if space == "immediate" {
+                    return typeFailure("the immediate space")
+                }
+                let base = wgslType(typeField(typeIndex, "base"))
+                if failedText(base) { return base }
+                return joinText(["ptr<", held, ", ", base, ">"])
+            }
+            "array" -> {
+                let base = wgslType(typeField(typeIndex, "base"))
+                if failedText(base) { return base }
+                let length = typeField(typeIndex, "length")
+                if length >= 0 { return joinText(["array<", base, ", ", decimalText(length), ">"]) }
+                let sized = typeField(typeIndex, "length_override")
+                if sized >= 0 { return joinText(["array<", base, ", ", overrideNames[sized], ">"]) }
+                return joinText(["array<", base, ">"])
+            }
+            "image" -> return wgslImage(typeIndex)
+            "sampler" -> {
+                if flag("types", -1, typeIndex, "comparison") { return "sampler_comparison" }
+                return "sampler"
+            }
+            else -> return typeFailure(joinText(["a ", shape]))
+        }
+    }
+
+    // A type's text where the module declares something of it; a type WGSL
+    // cannot spell is refused at the type.
+    function typeName(borrow self, typeIndex: Int) -> String {
+        let written = wgslType(typeIndex)
+        if failedText(written) {
+            refuseAt(failureText(written), "types", -1, typeIndex)
+            return ""
+        }
+        return written
+    }
+
+    // A type's text in a body, where a failure is written as its reason.
+    function bodyType(borrow self, typeIndex: Int) -> String {
+        let written = wgslType(typeIndex)
+        if failedText(written) { return failureText(written) }
+        return written
+    }
+
+    // The size and alignment WGSL gives a host-shareable type.
+    function naturalSize(borrow self, typeIndex: Int) -> Int {
+        let shape = typeKind(typeIndex)
+        if shape == "struct" { return typeField(typeIndex, "size") }
+        if shape == "array" {
+            var length = typeField(typeIndex, "length")
+            if length < 0 { length = 1 }
+            return length * typeField(typeIndex, "stride")
+        }
+        if shape == "pointer" || shape == "image" || shape == "sampler" { return 0 }
+        return typeField(typeIndex, "size_std430")
+    }
+
+    function naturalAlign(borrow self, typeIndex: Int) -> Int {
+        let shape = typeKind(typeIndex)
+        if shape == "struct" {
+            let members = count("members", typeIndex)
+            if members == 0 { return 4 }
+            var widest = 0
+            for member in 0..members {
+                let align = naturalAlign(field("members", typeIndex, member, "type"))
+                if align > widest { widest = align }
+            }
+            return widest
+        }
+        if shape == "array" { return naturalAlign(typeField(typeIndex, "base")) }
+        if shape == "pointer" || shape == "image" || shape == "sampler" { return 1 }
+        return typeField(typeIndex, "align_std430")
+    }
+
+    // The `@size` of each member that realizes its recorded offsets, 0 for
+    // a member that needs none, or a refusal at the struct when WGSL cannot
+    // reach them, which leaves no sizes.
+    function memberSizes(borrow self, typeIndex: Int) -> [Int] {
+        var sizes: [Int] = []
+        var end = 0
+        var widest = 1
+        let members = count("members", typeIndex)
+        let size = typeField(typeIndex, "size")
+        for member in 0..members {
+            let memberType = field("members", typeIndex, member, "type")
+            let memberSize = naturalSize(memberType)
+            let align = naturalAlign(memberType)
+            if align > widest { widest = align }
+            let offset = field("members", typeIndex, member, "offset")
+            let name = text("members", typeIndex, member, "name")
+            if alignUp(end, align) != offset {
+                var structText = "struct"
+                if textCount("types", -1, typeIndex, "name") > 0 { structText = typeText(typeIndex, "name") }
+                refuseAt(joinText(["member `", name, "` of `", structText, "` at offset ", decimalText(offset),
+                    " is not where WGSL places it"]), "types", -1, typeIndex)
+                return []
+            }
+            if typeKind(memberType) == "array" {
+                let base = typeField(memberType, "base")
+                let stride = typeField(memberType, "stride")
+                if alignUp(naturalSize(base), naturalAlign(base)) != stride {
+                    refuseAt(joinText(["member `", name, "` has array stride ", decimalText(stride),
+                        ", which WGSL cannot express"]), "types", -1, typeIndex)
+                    return []
+                }
+            }
+            var next = size
+            if member + 1 < members { next = field("members", typeIndex, member + 1, "offset") }
+            var wanted = next - offset
+            if wanted < 0 { wanted = 0 }
+            let runtime = typeKind(memberType) == "array" && typeField(memberType, "length") < 0
+                && typeField(memberType, "length_override") < 0
+            if runtime || wanted == memberSize {
+                sizes.append(0)
+                end = offset + memberSize
+            } else if wanted > memberSize {
+                sizes.append(wanted)
+                end = next
+            } else {
+                refuseAt(joinText(["member `", name, "` needs ", decimalText(memberSize), " bytes but has ",
+                    decimalText(wanted)]), "types", -1, typeIndex)
+                return []
+            }
+        }
+        if members > 0 && size % widest != 0 {
+            refuseAt(joinText(["a struct of size ", decimalText(size), " is not a multiple of its alignment ",
+                decimalText(widest)]), "types", -1, typeIndex)
+            return []
+        }
+        return sizes
+    }
+}

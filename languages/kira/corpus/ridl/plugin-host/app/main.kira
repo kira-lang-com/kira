@@ -1,0 +1,88 @@
+import Foundation
+
+// Calls the Geometry library as a plugin: its image runs on a VM instance of
+// its own, loaded beside this program, and is reached through the same RIDL
+// entries a native build of it exports. Its heap is its own, so every buffer
+// it gets back was the plugin's and has to be adopted.
+
+struct Point {
+    var x: Float
+    var y: Float
+}
+
+enum Shape {
+    Circle(Float)
+    Rectangle(Point)
+    Empty
+}
+
+distinct Tag = U32
+
+@Ridl("Geometry") function next(tag: Tag) -> Tag
+@Ridl("Geometry") function add(a: Int, b: Int) -> Int
+@Ridl("Geometry") function negate(flag: Bool) -> Bool
+@Ridl("Geometry") function length(text: String) -> Int
+@Ridl("Geometry") function sum(items: [Int]) -> Int
+@Ridl("Geometry") function joined(words: [String]) -> String
+@Ridl("Geometry") function words(count: Int) -> [String]
+@Ridl("Geometry") function orZero(value: Optional<Int>) -> Int
+@Ridl("Geometry") function point(x: Float, y: Float) -> Point
+@Ridl("Geometry") function area(shape: Shape) -> Float
+@Ridl("Geometry") function same(shape: Shape) -> Shape
+@Ridl("Geometry") function greet(name: borrow String) -> String
+@Ridl("Geometry") function half(value: Int) -> Result<Int, String>
+@Ridl("Geometry") function checkEven(value: Int) -> Result<Void, String>
+@Ridl("Geometry") function shift(point: borrow mut Point)
+
+extend Point {
+    @Ridl("Geometry") function total(borrow self) -> Float
+    @Ridl("Geometry") function bump(borrow mut self) -> Float
+}
+
+@Main
+function main() {
+    print(String(add(40, 2)))
+    print(String(negate(false)))
+    print(String(length("kira")))
+    print(String(sum([1, 2, 3, 4])))
+    print(joined(["a", "b", "c"]))
+    let list = words(3)
+    print(String(list.count))
+    print(list[2])
+    print(String(orZero(.Some(9))))
+    print(String(orZero(.None)))
+    let p = point(1.5, 2.0)
+    print(String(p.total()))
+    var q = point(10.0, 0.0)
+    shift(q)
+    print(String(q.x))
+    // The mutation happens in the provider, on this program's own value.
+    var bumped = point(4.0, 0.0)
+    print(String(bumped.bump()))
+    print(String(bumped.x))
+    print(String(area(.Circle(2.0))))
+    print(String(area(.Rectangle(Point { x = 2.0, y = 3.0 }))))
+    match same(.Rectangle(Point { x = 4.0, y = 5.0 })) {
+        Rectangle(size) -> print(String(size.x + size.y))
+        Circle(radius) -> print(String(radius))
+        Empty -> print("empty")
+    }
+    print(greet("ridl"))
+    match half(10) {
+        Ok(value) -> print(String(value))
+        Error(reason) -> print(reason)
+    }
+    match half(7) {
+        Ok(value) -> print(String(value))
+        Error(reason) -> print(reason)
+    }
+    match checkEven(4) {
+        Ok -> print("even")
+        Error(reason) -> print(reason)
+    }
+    match checkEven(5) {
+        Ok -> print("even")
+        Error(reason) -> print(reason)
+    }
+    print(String(Int(next(Tag(U32(41))).raw)))
+}

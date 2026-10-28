@@ -1,0 +1,59 @@
+extend Parser {
+    function interpolatedString(borrow mut self, span: Span) -> Result<Int, Failure> {
+        let raw = text(span)
+        let end = utf8Count(raw) - 1
+        var index = 1
+        var run = 1
+        var result = tree.addExpression(.StringLiteral(.Some("")), span)
+        var interpolated = false
+        while index < end {
+            if utf8Byte(raw, index) != asciiBackslash {
+                index += 1
+                continue
+            }
+            if utf8Byte(raw, index + 1) != 40 {
+                index += 2
+                continue
+            }
+            interpolated = true
+            result = appendStringPart(result, raw, run, index, span)
+            let start = span.start + index + 2
+            var scanner = Lexer { source = source, file = span.file, position = start }
+            try scanner.interpolation()
+            let tokens = try lex(utf8Slice(source, start, scanner.position), span.file)
+            var adjusted: [Token] = []
+            for token in tokens {
+                adjusted.append(Token {
+                    kind = token.kind,
+                    span = Span { file = span.file, start = start + token.span.start, end = start + token.span.end }
+                })
+            }
+            var nested = Parser {
+                source = source, tokens = adjusted, position = 0, tree = move tree,
+                imports = imports, structLiterals = true, quotes = quotes,
+                macroNames = macroNames, handling = handling
+            }
+            let value = try nested.expression()
+            let close = try nested.expect(.RightParen)
+            tree = move nested.tree
+            // No source name can be spelled `#interpolated`, so nothing shadows it.
+            let converted = tree.addExpression(.Call(Identifier { text = "#interpolated", span = span }, [value]), span)
+            result = tree.addExpression(.Binary(.Add, result, converted), span)
+            index = close.span.end - span.start
+            run = index
+        }
+        if !interpolated { return .Ok(tree.addExpression(.StringLiteral(stringLiteralText(raw)), span)) }
+        return .Ok(appendStringPart(result, raw, run, end, span))
+    }
+
+    function appendStringPart(borrow mut self, result: Int, raw: String, start: Int, end: Int, span: Span) -> Int {
+        let quoted = joinText(["\"", utf8Slice(raw, start, end), "\""])
+        var text = utf8Slice(raw, start, end)
+        match stringLiteralText(quoted) {
+            Some(decoded) -> text = decoded
+            None -> {}
+        }
+        let part = tree.addExpression(.StringLiteral(.Some(text)), span)
+        return tree.addExpression(.Binary(.Add, result, part), span)
+    }
+}

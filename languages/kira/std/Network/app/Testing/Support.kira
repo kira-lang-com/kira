@@ -1,0 +1,25 @@
+import Foundation
+
+// Fixtures the Network's own tests and its dependents' tests share: the trust
+// anchors and the server identity of the test PKI in the Foundation. They are
+// test support, not part of the runtime; a dependent reaches them as
+// `Net.NetworkTesting.anchors()` and `Net.NetworkTesting.identity()`.
+
+namespace NetworkTesting {
+    // The anchors that trust the test PKI's authority.
+    function anchors() -> [UN8] {
+        return anchorsOf([QuicTestPki.authority])
+    }
+
+    // The server identity of the test PKI's leaf certificate.
+    function identity() -> Result<TlsServerIdentity, String> {
+        let key = try loadSigningKey(QuicTestPki.leafKey) otherwise return .Error("key")
+        return .Ok(
+            TlsServerIdentity {
+                certificates: [QuicTestPki.leaf],
+                key: key,
+                scheme: .EcdsaSecp256r1Sha256
+            }
+        )
+    }
+}

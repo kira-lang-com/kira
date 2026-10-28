@@ -1,0 +1,100 @@
+// Time as the QUIC engines see it, and the packets a space has received,
+// kept as the ranges an ACK frame names (RFC 9000 section 13.2).
+
+// A moment on the monotonic clock, in microseconds. The engines never read
+// the clock: the driver passes `now` in.
+distinct QuicInstant = Number
+
+namespace QuicTime {
+    let millisecond: Number = 1000
+    let second: Number = 1000000
+}
+
+extend QuicInstant {
+    function plus(borrow self, microseconds: Number) -> QuicInstant {
+        return QuicInstant(raw + microseconds)
+    }
+
+    function since(borrow self, earlier: QuicInstant) -> Number {
+        return raw - earlier.raw
+    }
+}
+
+function quicEarliest(first: borrow QuicInstant?, second: borrow QuicInstant?) -> QuicInstant? {
+    return match first {
+        Some(a) -> match second {
+            Some(b) -> .Some(a.raw <= b.raw ? a : b)
+            None -> .Some(a)
+        }
+        None -> copy second
+    }
+}
+
+namespace QuicAckPolicy {
+    // The ranges remembered; older ones are forgotten, which at worst makes
+    // the peer resend what it already delivered.
+    let rangesKept: Number = 32
+    // Every second ack-eliciting packet is acknowledged at once (RFC 9000
+    // section 13.2.2).
+    let elicitingBeforeAck: Number = 2
+}
+
+struct QuicReceivedRanges {
+    // Largest first, none touching.
+    var ranges: [QuicAckRange] = []
+    var largestAt: QuicInstant? = .None
+    var elicitingUnacknowledged: Number = 0
+    var ackDue: Bool = false
+
+    function contains(borrow self, number: Number) -> Bool {
+        for range in ranges {
+            if number >= range.smallest && number <= range.largest { return true }
+        }
+        return false
+    }
+
+    // Records `number`, received at `now`.
+    function add(borrow mut self, number: Number, now: QuicInstant) {
+        if contains(number) { return }
+        var grown: [QuicAckRange] = []
+        var placed = false
+        for range in ranges {
+            if placed {
+                grown.append(range)
+            } else if number > range.largest {
+                grown.append(QuicAckRange { smallest: number, largest: number })
+                grown.append(range)
+                placed = true
+            } else {
+                grown.append(range)
+            }
+        }
+        if !placed { grown.append(QuicAckRange { smallest: number, largest: number }) }
+        ranges = quicMerged(grown)
+        if ranges[0].largest == number { largestAt = .Some(now) }
+    }
+
+    // An ACK frame for what arrived, its delay scaled by `exponent`.
+    function frame(borrow self, now: QuicInstant, exponent: Number) -> QuicAckFrame? {
+        if ranges.count == 0 { return .None }
+        let delay = match largestAt {
+            Some(at) -> max(now.since(at), 0) >> exponent
+            None -> 0
+        }
+        return .Some(QuicAckFrame { ranges: copy ranges, delay: delay })
+    }
+}
+
+// Adjacent ranges joined, and only the newest kept.
+function quicMerged(ranges: borrow [QuicAckRange]) -> [QuicAckRange] {
+    var out: [QuicAckRange] = []
+    for range in ranges {
+        if out.count > 0 && out[out.count - 1].smallest == range.largest + 1 {
+            let last = out[out.count - 1]
+            out[out.count - 1] = QuicAckRange { smallest: range.smallest, largest: last.largest }
+        } else if out.count < QuicAckPolicy.rangesKept {
+            out.append(range)
+        }
+    }
+    return out
+}

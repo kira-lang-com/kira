@@ -1,0 +1,114 @@
+struct TrackedCell {
+    let slot: KirAddress
+    let valueType: Type
+    let initialized: KirAddress
+}
+
+extend FunctionLowering {
+    function currentFunctionIndex(borrow self) -> Int {
+        match functionIndex {
+            Some(index) -> return index
+            None -> { abort() return 0 }
+        }
+    }
+
+    function localAddress(borrow mut self, local: Int) -> KirAddress {
+        let declared = checked.locals[local]
+        if declared.cell || isAlias(local) { return kir.typedMemory(kir.load(storage[local]), types.of(declared.valueType)) }
+        return storage[local]
+    }
+
+    // A local naming the value a `borrow mut` parameter names.
+    function isAlias(borrow self, local: Int) -> Bool {
+        let declared = checked.locals[local]
+        return local >= checked.parameterCount && declared.byReference && !declared.cell && !declared.captured
+    }
+
+    // Assigning an alias a whole value leaves the parameter's alone: the
+    // alias holds the new one in storage of its own from then on.
+    function rebindAlias(borrow mut self, local: Int, value: Int) {
+        match aliasStorage[local] {
+            Some(own) -> {
+                let valueType = checked.locals[local].valueType
+                let saved = temporary(valueType)
+                write(value, saved)
+                releaseTracked(own)
+                moveValue(saved, own, valueType)
+                forgetTracked(saved)
+                markInitialized(own)
+                kir.store(kir.convert(convertBitcast, kir.pointer(own), types.pointer), storage[local])
+            }
+            None -> abort()
+        }
+    }
+
+    function trackCell(borrow mut self, slot: KirAddress, valueType: Type) -> KirAddress {
+        let flag = storageSlot(types.boolean)
+        if !framed() { kir.store(kir.integer(types.boolean, 0), flag) }
+        cells.append(TrackedCell { slot = slot, valueType = valueType, initialized = flag })
+        return flag
+    }
+
+    function releaseCellData(borrow mut self, data: KirValue, valueType: Type, initialized: KirValue) {
+        let bits = kir.convert(convertBitcast, data, types.integer64)
+        let check = kir.block()
+        let done = kir.block()
+        kir.branchIf(kir.compare(kirPredicate(.NotEqual, false), bits, kir.integer(types.integer64, 0)), check, done)
+        enter(check)
+        kir.argument(data)
+        let unique = kir.call(functions[program.arrayFunctions[6]], types.boolean)
+        let destroy = kir.block()
+        let release = kir.block()
+        let last = kir.binary(kirOperator(.BitAnd, false), false, false, unique, initialized)
+        kir.branchIf(last, destroy, release)
+        enter(destroy)
+        destroyValue(kir.typedMemory(data, types.of(valueType)), valueType)
+        flowInto(release)
+        enter(release)
+        arrayRuntimeVoid(3, [data])
+        flowInto(done)
+        enter(done)
+    }
+
+    function initializeCell(borrow mut self, local: Int, value: Int) {
+        match cellFlags[local] {
+            Some(flag) -> {
+                let valueType = checked.locals[local].valueType
+                releaseCellData(kir.load(storage[local]), valueType, kir.load(flag))
+                if checked.locals[local].byReference {
+                    shareView(local, value)
+                } else {
+                    let data = arrayRuntimePointer(0, [kir.integer(types.integer64, types.byteSize(valueType))])
+                    kir.store(data, storage[local])
+                    write(value, kir.typedMemory(data, types.of(valueType)))
+                }
+                kir.store(kir.integer(types.boolean, 1), flag)
+            }
+            None -> abort()
+        }
+    }
+
+    // A view of callback state is a cell holding a share of the storage the
+    // state's `Any` keeps its value in, so writing the view writes the state.
+    function shareView(borrow mut self, local: Int, value: Int) {
+        let unboxed = program.expressions[value]
+        match unboxed.operation.unboxedOperand() {
+            Some(operand) -> {
+                var typeId = 0
+                for index in 0..program.anyTypes.count {
+                    if program.anyTypes[index].equals(canonicalAnyType(unboxed.valueType)) { typeId = program.anyTypeIds[index] }
+                }
+                let data = unboxedData(operand, typeId, .None, unboxed.span)
+                kir.store(arrayRuntimePointer(2, [data]), storage[local])
+            }
+            None -> abort()
+        }
+    }
+
+    function cleanupCells(borrow mut self) {
+        for offset in 0..cells.count {
+            let cell = cells[cells.count - 1 - offset]
+            releaseCellData(kir.load(cell.slot), cell.valueType, kir.load(cell.initialized))
+        }
+    }
+}

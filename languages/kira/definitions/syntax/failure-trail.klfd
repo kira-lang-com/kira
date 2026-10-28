@@ -1,0 +1,123 @@
+// What a failure leaves on the trail, with nothing written for it:
+//
+//     let field = try ktenGet(value, name) otherwise 0
+//
+// is a `match` whose `Error` arm records an absorbed event, the failure as
+// its field, before it falls back. On an optional value the `None` arm only
+// falls back: an absence is not a failure. A `handle` arm records the failure it
+// handles as it is entered, `absorb e` records `e` where a `match` takes a
+// failure apart, and `return .Error(x)` records where the failure was made,
+// so the event that absorbs it later can point back at it. A `return .Error`
+// written while a failure is being handled records that it converted one
+// failure into another.
+
+// The kinds of trail site, as Foundation's trail names them.
+let trailKindLog = 0
+let trailKindAbsorbed = 1
+let trailKindHandled = 2
+let trailKindOrigin = 3
+
+// The level an absorbed or handled failure records at, and the one a made
+// failure does.
+let failureLevel = 2
+let originLevel = 3
+
+extend Parser {
+    // After `try X`: `otherwise <value>` or `otherwise return <value>`.
+    function otherwiseExpression(borrow mut self, start: Span, tried: Int) -> Result<Int, Failure> {
+        let arms = try fallbackArms(start, true)
+        return .Ok(tree.addExpression(.MatchValue(tried, arms), spanFrom(start)))
+    }
+
+    // `try X otherwise Y` standing as a statement keeps no value, so its `Ok`
+    // arm binds nothing: `X` may be a `Result<Void, _>`, whose `Ok` has no
+    // payload to bind.
+    function otherwiseStatement(borrow mut self, start: Span, tried: Int) -> Result<Int, Failure> {
+        let arms = try fallbackArms(start, false)
+        return .Ok(tree.addStatement(.Match(tried, arms), spanFrom(start)))
+    }
+
+    // The arms of a fallback: the kept side gives the value when
+    // `keepsValue`, and the fallen side records the absorbed failure before
+    // the fallback runs. Which variants they take, `Ok` and `Error` or `Some`
+    // and `None`, the checker decides from the tried value's type.
+    function fallbackArms(borrow mut self, start: Span, keepsValue: Bool) -> Result<[MatchArm], Failure> {
+        advance()
+        let suffix = decimalText(tree.expressions.count)
+        let success = Identifier { text = joinText(["__tried#", suffix]), span = start }
+        let failed = Identifier { text = joinText(["__failure#", suffix]), span = start }
+        let fallbackStart = current().span
+        handling += 1
+        var fallback: [Int] = []
+        if at(.Return) {
+            fallback.append(try statement())
+        } else {
+            let value = try expressionWith(true)
+            fallback.append(tree.addStatement(.Evaluation(value), spanFrom(fallbackStart)))
+        }
+        handling -= 1
+        let span = spanFrom(start)
+        let message = joinText(["fell back to `", text(spanFrom(fallbackStart)), "`"])
+        var recovered = [failureRecord(span, trailKindAbsorbed, message, "failure", tree.addExpression(.Name(failed), span))]
+        for statement in fallback { recovered.append(statement) }
+        var taken: [Int] = []
+        var kept: Optional<Identifier> = .None
+        if keepsValue {
+            taken.append(tree.addStatement(.Evaluation(tree.addExpression(.Name(success), span)), span))
+            kept = .Some(success)
+        }
+        return .Ok([
+            MatchArm { variant = Identifier { text = "Ok", span = span }, binding = kept, pattern = .Kept, alternatives = [], body = taken },
+            MatchArm { variant = Identifier { text = "Error", span = span }, binding = .Some(failed), pattern = .Fallen, alternatives = [], body = recovered }
+        ])
+    }
+
+    // `absorb failure`: the failure recorded where it is let go.
+    function absorbStatement(borrow mut self) -> Result<Int, Failure> {
+        let start = advance().span
+        let valueStart = current().span
+        let value = try expression()
+        let span = spanFrom(start)
+        return .Ok(failureRecord(span, trailKindAbsorbed, "absorbed", text(spanFrom(valueStart)), value))
+    }
+
+    // At the start of a statement: `absorb` followed by what it absorbs.
+    function atAbsorb(borrow self) -> Bool {
+        return atWord("absorb") && peek(1).kind == .Identifier
+    }
+
+    // A `handle` arm's body, recording the failure it takes as it starts.
+    function handledBody(borrow mut self, variant: Identifier, body: [Int]) -> [Int] {
+        let field = "failure"
+        let failure = tree.addExpression(.Name(Identifier { text = "__error#handle", span = variant.span }), variant.span)
+        var recorded = [failureRecord(variant.span, trailKindHandled, joinText(["handled ", variant.text]), field, failure)]
+        for statement in body { recorded.append(statement) }
+        return recorded
+    }
+
+    // Whether the value a `return` gives starts `.Error(`: a failure made
+    // here. A compile-time function runs where there is no trail.
+    function atOrigin(borrow self) -> Bool {
+        if quotes { return false }
+        return at(.Dot) && peek(1).kind == .Identifier && text(peek(1).span) == "Error" && peek(2).kind == .LeftParen
+    }
+
+    // `return .Error(x)` as `return trailReturned(.Error(x), site, handling,
+    // trailUnknown(site) && trailSite(...))`: the site describes itself the
+    // first time, and the value passes through unchanged.
+    function originReturned(borrow mut self, value: Int, span: Span) -> Int {
+        let site = newTrailSite(span)
+        let describe = siteDescription(site, span, originLevel, trailKindOrigin, generatedText("", span), [generatedText("error", span)])
+        let unknown = generatedCall("trailUnknown", [siteNumber(site, span)], span)
+        let described = tree.addExpression(.Binary(.And, unknown, describe), span)
+        var context = 0
+        if handling > 0 { context = 1 }
+        return generatedCall("trailReturned", [value, siteNumber(site, span), generatedInteger(context, span), described], span)
+    }
+
+    // One failure event: the failure traced as the field `field`.
+    function failureRecord(borrow mut self, span: Span, kind: Int, message: String, field: String, failure: Int) -> Int {
+        let traced = generatedCall("traceText", [failure], span)
+        return logDesugared(span, failureLevel, kind, .Some(generatedText(message, span)), [generatedText(field, span)], [traced], .None)
+    }
+}

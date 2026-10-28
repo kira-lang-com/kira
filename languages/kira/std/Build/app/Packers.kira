@@ -1,0 +1,268 @@
+import Foundation
+import Kten
+import Archive
+
+// The library's packers and compressors (DESIGN.md section 5.6), over the
+// Archive library: each reproducible, its entries in byte order of their
+// paths, owned by 0 and dated 0.
+
+extend Graph {
+    // The tree `tree` as a cpio archive in the new ASCII format, which Linux
+    // unpacks as an initramfs.
+    function cpio(borrow mut self, name: borrow String, tree: borrow Artifact) -> Artifact {
+        let label = "cpio \(name)"
+        checkArtifact(tree, label)
+        checkTreePath(name, label)
+        if !holdsTree(tree) {
+            problems.append("\(label) packs \(artifactName(tree)), which is no tree")
+        }
+        return native(
+            NativeAction {
+                label: label,
+                code: sourceDigest!("package"),
+                inputs: [tree],
+                outputs: [Output { name: lastName(name) }],
+                work: { run in
+                    var writer = match createCpioWriter(run.outputs[0]) {
+                        Ok(created) -> created
+                        Error(failure) -> return .Error(.Files(archiveFailureText(failure)))
+                    }
+                    for entry in run.trees[0] {
+                        let added = match entry.kind {
+                            Directory -> writer.addDirectory(entry.path, entry.mode)
+                            Link -> writer.addLink(entry.path, entry.content)
+                            File -> {
+                                let path = joinPath(run.inputs[0], entry.path)
+                                match readArchiveFile(path) {
+                                    Ok(bytes) -> writer.addFile(entry.path, entry.mode, bytes)
+                                    Error(failure) -> .Error(failure)
+                                }
+                            }
+                        }
+                        match added {
+                            Ok -> {}
+                            Error(failure) -> return .Error(.Files(archiveFailureText(failure)))
+                        }
+                    }
+                    return match writer.finish() {
+                        Ok(size) -> .Ok
+                        Error(failure) -> .Error(.Files(archiveFailureText(failure)))
+                    }
+                }
+            }
+        )[0]
+    }
+
+    // The tree `tree` as a POSIX ustar archive, with pax headers for what
+    // ustar cannot hold.
+    function tar(borrow mut self, name: borrow String, tree: borrow Artifact) -> Artifact {
+        let label = "tar \(name)"
+        checkArtifact(tree, label)
+        checkTreePath(name, label)
+        if !holdsTree(tree) {
+            problems.append("\(label) packs \(artifactName(tree)), which is no tree")
+        }
+        return native(
+            NativeAction {
+                label: label,
+                code: sourceDigest!("package"),
+                inputs: [tree],
+                outputs: [Output { name: lastName(name) }],
+                work: { run in
+                    var writer = match createTarWriter(run.outputs[0]) {
+                        Ok(created) -> created
+                        Error(failure) -> return .Error(.Files(archiveFailureText(failure)))
+                    }
+                    for entry in run.trees[0] {
+                        let added = match entry.kind {
+                            Directory -> writer.addDirectory(entry.path, entry.mode)
+                            Link -> writer.addLink(entry.path, entry.content)
+                            File -> {
+                                let path = joinPath(run.inputs[0], entry.path)
+                                match readArchiveFile(path) {
+                                    Ok(bytes) -> writer.addFile(entry.path, entry.mode, bytes)
+                                    Error(failure) -> .Error(failure)
+                                }
+                            }
+                        }
+                        match added {
+                            Ok -> {}
+                            Error(failure) -> return .Error(.Files(archiveFailureText(failure)))
+                        }
+                    }
+                    return match writer.finish() {
+                        Ok(size) -> .Ok
+                        Error(failure) -> .Error(.Files(archiveFailureText(failure)))
+                    }
+                }
+            }
+        )[0]
+    }
+
+    // The tree `tree` as a SquashFS 4.0 image, compressed with zlib at
+    // `level`, from 1 to 9, in blocks of 128 KiB: no fragments, every entry
+    // owned by 0 and dated 0. Linux mounts it with `CONFIG_SQUASHFS_ZLIB`.
+    // At level 0 every data and metadata block is stored as it is.
+    function squashfs(
+        borrow mut self,
+        name: borrow String,
+        tree: borrow Artifact,
+        level: Number
+    ) -> Artifact {
+        let label = "squashfs \(name)"
+        checkArtifact(tree, label)
+        checkTreePath(name, label)
+        if !holdsTree(tree) {
+            problems.append("\(label) packs \(artifactName(tree)), which is no tree")
+        }
+        return native(
+            NativeAction {
+                label: label,
+                code: sourceDigest!("package"),
+                parameters: .Number(level),
+                inputs: [tree],
+                outputs: [Output { name: lastName(name) }],
+                work: { run in
+                    var writer = match createSquashfsWriter(run.outputs[0], level) {
+                        Ok(created) -> created
+                        Error(failure) -> return .Error(.Files(archiveFailureText(failure)))
+                    }
+                    for entry in run.trees[0] {
+                        let added = match entry.kind {
+                            Directory -> writer.addDirectory(entry.path, entry.mode)
+                            Link -> writer.addLink(entry.path, entry.content)
+                            File -> writer.addFileFrom(
+                                entry.path,
+                                entry.mode,
+                                joinPath(run.inputs[0], entry.path)
+                            )
+                        }
+                        match added {
+                            Ok -> {}
+                            Error(failure) -> return .Error(.Files(archiveFailureText(failure)))
+                        }
+                    }
+                    return match writer.finish() {
+                        Ok(size) -> .Ok
+                        Error(failure) -> .Error(.Files(archiveFailureText(failure)))
+                    }
+                }
+            }
+        )[0]
+    }
+
+    // The tree `tree` as a composefs image: an EROFS image of its
+    // directories, links and file metadata, each file carrying its fs-verity
+    // digest and a redirect to the same path in the tree, for overlayfs to
+    // mount with the tree as a data-only layer under `verity=require`
+    // (Archive's Composefs). The image holds no file data.
+    function composefs(borrow mut self, name: borrow String, tree: borrow Artifact) -> Artifact {
+        let label = "composefs \(name)"
+        checkArtifact(tree, label)
+        checkTreePath(name, label)
+        if !holdsTree(tree) {
+            problems.append("\(label) packs \(artifactName(tree)), which is no tree")
+        }
+        return native(
+            NativeAction {
+                label: label,
+                code: sourceDigest!("package"),
+                inputs: [tree],
+                outputs: [Output { name: lastName(name) }],
+                work: { run in
+                    var writer = match createComposefsWriter(run.outputs[0]) {
+                        Ok(created) -> created
+                        Error(failure) -> return .Error(.Files(archiveFailureText(failure)))
+                    }
+                    for entry in run.trees[0] {
+                        let added = match entry.kind {
+                            Directory -> writer.addDirectory(entry.path, entry.mode)
+                            Link -> writer.addLink(entry.path, entry.content)
+                            File -> {
+                                let path = joinPath(run.inputs[0], entry.path)
+                                let size = match fileStatus(path) {
+                                    Ok(status) -> status.size
+                                    Error(failure) -> return .Error(
+                                        .Files("cannot read \(path): \(traceText(failure))")
+                                    )
+                                }
+                                match verityDigestOfFile(path) {
+                                    Ok(verity) -> writer.addFile(
+                                        entry.path,
+                                        entry.mode,
+                                        size,
+                                        verity
+                                    )
+                                    Error(failure) -> .Error(failure)
+                                }
+                            }
+                        }
+                        match added {
+                            Ok -> {}
+                            Error(failure) -> return .Error(.Files(archiveFailureText(failure)))
+                        }
+                    }
+                    return match writer.finish() {
+                        Ok(size) -> .Ok
+                        Error(failure) -> .Error(.Files(archiveFailureText(failure)))
+                    }
+                }
+            }
+        )[0]
+    }
+
+    // The fs-verity digest of the file `file`, SHA-256 over 4096-byte blocks
+    // with no salt, as its 32 bytes: what the kernel answers for the file
+    // once fs-verity is on (Archive's FsVerity).
+    function verityDigest(borrow mut self, name: borrow String, file: borrow Artifact) -> Artifact {
+        let label = "fs-verity digest \(name)"
+        checkArtifact(file, label)
+        checkTreePath(name, label)
+        if holdsTree(file) { problems.append("\(label) digests a tree, not a file") }
+        return native(
+            NativeAction {
+                label: label,
+                code: sourceDigest!("package"),
+                inputs: [file],
+                outputs: [Output { name: lastName(name) }],
+                work: { run in
+                    return match verityDigestOfFile(run.inputs[0]) {
+                        Ok(digest) -> writeBinaryFile(run.outputs[0], digest, 420)
+                        Error(failure) -> .Error(.Files(archiveFailureText(failure)))
+                    }
+                }
+            }
+        )[0]
+    }
+
+    // The file `file` compressed as one Zstandard frame. `level`, from 1 to
+    // 19, is how hard it looks for matches.
+    function zstd(
+        borrow mut self,
+        name: borrow String,
+        file: borrow Artifact,
+        level: Number
+    ) -> Artifact {
+        let label = "zstd \(name)"
+        checkArtifact(file, label)
+        checkTreePath(name, label)
+        if holdsTree(file) {
+            problems.append("\(label) compresses \(artifactName(file)), which is a tree")
+        }
+        return native(
+            NativeAction {
+                label: label,
+                code: sourceDigest!("package"),
+                parameters: .Number(level),
+                inputs: [file],
+                outputs: [Output { name: lastName(name) }],
+                work: { run in
+                    return match zstdCompressFile(run.inputs[0], run.outputs[0], level) {
+                        Ok(size) -> .Ok
+                        Error(failure) -> .Error(.Files(archiveFailureText(failure)))
+                    }
+                }
+            }
+        )[0]
+    }
+}

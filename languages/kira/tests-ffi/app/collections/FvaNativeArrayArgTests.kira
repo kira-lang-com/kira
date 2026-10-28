@@ -1,0 +1,78 @@
+import Foundation
+
+// Native-array callback argument regressions. Prefix: fva / Fva.
+//
+// These cover the hybrid path where @Native code creates an array, passes it to
+// an @Runtime callback, and that runtime callback forwards the same array into
+// another @Native function. The callback argument must be materialized as a VM
+// array before the runtime body runs, rather than re-lowered from a native
+// layout pointer on the next runtime->native call.
+
+function fvaNativeMakeInts(seed: Int) -> [Int] {
+    var xs: [Int] = []
+    xs.append(seed)
+    xs.append(seed + 1)
+    xs.append(seed + 2)
+    return xs
+}
+
+function fvaNativeAppendScore(xs: borrow mut [Int], value: Int) {
+    xs.append(value)
+    return
+}
+
+function fvaNativeWeightedSum(xs: borrow [Int]) -> Int {
+    var total = 0
+    for i in 0..xs.count {
+        total = total + xs[i] * (i + 1)
+    }
+    return total
+}
+
+@Runtime
+function fvaRuntimeForwardsArray(xs: borrow [Int]) -> Int {
+    return fvaNativeWeightedSum(xs)
+}
+
+@Runtime
+function fvaRuntimeMutatesArray(xs: borrow mut [Int], value: Int) {
+    xs.append(value)
+    return
+}
+
+function fvaNativeCallsRuntimeWithArray(seed: Int) -> Int {
+    let xs = fvaNativeMakeInts(seed)
+    return fvaRuntimeForwardsArray(xs)
+}
+
+function fvaNativeCallsRuntimeMutatingArray(seed: Int) -> Int {
+    var xs = fvaNativeMakeInts(seed)
+    fvaRuntimeMutatesArray(xs, seed + 10)
+    return fvaNativeWeightedSum(xs)
+}
+
+construct FvaNativeArrayCallbackForwardLoop() extends Test {
+    test {
+        var total = 0
+        for i in 0..12 {
+            total = total + fvaNativeCallsRuntimeWithArray(i)
+        }
+        return total
+    }
+    // Per seed: seed*1 + (seed+1)*2 + (seed+2)*3 = 6*seed + 8.
+    // Sum seed 0..11: 6*66 + 8*12 = 492.
+    expect { let e: Result<Any, TestFailure> = .Ok(492) return e }
+}
+
+construct FvaNativeArrayCallbackMutateLoop() extends Test {
+    test {
+        var total = 0
+        for i in 0..10 {
+            total = total + fvaNativeCallsRuntimeMutatingArray(i)
+        }
+        return total
+    }
+    // Per seed after append: 1*s + 2*(s+1) + 3*(s+2) + 4*(s+10) = 10*s + 48.
+    // Sum seed 0..9: 10*45 + 48*10 = 930.
+    expect { let e: Result<Any, TestFailure> = .Ok(930) return e }
+}

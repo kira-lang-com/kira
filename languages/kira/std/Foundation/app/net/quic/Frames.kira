@@ -1,0 +1,449 @@
+// QUIC frames (RFC 9000 section 19, RFC 9221), decoded from a packet's
+// payload and encoded into one. A frame that does not decode is a
+// FRAME_ENCODING_ERROR for the whole connection (RFC 9000 section 12.4).
+
+distinct QuicStreamNumber = Number
+
+enum QuicStreamKind {
+    Bidirectional
+    Unidirectional
+}
+
+// The two low bits of a stream ID: who opened it and which way it flows
+// (RFC 9000 section 2.1).
+namespace QuicStreamBits {
+    let serverInitiated: Number = 1
+    let unidirectional: Number = 2
+    let kinds: Number = 4
+}
+
+extend QuicStreamNumber {
+    function kind(borrow self) -> QuicStreamKind {
+        return (
+            raw & QuicStreamBits.unidirectional
+        ) != 0 ? QuicStreamKind.Unidirectional : QuicStreamKind.Bidirectional
+    }
+
+    function openedBy(borrow self) -> TlsRole {
+        return (raw & QuicStreamBits.serverInitiated) != 0 ? TlsRole.Server : TlsRole.Client
+    }
+
+    // Its place among the streams of its kind and initiator, from zero.
+    function index(borrow self) -> Number {
+        return trunc(raw / QuicStreamBits.kinds)
+    }
+}
+
+function quicStreamId(index: Number, kind: QuicStreamKind, opener: TlsRole) -> QuicStreamNumber {
+    let direction = kind == .Unidirectional ? QuicStreamBits.unidirectional : 0
+    let side = opener == .Server ? QuicStreamBits.serverInitiated : 0
+    return QuicStreamNumber(index * QuicStreamBits.kinds + direction + side)
+}
+
+struct QuicAckRange {
+    let smallest: Number
+    let largest: Number
+}
+
+struct QuicAckFrame {
+    // Largest first, none overlapping.
+    let ranges: [QuicAckRange]
+    // In microseconds scaled down by the sender's ack_delay_exponent.
+    let delay: Number
+}
+
+struct QuicCryptoFrame {
+    let offset: Number
+    let data: [UN8]
+}
+
+struct QuicStreamFrame {
+    let id: QuicStreamNumber
+    let offset: Number
+    let data: [UN8]
+    let fin: Bool
+}
+
+struct QuicResetStreamFrame {
+    let id: QuicStreamNumber
+    let error: Number
+    let finalSize: Number
+    // The bytes the receiver still gets despite the reset; above zero it
+    // travels as RESET_STREAM_AT (draft-ietf-quic-reliable-stream-reset
+    // section 4), and at zero the two frames mean the same.
+    let reliableSize: Number = 0
+}
+
+struct QuicStopSendingFrame {
+    let id: QuicStreamNumber
+    let error: Number
+}
+
+struct QuicStreamCredit {
+    let id: QuicStreamNumber
+    let maximum: Number
+}
+
+struct QuicStreamCount {
+    let kind: QuicStreamKind
+    let maximum: Number
+}
+
+struct QuicNewConnectionIdFrame {
+    let sequence: Number
+    let retirePriorTo: Number
+    let id: [UN8]
+    let resetToken: [UN8]
+}
+
+struct QuicCloseFrame {
+    // An application's error, from CONNECTION_CLOSE type 0x1d.
+    let application: Bool
+    let error: Number
+    // The frame type that caused a transport error, zero when none did.
+    let frameType: Number
+    let reason: [UN8]
+}
+
+enum QuicFrame {
+    Padding
+    Ping
+    Ack(QuicAckFrame)
+    ResetStream(QuicResetStreamFrame)
+    StopSending(QuicStopSendingFrame)
+    Crypto(QuicCryptoFrame)
+    NewToken([UN8])
+    Stream(QuicStreamFrame)
+    MaxData(Number)
+    MaxStreamData(QuicStreamCredit)
+    MaxStreams(QuicStreamCount)
+    DataBlocked(Number)
+    StreamDataBlocked(QuicStreamCredit)
+    StreamsBlocked(QuicStreamCount)
+    NewConnectionId(QuicNewConnectionIdFrame)
+    RetireConnectionId(Number)
+    PathChallenge([UN8])
+    PathResponse([UN8])
+    Close(QuicCloseFrame)
+    HandshakeDone
+    Datagram([UN8])
+}
+
+// Whether a frame is ack-eliciting: everything but ACK, PADDING and
+// CONNECTION_CLOSE (RFC 9002 section 2).
+function quicElicitsAck(frame: borrow QuicFrame) -> Bool {
+    return match frame {
+        Padding -> false
+        Ping -> true
+        Ack(_) -> false
+        ResetStream(_) -> true
+        StopSending(_) -> true
+        Crypto(_) -> true
+        NewToken(_) -> true
+        Stream(_) -> true
+        MaxData(_) -> true
+        MaxStreamData(_) -> true
+        MaxStreams(_) -> true
+        DataBlocked(_) -> true
+        StreamDataBlocked(_) -> true
+        StreamsBlocked(_) -> true
+        NewConnectionId(_) -> true
+        RetireConnectionId(_) -> true
+        PathChallenge(_) -> true
+        PathResponse(_) -> true
+        Close(_) -> false
+        HandshakeDone -> true
+        Datagram(_) -> true
+    }
+}
+
+// Whether a frame may travel in an Initial or Handshake packet (RFC 9000
+// section 12.4).
+function quicAllowedDuringHandshake(frame: borrow QuicFrame) -> Bool {
+    return match frame {
+        Padding -> true
+        Ping -> true
+        Ack(_) -> true
+        ResetStream(_) -> false
+        StopSending(_) -> false
+        Crypto(_) -> true
+        NewToken(_) -> false
+        Stream(_) -> false
+        MaxData(_) -> false
+        MaxStreamData(_) -> false
+        MaxStreams(_) -> false
+        DataBlocked(_) -> false
+        StreamDataBlocked(_) -> false
+        StreamsBlocked(_) -> false
+        NewConnectionId(_) -> false
+        RetireConnectionId(_) -> false
+        PathChallenge(_) -> false
+        PathResponse(_) -> false
+        Close(close) -> !close.application
+        HandshakeDone -> false
+        Datagram(_) -> false
+    }
+}
+
+function quicReadId(reader: borrow mut WireReader) -> Result<QuicStreamNumber, QuicTransportError> {
+    let raw = try quicReadNumber(reader)
+    return .Ok(QuicStreamNumber(raw))
+}
+
+function quicReadNumber(reader: borrow mut WireReader) -> Result<Number, QuicTransportError> {
+    let value = try reader.readVarint() otherwise return .Error(.FrameEncodingError)
+    return .Ok(value)
+}
+
+function quicReadOpaque(
+    reader: borrow mut WireReader,
+    count: Number
+) -> Result<[UN8], QuicTransportError> {
+    let bytes = try reader.readBytes(count) otherwise return .Error(.FrameEncodingError)
+    return .Ok(bytes)
+}
+
+function quicReadAck(
+    reader: borrow mut WireReader,
+    ecn: Bool
+) -> Result<QuicFrame, QuicTransportError> {
+    let largest = try quicReadNumber(reader)
+    let delay = try quicReadNumber(reader)
+    let count = try quicReadNumber(reader)
+    let firstLength = try quicReadNumber(reader)
+    if firstLength > largest { return .Error(.FrameEncodingError) }
+    var ranges = [QuicAckRange { smallest: largest - firstLength, largest: largest }]
+    var smallest = largest - firstLength
+    for _ in 0..count {
+        let gap = try quicReadNumber(reader)
+        let length = try quicReadNumber(reader)
+        let next = smallest - gap - 2
+        if next < 0 || length > next { return .Error(.FrameEncodingError) }
+        ranges.append(QuicAckRange { smallest: next - length, largest: next })
+        smallest = next - length
+    }
+    // ECN counts are read past: ECN is not used yet.
+    if ecn {
+        for _ in 0..3 { try quicReadNumber(reader) }
+    }
+    return .Ok(.Ack(QuicAckFrame { ranges: ranges, delay: delay }))
+}
+
+function quicReadStream(
+    reader: borrow mut WireReader,
+    kind: Number
+) -> Result<QuicFrame, QuicTransportError> {
+    let id = try quicReadId(reader)
+    let offset = (kind & Quic.streamFlagOffset) != 0 ? try quicReadNumber(reader) : 0
+    let length = (kind & Quic.streamFlagLength) != 0 ? try quicReadNumber(
+        reader
+    ) : reader.remaining()
+    let data = try quicReadOpaque(reader, length)
+    // An offset past 2^62 - 1 cannot be (RFC 9000 section 19.8).
+    if offset + data.count > Wire.varintMaximum { return .Error(.FrameEncodingError) }
+    let fin = (kind & Quic.streamFlagFin) != 0
+    return .Ok(.Stream(QuicStreamFrame { id: id, offset: offset, data: data, fin: fin }))
+}
+
+function quicReadClose(
+    reader: borrow mut WireReader,
+    application: Bool
+) -> Result<QuicFrame, QuicTransportError> {
+    let error = try quicReadNumber(reader)
+    let frameType = application ? 0 : try quicReadNumber(reader)
+    let length = try quicReadNumber(reader)
+    let reason = try quicReadOpaque(reader, length)
+    return .Ok(
+        .Close(
+            QuicCloseFrame {
+                application: application,
+                error: error,
+                frameType: frameType,
+                reason: reason
+            }
+        )
+    )
+}
+
+function quicReadNewConnectionId(
+    reader: borrow mut WireReader
+) -> Result<QuicFrame, QuicTransportError> {
+    let sequence = try quicReadNumber(reader)
+    let retirePriorTo = try quicReadNumber(reader)
+    let length = try reader.readByte() otherwise return .Error(.FrameEncodingError)
+    if length < 1 || length > Quic.maximumConnectionId || retirePriorTo > sequence {
+        return .Error(.FrameEncodingError)
+    }
+    let id = try quicReadOpaque(reader, length)
+    let token = try quicReadOpaque(reader, Quic.statelessResetTokenBytes)
+    return .Ok(
+        .NewConnectionId(
+            QuicNewConnectionIdFrame {
+                sequence: sequence,
+                retirePriorTo: retirePriorTo,
+                id: id,
+                resetToken: token
+            }
+        )
+    )
+}
+
+function quicReadStreamCount(
+    reader: borrow mut WireReader,
+    kind: QuicStreamKind
+) -> Result<QuicStreamCount, QuicTransportError> {
+    let maximum = try quicReadNumber(reader)
+    if maximum > Quic.maximumStreams { return .Error(.FrameEncodingError) }
+    return .Ok(QuicStreamCount { kind: kind, maximum: maximum })
+}
+
+function quicReadCredit(
+    reader: borrow mut WireReader
+) -> Result<QuicStreamCredit, QuicTransportError> {
+    let id = try quicReadId(reader)
+    let maximum = try quicReadNumber(reader)
+    return .Ok(QuicStreamCredit { id: id, maximum: maximum })
+}
+
+// The next frame, its type read as the varint it is.
+function quicReadFrame(reader: borrow mut WireReader) -> Result<QuicFrame, QuicTransportError> {
+    let kind = try quicReadNumber(reader)
+    if kind >= code(QuicFrameType.Stream) && kind <= code(
+        QuicFrameType.Stream
+    ) + Quic.streamTypeMask {
+        return quicReadStream(reader, kind)
+    }
+    let typed: QuicFrameType = fromCode<QuicFrameType>(kind)
+    return match typed {
+        Padding -> .Ok(.Padding)
+        Ping -> .Ok(.Ping)
+        Ack -> quicReadAck(reader, false)
+        AckEcn -> quicReadAck(reader, true)
+        Crypto -> quicReadCrypto(reader)
+        NewToken -> quicReadToken(reader)
+        HandshakeDone -> .Ok(.HandshakeDone)
+        ConnectionClose -> quicReadClose(reader, false)
+        ApplicationClose -> quicReadClose(reader, true)
+        NewConnectionId -> quicReadNewConnectionId(reader)
+        else -> quicReadControl(reader, typed)
+    }
+}
+
+function quicReadCrypto(reader: borrow mut WireReader) -> Result<QuicFrame, QuicTransportError> {
+    let offset = try quicReadNumber(reader)
+    let length = try quicReadNumber(reader)
+    let data = try quicReadOpaque(reader, length)
+    return .Ok(.Crypto(QuicCryptoFrame { offset: offset, data: data }))
+}
+
+function quicReadToken(reader: borrow mut WireReader) -> Result<QuicFrame, QuicTransportError> {
+    let length = try quicReadNumber(reader)
+    if length == 0 { return .Error(.FrameEncodingError) }
+    let token = try quicReadOpaque(reader, length)
+    return .Ok(.NewToken(token))
+}
+
+// The flow control, stream and path frames.
+function quicReadControl(
+    reader: borrow mut WireReader,
+    typed: QuicFrameType
+) -> Result<QuicFrame, QuicTransportError> {
+    match typed {
+        ResetStream -> {
+            let id = try quicReadId(reader)
+            let error = try quicReadNumber(reader)
+            let finalSize = try quicReadNumber(reader)
+            return .Ok(
+                .ResetStream(QuicResetStreamFrame { id: id, error: error, finalSize: finalSize })
+            )
+        }
+        StopSending -> {
+            let id = try quicReadId(reader)
+            let error = try quicReadNumber(reader)
+            return .Ok(.StopSending(QuicStopSendingFrame { id: id, error: error }))
+        }
+        MaxData -> return .Ok(.MaxData(try quicReadNumber(reader)))
+        DataBlocked -> return .Ok(.DataBlocked(try quicReadNumber(reader)))
+        MaxStreamData -> return .Ok(.MaxStreamData(try quicReadCredit(reader)))
+        StreamDataBlocked -> return .Ok(.StreamDataBlocked(try quicReadCredit(reader)))
+        MaxStreamsBidirectional -> return .Ok(
+            .MaxStreams(try quicReadStreamCount(reader, .Bidirectional))
+        )
+        MaxStreamsUnidirectional -> return .Ok(
+            .MaxStreams(try quicReadStreamCount(reader, .Unidirectional))
+        )
+        StreamsBlockedBidirectional -> return .Ok(
+            .StreamsBlocked(try quicReadStreamCount(reader, .Bidirectional))
+        )
+        StreamsBlockedUnidirectional -> return .Ok(
+            .StreamsBlocked(try quicReadStreamCount(reader, .Unidirectional))
+        )
+        RetireConnectionId -> return .Ok(.RetireConnectionId(try quicReadNumber(reader)))
+        PathChallenge -> return .Ok(
+            .PathChallenge(try quicReadOpaque(reader, Quic.pathChallengeBytes))
+        )
+        PathResponse -> return .Ok(
+            .PathResponse(try quicReadOpaque(reader, Quic.pathChallengeBytes))
+        )
+        Datagram -> return .Ok(.Datagram(reader.readRest()))
+        DatagramWithLength -> {
+            let length = try quicReadNumber(reader)
+            return .Ok(.Datagram(try quicReadOpaque(reader, length)))
+        }
+        ResetStreamAt -> {
+            let id = try quicReadId(reader)
+            let error = try quicReadNumber(reader)
+            let finalSize = try quicReadNumber(reader)
+            let reliableSize = try quicReadNumber(reader)
+            if reliableSize > finalSize { return .Error(.FrameEncodingError) }
+            return .Ok(
+                .ResetStream(
+                    QuicResetStreamFrame {
+                        id: id,
+                        error: error,
+                        finalSize: finalSize,
+                        reliableSize: reliableSize
+                    }
+                )
+            )
+        }
+        else -> return .Error(.FrameEncodingError)
+    }
+}
+
+// Every frame of a payload. Runs of PADDING come back as one.
+function quicDecodeFrames(payload: borrow [UN8]) -> Result<[QuicFrame], QuicTransportError> {
+    if payload.count == 0 { return .Error(.ProtocolViolation) }
+    var reader = WireReader { bytes: copy payload }
+    var frames: [QuicFrame] = []
+    var padded = false
+    while !reader.atEnd() {
+        let frame = try quicReadFrame(reader)
+        let isPadding = match frame {
+            Padding -> true
+            Ping -> false
+            Ack(_) -> false
+            ResetStream(_) -> false
+            StopSending(_) -> false
+            Crypto(_) -> false
+            NewToken(_) -> false
+            Stream(_) -> false
+            MaxData(_) -> false
+            MaxStreamData(_) -> false
+            MaxStreams(_) -> false
+            DataBlocked(_) -> false
+            StreamDataBlocked(_) -> false
+            StreamsBlocked(_) -> false
+            NewConnectionId(_) -> false
+            RetireConnectionId(_) -> false
+            PathChallenge(_) -> false
+            PathResponse(_) -> false
+            Close(_) -> false
+            HandshakeDone -> false
+            Datagram(_) -> false
+        }
+        if !isPadding || !padded { frames.append(frame) }
+        padded = isPadding
+    }
+    return .Ok(frames)
+}

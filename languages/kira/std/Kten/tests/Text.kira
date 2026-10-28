@@ -1,0 +1,63 @@
+import Foundation
+
+// The text form: parsing, the loose spellings a writer may use, refusals with
+// their position, and the indented line form.
+
+@Test
+function theTextFormRoundTrips() {
+    let value = sample()
+    let back = match parseKten(value.written()) {
+        Ok(found) -> found
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    expect!((back == value) == (true))
+}
+
+// Space, a trailing comma and the escapes a writer may use all read.
+@Test
+function looseSpellingsParse() {
+    let loose = match parseKten("  Point {\n\tx: -2.50,\r y: [1, 2,],\n}  ") {
+        Ok(found) -> found.written()
+        Error(failure) -> traceText(failure)
+    }
+    expect!((loose) == "Point { x: -2.5, y: [1, 2] }")
+}
+
+@Test
+function badTextIsRefusedWithItsPosition() {
+    expect!((traceText(parseKten(""))) == "Error(KtenParseFailure.Unexpected(0))")
+    expect!((traceText(parseKten("\"open"))) == "Error(KtenParseFailure.UnterminatedText(0))")
+    expect!((traceText(parseKten("\"a\\q\""))) == "Error(KtenParseFailure.UnknownEscape(2))")
+    expect!((traceText(parseKten("0xabc"))) == "Error(KtenParseFailure.OddHexDigits(4))")
+    expect!((traceText(parseKten("1e5"))) == "Error(KtenParseFailure.Trailing(1))")
+    expect!((traceText(parseKten("T { a 1 }"))) == "Error(KtenParseFailure.Unexpected(6))")
+    expect!((traceText(parseKten("[1 2]"))) == "Error(KtenParseFailure.Unexpected(3))")
+    expect!((traceText(parseKten("true false"))) == "Error(KtenParseFailure.Trailing(5))")
+    expect!((traceText(parseKten("-"))) == "Error(KtenParseFailure.NotANumber(\"-\"))")
+}
+
+// The line form puts each object field on its own indented line and reads back.
+@Test
+function theLineFormRoundTrips() {
+    let value = ktenObject(
+        "Icon",
+        [
+            ktenField("fill", ktenCase("Solid", [ktenObject("Color", [ktenField("red", .Number(1))])])),
+            ktenField("groups", .List([ktenObject("Group", [ktenField("name", .Text("a"))])])),
+            ktenField("flat", .List([.Number(1), .Number(2)]))
+        ]
+    )
+    let text = value.writtenLines()
+    expect!((text) == "Icon {\n    fill: .Solid(Color { red: 1 }),\n    groups: [\n        Group { name: \"a\" }\n    ],\n    flat: [1, 2]\n}")
+    let back = match parseKten(text) {
+        Ok(found) -> found
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    expect!((back.written() == value.written()) == (true))
+}

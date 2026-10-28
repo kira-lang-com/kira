@@ -1,0 +1,457 @@
+// Expressions: names, members, indexing and the operators.
+//
+// A mistake makes an `Invalid` expression of type `void`; an operator over
+// one makes another silently, so a mistake is reported once. A buffer
+// pointer is a runtime array: `p[i]` indexes it, `*p` and `p->m` read its
+// first element, and nothing else applies to it.
+
+function expressionOf(kind: CheckedKind, expressionType: Int, span: Span) -> CheckedExpression {
+    return CheckedExpression {
+        kind = kind, expressionType = expressionType, value = ConstValue { scalar = .Int, text = "" }, target = -1,
+        left = -1, right = -1, third = -1, arguments = [], components = [], operator = .Plain, name = "", detail = "",
+        place = false, readOnly = false, span = span
+    }
+}
+
+function isComparison(operator: Operator) -> Bool {
+    return operator == .Equal || operator == .NotEqual || operator == .Less || operator == .LessEqual
+        || operator == .Greater || operator == .GreaterEqual
+}
+
+function isBitwise(operator: Operator) -> Bool {
+    return operator == .BitAnd || operator == .BitOr || operator == .BitXor
+}
+
+// A swizzle's lanes, or none when `text` is not one.
+function swizzleLanes(text: String) -> [Int] {
+    var lanes: [Int] = []
+    var colors = false
+    var positions = false
+    for index in 0..utf8Count(text) {
+        let letter = utf8Slice(text, index, index + 1)
+        var lane = -1
+        match letter {
+            "x" -> lane = 0
+            "y" -> lane = 1
+            "z" -> lane = 2
+            "w" -> lane = 3
+            "r" -> lane = 4
+            "g" -> lane = 5
+            "b" -> lane = 6
+            "a" -> lane = 7
+            else -> return []
+        }
+        if lane >= 4 {
+            colors = true
+            lane -= 4
+        } else {
+            positions = true
+        }
+        lanes.append(lane)
+    }
+    if colors && positions || lanes.count > 4 { return [] }
+    return lanes
+}
+
+extend Checker {
+    function add(borrow mut self, made: CheckedExpression) -> Int {
+        program.expressions.append(made)
+        return program.expressions.count - 1
+    }
+
+    function invalid(borrow mut self, span: Span) -> Int {
+        return add(expressionOf(.Invalid, voidType(), span))
+    }
+
+    function refuse(borrow mut self, diagnostic: Diagnostic, span: Span) -> Int {
+        report(diagnostic, span)
+        return invalid(span)
+    }
+
+    function typeOf(borrow self, expression: Int) -> Int {
+        return program.expressions[expression].expressionType
+    }
+
+    function broken(borrow self, expression: Int) -> Bool {
+        return program.expressions[expression].kind == .Invalid
+    }
+
+    // Whether evaluating `expression` changes nothing, so it may be
+    // evaluated early, or not at all.
+    function isPure(borrow self, expression: Int) -> Bool {
+        if expression < 0 { return true }
+        let checked = program.expressions[expression]
+        let kind = checked.kind
+        let effects = kind == .Call || kind == .Assign || kind == .Step || kind == .Atomic || kind == .Barrier
+            || kind == .Discard || kind == .Choose || kind == .ShortCircuit
+        if effects || (kind == .ImageCall && checked.name == "write") { return false }
+        if !isPure(checked.left) || !isPure(checked.right) || !isPure(checked.third) { return false }
+        for argument in checked.arguments {
+            if !isPure(argument) { return false }
+        }
+        return true
+    }
+
+    function checkExpression(borrow mut self, index: Int) -> Int {
+        let syntax = tree.expressions[index]
+        let span = syntax.span
+        match syntax.kind {
+            IntegerLiteral -> return integerLiteral(syntax)
+            FloatLiteral -> return floatLiteral(syntax)
+            BooleanLiteral -> return literal(.Bool, syntax.text, span)
+            Name -> return checkName(syntax)
+            Member -> return checkMember(syntax)
+            Index -> return indexOf(checkExpression(syntax.left), checkExpression(syntax.right), span)
+            Call -> return checkCall(syntax)
+            Construct -> return checkConstruct(syntax)
+            InitializerList -> return refuse(.TypeMismatch, span)
+            Unary -> return checkUnary(syntax)
+            Postfix -> return stepOf(checkExpression(syntax.left), syntax.operator, false, span)
+            Binary -> return checkBinary(syntax)
+            Assign -> return checkAssign(syntax)
+            Conditional -> return checkConditional(syntax)
+            Cast -> return checkCast(syntax)
+            Bitcast -> return checkBitcast(syntax)
+        }
+    }
+
+    // Locals, innermost first, then resources, then program-scope names.
+    function checkName(borrow mut self, syntax: Expression) -> Int {
+        let name = syntax.text
+        var at = visible.count - 1
+        while at >= 0 {
+            let local = visible[at]
+            if locals[local].name == name {
+                var made = expressionOf(.Local, locals[local].localType, syntax.span)
+                made.target = local
+                made.place = true
+                made.readOnly = locals[local].readOnly
+                return add(made)
+            }
+            at -= 1
+        }
+        for handle in handles {
+            if handle.name == name {
+                if handle.global >= 0 { return globalExpression(handle.global, syntax.span) }
+                return boundExpression(handle.parameter, syntax.span)
+            }
+        }
+        let global = lastNamed(globalNames, name)
+        if global >= 0 { return globalExpression(global, syntax.span) }
+        return refuse(.UnknownName, syntax.span)
+    }
+
+    function globalExpression(borrow mut self, global: Int, span: Span) -> Int {
+        let named = program.globals[global]
+        var made = expressionOf(.Global, named.globalType, span)
+        made.target = global
+        made.place = named.kind == .Buffer || named.kind == .Threadgroup
+        made.readOnly = named.readOnly
+        return add(made)
+    }
+
+    function boundExpression(borrow mut self, parameter: Int, span: Span) -> Int {
+        let named = program.functions[current].parameters[parameter]
+        var made = expressionOf(.BoundParameter, named.parameterType, span)
+        made.target = parameter
+        made.place = !isHandle(named.parameterType)
+        made.readOnly = named.readOnly
+        return add(made)
+    }
+
+    // A buffer pointer's first element.
+    function pointee(borrow mut self, pointer: Int, span: Span) -> Int {
+        let found = typeAt(typeOf(pointer))
+        let kind = program.expressions[pointer].kind
+        let buffer = kind == .Global || kind == .BoundParameter
+        if found.shape != .Array || found.length >= 0 || !buffer { return refuse(.BadOperator, span) }
+        return indexOf(pointer, literal(.Int, "0", span), span)
+    }
+
+    function checkMember(borrow mut self, syntax: Expression) -> Int {
+        var base = checkExpression(syntax.left)
+        let span = syntax.span
+        if broken(base) { return base }
+        if syntax.arrow { base = pointee(base, span) }
+        if broken(base) { return base }
+        let found = typeAt(typeOf(base))
+        let checked = program.expressions[base]
+        if found.shape == .Struct {
+            let members = program.structs[found.structure].members
+            for index in 0..members.count {
+                if members[index].name == syntax.text {
+                    var made = expressionOf(.Member, members[index].memberType, span)
+                    made.left = base
+                    made.target = index
+                    made.place = checked.place
+                    made.readOnly = checked.readOnly
+                    return add(made)
+                }
+            }
+            return refuse(.NoSuchMember, span)
+        }
+        if found.shape != .Vector { return refuse(.NoSuchMember, span) }
+        let lanes = swizzleLanes(syntax.text)
+        if lanes.count == 0 { return refuse(.NoSuchMember, span) }
+        for lane in lanes {
+            if lane >= found.width { return refuse(.NoSuchMember, span) }
+        }
+        var made = expressionOf(.Swizzle, vectorType(found.scalar, lanes.count), span)
+        made.left = base
+        made.components = lanes
+        made.place = checked.place
+        made.readOnly = checked.readOnly
+        return add(made)
+    }
+
+    function indexOf(borrow mut self, base: Int, index: Int, span: Span) -> Int {
+        if broken(base) || broken(index) { return invalid(span) }
+        if !isIntegral(typeOf(index)) || !isScalar(typeOf(index)) { return refuse(.TypeMismatch, span) }
+        let found = typeAt(typeOf(base))
+        var element = -1
+        if found.shape == .Array {
+            element = found.element
+        } else if found.shape == .Vector {
+            element = scalarType(found.scalar)
+        } else if found.shape == .Matrix {
+            element = vectorType(found.scalar, found.rows)
+        } else {
+            return refuse(.BadOperator, span)
+        }
+        let checked = program.expressions[base]
+        var made = expressionOf(.Index, element, span)
+        made.left = base
+        made.right = index
+        made.place = checked.place
+        made.readOnly = checked.readOnly
+        return add(made)
+    }
+
+    function checkUnary(borrow mut self, syntax: Expression) -> Int {
+        let span = syntax.span
+        if syntax.operator == .AddressOf { return refuse(.UnsupportedConstruct, span) }
+        let operand = checkExpression(syntax.left)
+        if broken(operand) { return operand }
+        let operator = syntax.operator
+        if operator == .Dereference { return pointee(operand, span) }
+        if operator == .Increment || operator == .Decrement { return stepOf(operand, operator, true, span) }
+        let operandType = typeOf(operand)
+        let laned = isLaned(operandType)
+        if syntax.operator == .Not {
+            if !laned { return refuse(.BadOperator, span) }
+            let truth = convertTo(operand, withScalar(operandType, .Bool))
+            return unaryOf(.Not, truth, span)
+        }
+        if !laned && typeAt(operandType).shape != .Matrix { return refuse(.BadOperator, span) }
+        let promoted = promote(operand)
+        if syntax.operator == .Plus { return promoted }
+        if syntax.operator == .BitNot && !isIntegral(typeOf(promoted)) { return refuse(.BadOperator, span) }
+        return unaryOf(syntax.operator, promoted, span)
+    }
+
+    function unaryOf(borrow mut self, operator: Operator, operand: Int, span: Span) -> Int {
+        let checked = program.expressions[operand]
+        let signed = checked.value.scalar != .Bool && checked.value.scalar != .UInt
+        if operator == .Negate && checked.kind == .Literal && signed {
+            var text = joinText(["-", checked.value.text])
+            if utf8Byte(checked.value.text, 0) == asciiMinus {
+                text = utf8Slice(checked.value.text, 1, utf8Count(checked.value.text))
+            }
+            return literal(checked.value.scalar, text, span)
+        }
+        var made = expressionOf(.Unary, typeOf(operand), span)
+        made.operator = operator
+        made.left = operand
+        return add(made)
+    }
+
+    // `++` and `--`, before or after the place they step.
+    function stepOf(borrow mut self, target: Int, operator: Operator, prefix: Bool, span: Span) -> Int {
+        if broken(target) { return target }
+        let targetType = typeOf(target)
+        if !isNumeric(targetType) { return refuse(.BadOperator, span) }
+        if !writable(target) { return refuse(.NotAssignable, span) }
+        var made = expressionOf(.Step, targetType, span)
+        made.left = target
+        made.operator = operator
+        if prefix { made.detail = "prefix" }
+        return add(made)
+    }
+
+    // Whether `target` names memory a store may write.
+    function writable(borrow self, target: Int) -> Bool {
+        let checked = program.expressions[target]
+        if !checked.place || checked.readOnly { return false }
+        if checked.kind != .Swizzle { return true }
+        for first in 0..checked.components.count {
+            for second in 0..first {
+                if checked.components[first] == checked.components[second] { return false }
+            }
+        }
+        return true
+    }
+
+    function checkBinary(borrow mut self, syntax: Expression) -> Int {
+        let left = checkExpression(syntax.left)
+        let right = checkExpression(syntax.right)
+        return binaryOf(syntax.operator, left, right, syntax.span)
+    }
+
+    function binaryOf(borrow mut self, operator: Operator, left: Int, right: Int, span: Span) -> Int {
+        if broken(left) || broken(right) { return invalid(span) }
+        if operator == .Comma {
+            var made = expressionOf(.Sequence, typeOf(right), span)
+            made.arguments = [left, right]
+            return add(made)
+        }
+        let leftShape = typeAt(typeOf(left)).shape
+        let rightShape = typeAt(typeOf(right)).shape
+        let pointers = leftShape == .Array || rightShape == .Array
+        if pointers && program.expressions[left].place { return refuse(.PointerArithmetic, span) }
+        if operator == .LogicalAnd || operator == .LogicalOr { return logicalOf(operator, left, right, span) }
+        if leftShape == .Matrix || rightShape == .Matrix { return matrixBinary(operator, left, right, span) }
+        if !isLaned(typeOf(left)) || !isLaned(typeOf(right)) { return refuse(.BadOperator, span) }
+        if operator == .ShiftLeft || operator == .ShiftRight { return shiftOf(operator, left, right, span) }
+        let common = commonType(left, right, span)
+        if common < 0 { return invalid(span) }
+        let scalar = typeAt(common).scalar
+        let integral = scalar.isInteger() || scalar == .Bool
+        if operator == .Remainder && !integral { return refuse(.BadOperator, span) }
+        if isBitwise(operator) && !integral { return refuse(.BadOperator, span) }
+        var operandType = common
+        if scalar == .Bool && !isBitwise(operator) && operator != .Equal && operator != .NotEqual {
+            operandType = withScalar(common, .Int)
+        }
+        var resultType = operandType
+        if isComparison(operator) { resultType = withScalar(operandType, .Bool) }
+        var made = expressionOf(.Binary, resultType, span)
+        made.operator = operator
+        made.left = convertTo(left, operandType)
+        made.right = convertTo(right, operandType)
+        return add(made)
+    }
+
+    // `&&` and `||`. A right operand with effects runs only when it
+    // decides, as C++ says; a pure one is evaluated beside the left.
+    function logicalOf(borrow mut self, operator: Operator, left: Int, right: Int, span: Span) -> Int {
+        let leftType = typeOf(left)
+        let rightType = typeOf(right)
+        if !isLaned(leftType) || !isLaned(rightType) { return refuse(.BadOperator, span) }
+        if isVector(leftType) || isVector(rightType) {
+            let common = commonType(left, right, span)
+            if common < 0 { return invalid(span) }
+            let truth = withScalar(common, .Bool)
+            var made = expressionOf(.Binary, truth, span)
+            made.operator = .BitOr
+            if operator == .LogicalAnd { made.operator = .BitAnd }
+            made.left = convertTo(left, truth)
+            made.right = convertTo(right, truth)
+            return add(made)
+        }
+        var kind: CheckedKind = .Binary
+        if !isPure(right) { kind = .ShortCircuit }
+        var made = expressionOf(kind, scalarType(.Bool), span)
+        made.operator = operator
+        made.left = toCondition(left)
+        made.right = toCondition(right)
+        return add(made)
+    }
+
+    function shiftOf(borrow mut self, operator: Operator, left: Int, right: Int, span: Span) -> Int {
+        let shifted = promote(left)
+        let shiftedType = typeOf(shifted)
+        if !isIntegral(shiftedType) || !isIntegral(typeOf(promote(right))) { return refuse(.BadOperator, span) }
+        if isVector(typeOf(right)) && lanes(typeOf(right)) != lanes(shiftedType) { return refuse(.TypeMismatch, span) }
+        var made = expressionOf(.Binary, shiftedType, span)
+        made.operator = operator
+        made.left = shifted
+        made.right = convertTo(right, withScalar(shiftedType, .UInt))
+        return add(made)
+    }
+
+    // Products and sums with a matrix: matrix by matrix, vector or
+    // scalar, the other operand taking the matrix's scalar.
+    function matrixBinary(borrow mut self, operator: Operator, left: Int, right: Int, span: Span) -> Int {
+        var leftType = typeAt(typeOf(left))
+        var rightType = typeAt(typeOf(right))
+        if !leftType.scalar.isFloat() || !rightType.scalar.isFloat() { return refuse(.BadOperator, span) }
+        var first = left
+        var second = right
+        if leftType.shape != .Matrix {
+            first = convertTo(left, withScalar(typeOf(left), rightType.scalar))
+            leftType = typeAt(typeOf(first))
+        } else if rightType.shape != .Matrix {
+            second = convertTo(right, withScalar(typeOf(right), leftType.scalar))
+            rightType = typeAt(typeOf(second))
+        }
+        let scalar = leftType.scalar
+        let leftMatrix = leftType.shape == .Matrix
+        let rightMatrix = rightType.shape == .Matrix
+        var resultType = -1
+        if operator == .Add || operator == .Subtract {
+            if typeOf(first) == typeOf(second) { resultType = typeOf(first) }
+        } else if operator == .Multiply {
+            if leftMatrix && rightMatrix && leftType.width == rightType.rows && leftType.scalar == rightType.scalar {
+                resultType = matrixType(scalar, rightType.width, leftType.rows)
+            } else if leftMatrix && rightType.shape == .Vector && rightType.width == leftType.width {
+                resultType = vectorType(scalar, leftType.rows)
+            } else if rightMatrix && leftType.shape == .Vector && leftType.width == rightType.rows {
+                resultType = vectorType(scalar, rightType.width)
+            } else if leftMatrix && rightType.shape == .ScalarShape {
+                resultType = typeOf(first)
+            } else if rightMatrix && leftType.shape == .ScalarShape {
+                resultType = typeOf(second)
+            }
+        }
+        if resultType < 0 { return refuse(.BadOperator, span) }
+        var made = expressionOf(.Binary, resultType, span)
+        made.operator = operator
+        made.left = first
+        made.right = second
+        return add(made)
+    }
+
+    function checkAssign(borrow mut self, syntax: Expression) -> Int {
+        let span = syntax.span
+        let target = checkExpression(syntax.left)
+        if broken(target) { return target }
+        if !writable(target) { return refuse(.NotAssignable, span) }
+        let targetType = typeOf(target)
+        var value = -1
+        if syntax.operator == .Plain {
+            value = checkInitializer(syntax.right, targetType, span)
+        } else {
+            let combined = binaryOf(syntax.operator, target, checkExpression(syntax.right), span)
+            if broken(combined) { return combined }
+            value = convertExplicitly(combined, targetType, span)
+        }
+        var made = expressionOf(.Assign, targetType, span)
+        made.left = target
+        made.right = value
+        return add(made)
+    }
+
+    // `c ? a : b`: a select when both sides are pure values, else a branch.
+    function checkConditional(borrow mut self, syntax: Expression) -> Int {
+        let span = syntax.span
+        let condition = checkCondition(syntax.left)
+        let accept = checkExpression(syntax.right)
+        let reject = checkExpression(syntax.third)
+        if broken(condition) || broken(accept) || broken(reject) { return invalid(span) }
+        var resultType = typeOf(accept)
+        if resultType != typeOf(reject) {
+            if !isLaned(resultType) || !isLaned(typeOf(reject)) { return refuse(.TypeMismatch, span) }
+            resultType = commonType(accept, reject, span)
+            if resultType < 0 { return invalid(span) }
+        }
+        if !isConstructible(resultType) && !isVoid(resultType) { return refuse(.TypeMismatch, span) }
+        var kind: CheckedKind = .Select
+        let simple = isPure(accept) && isPure(reject) && isLaned(resultType)
+        if !simple { kind = .Choose }
+        var made = expressionOf(kind, resultType, span)
+        made.left = condition
+        made.right = convertTo(accept, resultType)
+        made.third = convertTo(reject, resultType)
+        return add(made)
+    }
+}

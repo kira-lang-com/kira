@@ -1,0 +1,60 @@
+// Typed memory: the bare heap builtins that read and write a value as C lays
+// it out (`semantics/heap.klfd`). A scalar is one load or store at its own
+// width; anything else crosses through its C image, field by field.
+
+extend FunctionLowering {
+    // A scalar read: one load, or for a `Bool` or an enum its image read back.
+    function heapRead(borrow mut self, pointer: Int, valueType: Type, span: Span) -> KirValue {
+        let image = kir.typedMemory(value(pointer), types.imageType(program, valueType))
+        if directMemory(valueType) { return kir.load(image) }
+        let destination = temporary(valueType)
+        readImage(image, valueType, destination, span)
+        return kir.load(destination)
+    }
+
+    // A read into storage of its own: how a struct or enum value is read.
+    function heapReadAddress(borrow mut self, pointer: Int, valueType: Type, span: Span) -> KirAddress {
+        if !valueType.isAggregate() {
+            let destination = temporary(valueType)
+            kir.store(heapRead(pointer, valueType, span), destination)
+            return destination
+        }
+        let image = kir.typedMemory(value(pointer), types.imageType(program, valueType))
+        let destination = temporary(valueType)
+        readImage(image, valueType, destination, span)
+        markInitialized(destination)
+        return destination
+    }
+
+    function heapWrite(borrow mut self, pointer: Int, stored: Int) {
+        let valueType = program.expressions[stored].valueType
+        let image = kir.typedMemory(value(pointer), types.imageType(program, valueType))
+        if directMemory(valueType) {
+            kir.store(value(stored), image)
+            return
+        }
+        writeImage(address(stored), valueType, image, false)
+    }
+
+    function heapLayout(borrow mut self, measured: Type, measure: LayoutMeasure) -> KirValue {
+        match measure {
+            Size -> return kir.integer(types.integer64, types.imageSize(program, measured))
+            Alignment -> return kir.integer(types.integer64, types.imageAlignment(program, measured))
+        }
+    }
+}
+
+// A type whose image is its own value: read and written in one access.
+function directMemory(valueType: Type) -> Bool {
+    match valueType.kind {
+        Integer -> return true
+        Floating -> return true
+        Pointer -> return true
+        Decimal -> return false
+        Boolean -> return false
+        Enumeration -> return false
+        Void -> return false
+        Invalid -> return false
+        Structure -> return false
+    }
+}

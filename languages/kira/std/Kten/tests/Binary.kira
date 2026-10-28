@@ -1,0 +1,98 @@
+import Foundation
+
+// The binary form: the wire layout of each kind, round trips, and refusal of
+// hostile bytes with the reason.
+
+// --- Wire layout -----------------------------------------------------------
+
+// 300 zigzags to 600, which is LEB128 d8 04; -1 zigzags to 1.
+@Test
+function integersUseZigzagLeb128() {
+    expect!((ktenHex(Kten.Number(300).encoded())) == "02d804")
+    expect!((ktenHex(Kten.Number(-1).encoded())) == "0201")
+}
+
+// A fraction and a value past the 64-bit range go as decimal text.
+@Test
+function fractionsAndHugeNumbersGoAsDecimalText() {
+    expect!((ktenHex(Kten.Number(0.0025).encoded())) == "0306302e30303235")
+    expect!((ktenHex(Kten.Number(18446744073709551615).encoded())) == "03143138343436373434303733373039353531363135")
+}
+
+@Test
+function objectsCarryTheirTagAndFields() {
+    expect!((ktenHex(ktenObject("T", [ktenField("a", .Bool(true))]).encoded())) == "0701540101610101")
+}
+
+@Test
+function barePayloadsAndCasesHaveTheirOwnKinds() {
+    expect!((ktenHex(ktenBare([]).encoded())) == "070000")
+    expect!((ktenHex(ktenCase("Go", [.Null]).encoded())) == "0802476f0100")
+}
+
+@Test
+function bytesAreWrittenVerbatim() {
+    expect!((ktenHex(Kten.Bytes([1, 2]).encoded())) == "05020102")
+}
+
+// --- Round trips -----------------------------------------------------------
+
+@Test
+function sampleWithEveryKindRoundTrips() {
+    let value = sample()
+    let back = match decodeKten(value.encoded()) {
+        Ok(found) -> found
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    expect!((back == value) == (true))
+    expect!((back.written()) == "Message { id: 300, delta: -1, cost: 0.0025, huge: 18446744073709551615, text: \"é \\\"quoted\\\"\\n\", raw: 0x00abff, done: true, parts: [.None, .Role(\"user\"), .Idle], extra: { } }")
+}
+
+// --- Refusal ---------------------------------------------------------------
+
+@Test
+function emptyBufferIsTruncated() {
+    var empty: [UN8] = []
+    expect!((traceText(decodeKten(empty))) == "Error(KtenDecodeFailure.Truncated)")
+}
+
+@Test
+function lengthRunningPastTheEndIsRefused() {
+    expect!((traceText(decodeKten([4, 5, 65]))) == "Error(KtenDecodeFailure.LengthPastEnd)")
+    expect!((traceText(decodeKten([6, 200, 1]))) == "Error(KtenDecodeFailure.LengthPastEnd)")
+}
+
+// A length spelled with a redundant final byte is not the canonical encoding.
+@Test
+function overlongLengthIsRefused() {
+    expect!((traceText(decodeKten([2, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 1]))) == "Error(KtenDecodeFailure.Overlong)")
+}
+
+@Test
+function unknownKindIsRefusedWithItsByte() {
+    expect!((traceText(decodeKten([9]))) == "Error(KtenDecodeFailure.UnknownKind(9))")
+}
+
+@Test
+function textKindWithBadUtf8IsNotText() {
+    expect!((traceText(decodeKten([4, 1, 255]))) == "Error(KtenDecodeFailure.NotText)")
+}
+
+@Test
+function numberThatIsNotADecimalIsRefused() {
+    expect!((traceText(decodeKten([3, 3, 49, 101, 53]))) == "Error(KtenDecodeFailure.NotADecimal(\"1e5\"))")
+}
+
+// Nesting past the depth limit is refused rather than recursed into.
+@Test
+function nestingPastTheDepthLimitIsRefused() {
+    var nested: [UN8] = []
+    for _ in 0..300 {
+        nested.append(6)
+        nested.append(1)
+    }
+    expect!((traceText(decodeKten(nested))) == "Error(KtenDecodeFailure.TooDeep)")
+}

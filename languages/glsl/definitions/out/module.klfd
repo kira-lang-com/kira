@@ -1,0 +1,232 @@
+// The module: the version, the entry's layout, structs, constants, globals
+// and the interface variables, then each function, and each entry point
+// followed by the `main` that calls it.
+
+extend TextOut {
+    function writeGlslModule(borrow mut self) {
+        prepareNames(glslReserved(), true)
+        dialect.debug = flag("unit", -1, 0, "debug")
+        prepareSlots()
+        write("#version 430 core\n\n")
+        write(entryHeader())
+        writeStructs()
+        writeConstants()
+        writeGlobals()
+        write(interfaceDeclarations())
+        let functions = count("functions", -1)
+        for which in 0..functions {
+            if !isEntry(which) { writeFunction(which, functionNames[which]) }
+        }
+        for which in 0..functions {
+            if isEntry(which) {
+                writeFunction(which, entryNames[entryIndex(which)])
+                writeMain(which)
+            }
+        }
+    }
+
+    // The members of a struct, one declaration a line, with padding.
+    function memberLines(borrow self, typeIndex: Int, indent: String) -> String {
+        let members = count("members", typeIndex)
+        var slots: [Int] = []
+        if dialect.padded[typeIndex] {
+            slots = dialect.slots[typeIndex]
+        } else {
+            for member in 0..members {
+                slots.append(member)
+            }
+        }
+        var pieces: [String] = []
+        var pad = 0
+        for slot in slots {
+            if slot < 0 {
+                for scalar in 0..(0 - slot) {
+                    pieces.append(joinText([indent, "uint _pad", decimalText(pad), ";\n"]))
+                    pad += 1
+                }
+            } else {
+                let declared = declare(field("members", typeIndex, slot, "type"), memberName(typeIndex, slot))
+                pieces.append(joinText([indent, declared, ";\n"]))
+            }
+        }
+        return joinText(pieces)
+    }
+
+    // A struct that ends in a runtime-sized array is written only as the
+    // body of its buffer block.
+    function writeStructs(borrow self) {
+        let types = count("types", -1)
+        for typeIndex in 0..types {
+            if typeKind(typeIndex) == "struct" && !runtimeTail(typeIndex) {
+                let members = memberLines(typeIndex, "    ")
+                write(joinText(["struct ", structName(typeIndex), " {\n", members, "};\n\n"]))
+            }
+        }
+    }
+
+    function writeConstants(borrow self) {
+        let constants = count("constants", -1)
+        for constant in 0..constants {
+            let value = field("constants", -1, constant, "value")
+            if value < 0 {
+                refuseAt("a constant whose value is not known", "constants", -1, constant)
+            } else {
+                let valueText = constText(value)
+                let declared = declare(field("constants", -1, constant, "type"), constantNames[constant])
+                write(joinText(["const ", declared, " = ", valueText, ";\n"]))
+            }
+        }
+        if count("overrides", -1) > 0 { refuse("a kept override") }
+    }
+
+    function writeGlobals(borrow self) {
+        let globals = count("globals", -1)
+        for global in 0..globals {
+            let declaration = globalDeclaration(global)
+            if utf8Count(declaration) > 0 { write(joinText([declaration, "\n"])) }
+        }
+        write("\n")
+    }
+
+    // `readonly` or `writeonly` for an access that only loads or only
+    // stores.
+    function accessQualifier(borrow self, access: String, storeWords: Bool) -> String {
+        let loads = containsWord(access, "load")
+        var stores = containsWord(access, "store")
+        if storeWords && containsWord(access, "atomic") { stores = true }
+        if loads && !stores { return "readonly " }
+        if stores && !loads { return "writeonly " }
+        return ""
+    }
+
+    // A global's declaration, or empty when it has none.
+    function globalDeclaration(borrow self, global: Int) -> String {
+        let name = globalNames[global]
+        let globalType = field("globals", -1, global, "type")
+        let space = text("globals", -1, global, "space")
+        let registered = utf8Count(text("globals", -1, global, "resource")) > 0
+        let binding = decimalText(field("globals", -1, global, "slot"))
+        if space == "uniform" && registered {
+            let declared = declare(globalType, name)
+            return joinText(["layout(std140, binding = ", binding, ") uniform ", name, "_block {\n    ", declared,
+                ";\n};"])
+        }
+        if space == "storage" && registered {
+            let qualifier = accessQualifier(text("globals", -1, global, "access"), true)
+            let head = joinText(["layout(std430, binding = ", binding, ") ", qualifier, "buffer ", name, "_block {\n"])
+            if runtimeTail(globalType) {
+                return joinText([head, memberLines(globalType, "    "), "} ", name, ";"])
+            }
+            return joinText([head, "    ", declare(globalType, name), ";\n};"])
+        }
+        if space == "handle" && registered { return handleDeclaration(global, globalType, binding, name) }
+        if space == "private" {
+            let declared = declare(globalType, name)
+            var value = ""
+            if field("globals", -1, global, "init") >= 0 {
+                let at = field("globals", -1, global, "value")
+                if at < 0 {
+                    refuseAt("an initializer that is not constant", "globals", -1, global)
+                } else {
+                    value = constText(at)
+                }
+            } else {
+                let zero = zeroText(globalType)
+                if failedText(zero) {
+                    refuseAt(failureText(zero), "globals", -1, global)
+                } else {
+                    value = zero
+                }
+            }
+            return joinText([declared, " = ", value, ";"])
+        }
+        if space == "workgroup" { return joinText(["shared ", declare(globalType, name), ";"]) }
+        refuseAt(joinText(["global `", text("globals", -1, global, "name"), "` has no GLSL form"]), "globals", -1,
+            global)
+        return ""
+    }
+
+    // A texture or storage image; a sampler travels inside the texture it
+    // is paired with, so it declares nothing.
+    function handleDeclaration(borrow self, global: Int, globalType: Int, binding: String, name: String) -> String {
+        if typeKind(globalType) != "image" { return "" }
+        if typeText(globalType, "class") == "storage" {
+            let written = glslImage(globalType, false)
+            if failedText(written) {
+                refuseAt(failureText(written), "types", -1, globalType)
+                return ""
+            }
+            let format = glslFormat(typeText(globalType, "format"))
+            if failedText(format) {
+                refuseAt(failureText(format), "types", -1, globalType)
+                return ""
+            }
+            let qualifier = accessQualifier(typeText(globalType, "access"), false)
+            return joinText(["layout(", format, ", binding = ", binding, ") uniform ", qualifier, written, " ", name,
+                ";"])
+        }
+        var shadow = false
+        let sampler = field("globals", -1, global, "paired_sampler")
+        if sampler >= 0 {
+            let samplerType = field("globals", -1, sampler, "type")
+            shadow = typeKind(samplerType) == "sampler" && flag("types", -1, samplerType, "comparison")
+        }
+        let written = glslImage(globalType, shadow)
+        if failedText(written) {
+            refuseAt(failureText(written), "types", -1, globalType)
+            return ""
+        }
+        return joinText(["layout(binding = ", binding, ") uniform ", written, " ", name, ";"])
+    }
+
+    function writeFunction(borrow mut self, which: Int, name: String) {
+        prepareBody(which)
+        var parameters: [String] = []
+        let arguments = count("arguments", which)
+        for argument in 0..arguments {
+            let argumentType = field("arguments", which, argument, "type")
+            let shape = typeKind(argumentType)
+            if shape != "sampler" {
+                var written = ""
+                if shape == "pointer" {
+                    written = joinText(["inout ", typeName(typeField(argumentType, "base"))])
+                } else if shape == "image" {
+                    written = glslImage(argumentType, typeText(argumentType, "class") == "depth")
+                    if failedText(written) {
+                        refuseAt(failureText(written), "types", -1, argumentType)
+                        written = ""
+                    }
+                } else {
+                    written = typeName(argumentType)
+                }
+                parameters.append(joinText([written, " ", argumentNames[argument]]))
+            }
+        }
+        var result = "void"
+        let resultIndex = field("functions", -1, which, "result")
+        if resultIndex >= 0 { result = typeName(resultIndex) }
+        write(joinText([result, " ", name, "(", joinWith(parameters, ", "), ") {\n"]))
+        let locals = count("locals", which)
+        for local in 0..locals {
+            let localType = field("locals", which, local, "type")
+            let init = field("locals", which, local, "init")
+            var value = ""
+            if init >= 0 && !flag("expressions", which, init, "emits") {
+                value = operand(init)
+            } else if init >= 0 {
+                refuseAt("a local initialized by a runtime expression", "locals", which, local)
+            } else {
+                let zero = zeroText(localType)
+                if failedText(zero) {
+                    refuseAt(failureText(zero), "locals", which, local)
+                } else {
+                    value = zero
+                }
+            }
+            let declared = declare(localType, localNames[local])
+            write(joinText(["    ", declared, " = ", value, ";\n"]))
+        }
+        writeBlock(field("functions", -1, which, "body"), 1)
+        write("}\n\n")
+    }
+}

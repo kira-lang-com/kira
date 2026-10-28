@@ -1,0 +1,210 @@
+import Foundation
+
+// `kira test` cover for Foundation's image decoding and the DEFLATE underneath
+// it.
+//
+// Every expectation here came from decoding the same bytes with an established
+// decoder, not from running this one. A decoder's whole contract is that it
+// agrees with everyone else about what a file says, so a test whose expected
+// value was recorded from the implementation under test would pass against any
+// self-consistent wrong answer — including the one this suite already caught,
+// where a channel stored at full resolution was blended against the row below
+// it and every picture came out very slightly blurred.
+//
+// The fixtures are in `ImageFixtures.kira`. All top-level names carry the
+// `image` or `inflate` prefix, because the harness is one flat namespace.
+
+// The same fold over bytes the fixtures' expected values were taken with.
+function imageChecksum(bytes: borrow [UN8]) -> Int {
+    var total = 0
+    for index in 0..bytes.count {
+        total = ((total * 31) + Int(bytes[index])) & 1073741823
+    }
+    return total
+}
+
+// A decode's size, as one number the runner can compare: width, then height.
+function imageExtent(bytes: [UN8]) -> Int {
+    match decodeImage(move bytes) {
+        Ok(image) -> { return (image.width * 1000) + image.height }
+        Error(reason) -> { return 0 - 1 }
+    }
+}
+
+// A decode's pixels, as their checksum.
+function imagePixelChecksum(bytes: [UN8]) -> Int {
+    match decodeImage(move bytes) {
+        Ok(image) -> { return imageChecksum(image.pixels) }
+        Error(reason) -> { return 0 - 1 }
+    }
+}
+
+// Which answer a decode gave: zero for a picture, and one number per reason.
+function imageRefusal(bytes: [UN8]) -> Int {
+    match decodeImage(move bytes) {
+        Ok(image) -> { return 0 }
+        Error(reason) -> {
+            match reason {
+                FileUnreadable -> { return 1 }
+                UnknownFormat -> { return 2 }
+                Malformed -> { return 3 }
+            }
+        }
+    }
+}
+
+// The first `count` bytes of a blob, for the tests that damage one.
+function imageTruncated(bytes: borrow [UN8], count: Int) -> [UN8] {
+    var shortened: [UN8] = []
+    var index = 0
+    while index < count && index < bytes.count {
+        shortened.append(bytes[index])
+        index = index + 1
+    }
+    return shortened
+}
+
+// --- PNG -------------------------------------------------------------------
+
+@Test
+function imagePngRgba8Extent() {
+    let got = imageExtent(imagePngRgba8Bytes())
+    expect!(got == 4003)
+}
+
+@Test
+function imagePngRgba8Pixels() {
+    let got = imagePixelChecksum(imagePngRgba8Bytes())
+    expect!(got == 877726118)
+}
+
+// A four-bit palette with transparency: two expansions at once, an index
+// unpacked from half a byte and an alpha taken from a table beside the colours.
+@Test
+function imagePngPalette4Extent() {
+    let got = imageExtent(imagePngPalette4Bytes())
+    expect!(got == 7005)
+}
+
+@Test
+function imagePngPalette4Pixels() {
+    let got = imagePixelChecksum(imagePngPalette4Bytes())
+    expect!(got == 913834597)
+}
+
+// Sixteen bits per sample and Adam7 interlacing together: seven sparse passes,
+// each filtered on its own, each landing every eighth pixel of every eighth
+// row before the next one fills in between.
+@Test
+function imagePngGrey16InterlacedExtent() {
+    let got = imageExtent(imagePngGrey16InterlacedBytes())
+    expect!(got == 9007)
+}
+
+@Test
+function imagePngGrey16InterlacedPixels() {
+    let got = imagePixelChecksum(imagePngGrey16InterlacedBytes())
+    expect!(got == 356720403)
+}
+
+@Test
+function imagePngGreyAlpha8Pixels() {
+    let got = imagePixelChecksum(imagePngGreyAlpha8Bytes())
+    expect!(got == 555376892)
+}
+
+// Transparency named as a colour rather than as a channel: one exact triple is
+// see-through and every other pixel is opaque.
+@Test
+function imagePngTruecolourTransparencyPixels() {
+    let got = imagePixelChecksum(imagePngTruecolourTransparencyBytes())
+    expect!(got == 888967917)
+}
+
+// --- JPEG ------------------------------------------------------------------
+
+// Chroma at half width and half height, which is what a camera writes: the
+// decode has to stretch two channels back over the third.
+@Test
+function imageJpegColour420Extent() {
+    let got = imageExtent(imageJpegColour420Bytes())
+    expect!(got == 17009)
+}
+
+@Test
+function imageJpegColour420Pixels() {
+    let got = imagePixelChecksum(imageJpegColour420Bytes())
+    expect!(got == 19047066)
+}
+
+// Full-resolution chroma and a restart every two coded units: the difference
+// chain that carries each block's average restarts with them.
+@Test
+function imageJpegColour444RestartsExtent() {
+    let got = imageExtent(imageJpegColour444RestartsBytes())
+    expect!(got == 11013)
+}
+
+@Test
+function imageJpegColour444RestartsPixels() {
+    let got = imagePixelChecksum(imageJpegColour444RestartsBytes())
+    expect!(got == 887078426)
+}
+
+// One component: no colour conversion and no stretch, so the transform is on
+// its own and a mistake in it has nowhere to hide.
+@Test
+function imageJpegGreyscalePixels() {
+    let got = imagePixelChecksum(imageJpegGreyscaleBytes())
+    expect!(got == 316885714)
+}
+
+// --- What a decode refuses -------------------------------------------------
+
+@Test
+function imageBytesInNoFormatAreUnknown() {
+    let got = imageRefusal([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+    expect!(got == 2)
+}
+
+@Test
+function imageNothingIsUnknown() {
+    let got = imageRefusal([])
+    expect!(got == 2)
+}
+
+// A PNG signature over a stream that stops halfway is damage, not a format
+// nobody recognises — the two are different answers because a caller retrying
+// a download cares which it was.
+@Test
+function imageHalfAPngIsMalformed() {
+    let got = imageRefusal(imageTruncated(imagePngRgba8Bytes(), 60))
+    expect!(got == 3)
+}
+
+// A JPEG cut short still decodes: everything up to the cut is real picture,
+// and the bits past it read as zero rather than trapping.
+@Test
+function imageHalfAJpegStillDecodes() {
+    let got = imageExtent(imageTruncated(imageJpegColour420Bytes(), 700))
+    expect!(got == 17009)
+}
+
+// A path with no file behind it is answered, not trapped.
+function imageMissingFileIsUnreadableAnswer() -> Number {
+    match decodeImageFile("no-such-directory/no-such-image.png") {
+        Ok(image) -> { return 0 }
+        Error(reason) -> {
+            match reason {
+                FileUnreadable -> { return 1 }
+                UnknownFormat -> { return 2 }
+                Malformed -> { return 3 }
+            }
+        }
+    }
+}
+
+@Test
+function imageMissingFileIsUnreadable() {
+    expect!(imageMissingFileIsUnreadableAnswer() == 1)
+}

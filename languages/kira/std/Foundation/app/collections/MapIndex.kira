@@ -1,0 +1,91 @@
+// The hashed index behind `Map` and `Set`: keys in the order they were first
+// added, and buckets of positions into that order, chained by `hash(key)`.
+//
+// A removed key leaves `.None` at its position, so every position a bucket
+// holds stays valid and later keys keep their order. The owner rebuilds
+// itself once removed positions outnumber the live ones; the index cannot
+// compact alone, since `Map` keeps its values at the same positions.
+//
+// It is built from arrays, which are copy-on-write, so a copied index shares
+// its storage until one side writes (KLF section 6.5).
+
+namespace MapIndexLimit {
+    // Buckets a fresh index starts with, so a small map does not rehash on
+    // each of its first few keys.
+    let firstBuckets: Number = 8
+}
+
+struct MapIndex<Key> {
+    var keys: [Key?] = []
+    var buckets: [[Number]] = []
+    var count: Number = 0
+
+    // Where `key` sits in insertion order, when the index holds it.
+    function position(borrow self, key: borrow Key) -> Number? {
+        if buckets.count == 0 { return .None }
+        for place in buckets[bucket(key)] {
+            match keys[place] {
+                Some(held) -> { if held == key { return .Some(place) } }
+                // A bucket only holds positions of live keys.
+                None -> {}
+            }
+        }
+        return .None
+    }
+
+    // Adds `key`, which the index does not hold, at the end of the order.
+    function insert(borrow mut self, key: Key) {
+        if count + 1 > buckets.count { rehash(max(buckets.count * 2, MapIndexLimit.firstBuckets)) }
+        let place = keys.count
+        let chain = bucket(key)
+        keys.append(.Some(key))
+        buckets[chain].append(place)
+        count++
+    }
+
+    // Drops the key at `place`, leaving its position empty.
+    function remove(borrow mut self, place: Number) {
+        match keys[place] {
+            Some(key) -> {
+                let chain = bucket(key)
+                var kept: [Number] = []
+                for other in buckets[chain] {
+                    if other != place { kept.append(other) }
+                }
+                buckets[chain] = kept
+                keys[place] = .None
+                count--
+            }
+            // Already empty: the owner found it through `position`, so this
+            // does not happen, and there is nothing to drop.
+            None -> {}
+        }
+    }
+
+    // Whether removed keys hold more positions than live ones, so the owner
+    // should rebuild to keep lookups and iteration proportional to its size.
+    function sparse(borrow self) -> Bool {
+        return keys.count - count > max(count, MapIndexLimit.firstBuckets)
+    }
+
+    function bucket(borrow self, key: borrow Key) -> Number {
+        let chains = Number(buckets.count)
+        return Number(((hash(key) % chains) + chains) % chains)
+    }
+
+    // Spreads every live position over `chains` buckets.
+    function rehash(borrow mut self, chains: Number) {
+        let empty: [Number] = []
+        buckets = filled(chains, empty)
+        for (place, held) in keys.enumerated() {
+            match held {
+                Some(key) -> {
+                    let chain = bucket(key)
+                    buckets[chain].append(place)
+                }
+                // A removed key has no bucket.
+                None -> {}
+            }
+        }
+    }
+}

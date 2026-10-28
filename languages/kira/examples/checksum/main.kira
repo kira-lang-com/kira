@@ -1,0 +1,25 @@
+// FNV-1a over the bytes of a few numbers, in `U32` arithmetic. The
+// multiplication wraps on purpose; everything else traps on overflow.
+
+function mix(hash: U32, byte: U8) -> U32 {
+    let prime: U32 = 16777619
+    return wrappingMul(hash ^ U32(byte), prime)
+}
+
+function hashNumber(hash: U32, value: U32) -> U32 {
+    var result = hash
+    for index in 0..4 {
+        let shift = U32(index * 8)
+        result = mix(result, U8((value >> shift) & U32(255)))
+    }
+    return result
+}
+
+@Main
+function main() -> Int {
+    var hash: U32 = 2166136261
+    for value in 0..10 {
+        hash = hashNumber(hash, U32(value * 37))
+    }
+    return Int(hash >> U32(16))
+}

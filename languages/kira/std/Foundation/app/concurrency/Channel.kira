@@ -1,0 +1,57 @@
+struct Sender<Element> {
+    let id: Int
+}
+
+struct Receiver<Element> {
+    let id: Int
+}
+
+type Channel<Element> = Sender<Element>
+
+enum ChannelFailure {
+    Closed
+}
+
+struct ChannelState {
+    var messages: [Optional<Any>]
+    var cursor: Int
+    var closed: Bool
+}
+
+function createChannelData() -> Int {
+    let id = runtimeContext.channels.count
+    runtimeContext.channels.append(ChannelState { messages = [], cursor = 0, closed = false })
+    return id
+}
+
+function sendChannelData(id: Int, value: Any) {
+    if runtimeContext.channels[id].closed { runtimeTrap() }
+    runtimeContext.channels[id].messages.append(.Some(move value))
+}
+
+function closeChannelData(id: Int) {
+    runtimeContext.channels[id].closed = true
+}
+
+// A receiver that closes drops every value still queued, which owns its
+// storage, and the sender's later sends trap.
+function closeChannelReceiver(id: Int) {
+    runtimeContext.channels[id].closed = true
+    runtimeContext.channels[id].messages = []
+    runtimeContext.channels[id].cursor = 0
+}
+
+function receiveChannelData(id: Int) -> Result<Any, ChannelFailure> {
+    while runtimeContext.channels[id].cursor >= runtimeContext.channels[id].messages.count {
+        if runtimeContext.channels[id].closed { return .Error(.Closed) }
+        if !driveDeferredTask() { runtimeTrap() }
+    }
+    let cursor = runtimeContext.channels[id].cursor
+    runtimeContext.channels[id].cursor = cursor + 1
+    let message: Optional<Any> = copy runtimeContext.channels[id].messages[cursor]
+    runtimeContext.channels[id].messages[cursor] = .None
+    match message {
+        Some(value) -> { return .Ok(move value) }
+        None -> { runtimeTrap() return .Error(.Closed) }
+    }
+}

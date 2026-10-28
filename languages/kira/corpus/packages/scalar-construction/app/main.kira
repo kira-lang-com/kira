@@ -1,0 +1,86 @@
+import Foundation
+
+struct Pair {
+    var a: Int
+    var b: Int
+}
+
+struct Color {
+    let red: Float
+    let green: Float
+    let blue: Float
+    let alpha: Float
+}
+
+struct Padded {
+    let small: U8
+    let large: U64
+}
+
+function require(ok: Bool) -> Int {
+    if ok { return 0 }
+    var zero = 0
+    return 1 / zero
+}
+
+function swapped(pair: borrow Pair) -> Pair {
+    return Pair { a = pair.b, b = pair.a }
+}
+
+function amplified(color: borrow Color, factor: Float) -> Color {
+    return Color { red = color.red * factor, green = color.green * factor, blue = color.blue * factor, alpha = color.alpha }
+}
+
+function next(counter: borrow mut Int) -> Int {
+    counter += 1
+    return counter
+}
+
+function ordered(counter: borrow mut Int) -> Pair {
+    return Pair { a = next(counter), b = next(counter) }
+}
+
+function padded(value: U64) -> Padded {
+    return Padded { small = U8(7), large = value }
+}
+
+function repeated(pair: borrow Pair) -> Pair {
+    return Pair { a = pair.a + pair.a + pair.b, b = pair.b + pair.b + pair.a }
+}
+
+function change(pair: borrow mut Pair) -> Int {
+    pair.a += 10
+    return pair.a
+}
+
+function observesMutation(pair: borrow mut Pair) -> Pair {
+    return Pair { a = pair.a, b = change(pair) }
+}
+
+function conditional(pair: borrow Pair, flag: Bool) -> Pair {
+    return Pair { a = flag ? pair.a : pair.b, b = pair.a }
+}
+
+@Main
+function main() -> Int {
+    var pair = Pair { a = 11, b = 23 }
+    pair = swapped(pair)
+    require(pair.a == 23 && pair.b == 11)
+    pair = swapped(pair)
+    require(pair.a == 11 && pair.b == 23)
+    let repeatedPair = repeated(pair)
+    require(repeatedPair.a == 45 && repeatedPair.b == 57)
+    let beforeChange = observesMutation(pair)
+    require(beforeChange.a == 11 && beforeChange.b == 21 && pair.a == 21)
+    let whenTrue = conditional(pair, true)
+    let whenFalse = conditional(pair, false)
+    require(whenTrue.a == 21 && whenTrue.b == 21 && whenFalse.a == 23 && whenFalse.b == 21)
+    var count: Int = 0
+    let sequence = ordered(count)
+    require(count == 2 && sequence.a == 1 && sequence.b == 2)
+    let color = amplified(Color { red = 0.25, green = -0.5, blue = 1.0, alpha = 0.75 }, 2.0)
+    require(color.red == 0.5 && color.green == -1.0 && color.blue == 2.0 && color.alpha == 0.75)
+    let withPadding = padded(U64(123456))
+    require(withPadding.small == U8(7) && withPadding.large == U64(123456))
+    return 0
+}

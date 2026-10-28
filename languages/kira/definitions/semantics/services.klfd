@@ -1,0 +1,64 @@
+// Kernel services: `@Service("klfsvc_fs_read") function ...` declares a
+// function the platform's KLF runtime implements under that symbol, so
+// Foundation reaches files, clocks and the like through the kernel rather
+// than through any platform library. The signature carries machine words
+// only; Foundation turns strings and arrays into an address and a count
+// itself.
+
+function serviceSymbol(tree: SyntaxTree, annotations: [Annotation]) -> Optional<String> {
+    return attributeText(tree, annotations, .Service)
+}
+
+// `@Ridl("Shapes") function area(shape: Shape) -> Float` declares a
+// function another module exports through RIDL (KLF-RIDL section 20): the
+// engine links it to that module's `ridlcc` entry. Returns the module.
+function ridlImportModule(tree: SyntaxTree, annotations: [Annotation]) -> Optional<String> {
+    return attributeText(tree, annotations, .Ridl)
+}
+
+// The part a function plays in a crossing family's witness tables, which
+// `materializeConstructs` gives it as a `Witness` attribute: `export`, a
+// method a table names; `default`, a default its module exports, or a trait
+// method that has one; `box` and its fields, the function boxing a value as
+// a trait object. Nothing for any other function.
+function witnessRole(tree: SyntaxTree, annotations: [Annotation]) -> String {
+    match attributeText(tree, annotations, .Witness) {
+        Some(role) -> return role
+        None -> return ""
+    }
+}
+
+// Whether `name` is one the compiler gave a function it made, which no
+// surface offers.
+function generatedName(name: String) -> Bool {
+    return startsWithText(name, "__")
+}
+
+// Whether a witness role is the boxing function's.
+function boxesWitness(role: String) -> Bool {
+    return startsWithText(role, "box")
+}
+
+extend Checker {
+    function checkService(borrow mut self, signature: Signature) {
+        if signature.declaration.body.count > 0 {
+            report(.ServiceBody, signature.name.span)
+        }
+        if signature.owner.isSome() || signature.declaration.typeParameters.count > 0 {
+            report(.ServiceSignature, signature.name.span)
+            return
+        }
+        for parameter in signature.parameters {
+            if parameter.mode != .Owned || !isServiceWord(parameter.valueType) {
+                report(.ServiceSignature, parameter.name.span)
+            }
+        }
+        if !signature.result.equals(Type.void()) && !isServiceWord(signature.result) {
+            report(.ServiceSignature, signature.name.span)
+        }
+    }
+}
+
+function isServiceWord(valueType: Type) -> Bool {
+    return (valueType.isInteger() && valueType.bits == 64) || valueType.equals(Type.pointer())
+}

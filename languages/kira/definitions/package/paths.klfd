@@ -1,0 +1,166 @@
+// Paths as the driver spells them: `/`-separated, absolute or relative to the
+// directory the driver runs in.
+
+// The directory holding `path`: `.` for a bare name, `/` for a top-level one.
+function directoryOf(path: String) -> String {
+    var slash = -1
+    for index in 0..utf8Count(path) {
+        if utf8Byte(path, index) == 47 { slash = index }
+    }
+    if slash < 0 { return "." }
+    if slash == 0 { return "/" }
+    return utf8Slice(path, 0, slash)
+}
+
+// `relative` read from `directory`. An absolute `relative` stands alone.
+function joinPath(directory: String, relative: String) -> String {
+    if utf8Count(relative) > 0 && utf8Byte(relative, 0) == 47 { return relative }
+    match directory {
+        "." -> return relative
+        "/" -> return joinText(["/", relative])
+        else -> return joinText([directory, "/", relative])
+    }
+}
+
+// `path` with its `.` segments and each `name/..` pair removed, so two
+// spellings of one directory compare equal.
+function normalizedPath(path: String) -> String {
+    let absolute = utf8Count(path) > 0 && utf8Byte(path, 0) == 47
+    var segments: [String] = []
+    var start = 0
+    for index in 0..(utf8Count(path) + 1) {
+        if index < utf8Count(path) && utf8Byte(path, index) != 47 { continue }
+        let segment = utf8Slice(path, start, index)
+        start = index + 1
+        match segment {
+            "", "." -> continue
+            ".." -> {
+                if segments.count > 0 && segments[segments.count - 1] != ".." {
+                    var shorter: [String] = []
+                    for kept in 0..(segments.count - 1) { shorter.append(segments[kept]) }
+                    segments = shorter
+                    continue
+                }
+                if absolute { continue }
+            }
+            else -> {}
+        }
+        segments.append(segment)
+    }
+    var parts: [String] = []
+    if absolute { parts.append("/") }
+    for index in 0..segments.count {
+        if index > 0 { parts.append("/") }
+        parts.append(segments[index])
+    }
+    if parts.count == 0 { return "." }
+    return joinText(parts)
+}
+
+// The directory every one of `inputs` lies under: the directory the driver
+// was given, whose files it expanded them from.
+function inputsDirectory(session: Session, inputs: [SourceFile]) -> String {
+    var directory = directoryOf(fileName(session, inputs[0]))
+    var settled = false
+    while !settled {
+        settled = true
+        for input in inputs {
+            if !startsWithText(fileName(session, input), joinPath(directory, "")) {
+                settled = false
+            }
+        }
+        if !settled {
+            let parent = directoryOf(directory)
+            if parent == directory { return directory }
+            directory = parent
+        }
+    }
+    return directory
+}
+
+// The package `path` belongs to: the nearest directory at or under `top`
+// holding a `package.kira`, or none.
+function packageRootOf(session: Session, path: String, top: String) -> Optional<String> {
+    var directory = directoryOf(path)
+    while true {
+        if readFile(session, joinPath(directory, "package.kira")) >= 0 { return .Some(directory) }
+        if directory == top { return .None }
+        let parent = directoryOf(directory)
+        if parent == directory { return .None }
+        directory = parent
+    }
+    return .None
+}
+
+// One unit for each package `inputs` come from that no other of them depends
+// on, named by its first file under that package's `app/`, after the units of
+// the packages they depend on (`separate-packages.klfd`). A manifest stands
+// for nothing of its own. None when a file lies
+// outside every package, or a package has no `app/` file.
+// The nearest directory at or above `directory` holding a `package.kira`, or
+// `directory` itself when none does.
+function enclosingPackageDirectory(session: Session, directory: String) -> String {
+    var current = directory
+    while true {
+        if readFile(session, joinPath(current, "package.kira")) >= 0 { return current }
+        let parent = directoryOf(current)
+        if parent == current || parent == "." { return directory }
+        current = parent
+    }
+    return directory
+}
+
+function packageUnits(session: Session, inputs: [SourceFile], top: String) -> Optional<[Unit]> {
+    var roots: [String] = []
+    var entries: [SourceFile] = []
+    for input in inputs {
+        let name = fileName(session, input)
+        var root = ""
+        match packageRootOf(session, name, top) {
+            Some(found) -> root = found
+            None -> return .None
+        }
+        if normalizedPath(name) == normalizedPath(joinPath(root, "package.kira")) { continue }
+        // A package's `tests/` belong to its test builds, which read them
+        // themselves (`loader.klfd`), so a library unit leaves them out.
+        let tests = joinPath(normalizedPath(joinPath(root, "tests")), "")
+        if startsWithText(normalizedPath(name), tests) { continue }
+        let app = joinPath(normalizedPath(joinPath(root, "app")), "")
+        if !startsWithText(normalizedPath(name), app) { return .None }
+        var seen = false
+        for known in roots {
+            if known == root { seen = true }
+        }
+        if !seen {
+            roots.append(root)
+            entries.append(input)
+        }
+    }
+    var kept: [SourceFile] = []
+    for index in 0..roots.count {
+        if !neededByAnother(session, roots, index) { kept.append(entries[index]) }
+    }
+    if kept.count == 0 { return .None }
+    return .Some(programUnits(session, kept))
+}
+
+// Whether a package in `roots` other than `roots[index]` names it as a path
+// dependency. A manifest that does not read is left to the package's own
+// load to report.
+function neededByAnother(session: Session, roots: [String], index: Int) -> Bool {
+    let wanted = normalizedPath(roots[index])
+    for other in 0..roots.count {
+        if other == index { continue }
+        let file = readFile(session, joinPath(roots[other], "package.kira"))
+        if file < 0 { continue }
+        match readManifest(fileText(session, file as SourceFile), file) {
+            Ok(manifest) -> {
+                for dependency in manifest.dependencies {
+                    if normalizedPath(joinPath(roots[other], dependency.path)) == wanted { return true }
+                }
+            }
+            Error(failure) -> {}
+        }
+    }
+    return false
+}

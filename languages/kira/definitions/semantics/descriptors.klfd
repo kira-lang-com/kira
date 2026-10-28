@@ -1,0 +1,337 @@
+// Runtime type descriptors: `value.type` is Foundation's `Type`, holding the
+// id the value's type has in the program's table of types, the same id an
+// `Any` carries. What a descriptor answers is read from that table through
+// the `@TypeTable` functions, whose bodies are written here once checking
+// has seen every type the program describes or erases.
+
+// What a descriptor answers, and the `@TypeTable` function answering each.
+function descriptorMembers() -> [String] {
+    return ["name", "package", "kind", "arguments", "conformances"]
+}
+
+function descriptorFunctions() -> [String] {
+    return ["typeName", "typePackage", "typeKind", "typeArguments", "typeConformances"]
+}
+
+function isDescriptorType(declarations: Declarations, valueType: Type) -> Bool {
+    if valueType.kind != .Structure { return false }
+    let declared = declarations.structs[valueType.declaration]
+    return declared.name.text == "Type" && libraryDeclaration(declarations, declared.name.span.file)
+}
+
+function libraryDeclaration(declarations: Declarations, file: Int) -> Bool {
+    for source in declarations.sources {
+        if source.file == file { return declarations.modules[source.module].library }
+    }
+    return false
+}
+
+function declaresField(program: CheckedProgram, valueType: Type, name: String) -> Bool {
+    return valueType.kind == .Structure && program.structs[valueType.declaration].field(name).isSome()
+}
+
+// A generic instance's name without its arguments.
+function baseTypeName(name: String) -> String {
+    for index in 0..utf8Count(name) {
+        if utf8Byte(name, index) == 60 { return utf8Slice(name, 0, index) }
+    }
+    return name
+}
+
+// Whether `left` sorts before `right`, byte by byte.
+function textBefore(left: String, right: String) -> Bool {
+    let shared = utf8Count(left) < utf8Count(right) ? utf8Count(left) : utf8Count(right)
+    for index in 0..shared {
+        if utf8Byte(left, index) != utf8Byte(right, index) { return utf8Byte(left, index) < utf8Byte(right, index) }
+    }
+    return utf8Count(left) < utf8Count(right)
+}
+
+extend Checker {
+    function runtimeType(borrow mut self, base: Int, span: Span) -> Int {
+        let baseType = typeOf(base)
+        match descriptorStruct() {
+            Some(descriptor) -> {
+                if baseType.equals(Type.void()) {
+                    report(.TypeOfNoValue, span)
+                    return add(.Integer(0), Type.invalid(), span)
+                }
+                if isAnyType(program, baseType) {
+                    let held = add(.Member(base, 1), Type.int(), span)
+                    return add(.Construct([held]), descriptor, span)
+                }
+                let id = add(.Integer(internAnyType(baseType)), Type.int(), span)
+                let described = add(.Construct([id]), descriptor, span)
+                return add(.Sequence([program.addStatement(.Evaluate(base))], described), descriptor, span)
+            }
+            None -> {
+                report(.UndefinedName, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+
+    function descriptorStruct(borrow self) -> Optional<Type> {
+        for index in 0..declarations.structs.count {
+            if isDescriptorType(declarations, Type.structure(index)) { return .Some(Type.structure(index)) }
+        }
+        return .None
+    }
+
+    function descriptorMember(borrow mut self, base: Int, field: Identifier, span: Span) -> Int {
+        let members = descriptorMembers()
+        for index in 0..members.count {
+            if field.text != members[index] { continue }
+            match typeTableFunction(descriptorFunctions()[index]) {
+                Some(target) -> {
+                    let id = add(.Member(base, 0), Type.int(), span)
+                    return add(.Call(target, [id]), declarations.signatures[target].result, span)
+                }
+                None -> {}
+            }
+        }
+        report(.DescriptorMember, field.span)
+        return add(.Integer(0), Type.invalid(), span)
+    }
+
+    // Every type the table holds gets its arguments a row of their own, then
+    // each `@TypeTable` function answers its member for every row.
+    function writeTypeTable(borrow mut self) {
+        var targets: [Int] = []
+        for name in descriptorFunctions() {
+            match typeTableFunction(name) {
+                Some(target) -> targets.append(target)
+                None -> return
+            }
+        }
+        // A failed cast in any unit names the type an `Any` held through
+        // `typeName`, so a unit another one defines it for declares its
+        // parameters as it calls it.
+        program.typeNames = .Some(targets[0])
+        if program.builtElsewhere(targets[0]) && program.functions[targets[0]].locals.count == 0 { declareParameters(targets[0]) }
+        for index in 0..program.anyTypes.count {
+            for argument in descriptorArguments(program.anyTypes[index]) { internAnyType(argument) }
+        }
+        for member in 0..targets.count { writeTypeColumn(targets[member], member) }
+        if program.dependencyUnit { return }
+        for target in targets {
+            if program.declaredApart(target) { program.typeTableFunctions.append(target) }
+        }
+    }
+
+    // Foundation's `@TypeTable` declaration of `name`. A program may declare
+    // a function of the same name, and its body is its own.
+    function typeTableFunction(borrow self, name: String) -> Optional<Int> {
+        for candidate in declarations.overloadsOf(.None, name) {
+            if hasAttribute(declarations.signatures[candidate].declaration.annotations, .TypeTable) { return .Some(candidate) }
+        }
+        return .None
+    }
+
+    function writeTypeColumn(borrow mut self, target: Int, member: Int) {
+        let signature = declarations.signatures[target]
+        let span = signature.name.span
+        var body: [Int] = []
+        for index in 0..program.anyTypes.count {
+            let read = add(.Read(0), Type.int(), span)
+            // The row's id is the one its `Any` carries (`internAnyType`).
+            let id = add(.Integer(program.anyTypeIds[index]), Type.int(), span)
+            let matches = add(.Compare(.Equal, read, id), Type.boolean(), span)
+            let answer = typeColumnValue(program.anyTypes[index], member, signature.result, span)
+            body.append(program.addStatement(.Branch(matches, [program.addStatement(.Return(.Some(answer)))], [])))
+        }
+        body.append(program.addStatement(.Evaluate(add(.RuntimeTrap(.TypeTableRow), Type.void(), span))))
+        var empty = add(.StringText(""), signature.result, span)
+        if member >= 3 { empty = add(.ArrayLiteral([]), signature.result, span) }
+        body.append(program.addStatement(.Return(.Some(empty))))
+        program.functions[target] = CheckedFunction {
+            symbol = signature.symbol, name = span, result = signature.result, parameterCount = 1,
+            locals = [Local {
+                name = "id", valueType = Type.int(), mutable = false, byReference = false, moved = false,
+                cell = false, captured = false, passingMode = .Owned
+            }],
+            body = body, entry = false, lambda = false, captures = [], globalInitializer = false, service = false, foreign = .None,
+            memberName = signature.member
+        }
+    }
+
+    function typeColumnValue(borrow mut self, described: Type, member: Int, resultType: Type, span: Span) -> Int {
+        if member == 0 { return add(.StringText(descriptorName(described)), resultType, span) }
+        if member == 1 { return add(.StringText(descriptorPackage(described)), resultType, span) }
+        if member == 2 { return add(.StringText(descriptorKind(described)), resultType, span) }
+        let element = program.structs[resultType.declaration].typeArguments[0]
+        var elements: [Int] = []
+        if member == 3 {
+            for argument in descriptorArguments(described) {
+                let id = add(.Integer(internAnyType(argument)), Type.int(), span)
+                elements.append(add(.Construct([id]), element, span))
+            }
+        } else {
+            for name in descriptorConformances(described) { elements.append(add(.StringText(name), element, span)) }
+        }
+        return add(.ArrayLiteral(elements), resultType, span)
+    }
+
+    // The declared name; the written spelling for an array.
+    function descriptorName(borrow self, described: Type) -> String {
+        if described.kind == .Structure && isArrayType(program, described) {
+            return joinText(["[", spelledTypeName(program.structs[described.declaration].typeArguments[0]), "]"])
+        }
+        match described.kind {
+            Structure -> return displayedTypeName(baseTypeName(program.structs[described.declaration].name.text))
+            Enumeration -> return displayedTypeName(baseTypeName(program.enums[described.declaration].name.text))
+            Integer -> return "Int"
+            Decimal -> return described.numberName()
+            Floating -> return "Float"
+            Boolean -> return "Bool"
+            Pointer -> return "RawPtr"
+            Void -> return "Void"
+            Invalid -> return ""
+        }
+    }
+
+    function spelledTypeName(borrow self, valueType: Type) -> String {
+        if valueType.kind == .Structure && isArrayType(program, valueType) {
+            return joinText(["[", spelledTypeName(program.structs[valueType.declaration].typeArguments[0]), "]"])
+        }
+        return displayedTypeName(declarations.typeName(valueType))
+    }
+
+    // The declaring package's identity; empty for a builtin type and for the
+    // program's own declarations.
+    function descriptorPackage(borrow self, described: Type) -> String {
+        if builtinDescriptor(described) { return "" }
+        var file = 0
+        match described.kind {
+            Structure -> file = program.structs[described.declaration].name.span.file
+            Enumeration -> file = program.enums[described.declaration].name.span.file
+            Integer -> return ""
+            Decimal -> return ""
+            Floating -> return ""
+            Boolean -> return ""
+            Pointer -> return ""
+            Void -> return ""
+            Invalid -> return ""
+        }
+        for source in declarations.sources {
+            if source.file == file { return declarations.modules[source.module].package }
+        }
+        return ""
+    }
+
+    // The types the language has without a declaration, though Foundation
+    // spells some of them.
+    function builtinDescriptor(borrow self, described: Type) -> Bool {
+        if described.kind != .Structure { return described.kind != .Enumeration }
+        return isStringType(program, described) || isArrayType(program, described)
+            || isClosureType(program, described) || isDescriptorType(declarations, described)
+    }
+
+    function descriptorKind(borrow self, described: Type) -> String {
+        match described.kind {
+            Structure -> {
+                if isStringType(program, described) { return "string" }
+                if isArrayType(program, described) { return "array" }
+                if isClassType(program, described) { return "class" }
+                if isDistinctType(program, described) { return "distinct" }
+                if isClosureType(program, described) { return "function type" }
+                if isWitnessedType(program, described) { return "construct family" }
+                if isDescriptorType(declarations, described) { return "type" }
+                return "struct"
+            }
+            Enumeration -> {
+                let declared = program.enums[described.declaration]
+                if !declared.existential { return "enum" }
+                if traitNamed(tree.traits, baseTypeName(declared.name.text)).isSome() { return "trait existential" }
+                return "construct family"
+            }
+            Integer -> return "int"
+            Decimal -> return "number"
+            Floating -> return "float"
+            Boolean -> return "bool"
+            Pointer -> return "pointer"
+            Void -> return ""
+            Invalid -> return ""
+        }
+    }
+
+    // The arguments an instance was minted with; an array's element.
+    function descriptorArguments(borrow self, described: Type) -> [Type] {
+        match described.kind {
+            Structure -> {
+                let declared = program.structs[described.declaration]
+                if isClosureType(program, described) { return [] }
+                if declared.specialized || isArrayType(program, described) { return declared.typeArguments }
+                return []
+            }
+            Enumeration -> {
+                let declared = program.enums[described.declaration]
+                if declared.specialized { return declared.typeArguments }
+                return []
+            }
+            Integer -> return []
+            Decimal -> return []
+            Floating -> return []
+            Boolean -> return []
+            Pointer -> return []
+            Void -> return []
+            Invalid -> return []
+        }
+    }
+
+    // The traits the type claims, or claims through what it extends, sorted.
+    function descriptorConformances(borrow self, described: Type) -> [String] {
+        var names: [String] = []
+        for name in claimedTraits(described, 0) {
+            var position = names.count
+            var known = false
+            for index in 0..names.count {
+                if names[index] == name { known = true }
+                if position == names.count && textBefore(name, names[index]) { position = index }
+            }
+            if known { continue }
+            var sorted: [String] = []
+            for index in 0..names.count {
+                if index == position { sorted.append(name) }
+                sorted.append(names[index])
+            }
+            if position == names.count { sorted.append(name) }
+            names = sorted
+        }
+        return names
+    }
+
+    function claimedTraits(borrow self, actual: Type, depth: Int) -> [String] {
+        var names: [String] = []
+        for conformance in tree.conformances {
+            if isTemplateReference(tree, conformance.owner) {
+                match instanceArguments(declarations, actual, conformance.owner.name.text) {
+                    Some(arguments) -> {
+                        let parameters = templateParameters(tree, conformance.owner.name.text)
+                        let claimed = substituteGenericReference(conformance.traitName, parameters, arguments)
+                        names.append(canonicalAliasReference(declarations.aliases, claimed, 0).instanceName)
+                    }
+                    None -> {}
+                }
+                continue
+            }
+            match declarations.typeNamed(canonicalAliasReference(declarations.aliases, conformance.owner, 0).instanceName) {
+                Some(owner) -> {
+                    if owner.equals(actual) {
+                        names.append(canonicalAliasReference(declarations.aliases, conformance.traitName, 0).instanceName)
+                    }
+                }
+                None -> {}
+            }
+        }
+        if actual.kind == .Structure && depth <= declarations.structs.count {
+            for ancestor in declarations.structs[actual.declaration].ancestors {
+                match declarations.typeNamed(ancestor) {
+                    Some(parent) -> { for name in claimedTraits(parent, depth + 1) { names.append(name) } }
+                    None -> {}
+                }
+            }
+        }
+        return names
+    }
+}

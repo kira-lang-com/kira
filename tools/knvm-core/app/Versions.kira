@@ -1,0 +1,97 @@
+import Foundation
+
+// Ordering versions, the way a listing and a `latest` both need them.
+
+// Orders two versions: negative when `left` is older, positive when it is
+// newer, zero when they are the same.
+//
+// `2026.07.10` sorts above `2026.07.2`, which a lexicographic sort gets wrong.
+// Components that are not numbers fall back to a text comparison, and a version
+// with more components sorts above its own prefix (`1.7.3` above `1.7`).
+//
+// This is deliberately not semver: a trailing prerelease tag is compared as
+// text, so `1.7.0-rc1` sorts *above* `1.7.0` rather than below it. Kira
+// separates prereleases by channel instead of by tag, so a `-rc` version on the
+// release channel is out of contract; ordering it correctly is a semver
+// parser's job and belongs here only once such tags are actually published.
+public function compareVersions(left: borrow String, right: borrow String) -> Number {
+    let leftParts = left.split(".")
+    let rightParts = right.split(".")
+    var index = 0
+    var ordering = 0
+    var deciding = false
+    while index < leftParts.count || index < rightParts.count {
+        if index < leftParts.count && index < rightParts.count {
+            let step = compareVersionParts(leftParts[index], rightParts[index])
+            if step != 0 && !deciding {
+                ordering = step
+                deciding = true
+            }
+        } else {
+            let step = index < leftParts.count ? 1 : -1
+            if !deciding {
+                ordering = step
+                deciding = true
+            }
+        }
+        index = index + 1
+    }
+    return ordering
+}
+
+// One dotted component against another: numerically where both are numbers.
+public function compareVersionParts(left: borrow String, right: borrow String) -> Number {
+    match left.toNumber() {
+        Some(leftNumber) -> {
+            match right.toNumber() {
+                Some(rightNumber) -> {
+                    if leftNumber < rightNumber { return -1 }
+                    if leftNumber > rightNumber { return 1 }
+                    return 0
+                }
+                None -> {}
+            }
+        }
+        None -> {}
+    }
+    return compareText(left, right)
+}
+
+// Two strings as an order: negative, zero or positive, by their bytes.
+public function compareText(left: borrow String, right: borrow String) -> Number {
+    return orderStrings(left, right)
+}
+
+// `versions` newest first.
+public function sortNewestFirst(versions: borrow [String]) -> [String] {
+    var sorted: [String] = []
+    for index in 0..versions.count {
+        sorted = insertingNewestFirst(sorted, versions[index])
+    }
+    return sorted
+}
+
+// `sorted` with `version` in it, in the same descending order.
+//
+// Insertion sort by version order: a listing holds a handful of versions, and an
+// insertion sort is the one that is obviously correct at that size.
+public function insertingNewestFirst(sorted: borrow [String], version: borrow String) -> [String] {
+    var ordered: [String] = []
+    var placed = false
+    for index in 0..sorted.count {
+        let existing = sorted[index]
+        // Everything newer than `version` stays ahead of it; the first entry that
+        // is not is where `version` belongs.
+        if !placed && compareVersions(existing, version) > 0 {
+            ordered.append(existing)
+            continue
+        }
+        if !placed {
+            ordered.append(version)
+            placed = true
+        }
+        ordered.append(existing)
+    }
+    if !placed { ordered.append(version) }
+    return ordered
+}

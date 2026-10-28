@@ -1,0 +1,194 @@
+// Expanding the macros a declaration's annotations name. A derive or an
+// attribute adds what it produces next to the declaration, or with
+// `replace { true }` takes its place. A wrapper macro's name on a struct
+// makes the struct a template: it is taken out of the program, since it may
+// name types that exist only once the wrapper fills them in. A field
+// annotated with a template's name, or with a field-triggered macro's,
+// summons that macro over the declaration carrying the field, and its output
+// replaces the declaration.
+
+struct MacroTemplate {
+    let name: String
+    let macro: ProceduralMacroDeclaration
+    let reflection: String
+}
+
+// The templates registered so far and those among `annotated`.
+function withTemplates(tree: SyntaxTree, annotated: [AnnotatedDeclaration], known: [MacroTemplate]) -> [MacroTemplate] {
+    var templates: [MacroTemplate] = []
+    for template in known { templates.append(template) }
+    for declaration in annotated {
+        for annotation in declaration.annotations {
+            match findProceduralMacro(tree, annotation.name) {
+                Some(declared) -> {
+                    match declared.kind {
+                        MacroWrapper -> templates.append(MacroTemplate { name = declaration.name.text, macro = declared, reflection = declaration.reflection })
+                        MacroFunction -> {}
+                        MacroDerive -> {}
+                        MacroAttribute -> {}
+                        MacroCollector -> {}
+                    }
+                }
+                None -> {}
+            }
+        }
+    }
+    return templates
+}
+
+function templateNamed(templates: [MacroTemplate], name: String) -> Optional<MacroTemplate> {
+    for template in templates {
+        if template.name == name { return .Some(template) }
+    }
+    return .None
+}
+
+function checkAppliesTo(declared: ProceduralMacroDeclaration, declaration: AnnotatedDeclaration, span: Span) -> Result<Bool, Failure> {
+    if appliesTo(declared, declaration) { return .Ok(true) }
+    return .Error(Failure { diagnostic = .MacroAppliesTo, span = span })
+}
+
+function appliesTo(declared: ProceduralMacroDeclaration, declaration: AnnotatedDeclaration) -> Bool {
+    for kind in declared.appliesTo {
+        if kind == declaration.kind { return true }
+    }
+    return false
+}
+
+function expandAnnotated(session: Session, unit: Unit, move tree: SyntaxTree, batch: MacroBatch, declaration: AnnotatedDeclaration, templates: [MacroTemplate]) -> Result<SyntaxTree, Failure> {
+    let reflection = [declaration.reflection]
+    var generated: [Int] = []
+    var replacement: Optional<Int> = .None
+    var template = false
+    var asserted: [Identifier] = []
+    for annotation in declaration.annotations {
+        if isAttribute(annotation, .Derive) {
+            for name in derivedMacros(tree, annotation) {
+                if name.text == "Copy" {
+                    asserted.append(declaration.name)
+                    continue
+                }
+                match findProceduralMacro(tree, name) {
+                    Some(declared) -> {
+                        match declared.kind {
+                            MacroDerive -> {
+                                try checkAppliesTo(declared, declaration, name.span)
+                                generated.append(try evaluateMacro(session, unit, tree, batch, declared, reflection, name.span))
+                            }
+                            MacroFunction -> return .Error(Failure { diagnostic = .MacroNotDerive, span = name.span })
+                            MacroAttribute -> return .Error(Failure { diagnostic = .MacroNotDerive, span = name.span })
+                            MacroWrapper -> return .Error(Failure { diagnostic = .MacroNotDerive, span = name.span })
+                            MacroCollector -> return .Error(Failure { diagnostic = .MacroNotDerive, span = name.span })
+                        }
+                    }
+                    None -> return .Error(Failure { diagnostic = .MacroNotFound, span = name.span })
+                }
+            }
+            continue
+        }
+        match findProceduralMacro(tree, annotation.name) {
+            Some(declared) -> {
+                // A macro is handed the declaration, not what its annotation
+                // is written with.
+                if annotation.arguments.count > 0 {
+                    return .Error(Failure { diagnostic = .OutsideSubset, span = tree.expressions[annotation.arguments[0]].span })
+                }
+                match declared.kind {
+                    MacroAttribute -> {
+                        try checkAppliesTo(declared, declaration, annotation.name.span)
+                        let file = try evaluateMacro(session, unit, tree, batch, declared, reflection, annotation.name.span)
+                        if declared.replace {
+                            if replacement.isSome() { return .Error(Failure { diagnostic = .MacroTwoReplacers, span = annotation.name.span }) }
+                            replacement = .Some(file)
+                        } else {
+                            generated.append(file)
+                        }
+                    }
+                    MacroWrapper -> {
+                        template = true
+                        let pair = [declaration.reflection, declaration.reflection]
+                        generated.append(try evaluateMacro(session, unit, tree, batch, declared, pair, annotation.name.span))
+                    }
+                    MacroCollector -> return .Error(Failure { diagnostic = .MacroNotDerive, span = annotation.name.span })
+                    MacroDerive -> return .Error(Failure { diagnostic = .MacroDeriveUsedBare, span = annotation.name.span })
+                    MacroFunction -> return .Error(Failure { diagnostic = .MacroNotDerive, span = annotation.name.span })
+                }
+            }
+            None -> return .Error(Failure { diagnostic = .MacroUnknown, span = annotation.name.span })
+        }
+    }
+    if !template && wrapsGenerically(tree, declaration) {
+        // A generic struct's fields are written first; a template or macro
+        // another field names sees the declaration that leaves, next round.
+        if replacement.isSome() { return .Error(Failure { diagnostic = .MacroTwoReplacers, span = declaration.name.span }) }
+        replacement = .Some(try wrappedDeclaration(session, tree, declaration))
+    } else if !template {
+        var summoned: [String] = []
+        for annotation in declaration.fieldAnnotations {
+            var seen = false
+            for name in summoned { if name == annotation.name.text { seen = true } }
+            if seen { continue }
+            var file = -1
+            match templateNamed(templates, annotation.name.text) {
+                Some(found) -> {
+                    summoned.append(annotation.name.text)
+                    let pair = [declaration.reflection, found.reflection]
+                    file = try evaluateMacro(session, unit, tree, batch, found.macro, pair, annotation.name.span)
+                }
+                None -> {
+                    match findProceduralMacro(tree, annotation.name) {
+                        Some(declared) -> {
+                            if declared.triggerField {
+                                summoned.append(annotation.name.text)
+                                try checkAppliesTo(declared, declaration, annotation.name.span)
+                                file = try evaluateMacro(session, unit, tree, batch, declared, reflection, annotation.name.span)
+                            }
+                        }
+                        None -> {}
+                    }
+                }
+            }
+            if file < 0 { continue }
+            if replacement.isSome() { return .Error(Failure { diagnostic = .MacroTwoReplacers, span = declaration.name.span }) }
+            replacement = .Some(file)
+        }
+    }
+    var expanded = move tree
+    for name in asserted { expanded.copyAssertions.append(name) }
+    if template || replacement.isSome() { expanded = withoutDeclaration(expanded, declaration.name) }
+    match replacement {
+        Some(file) -> expanded = try parseGenerated(session, move expanded, file, declaration.span)
+        None -> {}
+    }
+    for file in generated { expanded = try parseGenerated(session, move expanded, file, declaration.span) }
+    return .Ok(expanded)
+}
+
+// The tree without the declaration named at this span, nor what it conforms
+// to.
+function withoutDeclaration(tree: SyntaxTree, name: Identifier) -> SyntaxTree {
+    var kept = tree
+    kept.structs = []
+    for declared in tree.structs { if !declared.name.span.same(name.span) { kept.structs.append(declared) } }
+    kept.genericStructs = []
+    for declared in tree.genericStructs { if !declared.name.span.same(name.span) { kept.genericStructs.append(declared) } }
+    kept.enums = []
+    for declared in tree.enums { if !declared.name.span.same(name.span) { kept.enums.append(declared) } }
+    kept.genericEnums = []
+    for declared in tree.genericEnums { if !declared.name.span.same(name.span) { kept.genericEnums.append(declared) } }
+    kept.constructs = []
+    for declared in tree.constructs { if !declared.name.span.same(name.span) { kept.constructs.append(declared) } }
+    kept.classes = []
+    for declared in tree.classes { if !declared.name.span.same(name.span) { kept.classes.append(declared) } }
+    kept.distincts = []
+    for declared in tree.distincts { if !declared.name.span.same(name.span) { kept.distincts.append(declared) } }
+    kept.conformances = []
+    for conformance in tree.conformances { if !conformance.owner.name.span.same(name.span) { kept.conformances.append(conformance) } }
+    kept.functions = []
+    for declared in tree.functions { if !declared.name.span.same(name.span) { kept.functions.append(declared) } }
+    kept.genericFunctions = []
+    for declared in tree.genericFunctions { if !declared.name.span.same(name.span) { kept.genericFunctions.append(declared) } }
+    kept.declarationSites = []
+    for site in tree.declarationSites { if !site.name.span.same(name.span) { kept.declarationSites.append(site) } }
+    return kept
+}

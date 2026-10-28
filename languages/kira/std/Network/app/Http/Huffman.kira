@@ -1,0 +1,65 @@
+import Foundation
+
+// The HPACK Huffman coding (RFC 7541 section 5.2), over `HuffmanTable`.
+
+// `bytes` Huffman coded, padded to a whole byte with the high bits of the
+// end-of-string code, which are all ones.
+function huffmanEncode(bytes: borrow [UN8]) -> [UN8] {
+    var out: [UN8] = []
+    var pending = 0
+    var pendingBits = 0
+    for byte in bytes {
+        let symbol = Number(byte)
+        pending = (pending << HuffmanTable.lengths[symbol]) | HuffmanTable.codes[symbol]
+        pendingBits += HuffmanTable.lengths[symbol]
+        while pendingBits >= Wire.byteBits {
+            pendingBits -= Wire.byteBits
+            out.append(UN8((pending >> pendingBits) & HuffmanLimit.byteMask))
+        }
+        pending = pending & ((1 << pendingBits) - 1)
+    }
+    if pendingBits > 0 {
+        let padding = Wire.byteBits - pendingBits
+        out.append(UN8(((pending << padding) | ((1 << padding) - 1)) & HuffmanLimit.byteMask))
+    }
+    return out
+}
+
+// The length `bytes` would have Huffman coded.
+function huffmanLength(bytes: borrow [UN8]) -> Number {
+    var bits: Number = 0
+    for byte in bytes { bits += HuffmanTable.lengths[Number(byte)] }
+    return trunc((bits + Wire.byteBits - 1) / Wire.byteBits)
+}
+
+namespace HuffmanLimit {
+    let byteMask: Number = 255
+    // Padding longer than seven bits is an error (RFC 7541 section 5.2).
+    let longestPadding: Number = 7
+}
+
+// `bytes` decoded; a code that is not in the table, the end-of-string
+// symbol, or padding that is too long or not all ones is refused.
+function huffmanDecode(bytes: borrow [UN8]) -> [UN8]? {
+    var out: [UN8] = []
+    var code: Number = 0
+    var length: Number = 0
+    for byte in bytes {
+        for shift in 0..Wire.byteBits {
+            let bit = (Number(byte) >> (Wire.byteBits - 1 - shift)) & 1
+            code = code * 2 + bit
+            length += 1
+            if length > HuffmanTable.longestCode { return .None }
+            let index = code - HuffmanTable.firstCode[length]
+            if index >= 0 && index < HuffmanTable.countAt[length] {
+                let symbol = HuffmanTable.symbols[HuffmanTable.symbolsAt[length] + index]
+                if symbol == HuffmanTable.endOfString { return .None }
+                out.append(UN8(symbol))
+                code = 0
+                length = 0
+            }
+        }
+    }
+    if length > HuffmanLimit.longestPadding || code != (1 << length) - 1 { return .None }
+    return .Some(out)
+}

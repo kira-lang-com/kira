@@ -1,0 +1,319 @@
+import Foundation
+
+// StrxClosureTests.kira — deep closure coverage for `kira test`.
+// PREFIX: strx / Strx  (all top-level names use this prefix).
+// This file imports Foundation (imports are file-scoped); already in scope.
+
+// ---------------------------------------------------------------------------
+// Shared mutable var captures
+// ---------------------------------------------------------------------------
+@Test
+function strxClMutTotal() {
+    var total = 0
+    let acc: (Int) -> Int = { x in
+        total = total + x
+        return total
+    }
+    for i in 1..11 {
+        let _ = acc(i)
+    }
+    // 1+2+...+10 = 55
+    expect!(total == 55)
+}
+
+@Test
+function strxClMutCount() {
+    var count = 0
+    let tick: (Int) -> Int = { x in
+        count = count + 1
+        return count
+    }
+    for i in 0..5 {
+        let _ = tick(0)
+    }
+    expect!(count == 5)
+}
+
+@Test
+function strxClMutMul() {
+    var prod = 1
+    let mul: (Int) -> Int = { x in
+        prod = prod * x
+        return prod
+    }
+    for i in 1..6 {
+        let _ = mul(i)
+    }
+    // 1*2*3*4*5 = 120
+    expect!(prod == 120)
+}
+
+@Test
+function strxClMutToggle() {
+    var flag = 0
+    let toggle: (Int) -> Int = { x in
+        if flag == 0 {
+            flag = 1
+        } else {
+            flag = 0
+        }
+        return flag
+    }
+    for i in 0..6 {
+        let _ = toggle(0)
+    }
+    // 6 toggles from 0 -> 1,0,1,0,1,0 = 0
+    expect!(flag == 0)
+}
+
+@Test
+function strxClMutEvenCount() {
+    var evens = 0
+    let countEven: (Int) -> Int = { x in
+        if x % 2 == 0 {
+            evens = evens + 1
+        }
+        return evens
+    }
+    for i in 0..10 {
+        let _ = countEven(i)
+    }
+    // 0,2,4,6,8 -> 5 evens
+    expect!(evens == 5)
+}
+
+@Test
+function strxClMutAccumProd() {
+    let mult = 3
+    var total = 0
+    let addMult: (Int) -> Int = { x in
+        total = total + x * mult
+        return total
+    }
+    for i in 1..6 {
+        let _ = addMult(i)
+    }
+    // 3*(1+2+3+4+5) = 45
+    expect!(total == 45)
+}
+
+@Test
+function strxClMutBucket() {
+    var bucket = 0
+    let deposit: (Int) -> Int = { x in
+        bucket = bucket + x * 2
+        return bucket
+    }
+    for i in 1..6 {
+        let _ = deposit(i)
+    }
+    // 2*(1+2+3+4+5) = 30
+    expect!(bucket == 30)
+}
+
+@Test
+function strxClMutMax() {
+    var mx = 0
+    let track: (Int) -> Int = { x in
+        if x > mx {
+            mx = x
+        }
+        return mx
+    }
+    let vals: [Int] = [3, 7, 2, 9, 1, 5]
+    for i in 0..vals.count {
+        let _ = track(vals[i])
+    }
+    // max is 9
+    expect!(mx == 9)
+}
+
+@Test
+function strxClMutCountDown() {
+    var remaining = 10
+    let use: (Int) -> Int = { x in
+        remaining = remaining - 1
+        return remaining
+    }
+    for i in 0..7 {
+        let _ = use(0)
+    }
+    // 10 - 7 = 3
+    expect!(remaining == 3)
+}
+
+@Test
+function strxClMutRunning() {
+    var running = 0
+    let update: (Int) -> Int = { x in
+        running = running + x
+        return running
+    }
+    let vals: [Int] = [2, 4, 6, 8]
+    for i in 0..vals.count {
+        let _ = update(vals[i])
+    }
+    // 2+4+6+8 = 20
+    expect!(running == 20)
+}
+
+@Test
+function strxClMutTriangle() {
+    var sum = 0
+    let addI: (Int) -> Int = { x in
+        sum = sum + x
+        return sum
+    }
+    for i in 1..11 {
+        let _ = addI(i)
+    }
+    // 1+2+...+10 = 55
+    expect!(sum == 55)
+}
+
+@Test
+function strxClMutLoopModify() {
+    var accum = 0
+    let add: (Int) -> Int = { x in
+        accum = accum + x
+        return x
+    }
+    for i in 0..8 {
+        let _ = add(i * 3)
+    }
+    // 0+3+6+9+12+15+18+21 = 84
+    expect!(accum == 84)
+}
+
+// ---------------------------------------------------------------------------
+// Compose by sequencing (two closures, one after another)
+// ---------------------------------------------------------------------------
+
+@Test
+function strxClCompose() {
+    let f: (Int) -> Int = { x in return x + 3 }
+    let g: (Int) -> Int = { x in return x * 2 }
+    let r1 = strxCApply(move f, 5)
+    let r2 = strxCApply(move g, r1)
+    // (5+3)*2 = 16
+    expect!(r2 == 16)
+}
+
+@Test
+function strxClComposeLoop() {
+    var acc = 0
+    for i in 0..5 {
+        let f: (Int) -> Int = { x in return x + i }
+        let g: (Int) -> Int = { x in return x * 2 }
+        let mid = strxCApply(move f, i)
+        acc = acc + strxCApply(move g, mid)
+    }
+    // i=0..4: 0+4+8+12+16 = 40
+    expect!(acc == 40)
+}
+
+@Test
+function strxClNestedHOF() {
+    let xs: [Int] = [1, 2, 3, 4]
+    let add2: (Int) -> Int = { x in return x + 2 }
+    let r1 = strxCReduce(xs, move add2)
+    let dbl: (Int) -> Int = { x in return x * 2 }
+    // reduce: 3+4+5+6=18; apply dbl: 36
+    expect!(strxCApply(move dbl, r1) == 36)
+}
+
+// ---------------------------------------------------------------------------
+// More patterns
+// ---------------------------------------------------------------------------
+
+@Test
+function strxClSingleCall() {
+    let add1: (Int) -> Int = { x in return x + 1 }
+    let r = strxCApplyTwice(move add1, 40)
+    // 40+1+1 = 42
+    expect!(r == 42)
+}
+
+@Test
+function strxClDirectCall() {
+    let f: (Int) -> Int = { x in return x * x }
+    // 81
+    expect!(f(9) == 81)
+}
+
+@Test
+function strxClMultiCallSameClosure() {
+    let f: (Int) -> Int = { x in return x + 5 }
+    var acc = 0
+    acc = acc + f(0)
+    acc = acc + f(10)
+    acc = acc + f(20)
+    // 5+15+25 = 45
+    expect!(acc == 45)
+}
+
+@Test
+function strxClChainResult() {
+    var step = 1
+    let f: (Int) -> Int = { x in return x + step }
+    var out = 0
+    for i in 0..5 {
+        out = f(out)
+    }
+    // starts 0, adds step=1 five times -> 5
+    expect!(out == 5)
+}
+
+@Test
+function strxClReduceThenApply() {
+    let xs: [Int] = [2, 4, 6]
+    let id: (Int) -> Int = { x in return x }
+    let sum = strxCReduce(xs, move id)
+    let triple: (Int) -> Int = { x in return x * 3 }
+    // sum=12; 12*3=36
+    expect!(strxCApply(move triple, sum) == 36)
+}
+
+// ---------------------------------------------------------------------------
+// Trap tests — closure body traps, or outer array OOB
+// ---------------------------------------------------------------------------
+
+@Test
+function strxClTrapOobInClosure() {
+    expectTrap!("")
+        // Closure body itself causes OOB by computing an out-of-range index
+        let f: (Int) -> Int = { x in
+            let dummy: [Int] = [1, 2, 3]
+            let _ = dummy[x]
+        }
+        let _ = f(99)
+}
+
+@Test
+function strxClTrapDivZeroInClosure() {
+    expectTrap!("")
+        let f: (Int) -> Int = { x in return 100 / x }
+        let _ = f(0)
+}
+
+@Test
+function strxClTrapModZeroInClosure() {
+    expectTrap!("")
+        let f: (Int) -> Int = { x in return x % 0 }
+        let _ = f(5)
+}
+
+@Test
+function strxClTrapOobDirect() {
+    expectTrap!("")
+    let xs: [Int] = [1, 2, 3]
+    let _ = xs[10]
+}
+
+@Test
+function strxClTrapOobBeforeApply() {
+    expectTrap!("")
+        let f: (Int) -> Int = { x in return x * 2 }
+        let xs: [Int] = [1, 2, 3]
+        let _ = strxCApply(move f, xs[99])
+}

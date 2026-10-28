@@ -1,0 +1,385 @@
+import Foundation
+
+// The driver (DESIGN.md section 8.1): one value that owns the poller, the
+// sockets, every engine and the requests in flight. A program moves it with
+// `wait` or `poll`, and what happened comes back as events. Nothing here
+// blocks except the poller's wait.
+
+distinct RequestId = Number
+
+distinct ServerId = Number
+
+// The version of HTTP a connection speaks (DESIGN.md section 7.1).
+enum HttpVersion {
+    Http1
+    Http2
+    Http3
+}
+
+// How a request may travel (DESIGN.md section 7.5).
+enum Transport {
+    Automatic
+    Http3Only
+    // `http://` to an address that is not loopback.
+    Cleartext
+}
+
+// Where a request was when its time ran out.
+enum Phase {
+    Resolve
+    Connect
+    Handshake
+    Response
+}
+
+// Why a request ended without its whole response (DESIGN.md section 8.2).
+enum HttpFailure {
+    Resolve(String)
+    Connect(NetFailure)
+    Tls(TlsAlert)
+    // The QUIC or HTTP error code that ended the exchange.
+    Protocol(Number)
+    // The peer reset the request's stream with this error.
+    Reset(Number)
+    TimedOut(Phase)
+    // A message passed this many bytes.
+    TooLarge(Number)
+    Closed
+}
+
+struct NetworkOptions {
+    let quic: QuicLimits = QuicLimits {}
+    // Extra trust anchors, each DER certificate behind a 24-bit length, for
+    // a private certificate authority (DESIGN.md section 3.2).
+    let anchors: [UN8] = []
+    let transport: Transport = .Automatic
+    // A server collects a request body up to this before `Incoming`.
+    let requestBodyLimit: Number = 16777216
+    // Sent on every request that names none (RFC 9110 section 10.1.5): some
+    // origins refuse a request without one.
+    let userAgent: String = "Kira-Network/0.1"
+}
+
+// `certificates`, each DER, as `NetworkOptions.anchors` holds them.
+function anchorsOf(certificates: borrow [[UN8]]) -> [UN8] {
+    var writer = WireWriter {}
+    for certificate in certificates { writer.writeVector(certificate, Tls.longVector) }
+    return writer.bytes
+}
+
+struct ServeOptions {
+    // "host:port"; port 0 takes any free one.
+    let address: String
+    let identity: TlsServerIdentity
+    let protocols: [HttpVersion] = [.Http3]
+}
+
+struct ResponseHeadEvent {
+    let request: RequestId
+    let status: Status
+    let fields: Fields
+    let version: HttpVersion
+}
+
+struct BodyChunk {
+    let request: RequestId
+    let bytes: [UN8]
+}
+
+struct RequestEnd {
+    let request: RequestId
+    let trailers: Fields
+    let failure: HttpFailure?
+}
+
+// A whole request a server received; answer it with `respond`, `write` and
+// `finish`.
+struct IncomingRequest {
+    let request: RequestId
+    let server: ServerId
+    let message: Request
+    let peer: String
+}
+
+enum NetworkEvent {
+    ResponseHead(ResponseHeadEvent)
+    ResponseBody(BodyChunk)
+    ResponseEnded(RequestEnd)
+    Incoming(IncomingRequest)
+    // WebTransport sessions (DESIGN.md section 8.4).
+    SessionOpened(SessionId)
+    StreamOpened(SessionStream)
+    StreamData(SessionBytes)
+    StreamEnded(StreamEnd)
+    Datagram(SessionDatagram)
+    // The peer asks for the session to wind down; it still works.
+    SessionDraining(SessionId)
+    SessionClosed(SessionClose)
+}
+
+namespace DriverLimit {
+    let datagramRoom: Number = 65536
+    let eventRoom: Number = 256
+    let nanosecondsPerMicrosecond: Number = 1000
+    let microsecondsPerSecond: Number = 1000000
+    let millisecondsPerSecond: Number = 1000
+    let httpsPort: Number = 443
+    let highestPort: Number = 65535
+    let portDigits: Number = 5
+    let anyIpv4: String = "0.0.0.0:0"
+    let anyIpv6: String = "[::]:0"
+    let alpn: String = "h3"
+}
+
+// One UDP socket and the QUIC endpoint behind it.
+struct EndpointSlot {
+    let socket: UdpSocket
+    let token: Number
+    var endpoint: QuicEndpoint
+    // A client slot carries one address family; a server slot has its own
+    // ID.
+    let ipv6: Bool
+    let server: ServerId?
+}
+
+// HTTP/3 on one connection of one slot.
+struct SessionEntry {
+    let id: Number
+    let slot: Number
+    let handle: QuicConnectionHandle
+    // "host:port" a client session reaches; empty on a server.
+    let origin: String
+    let peer: String
+    var http: Http3Session
+    var connected: Bool = false
+    // The peer sent GOAWAY: no new requests go on this connection.
+    var going: Bool = false
+    // The connection ended; the session goes at the end of the pump.
+    var closed: Bool = false
+}
+
+struct ClientRequest {
+    let id: RequestId
+    let route: Route
+    // Held until a connection for the route is ready.
+    var pending: Request?
+    // The key of the session or link that carries it.
+    var session: Number? = .None
+    var stream: QuicStreamNumber? = .None
+}
+
+struct ServerRequest {
+    let id: RequestId
+    let session: Number
+    // Zero on HTTP/1.1, which has one message at a time.
+    let stream: QuicStreamNumber
+    var head: RequestHead? = .None
+    var body: [UN8] = []
+    // The whole request arrived and went out as `Incoming`.
+    var received: Bool = false
+    // A response to HEAD, or a status without content, carries no body.
+    var bodiless: Bool = false
+    // An extended CONNECT for a WebTransport session: handed over at its
+    // head, since its stream stays open.
+    var connect: Bool = false
+}
+
+struct PendingLookup {
+    let token: Number
+    let lookup: Lookup
+    let route: Route
+}
+
+struct Network {
+    let options: NetworkOptions
+    let poller: Poller
+    var nextToken: Number = 1
+    var nextRequest: Number = 1
+    var slots: [EndpointSlot] = []
+    var sessions: [SessionEntry] = []
+    var links: [TcpLink] = []
+    var listeners: [TcpListening] = []
+    var lookups: [PendingLookup] = []
+    var requests: [ClientRequest] = []
+    var served: [ServerRequest] = []
+    var webSessions: [WebSession] = []
+    var events: [NetworkEvent] = []
+
+    function now(borrow self) -> QuicInstant {
+        return QuicInstant(floor(monotonicNanoseconds() / DriverLimit.nanosecondsPerMicrosecond))
+    }
+
+    // Poller tokens, slot keys and session keys share one counter.
+    function takeToken(borrow mut self) -> Number {
+        let token = nextToken
+        nextToken += 1
+        return token
+    }
+
+    function takeRequestId(borrow mut self) -> RequestId {
+        let id = RequestId(nextRequest)
+        nextRequest += 1
+        return id
+    }
+
+    // Blocks until something happens or `until` passes, then gives what
+    // happened.
+    function wait(borrow mut self, until: QuicInstant?) -> [NetworkEvent] {
+        // What calls since the last turn queued goes out before blocking,
+        // and what they produced is returned at once.
+        advance()
+        if events.count > 0 { return poll() }
+        var deadline = copy until
+        for slot in slots { deadline = quicEarliest(deadline, slot.endpoint.deadline()) }
+        let timeout: Number? = match deadline {
+            Some(at) -> .Some(
+                Number(max(at.raw - now().raw, 0)) / DriverLimit.microsecondsPerSecond
+            )
+            None -> .None
+        }
+        return turn(timeout)
+    }
+
+    // What happened, without blocking.
+    function poll(borrow mut self) -> [NetworkEvent] {
+        return turn(.Some(0))
+    }
+
+    function turn(borrow mut self, timeout: borrow Number?) -> [NetworkEvent] {
+        match poller.wait(copy timeout, DriverLimit.eventRoom) {
+            Ok(ready) -> {
+                for event in ready { takeReadiness(event) }
+            }
+            Error(failure) -> absorb failure
+        }
+        advance()
+        let out = events
+        events = []
+        return out
+    }
+
+    // Timers that are due, engine events, and datagrams to send.
+    function advance(borrow mut self) {
+        let at = now()
+        for index in 0..slots.count {
+            let due = slots[index].endpoint.deadline()
+            match due {
+                Some(when) -> {
+                    if at.raw >= when.raw { slots[index].endpoint.expire(at) }
+                }
+                None -> {}
+            }
+        }
+        pumpSessions()
+        flush(at)
+        for index in 0..links.count { flushLink(index) }
+        sweepLinks()
+    }
+
+    function takeReadiness(borrow mut self, event: borrow NetEvent) {
+        let token = match event.token {
+            Some(value) -> value
+            None -> return
+        }
+        for index in 0..slots.count {
+            if slots[index].token == token { return drainSocket(index) }
+        }
+        if takeTcpReadiness(token, event) { return }
+        takeLookup(token)
+    }
+
+    function drainSocket(borrow mut self, index: Number) {
+        let at = now()
+        while true {
+            let received = slots[index].socket.receive(DriverLimit.datagramRoom)
+            let datagram = match received {
+                Ok(value) -> value
+                Error(failure) -> {
+                    absorb failure
+                    break
+                }
+            }
+            slots[index].endpoint.receive(datagram, at)
+        }
+        match slots[index].server {
+            Some(server) -> acceptSessions(index, server)
+            None -> {}
+        }
+    }
+
+    function flush(borrow mut self, at: QuicInstant) {
+        for index in 0..slots.count {
+            while true {
+                let next = slots[index].endpoint.transmit(at)
+                let datagram = match next {
+                    Some(value) -> value
+                    None -> break
+                }
+                // A datagram the socket refuses is as if lost; recovery
+                // sends its content again.
+                absorb slots[index].socket.send(datagram.bytes, datagram.peer)
+            }
+        }
+    }
+
+    // A new UDP socket the poller watches.
+    function openSlot(
+        borrow mut self,
+        address: borrow String,
+        settings: QuicEndpointSettings,
+        server: ServerId?
+    ) -> Result<Number, NetFailure> {
+        let socket = try bindUdp(address)
+        let endpoint = match quicEndpoint(move settings) {
+            Ok(value) -> value
+            Error(problem) -> {
+                absorb problem
+                match socket.close() {
+                    Ok -> {}
+                    Error(failure) -> absorb failure
+                }
+                return .Error(.Io)
+            }
+        }
+        let token = takeToken()
+        try poller.watch(socket.handle, .Readable, token)
+        slots.append(
+            EndpointSlot {
+                socket: socket,
+                token: token,
+                endpoint: move endpoint,
+                ipv6: address.startsWith("["),
+                server: move server
+            }
+        )
+        return .Ok(slots.count - 1)
+    }
+}
+
+function openNetwork(options: NetworkOptions) -> Result<Network, NetFailure> {
+    let poller = try makePoller()
+    return .Ok(Network { options: move options, poller: poller })
+}
+
+// The TLS alert inside a QUIC CRYPTO_ERROR, or the code as it is.
+function connectionFailure(end: borrow QuicConnectionEnd) -> HttpFailure {
+    if !end.application && end.error >= Quic.cryptoError && end.error < Quic.cryptoError * 2 {
+        let alert = end.error - Quic.cryptoError
+        for known in TlsAlertList.all {
+            if code(known) == alert { return .Tls(known) }
+        }
+    }
+    if end.error == 0 { return .Closed }
+    return .Protocol(end.error)
+}
+
+namespace TlsAlertList {
+    let all: [TlsAlert] = [
+        .CloseNotify, .UnexpectedMessage, .BadRecordMac, .RecordOverflow, .HandshakeFailure,
+        .BadCertificate, .UnsupportedCertificate, .CertificateRevoked, .CertificateExpired,
+        .CertificateUnknown, .IllegalParameter, .UnknownCa, .AccessDenied, .DecodeError,
+        .DecryptError, .ProtocolVersion, .InsufficientSecurity, .InternalError,
+        .InappropriateFallback, .UserCanceled, .MissingExtension, .UnsupportedExtension,
+        .UnrecognizedName, .UnknownPskIdentity, .CertificateRequired, .NoApplicationProtocol
+    ]
+}

@@ -1,0 +1,540 @@
+import Foundation
+
+// StrxClassTests.kira — deep class/inheritance coverage for `kira test`.
+// PREFIX: strx / Strx  (all top-level names use this prefix).
+//
+// PARITY: an inherited base method calling self.<m>() where a descendant
+// overrides <m> was once virtual on vm and hybrid and static on llvm, and this
+// file avoided the shape entirely. It no longer diverges — classes are
+// monomorphized, so a parent's body is registered per descendant with `self`
+// statically the concrete class — and H9 in StrxClassDispatchTests.kira pins the
+// cases that used to differ, on every backend.
+
+// ---------------------------------------------------------------------------
+// H1: Three-level single inheritance, field-default overrides, super-calls
+// ---------------------------------------------------------------------------
+
+class StrxCBase {
+    var points: Int = 10
+    let rank: Int = 1
+
+    // reads only self fields -> consistent on any subclass instance
+    function score() -> Int {
+        return self.points * self.rank
+    }
+
+    function tier() -> Int {
+        return 1
+    }
+}
+
+class StrxCSilver extends StrxCBase {
+    override let rank = 3
+
+    override function tier() -> Int {
+        return 2
+    }
+
+    // parent-qualified super-call
+    function bonus() -> Int {
+        return StrxCBase.score() + self.points
+    }
+}
+
+class StrxCGold extends StrxCSilver {
+    override let rank = 7
+
+    override function tier() -> Int {
+        return 3
+    }
+}
+
+// ---------------------------------------------------------------------------
+// H2: Multiple inheritance with same-named members; parent-qualified dispatch
+// ---------------------------------------------------------------------------
+
+class StrxCX {
+    let v: Int = 10
+
+    function weight() -> Int {
+        return 5
+    }
+
+    function compute(n: Int) -> Int {
+        return n + 10
+    }
+}
+
+class StrxCY {
+    let v: Int = 20
+
+    function weight() -> Int {
+        return 8
+    }
+
+    function compute(n: Int) -> Int {
+        return n + 20
+    }
+}
+
+class StrxCMix extends StrxCX, StrxCY {
+    function vSum() -> Int {
+        return StrxCX.v + StrxCY.v
+    }
+
+    function wSum() -> Int {
+        return StrxCX.weight() + StrxCY.weight()
+    }
+
+    function cSum(n: Int) -> Int {
+        return StrxCX.compute(n) + StrxCY.compute(n)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// H3: Array of leaf instances; overridden method dispatch in loops
+// ---------------------------------------------------------------------------
+
+class StrxCShape {
+    let sides: Int = 0
+
+    function area(k: Int) -> Int {
+        return 0
+    }
+
+    // never overridden -> safe to call from any context
+    function baseFee() -> Int {
+        return 1
+    }
+}
+
+class StrxCTriangle extends StrxCShape {
+    override let sides = 3
+    var base_len: Int = 1
+
+    override function area(k: Int) -> Int {
+        return self.base_len * k
+    }
+}
+
+class StrxCRect extends StrxCShape {
+    override let sides = 4
+    var width: Int = 1
+    var height: Int = 1
+
+    override function area(k: Int) -> Int {
+        return self.width * self.height * k
+    }
+}
+
+// ---------------------------------------------------------------------------
+// H4: Parameterized override + super-call chain, three levels
+// ---------------------------------------------------------------------------
+
+class StrxCVehicle {
+    let base: Int = 5
+
+    function cost(km: Int) -> Int {
+        return self.base + km
+    }
+}
+
+class StrxCCar extends StrxCVehicle {
+    override let base = 10
+
+    override function cost(km: Int) -> Int {
+        return self.base + km * 2
+    }
+}
+
+class StrxCTruck extends StrxCCar {
+    override let base = 15
+
+    // super-call via parent-qualified
+    override function cost(km: Int) -> Int {
+        return StrxCCar.cost(km) + 3
+    }
+}
+
+// ---------------------------------------------------------------------------
+// H5: Stateful class with mutable field, inheritance of non-conflicting methods
+// ---------------------------------------------------------------------------
+
+class StrxCCounter {
+    var count: Int = 0
+
+    function increment() -> Int {
+        self.count = self.count + 1
+        return self.count
+    }
+
+    function getCount() -> Int {
+        return self.count
+    }
+
+    function reset() -> Int {
+        self.count = 0
+        return 0
+    }
+}
+
+class StrxCSmartCounter extends StrxCCounter {
+    var step: Int = 2
+
+    function incrementBy(n: Int) -> Int {
+        self.count = self.count + n
+        return self.count
+    }
+
+    function addStep() -> Int {
+        self.count = self.count + self.step
+        return self.count
+    }
+}
+
+// ---------------------------------------------------------------------------
+// H6: Three-level hierarchy, field override chain, super-call in describe
+// ---------------------------------------------------------------------------
+
+class StrxCNode {
+    var value: Int = 0
+    let label: Int = 1
+
+    function describe() -> Int {
+        return self.value + self.label
+    }
+}
+
+class StrxCLeaf extends StrxCNode {
+    override let label = 10
+
+    override function describe() -> Int {
+        return self.value * self.label
+    }
+}
+
+class StrxCDeepLeaf extends StrxCLeaf {
+    override let label = 100
+
+    // super-call: uses StrxCLeaf.describe() on self (self.label=100)
+    override function describe() -> Int {
+        return StrxCLeaf.describe() + self.label
+    }
+}
+
+// ---------------------------------------------------------------------------
+// H1 Tests
+// ---------------------------------------------------------------------------
+@Test
+function strxClsBaseScore() {
+    let a = StrxCBase()
+    // 10 * 1 = 10
+    expect!(a.score() == 10)
+}
+
+@Test
+function strxClsBaseTier() {
+    let a = StrxCBase()
+    expect!(a.tier() == 1)
+}
+
+@Test
+function strxClsSilverScore() {
+    let s = StrxCSilver()
+    // 10 * 3 = 30
+    expect!(s.score() == 30)
+}
+
+@Test
+function strxClsSilverTier() {
+    let s = StrxCSilver()
+    expect!(s.tier() == 2)
+}
+
+@Test
+function strxClsSilverBonus() {
+    let s = StrxCSilver()
+    // StrxCBase.score() = 10*3=30; + points=10 -> 40
+    expect!(s.bonus() == 40)
+}
+
+@Test
+function strxClsGoldScore() {
+    let g = StrxCGold()
+    // 10 * 7 = 70
+    expect!(g.score() == 70)
+}
+
+@Test
+function strxClsGoldTier() {
+    let g = StrxCGold()
+    expect!(g.tier() == 3)
+}
+
+@Test
+function strxClsGoldBonus() {
+    let g = StrxCGold()
+    // inherited from Silver: StrxCBase.score()=10*7=70; + 10 = 80
+    expect!(g.bonus() == 80)
+}
+
+@Test
+function strxClsGoldMutPoints() {
+    var g = StrxCGold()
+    for i in 0..10 {
+        g.points = g.points + 7
+    }
+    // 10 + 10*7 = 80
+    expect!(g.points == 80)
+}
+
+@Test
+function strxClsGoldMutScore() {
+    var g = StrxCGold()
+    for i in 0..10 {
+        g.points = g.points + 7
+    }
+    // points = 80; score = 80*7 = 560
+    expect!(g.score() == 560)
+}
+
+@Test
+function strxClsBaseRankField() {
+    let a = StrxCBase()
+    expect!(a.rank == 1)
+}
+
+@Test
+function strxClsSilverRankField() {
+    let s = StrxCSilver()
+    expect!(s.rank == 3)
+}
+
+@Test
+function strxClsGoldRankField() {
+    let g = StrxCGold()
+    expect!(g.rank == 7)
+}
+
+@Test
+function strxClsTierSum() {
+    let a = StrxCBase()
+    let s = StrxCSilver()
+    let g = StrxCGold()
+    // 1 + 2 + 3 = 6
+    expect!(a.tier() + s.tier() + g.tier() == 6)
+}
+
+@Test
+function strxClsScoreSum() {
+    let a = StrxCBase()
+    let s = StrxCSilver()
+    let g = StrxCGold()
+    // 10 + 30 + 70 = 110
+    expect!(a.score() + s.score() + g.score() == 110)
+}
+
+@Test
+function strxClsSilverMutBonus() {
+    var s = StrxCSilver()
+    s.points = 20
+    // StrxCBase.score() = 20*3=60; + 20 = 80
+    expect!(s.bonus() == 80)
+}
+
+@Test
+function strxClsH1Loop() {
+    let a = StrxCBase()
+    let s = StrxCSilver()
+    let g = StrxCGold()
+    var acc = 0
+    acc = acc + a.score() + a.tier()
+    acc = acc + s.score() + s.tier()
+    acc = acc + g.score() + g.tier()
+    // (10+1) + (30+2) + (70+3) = 116
+    expect!(acc == 116)
+}
+
+// ---------------------------------------------------------------------------
+// H2 Tests
+// ---------------------------------------------------------------------------
+
+@Test
+function strxClsMixVSum() {
+    let m = StrxCMix()
+    // 10 + 20 = 30
+    expect!(m.vSum() == 30)
+}
+
+@Test
+function strxClsMixWSum() {
+    let m = StrxCMix()
+    // 5 + 8 = 13
+    expect!(m.wSum() == 13)
+}
+
+@Test
+function strxClsMixCSum5() {
+    let m = StrxCMix()
+    // (5+10) + (5+20) = 40
+    expect!(m.cSum(5) == 40)
+}
+
+@Test
+function strxClsMixCSum0() {
+    let m = StrxCMix()
+    // (0+10) + (0+20) = 30
+    expect!(m.cSum(0) == 30)
+}
+
+@Test
+function strxClsMixCLoop() {
+    let m = StrxCMix()
+    var sum = 0
+    for n in 0..5 {
+        sum = sum + m.cSum(n)
+    }
+    // n=0: 30; n=1: 32; n=2: 34; n=3: 36; n=4: 38 -> 170
+    expect!(sum == 170)
+}
+
+@Test
+function strxClsMixWLoopMul() {
+    let m = StrxCMix()
+    var acc = 0
+    for k in 0..4 {
+        acc = acc + m.wSum() * k
+    }
+    // 0*13 + 1*13 + 2*13 + 3*13 = 78
+    expect!(acc == 78)
+}
+
+@Test
+function strxClsMixAllFields() {
+    let m = StrxCMix()
+    // 30 + 13 = 43
+    expect!(m.vSum() + m.wSum() == 43)
+}
+
+// ---------------------------------------------------------------------------
+// H3 Tests
+// ---------------------------------------------------------------------------
+
+@Test
+function strxClsTriSides() {
+    let t = StrxCTriangle()
+    expect!(t.sides == 3)
+}
+
+@Test
+function strxClsRectSides() {
+    let r = StrxCRect()
+    expect!(r.sides == 4)
+}
+
+@Test
+function strxClsTriArea() {
+    var t = StrxCTriangle()
+    t.base_len = 5
+    // 5 * 2 = 10
+    expect!(t.area(2) == 10)
+}
+
+@Test
+function strxClsRectArea() {
+    var r = StrxCRect()
+    r.width = 3
+    r.height = 4
+    // 3 * 4 * 2 = 24
+    expect!(r.area(2) == 24)
+}
+
+@Test
+function strxClsTriBaseFee() {
+    let t = StrxCTriangle()
+    // inherited, not overridden -> 1
+    expect!(t.baseFee() == 1)
+}
+
+@Test
+function strxClsRectBaseFee() {
+    let r = StrxCRect()
+    expect!(r.baseFee() == 1)
+}
+
+@Test
+function strxClsArrTriLoop() {
+    var tris: [StrxCTriangle] = []
+    for i in 0..5 {
+        var t = StrxCTriangle()
+        t.base_len = i + 1
+        tris.append(move t)
+    }
+    var total = 0
+    for j in 0..tris.count {
+        total = total + tris[j].area(2)
+    }
+    // area(2): 2+4+6+8+10 = 30
+    expect!(total == 30)
+}
+
+@Test
+function strxClsArrTriSides() {
+    var tris: [StrxCTriangle] = []
+    for i in 0..5 {
+        tris.append(StrxCTriangle())
+    }
+    var total = 0
+    for j in 0..tris.count {
+        total = total + tris[j].sides
+    }
+    // 5 * 3 = 15
+    expect!(total == 15)
+}
+
+@Test
+function strxClsArrTriAcc() {
+    var tris: [StrxCTriangle] = []
+    for i in 0..5 {
+        var t = StrxCTriangle()
+        t.base_len = i + 1
+        tris.append(move t)
+    }
+    var total = 0
+    for j in 0..tris.count {
+        total = total + tris[j].area(2) + tris[j].sides + tris[j].baseFee()
+    }
+    // area: 30; sides: 5*3=15; baseFee: 5*1=5 -> 50
+    expect!(total == 50)
+}
+
+@Test
+function strxClsArrRectLoop() {
+    var rects: [StrxCRect] = []
+    for i in 0..4 {
+        var r = StrxCRect()
+        r.width = i + 1
+        r.height = 2
+        rects.append(move r)
+    }
+    var total = 0
+    for j in 0..rects.count {
+        total = total + rects[j].area(1)
+    }
+    // width*2*1: 2+4+6+8 = 20
+    expect!(total == 20)
+}
+
+@Test
+function strxClsArrRectSides() {
+    var rects: [StrxCRect] = []
+    for i in 0..3 {
+        rects.append(StrxCRect())
+    }
+    var total = 0
+    for j in 0..rects.count {
+        total = total + rects[j].sides
+    }
+    // 3 * 4 = 12
+    expect!(total == 12)
+}

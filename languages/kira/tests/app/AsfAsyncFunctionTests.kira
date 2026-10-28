@@ -1,0 +1,228 @@
+import Foundation
+import Heap
+
+// `async function` bodies as futures: each `.await` inside one is a
+// suspension point of the state machine lowering writes, the frame keeps the
+// body's bindings across it, and dropping an unfinished `Async` destroys
+// exactly what is live at the await it waits at.
+
+// Pending (and self-woken) `remaining` times, then ready with `value`.
+struct AsfDelay: Future<Int> {
+    var remaining: Int
+    let value: Int
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Int> {
+        if self.remaining == 0 { return .Ready(self.value) }
+        self.remaining -= 1
+        context.waker.wakeUp()
+        return .Pending
+    }
+}
+
+function asfDelay(remaining: Int, value: Int) -> AsfDelay {
+    return AsfDelay { remaining = remaining, value = value }
+}
+
+async function asfNoAwait(a: Int, b: Int) -> Int {
+    return a + b
+}
+
+async function asfOneAwait(a: Int) -> Int {
+    let b = asfDelay(2, 10).await
+    return a + b
+}
+
+async function asfTwoAwaits(a: Int) -> Int {
+    let first = asfDelay(1, a).await
+    var total = first * 2
+    total += asfDelay(3, 5).await
+    return total
+}
+
+async function asfNested(a: Int) -> Int {
+    let inner = asfOneAwait(a).await
+    let again = asfTwoAwaits(inner).await
+    return again
+}
+
+async function asfLoop(times: Int) -> Int {
+    var sum = 0
+    for index in 0..times {
+        sum += asfDelay(1, index).await
+    }
+    return sum
+}
+
+async function asfText(name: String) -> String {
+    let suffix = asfDelay(1, 7).await
+    return "\(name)-\(suffix)"
+}
+
+async function asfNothing(cell: RawPtr) {
+    let value = asfDelay(1, 3).await
+    heapStore<Int>(cell, value)
+}
+
+@Test
+function asfBodyWithoutAwaitIsReadyAtOnce() {
+    expect!(blockOn(asfNoAwait(2, 3)) == 5)
+}
+
+@Test
+function asfAwaitSuspendsAndResumes() {
+    expect!(blockOn(asfOneAwait(1)) == 11)
+}
+
+@Test
+function asfBindingsLiveAcrossAwaits() {
+    expect!(blockOn(asfTwoAwaits(4)) == 13)
+}
+
+@Test
+function asfAsyncAwaitsAsync() {
+    // asfOneAwait(1) = 11; asfTwoAwaits(11) = 27.
+    expect!(blockOn(asfNested(1)) == 27)
+}
+
+@Test
+function asfAwaitInsideLoop() {
+    expect!(blockOn(asfLoop(5)) == 10)
+}
+
+@Test
+function asfAggregatesCrossAwaits() {
+    expect!(blockOn(asfText("job")) == "job-7")
+}
+
+@Test
+function asfVoidBodyRuns() {
+    let cell = allocateBytes(8)
+    heapStore<Int>(cell, 0)
+    let finished = blockOn(asfNothing(cell))
+    expect!(finished == 0)
+    expect!(heapLoad<Int>(cell) == 3)
+    freeBytes(cell)
+}
+
+@Test
+function asfAwaitOutsideAsyncBlocksOn() {
+    let value = asfOneAwait(5).await
+    expect!(value == 15)
+}
+
+// Adds `mark` to the counter at `cell` when destroyed, and is pending (and
+// self-woken) forever.
+struct AsfGuard: Future<Int>, Drop {
+    let cell: RawPtr
+    let mark: Int
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Int> {
+        context.waker.wakeUp()
+        return .Pending
+    }
+
+    function drop(borrow mut self) {
+        heapStore<Int>(self.cell, heapLoad<Int>(self.cell) + self.mark)
+    }
+}
+
+async function asfWaitOnGuard(cell: RawPtr, held: AsfGuard) -> Int {
+    let first = asfDelay(1, 1).await
+    let never = AsfGuard { cell = cell, mark = 100 }.await
+    return first + never
+}
+
+function asfIgnoreWake(target: RawPtr, slot: Number) {}
+
+function asfQuietContext() -> Context {
+    return Context { waker = Waker { wake = asfIgnoreWake, target = Heap.nullPointer(), slot = 0 } }
+}
+
+function asfPollTimes(future: Async<Int>, times: Int) {
+    var driven = move future
+    let context = asfQuietContext()
+    for index in 0..times {
+        let polled = driven.poll(context)
+        expect!(polled.isPending())
+    }
+}
+
+@Test
+function asfDropBeforeFirstPollDestroysParameters() {
+    let cell = allocateBytes(8)
+    heapStore<Int>(cell, 0)
+    asfPollTimes(asfWaitOnGuard(cell, AsfGuard { cell = cell, mark = 1 }), 0)
+    expect!(heapLoad<Int>(cell) == 1)
+    freeBytes(cell)
+}
+
+@Test
+function asfDropAtFirstAwaitDestroysWhatIsLive() {
+    let cell = allocateBytes(8)
+    heapStore<Int>(cell, 0)
+    asfPollTimes(asfWaitOnGuard(cell, AsfGuard { cell = cell, mark = 1 }), 1)
+    expect!(heapLoad<Int>(cell) == 1)
+    freeBytes(cell)
+}
+
+@Test
+function asfDropAtInnerAwaitDestroysTheAwaitedFuture() {
+    let cell = allocateBytes(8)
+    heapStore<Int>(cell, 0)
+    asfPollTimes(asfWaitOnGuard(cell, AsfGuard { cell = cell, mark = 1 }), 4)
+    expect!(heapLoad<Int>(cell) == 101)
+    freeBytes(cell)
+}
+
+async function asfFinishHolding(held: AsfGuard) -> Int {
+    let value = asfDelay(2, 9).await
+    return value + held.mark
+}
+
+@Test
+function asfFinishedBodyDestroysParametersOnce() {
+    let cell = allocateBytes(8)
+    heapStore<Int>(cell, 0)
+    expect!(blockOn(asfFinishHolding(AsfGuard { cell = cell, mark = 1 })) == 10)
+    expect!(heapLoad<Int>(cell) == 1)
+    freeBytes(cell)
+}
+
+// A `Void` future: pending once, self-woken, then ready with nothing.
+struct AsfPause: Future<Void> {
+    var paused: Bool
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Void> {
+        if self.paused { return .Ready }
+        self.paused = true
+        context.waker.wakeUp()
+        return .Pending
+    }
+}
+
+async function asfPauseTwice(words: [String]) -> Number {
+    AsfPause { paused = false }.await
+    AsfPause { paused = false }.await
+    return words.count
+}
+
+@Test
+function asfAwaitingAVoidFutureKeepsNoValue() {
+    expect!(blockOn(asfPauseTwice(["a", "b"])) == 2)
+}
+
+async function asfCountTimesHundred(words: [String]) -> Number {
+    let first = asfPauseTwice(copy words).await
+    return first * 100 + words.count
+}
+
+@Test
+function asfANumberOutputTakesConvertedValues() {
+    expect!(blockOn(asfCountTimesHundred(["a", "b", "c"])) == 303)
+}
+
+@Test
+function asfAVoidPollStillMatchesGenerically() {
+    var pause = AsfPause { paused = true }
+    expect!(pause.poll(asfQuietContext()).isReady())
+}

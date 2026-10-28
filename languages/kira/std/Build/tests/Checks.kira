@@ -1,0 +1,90 @@
+import Foundation
+
+// The checks a graph makes of its own description: each wrong command,
+// stage, step or option is one problem, in the order the graph finds them.
+
+@Test
+function wrongCommandsAreProblems() {
+    var graph = Graph { project: "Try", root: "/", request: BuildRequest {} }
+    let made = graph.command(
+        CommandAction {
+            label: "make",
+            tool: "true",
+            arguments: [.Output("missing")],
+            inputs: [PlacedInput { path: "../up", artifact: Artifact { id: 7 } }],
+            outputs: [Output { name: "a" }, Output { name: "a" }]
+        }
+    )
+    graph.command(
+        CommandAction { label: "make", tool: "true", outputs: [Output { name: "b" }] }
+    )
+    graph.step(Step { name: "all", summary: "", produces: made })
+    graph.step(Step { name: "all", summary: "" })
+    let level = graph.option(
+        Choice { name: "level", summary: "", values: ["1", "2"], fallback: "3" }
+    )
+    expect!((graph.problems[0]) == "make places an input at ../up, outside its working directory")
+    expect!((graph.problems[1]) == "make names no output missing")
+    expect!((graph.problems[2]) == "make names an artifact of another graph")
+    expect!((graph.problems[3]) == "make declares the output `a` wrongly")
+    expect!((graph.problems[4]) == "label make is used twice")
+    expect!((graph.problems[5]) == "step all is declared twice")
+    expect!((graph.problems[6]) == "-level is 3; it takes 1, 2")
+}
+
+@Test
+function wrongStagesAreProblems() {
+    var graph = Graph { project: "Try", root: "/", request: BuildRequest {} }
+    let made = graph.command(
+        CommandAction {
+            label: "configure",
+            tool: "true",
+            outputs: [Output { name: "a" }],
+            followedBy: [
+                CommandStage { tool: "", arguments: [.Output("missing")] },
+                CommandStage { tool: "true", directory: .Workspace }
+            ]
+        }
+    )
+    expect!((joined(graph.problems, "; ")) == "configure runs a stage with no tool; configure names its workspace but has none; configure names no output missing")
+}
+
+// An action naming the file it produces fetches one file from nothing.
+function producedFilesAreCheckedOutcome() -> String {
+    var graph = Graph { project: "Try", root: "/", request: BuildRequest {} }
+    let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    let fetched = graph.native(
+        NativeAction {
+            label: "fetch",
+            code: digest,
+            produces: digest,
+            outputs: [Output { name: "a" }],
+            work: { run in return .Ok }
+        }
+    )
+    graph.native(
+        NativeAction {
+            label: "short",
+            code: digest,
+            produces: "ab",
+            outputs: [Output { name: "b" }],
+            work: { run in return .Ok }
+        }
+    )
+    graph.native(
+        NativeAction {
+            label: "tree",
+            code: digest,
+            produces: digest,
+            inputs: fetched,
+            outputs: [Output { name: "c", kind: .Tree }],
+            work: { run in return .Ok }
+        }
+    )
+    return joined(graph.problems, "; ")
+}
+
+@Test
+function producedFilesAreChecked() {
+    expect!((producedFilesAreCheckedOutcome()) == "short produces ab, which is no SHA-256; tree names the file it produces, so it takes no inputs and makes one file")
+}

@@ -1,0 +1,38 @@
+// The `Test` family every test package declares its cases in, and the values
+// a case answers. `TestRunner` collects the cases of a `--test` build.
+
+enum TestFailure {
+    Runtime(String)
+    Diagnostic(KiraError)
+    Compile(String)
+}
+
+construct Test {
+    @Required function test() -> Any
+    @Required function expect() -> Result<Any, TestFailure>
+}
+
+// Whether a test's value is the one it expected. A literal is a `Number` by
+// default and an integer of any width is held as an `Int`, so numbers compare
+// by value across those types, and a `Float` against the `Number` it spells.
+function sameTestValue(got: borrow Any, expected: borrow Any) -> Bool {
+    if got == expected { return true }
+    match heldNumber(got) {
+        Some(left) -> {
+            match heldNumber(expected) {
+                Some(right) -> return left == right
+                None -> {}
+            }
+        }
+        None -> {}
+    }
+    if got is Float && expected is Number { return (got as Float) == Float(expected as Number) }
+    if got is Number && expected is Float { return Float(got as Number) == (expected as Float) }
+    return false
+}
+
+function heldNumber(value: borrow Any) -> Number? {
+    if value is Number { return .Some(value as Number) }
+    if value is Int { return .Some(Number(value as Int)) }
+    return .None
+}

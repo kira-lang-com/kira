@@ -1,0 +1,314 @@
+import Foundation
+import Kten
+import Archive
+
+// Ed25519 signatures (RFC 8032) by a key kept outside the project, and the
+// joining a signed file is put together with. The key is read when the graph
+// is built, for its public half, which keys each signature: the private half
+// never enters the store or an action record.
+
+/// A private key in a file, PKCS#8 as PEM or DER, which `openssl genpkey -algorithm ed25519` writes, and its public half's 32 bytes.
+public struct SigningKeyFile {
+    /// The key file's path, absolute or from the project root.
+    let path: String
+    /// The public half's 32 bytes, which key each signature.
+    let publicKey: [UN8]
+}
+
+extend Graph {
+    // The Ed25519 key in the file at `path`, absolute or from the project
+    // root. When there is none and `create` holds, a new one is made there,
+    // as PEM readable by its owner alone.
+    function signingKey(borrow mut self, path: borrow String, create: Bool) -> SigningKeyFile {
+        let at = path.startsWith("/") ? copy path : joinPath(root, path)
+        let none: [UN8] = []
+        if !fileExists(at) {
+            if !create {
+                problems.append("no signing key at \(at)")
+                return SigningKeyFile { path: at, publicKey: none }
+            }
+            match makeSigningKeyFile(at) {
+                Ok -> {}
+                Error(failure) -> {
+                    problems.append(failureText(failure))
+                    return SigningKeyFile { path: at, publicKey: none }
+                }
+            }
+        }
+        return match signingKeyPublic(at) {
+            Ok(public) -> SigningKeyFile { path: at, publicKey: public }
+            Error(failure) -> {
+                problems.append(failureText(failure))
+                SigningKeyFile { path: at, publicKey: none }
+            }
+        }
+    }
+
+    // The Ed25519 signature of the file `artifact` by `key`: 64 bytes, as
+    // RFC 8032 and `openssl pkeyutl -sign -rawin` make it.
+    function sign(
+        borrow mut self,
+        name: borrow String,
+        artifact: borrow Artifact,
+        key: borrow SigningKeyFile
+    ) -> Artifact {
+        let label = "sign \(name)"
+        checkArtifact(artifact, label)
+        checkTreePath(name, label)
+        if holdsTree(artifact) { problems.append("\(label) signs a tree, not a file") }
+        let keyPath = copy key.path
+        return native(
+            NativeAction {
+                label: label,
+                code: sourceDigest!("package"),
+                parameters: .Bytes(copy key.publicKey),
+                inputs: [artifact],
+                outputs: [Output { name: lastName(name) }],
+                work: { run in
+                    let message = match readFileBytes(run.inputs[0]) {
+                        Ok(read) -> read
+                        Error(failure) -> return .Error(
+                            .Files("cannot read \(run.inputs[0]): \(traceText(failure))")
+                        )
+                    }
+                    let signature = match signedBy(keyPath, message) {
+                        Ok(made) -> made
+                        Error(failure) -> return .Error(failure)
+                    }
+                    return writeBinaryFile(run.outputs[0], signature, 420)
+                }
+            }
+        )[0]
+    }
+
+    // The files `parts` one after another, with the permission bits `mode`.
+    function concatenated(
+        borrow mut self,
+        name: borrow String,
+        parts: borrow [Artifact],
+        mode: UNumber
+    ) -> Artifact {
+        let label = "concatenate \(name)"
+        checkTreePath(name, label)
+        for part in parts {
+            checkArtifact(part, label)
+            if holdsTree(part) { problems.append("\(label) joins a tree, not a file") }
+        }
+        return native(
+            NativeAction {
+                label: label,
+                code: sourceDigest!("package"),
+                parameters: .Number(mode),
+                inputs: copy parts,
+                outputs: [Output { name: lastName(name) }],
+                work: { run in
+                    var sink = match createArchiveSink(run.outputs[0]) {
+                        Ok(created) -> created
+                        Error(failure) -> return .Error(.Files(archiveFailureText(failure)))
+                    }
+                    for input in run.inputs {
+                        let bytes = match readFileBytes(input) {
+                            Ok(read) -> read
+                            Error(failure) -> return .Error(
+                                .Files("cannot read \(input): \(traceText(failure))")
+                            )
+                        }
+                        sink.append(bytes)
+                        match sink.spill() {
+                            Ok -> {}
+                            Error(failure) -> return .Error(.Files(archiveFailureText(failure)))
+                        }
+                    }
+                    match sink.finish() {
+                        Ok(length) -> {}
+                        Error(failure) -> return .Error(.Files(archiveFailureText(failure)))
+                    }
+                    return match setFileMode(run.outputs[0], mode) {
+                        Ok -> .Ok
+                        Error(failure) -> .Error(
+                            .Files(
+                                "cannot set the mode of \(run.outputs[0]): \(traceText(failure))"
+                            )
+                        )
+                    }
+                }
+            }
+        )[0]
+    }
+
+    // The file `artifact` with zero bytes after it up to a multiple of
+    // `multiple` bytes, under its own permission bits.
+    function padded(
+        borrow mut self,
+        name: borrow String,
+        artifact: borrow Artifact,
+        multiple: UNumber
+    ) -> Artifact {
+        let label = "pad \(name)"
+        checkArtifact(artifact, label)
+        checkTreePath(name, label)
+        if holdsTree(artifact) { problems.append("\(label) pads a tree, not a file") }
+        if multiple < 1 { problems.append("\(label) pads to a multiple of \(multiple)") }
+        return native(
+            NativeAction {
+                label: label,
+                code: sourceDigest!("package"),
+                parameters: .Number(multiple),
+                inputs: [artifact],
+                outputs: [Output { name: lastName(name) }],
+                work: { run in
+                    match placeCopy(run.inputs[0], run.outputs[0], run.modes[0]) {
+                        Ok -> {}
+                        Error(failure) -> return .Error(failure)
+                    }
+                    let file = match openFileHandle(run.outputs[0], .ReadWrite) {
+                        Ok(opened) -> opened
+                        Error(failure) -> return .Error(
+                            .Files("cannot open \(run.outputs[0]): \(traceText(failure))")
+                        )
+                    }
+                    let sized = match file.size() {
+                        Ok(length) -> file.truncate(ceil(length / multiple) * multiple)
+                        Error(failure) -> .Error(failure)
+                    }
+                    match file.close() {
+                        Ok -> {}
+                        Error(failure) -> absorb failure
+                    }
+                    return match sized {
+                        Ok -> .Ok
+                        Error(failure) -> .Error(
+                            .Files("cannot pad \(run.outputs[0]): \(traceText(failure))")
+                        )
+                    }
+                }
+            }
+        )[0]
+    }
+}
+
+// Makes a new Ed25519 key at `path` as PEM, its file readable by its owner
+// alone before the key is in it.
+function makeSigningKeyFile(path: borrow String) -> Result<Void, BuildFailure> {
+    let der = match generateSigningKey(.Ed25519) {
+        Ok(made) -> made
+        Error(failure) -> return .Error(.Failed("cannot make a signing key: \(traceText(failure))"))
+    }
+    match makePathTree(parentPath(path)) {
+        Ok -> {}
+        Error(failure) -> return .Error(failure)
+    }
+    let empty: [UN8] = []
+    match writeFileBytes(path, empty) {
+        Ok -> {}
+        Error(failure) -> return .Error(.Files("cannot write \(path): \(traceText(failure))"))
+    }
+    match setFileMode(path, 384) {
+        Ok -> {}
+        Error(failure) -> return .Error(
+            .Files("cannot set the mode of \(path): \(traceText(failure))")
+        )
+    }
+    return match writeFileBytes(path, pemText("PRIVATE KEY", der).utf8()) {
+        Ok -> .Ok
+        Error(failure) -> .Error(.Files("cannot write \(path): \(traceText(failure))"))
+    }
+}
+
+// The PKCS#8 DER of the key file at `path`, PEM or DER.
+function signingKeyDer(path: borrow String) -> Result<[UN8], BuildFailure> {
+    let bytes = match readFileBytes(path) {
+        Ok(read) -> read
+        Error(failure) -> return .Error(.Files("cannot read \(path): \(traceText(failure))"))
+    }
+    let text = textFromBytes(bytes).or("")
+    if !text.startsWith("-----BEGIN") { return .Ok(bytes) }
+    var encoded: [String] = []
+    var inside = false
+    for line in text.split("\n") {
+        let trimmed = line.trim()
+        if trimmed.startsWith("-----BEGIN") {
+            inside = true
+        } else if trimmed.startsWith("-----END") {
+            break
+        } else if inside {
+            encoded.append(trimmed)
+        }
+    }
+    return match base64Decoded(joined(encoded, "")) {
+        Some(der) -> .Ok(der)
+        None -> .Error(.Failed("the signing key at \(path) is not PEM"))
+    }
+}
+
+// The public half of the Ed25519 key in the file at `path`.
+function signingKeyPublic(path: borrow String) -> Result<[UN8], BuildFailure> {
+    let der = match signingKeyDer(path) {
+        Ok(read) -> read
+        Error(failure) -> return .Error(failure)
+    }
+    let key = match loadSigningKey(der) {
+        Ok(loaded) -> loaded
+        Error(failure) -> return .Error(
+            .Failed("the signing key at \(path) does not load: \(traceText(failure))")
+        )
+    }
+    let public = key.publicKey()
+    match key.release() {
+        Ok -> {}
+        Error(failure) -> absorb failure
+    }
+    return match public {
+        Ok(bytes) -> {
+            if bytes.count != 32 {
+                return .Error(.Failed("the signing key at \(path) is not an Ed25519 key"))
+            }
+            .Ok(bytes)
+        }
+        Error(failure) -> .Error(
+            .Failed("the signing key at \(path) has no public half: \(traceText(failure))")
+        )
+    }
+}
+
+// The Ed25519 signature of `message` by the key in the file at `path`.
+function signedBy(path: borrow String, message: borrow [UN8]) -> Result<[UN8], BuildFailure> {
+    let der = match signingKeyDer(path) {
+        Ok(read) -> read
+        Error(failure) -> return .Error(failure)
+    }
+    let key = match loadSigningKey(der) {
+        Ok(loaded) -> loaded
+        Error(failure) -> return .Error(
+            .Failed("the signing key at \(path) does not load: \(traceText(failure))")
+        )
+    }
+    let signature = key.sign(.Ed25519, message)
+    match key.release() {
+        Ok -> {}
+        Error(failure) -> absorb failure
+    }
+    return match signature {
+        Ok(bytes) -> .Ok(bytes)
+        Error(failure) -> .Error(.Failed("cannot sign with \(path): \(traceText(failure))"))
+    }
+}
+
+namespace Pem {
+    // How many characters a PEM line holds.
+    let line: Number = 64
+}
+
+// `bytes` as a PEM block of type `label` (RFC 7468).
+function pemText(label: borrow String, bytes: borrow [UN8]) -> String {
+    let encoded = base64Text(bytes)
+    var lines = ["-----BEGIN \(label)-----"]
+    var at: Number = 0
+    while at < encoded.count {
+        lines.append(encoded.substring(at, min(at + Pem.line, encoded.count)))
+        at += Pem.line
+    }
+    lines.append("-----END \(label)-----")
+    lines.append("")
+    return joined(lines, "\n")
+}

@@ -1,0 +1,85 @@
+import Foundation
+import Kten
+import Elf
+
+// Checks a file passes before what is downstream takes it (DESIGN.md section
+// 5.6): a check is Kira code, keyed like a native action by its code and
+// parameters, so it runs again only when they or the file change.
+
+/// A check of one file, which passes before what is downstream takes it.
+public struct FileCheck {
+    /// What the check is, as its label reads.
+    let label: String
+    /// The code the check runs: `sourceDigest!()`, written in the package `test` is in.
+    let code: String
+    /// Every value `test` reads besides the file.
+    let parameters: Kten = .Null
+    /// Whether the file at the path passes; the failure says why not.
+    let test: (String) -> Result<Void, String>
+}
+
+extend Graph {
+    // The file `artifact` unchanged, as `name`, once `check` passed on it.
+    function checked(
+        borrow mut self,
+        name: borrow String,
+        artifact: borrow Artifact,
+        check: borrow FileCheck
+    ) -> Artifact {
+        let label = "check \(name): \(check.label)"
+        checkArtifact(artifact, label)
+        checkTreePath(name, label)
+        if holdsTree(artifact) { problems.append("\(label) checks a tree, not a file") }
+        if check.code.count != 64 {
+            problems.append("\(label) names no code; write `code: sourceDigest!()`")
+        }
+        let test = check.test
+        return native(
+            NativeAction {
+                label: label,
+                code: sourceDigest!("package"),
+                parameters: ktenBare(
+                    [
+                        ktenField("code", .Text(copy check.code)),
+                        ktenField("parameters", copy check.parameters)
+                    ]
+                ),
+                inputs: [artifact],
+                outputs: [Output { name: lastName(name) }],
+                work: { run in
+                    match test(run.inputs[0]) {
+                        Ok -> {}
+                        Error(why) -> return .Error(.Failed(why))
+                    }
+                    match placeCopy(run.inputs[0], run.outputs[0], run.modes[0]) {
+                        Ok -> {}
+                        Error(failure) -> return .Error(failure)
+                    }
+                    run.copied(run.outputs[0], run.digests[0])
+                    return .Ok
+                }
+            }
+        )[0]
+    }
+}
+
+/// A check that a file is an ELF executable or shared library built for `machine`, its `e_machine`: 62 is x86_64, 183 is aarch64.
+public function machineCheck(machine: Number) -> FileCheck {
+    return FileCheck {
+        label: "built for machine \(machine)",
+        code: sourceDigest!("package"),
+        parameters: .Number(machine),
+        test: { path in
+            let bytes = match readFileBytes(path) {
+                Ok(read) -> read
+                Error(failure) -> return .Error("cannot read \(path): \(traceText(failure))")
+            }
+            let found = match elfMachine(bytes) {
+                Ok(read) -> read
+                Error(failure) -> return .Error(elfFailureText(failure))
+            }
+            if found != machine { return .Error("built for machine \(found), not \(machine)") }
+            return .Ok
+        }
+    }
+}

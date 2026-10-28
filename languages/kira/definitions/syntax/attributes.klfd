@@ -1,0 +1,192 @@
+// The annotations the compiler gives meaning to, each declared here once, as
+// Swift's `DeclAttr.def` declares its built-in attributes: how a source
+// spells it and what it may be written on. The parser resolves a written name
+// against `writtenAttributes`, and code that reads an annotation asks for its
+// attribute, never for its spelling. An annotation that names no attribute
+// names a macro or a property wrapper, which takes it up; one left once the
+// macros have run names nothing (`checkAnnotations`).
+//
+// The engine, entry and export attributes are KLF-RIDL.md section 27.3's.
+enum Attribute {
+    Main
+    MainThread
+    AtExit
+    Runtime
+    Native
+    Export
+    Required
+    TypeTable
+    Open
+    Content
+    // `@Service("symbol")`, `@Ridl("Module")` and `@Derive(A, B)`: what each
+    // holds is its arguments.
+    Service
+    Ridl
+    Derive
+    // `@Instance(Number)` on a generic declaration: an instance it exports
+    // under its own symbols (KLF-RIDL section 23.5). It holds the arguments.
+    Instance
+    // `@FFI.Form { ... }`, whose mark sits beside the tree at the
+    // annotation's span (`foreignMarkOf`).
+    Foreign
+    // `@ThreadLocal let`: a global each thread has its own copy of, made on
+    // the thread's first read.
+    ThreadLocal
+    // The compiler's own, which it puts on a function it reads or makes and
+    // no source writes: `comptime` and `async`, a trait's member, a computed
+    // member's getter and setter, and the part a function plays in a
+    // crossing family's witness tables, its argument (`witnessRole`).
+    Comptime
+    Async
+    Trait
+    Computed
+    ComputedSetter
+    Witness
+    // A family member matching on its enum's cases, which a generic
+    // declaration's instance adds to as it is minted.
+    Dispatch
+    // A function read without its body, which a unit of its own package
+    // compiles (`separate-packages.klfd`).
+    Elsewhere
+}
+
+// What an annotation is written on.
+enum AttributeSite {
+    OnFunction
+    OnField
+    OnTypeDeclaration
+    OnGlobal
+}
+
+// The attributes a source may write, which `attributeNamed` resolves names
+// against.
+function writtenAttributes() -> [Attribute] {
+    var attributes: [Attribute] = []
+    listAttribute(attributes, .Main)
+    listAttribute(attributes, .MainThread)
+    listAttribute(attributes, .AtExit)
+    listAttribute(attributes, .Runtime)
+    listAttribute(attributes, .Native)
+    listAttribute(attributes, .Export)
+    listAttribute(attributes, .Required)
+    listAttribute(attributes, .TypeTable)
+    listAttribute(attributes, .Open)
+    listAttribute(attributes, .Content)
+    listAttribute(attributes, .Service)
+    listAttribute(attributes, .Ridl)
+    listAttribute(attributes, .Derive)
+    listAttribute(attributes, .Instance)
+    listAttribute(attributes, .Foreign)
+    listAttribute(attributes, .ThreadLocal)
+    return attributes
+}
+
+// An attribute case named bare in a list could be another enum's of the same
+// name; a parameter of its type says whose it is.
+function listAttribute(attributes: borrow mut [Attribute], attribute: Attribute) {
+    attributes.append(attribute)
+}
+
+function attributeSpelling(attribute: Attribute) -> String {
+    match attribute {
+        Main -> return "Main"
+        MainThread -> return "MainThread"
+        AtExit -> return "AtExit"
+        Runtime -> return "Runtime"
+        Native -> return "Native"
+        Export -> return "Export"
+        Required -> return "Required"
+        TypeTable -> return "TypeTable"
+        Open -> return "Open"
+        Content -> return "Content"
+        Service -> return "Service"
+        Ridl -> return "Ridl"
+        Derive -> return "Derive"
+        Instance -> return "Instance"
+        Foreign -> return "FFI"
+        ThreadLocal -> return "ThreadLocal"
+        Comptime -> return "Comptime"
+        Async -> return "Async"
+        Trait -> return "Trait"
+        Computed -> return "Computed"
+        ComputedSetter -> return "ComputedSetter"
+        Witness -> return "Witness"
+        Dispatch -> return "Dispatch"
+        Elsewhere -> return "Elsewhere"
+    }
+}
+
+// Whether the attribute may be written on `site`.
+function attributeApplies(attribute: Attribute, site: AttributeSite) -> Bool {
+    match attribute {
+        Main -> return site == .OnFunction || site == .OnTypeDeclaration
+        MainThread -> return site == .OnFunction
+        AtExit -> return site == .OnFunction
+        Runtime -> return site == .OnFunction
+        Native -> return site == .OnFunction
+        Export -> return site == .OnFunction
+        Required -> return site == .OnFunction || site == .OnField
+        TypeTable -> return site == .OnFunction
+        Open -> return site == .OnTypeDeclaration
+        Content -> return site == .OnField
+        Service -> return site == .OnFunction
+        Ridl -> return site == .OnFunction
+        Derive -> return site == .OnTypeDeclaration
+        Instance -> return site == .OnTypeDeclaration
+        Foreign -> return site != .OnGlobal
+        ThreadLocal -> return site == .OnGlobal
+        Comptime -> return site == .OnFunction
+        Async -> return site == .OnFunction
+        Trait -> return site == .OnFunction
+        Computed -> return site == .OnFunction
+        ComputedSetter -> return site == .OnFunction
+        Witness -> return site == .OnFunction
+        Dispatch -> return site == .OnFunction
+        Elsewhere -> return site == .OnFunction
+    }
+}
+
+// The attribute a source names with `name`, if it names one.
+function attributeNamed(name: String) -> Optional<Attribute> {
+    for attribute in writtenAttributes() {
+        if attributeSpelling(attribute) == name { return .Some(attribute) }
+    }
+    return .None
+}
+
+// An annotation the compiler puts on a declaration at `span`.
+function implicitAnnotation(attribute: Attribute, span: Span) -> Annotation {
+    return Annotation { name = Identifier { text = attributeSpelling(attribute), span = span }, attribute = .Some(attribute), arguments = [] }
+}
+
+// One the compiler puts on a declaration it makes, holding `text`, as
+// `@Ridl("Module")` holds its module.
+function implicitTextAnnotation(tree: borrow mut SyntaxTree, attribute: Attribute, text: String, span: Span) -> Annotation {
+    let argument = tree.addExpression(.StringLiteral(.Some(text)), span)
+    return Annotation { name = Identifier { text = attributeSpelling(attribute), span = span }, attribute = .Some(attribute), arguments = [argument] }
+}
+
+function isAttribute(annotation: Annotation, attribute: Attribute) -> Bool {
+    match annotation.attribute {
+        Some(found) -> return found == attribute
+        None -> return false
+    }
+}
+
+function hasAttribute(annotations: [Annotation], attribute: Attribute) -> Bool {
+    for annotation in annotations {
+        if isAttribute(annotation, attribute) { return true }
+    }
+    return false
+}
+
+// The text an annotation holding one is written with: `@Service`'s symbol,
+// `@Ridl`'s module, a witness role.
+function attributeText(tree: SyntaxTree, annotations: [Annotation], attribute: Attribute) -> Optional<String> {
+    for annotation in annotations {
+        if isAttribute(annotation, attribute) && annotation.arguments.count == 1 {
+            return tree.expressions[annotation.arguments[0]].kind.spelledText()
+        }
+    }
+    return .None
+}

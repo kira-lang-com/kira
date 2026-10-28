@@ -1,0 +1,717 @@
+import Foundation
+
+// The .xz reader (the xz file format 1.2.1, and LZMA2 and LZMA as liblzma
+// decodes them): streams of blocks, each one LZMA2 filter, read one LZMA2
+// chunk at a time so a large archive never sits whole in memory. Every block's
+// check and the index are verified.
+
+namespace XzFormat {
+    let headerSize: Number = 12
+    // The check types: none, CRC-32, CRC-64, SHA-256.
+    let noCheck: Number = 0
+    let crc32Check: Number = 1
+    let crc64Check: Number = 4
+    let sha256Check: Number = 10
+    let lzma2Filter: Number = 33
+    // Above this, an LZMA2 dictionary size byte means nothing.
+    let largestDictionary: Number = 40
+}
+
+// Where each kind of LZMA probability starts in `XzReader.probabilities`.
+namespace LzmaSlots {
+    let isMatch: Number = 0
+    let isRep: Number = 192
+    let isRepG0: Number = 204
+    let isRepG1: Number = 216
+    let isRepG2: Number = 228
+    let isRep0Long: Number = 240
+    let distanceSlot: Number = 432
+    let distanceSpecial: Number = 688
+    let distanceAlign: Number = 802
+    let matchLength: Number = 818
+    let repeatLength: Number = 1332
+    let literal: Number = 1846
+    // A length coder's parts: two choices, then 16 low and 16 middle trees
+    // of 8, then one high tree of 256.
+    let lengthLow: Number = 2
+    let lengthMiddle: Number = 130
+    let lengthHigh: Number = 258
+}
+
+enum XzPhase {
+    Stream
+    Block
+    Chunks
+    Done
+}
+
+/// A reader of an .xz file, giving its decompressed bytes one run at a time.
+public struct XzReader {
+    /// The file's bytes, as read.
+    let bytes: [UN8]
+    /// Where the reader is in `bytes`.
+    var at: Number = 0
+    /// What the reader expects next: a stream header, a block header, LZMA2 chunks, or the end.
+    var phase: XzPhase = .Stream
+    /// The stream's check type: none, CRC-32 or CRC-64.
+    var checkType: Number = 0
+    /// The running CRC-32 of the block's output.
+    var crc: Number = 0
+    /// The running CRC-64 of the block's output. It is kept as an unsigned number: it is only xored, masked and shifted right, so it never leaves 64 bits.
+    var crc64: UNumber = 0
+    /// The CRC-32 table, one entry per byte value.
+    let crcs: [Number]
+    /// The CRC-64 table, one entry per byte value.
+    let crc64s: [UNumber]
+    /// The blocks of the stream so far, as the index lists them: each block's unpadded size, then its uncompressed size.
+    var listed: [Number] = []
+    /// Where the current block's header starts in `bytes`.
+    var blockStart: Number = 0
+    /// The byte size of the current block's header.
+    var blockHeaderSize: Number = 0
+    /// Where the current block's data starts in `bytes`.
+    var dataStart: Number = 0
+    /// How many uncompressed bytes the current block has produced.
+    var blockOutput: Number = 0
+    /// The LZMA2 dictionary: the most recent output, up to `dictionarySize` bytes.
+    var window: [UN8] = []
+    /// Where the next byte goes in `window`.
+    var position: Number = 0
+    /// The dictionary's size in bytes, from the block header.
+    var dictionarySize: Number = 0
+    /// How many bytes have gone into the dictionary since it was last reset.
+    var total: Number = 0
+    /// Whether the next LZMA2 chunk must reset the dictionary.
+    var needDictionaryReset: Bool = true
+    /// Whether the next LZMA2 chunk must give the LZMA properties.
+    var needProperties: Bool = true
+    /// The number of literal context bits in the LZMA properties.
+    var literalBits: Number = 0
+    /// The mask that keeps the position bits of the LZMA properties.
+    var positionMask: Number = 0
+    /// The mask that keeps the literal position bits of the LZMA properties.
+    var literalPositionMask: Number = 0
+    /// The LZMA state machine's state, from 0 to 11.
+    var state: Number = 0
+    /// The most recent match distance.
+    var rep0: Number = 0
+    /// The second most recent match distance.
+    var rep1: Number = 0
+    /// The third most recent match distance.
+    var rep2: Number = 0
+    /// The fourth most recent match distance.
+    var rep3: Number = 0
+    /// How many bytes of a match are still to copy into the output.
+    var pendingLength: Number = 0
+    /// Every LZMA probability, at the offsets given by `LzmaSlots`.
+    var probabilities: [Number] = []
+    /// The range decoder's range.
+    var range: Number = 0
+    /// The range decoder's code value.
+    var code: Number = 0
+    /// Where the current LZMA2 chunk's compressed data ends in `bytes`.
+    var chunkEnd: Number = 0
+    /// Whether the range decoder read past the end of the chunk.
+    var overrun: Bool = false
+    /// The bytes decoded since the last run was returned.
+    var out: [UN8] = []
+
+    /// The next run of decompressed bytes, or an empty run once the file is read. Fails when the file is malformed.
+    function next(borrow mut self) -> Result<[UN8], ArchiveFailure> {
+        while true {
+            match phase {
+                Stream -> match streamStart() {
+                    Ok -> {}
+                    Error(failure) -> return .Error(failure)
+                }
+                Block -> match blockHeader() {
+                    Ok -> {}
+                    Error(failure) -> return .Error(failure)
+                }
+                Chunks -> {
+                    match chunk() {
+                        Ok -> {}
+                        Error(failure) -> return .Error(failure)
+                    }
+                    if out.count > 0 {
+                        let produced = copy out
+                        out = []
+                        return .Ok(produced)
+                    }
+                }
+                Done -> {
+                    let none: [UN8] = []
+                    return .Ok(none)
+                }
+            }
+        }
+        let none: [UN8] = []
+        return .Ok(none)
+    }
+
+    /// The byte at `index` of the file, or 0 past its end.
+    function byteAt(borrow self, index: Number) -> Number {
+        return index < bytes.count ? Number(bytes[index]) : 0
+    }
+
+    /// The little-endian 32-bit number at `index` of the file.
+    function little32(borrow self, index: Number) -> Number {
+        return byteAt(index) | (byteAt(index + 1) << 8) | (byteAt(index + 2) << 16)
+            | (byteAt(index + 3) << 24)
+    }
+
+    /// The big-endian 16-bit number at `index` of the file.
+    function big16(borrow self, index: Number) -> Number {
+        return (byteAt(index) << 8) | byteAt(index + 1)
+    }
+
+    /// The multibyte integer at `at`, moving past it. Fails when it runs past the end or is too long.
+    function varint(borrow mut self) -> Result<Number, ArchiveFailure> {
+        var value: Number = 0
+        for shift in 0..9 {
+            if at >= bytes.count { return .Error(.Malformed("an xz integer runs past the end")) }
+            let byte = Number(bytes[at])
+            at += 1
+            value = value | ((byte & 127) << (shift * 7))
+            if byte < 128 { return .Ok(value) }
+        }
+        return .Error(.Malformed("an xz integer is too long"))
+    }
+
+    /// The CRC-32 of `count` bytes of the file, from `from`.
+    function crcOf(borrow self, from: Number, count: Number) -> Number {
+        var value: Number = 4294967295
+        for index in from..(from + count) {
+            value = crcs[(value ^ byteAt(index)) & 255] ^ (value >> 8)
+        }
+        return value ^ 4294967295
+    }
+
+    /// Reads a stream header, after the zero padding that may end the file. Ends the reader when only that padding is left.
+    function streamStart(borrow mut self) -> Result<Void, ArchiveFailure> {
+        var zeros: Number = 0
+        while at < bytes.count && bytes[at] == 0 {
+            at += 1
+            zeros += 1
+        }
+        if at == bytes.count && at > 0 {
+            if zeros % 4 != 0 { return .Error(.Malformed("xz stream padding is not whole words")) }
+            phase = .Done
+            return .Ok
+        }
+        let magic: [Number] = [253, 55, 122, 88, 90, 0]
+        for index in 0..6 {
+            if byteAt(at + index) != magic[index] {
+                return .Error(.Malformed("not an xz stream"))
+            }
+        }
+        if byteAt(at + 6) != 0 || byteAt(at + 7) > 15 {
+            return .Error(.Unsupported("xz stream flags \(byteAt(at + 6)) \(byteAt(at + 7))"))
+        }
+        if crcOf(at + 6, 2) != little32(at + 8) {
+            return .Error(.Malformed("the xz stream header's CRC-32 is wrong"))
+        }
+        checkType = byteAt(at + 7)
+        let known = checkType == XzFormat.noCheck || checkType == XzFormat.crc32Check
+            || checkType == XzFormat.crc64Check
+        if !known { return .Error(.Unsupported("xz check type \(checkType)")) }
+        at += XzFormat.headerSize
+        listed = []
+        phase = .Block
+        return .Ok
+    }
+
+    /// The byte size of the stream's check: 4 for CRC-32, 8 for CRC-64, 0 for none.
+    function checkSize(borrow self) -> Number {
+        return match checkType {
+            1 -> 4
+            4 -> 8
+            else -> 0
+        }
+    }
+
+    /// Reads a block header, or the index and stream footer where the blocks end.
+    function blockHeader(borrow mut self) -> Result<Void, ArchiveFailure> {
+        if at >= bytes.count { return .Error(.Malformed("an xz stream has no index")) }
+        if bytes[at] == 0 { return index() }
+        blockStart = at
+        blockHeaderSize = (Number(bytes[at]) + 1) * 4
+        let end = at + blockHeaderSize
+        if end > bytes.count { return .Error(.Malformed("an xz block header runs past the end")) }
+        if crcOf(at, blockHeaderSize - 4) != little32(end - 4) {
+            return .Error(.Malformed("an xz block header's CRC-32 is wrong"))
+        }
+        let flags = Number(bytes[at + 1])
+        if (flags & 60) != 0 { return .Error(.Unsupported("xz block flags \(flags)")) }
+        at += 2
+        if (flags & 64) != 0 {
+            match varint() {
+                Ok -> {}
+                Error(failure) -> return .Error(failure)
+            }
+        }
+        if (flags & 128) != 0 {
+            match varint() {
+                Ok -> {}
+                Error(failure) -> return .Error(failure)
+            }
+        }
+        if (flags & 3) != 0 { return .Error(.Unsupported("an xz filter chain besides LZMA2")) }
+        let filter = match varint() {
+            Ok(id) -> id
+            Error(failure) -> return .Error(failure)
+        }
+        if filter != XzFormat.lzma2Filter {
+            return .Error(.Unsupported("the xz filter \(filter)"))
+        }
+        let propertiesSize = match varint() {
+            Ok(size) -> size
+            Error(failure) -> return .Error(failure)
+        }
+        if propertiesSize != 1 { return .Error(.Malformed("LZMA2 properties are one byte")) }
+        let dictionaryByte = byteAt(at)
+        if dictionaryByte > XzFormat.largestDictionary {
+            return .Error(.Malformed("an LZMA2 dictionary size byte of \(dictionaryByte)"))
+        }
+        dictionarySize = dictionaryByte == XzFormat.largestDictionary
+        ? 4294967295
+        : (2 | (dictionaryByte & 1)) << (trunc(dictionaryByte / 2) + 11)
+        at = end
+        dataStart = at
+        blockOutput = 0
+        crc = 4294967295
+        crc64 = 18446744073709551615
+        window = []
+        position = 0
+        total = 0
+        needDictionaryReset = true
+        needProperties = true
+        phase = .Chunks
+        return .Ok
+    }
+
+    /// Checks the index against the blocks read, then reads the stream footer.
+    function index(borrow mut self) -> Result<Void, ArchiveFailure> {
+        let start = at
+        at += 1
+        let count = match varint() {
+            Ok(value) -> value
+            Error(failure) -> return .Error(failure)
+        }
+        if count * 2 != listed.count {
+            return .Error(.Malformed("the xz index lists \(count) blocks"))
+        }
+        for record in 0..(count * 2) {
+            let value = match varint() {
+                Ok(read) -> read
+                Error(failure) -> return .Error(failure)
+            }
+            if value != listed[record] {
+                return .Error(.Malformed("the xz index does not match block \(trunc(record / 2))"))
+            }
+        }
+        while (at - start) % 4 != 0 {
+            if byteAt(at) != 0 { return .Error(.Malformed("xz index padding is not zero")) }
+            at += 1
+        }
+        if crcOf(start, at - start) != little32(at) {
+            return .Error(.Malformed("the xz index's CRC-32 is wrong"))
+        }
+        at += 4
+        let footer = at
+        if footer + 12 > bytes.count || byteAt(footer + 10) != 89 || byteAt(footer + 11) != 90 {
+            return .Error(.Malformed("an xz stream has no footer"))
+        }
+        if crcOf(footer + 4, 6) != little32(footer) {
+            return .Error(.Malformed("the xz stream footer's CRC-32 is wrong"))
+        }
+        if (little32(footer + 4) + 1) * 4 != footer - start {
+            return .Error(.Malformed("the xz stream footer names another index size"))
+        }
+        at = footer + 12
+        phase = .Stream
+        return .Ok
+    }
+
+    /// Decodes one LZMA2 chunk into the output, or ends the block.
+    function chunk(borrow mut self) -> Result<Void, ArchiveFailure> {
+        if at >= bytes.count { return .Error(.Malformed("an LZMA2 stream runs past the end")) }
+        let control = Number(bytes[at])
+        at += 1
+        if control == 0 { return blockEnd() }
+        if control == 1 || control == 2 {
+            if control == 1 {
+                resetDictionary()
+                needProperties = true
+            } else if needDictionaryReset {
+                return .Error(.Malformed("an LZMA2 stream starts without a dictionary"))
+            }
+            let size = big16(at) + 1
+            at += 2
+            if at + size > bytes.count {
+                return .Error(.Malformed("an LZMA2 chunk runs past the end"))
+            }
+            for index in at..(at + size) { put(bytes[index]) }
+            at += size
+            return finishChunk()
+        }
+        if control < 128 { return .Error(.Malformed("an LZMA2 control byte of \(control)")) }
+        let unpacked = ((control & 31) << 16) + big16(at) + 1
+        let packed = big16(at + 2) + 1
+        at += 4
+        if control >= 224 {
+            resetDictionary()
+        } else if needDictionaryReset {
+            return .Error(.Malformed("an LZMA2 stream starts without a dictionary"))
+        }
+        if control >= 192 {
+            match readProperties(byteAt(at)) {
+                Ok -> {}
+                Error(failure) -> return .Error(failure)
+            }
+            at += 1
+            needProperties = false
+            resetState()
+        } else if needProperties {
+            return .Error(.Malformed("an LZMA2 chunk comes before its properties"))
+        } else if control >= 160 {
+            resetState()
+        }
+        let start = at
+        chunkEnd = at + packed
+        if chunkEnd > bytes.count { return .Error(.Malformed("an LZMA2 chunk runs past the end")) }
+        if byteAt(at) != 0 { return .Error(.Malformed("an LZMA chunk's range coder is wrong")) }
+        code = (byteAt(at + 1) << 24) | (byteAt(at + 2) << 16) | (byteAt(at + 3) << 8)
+            | byteAt(at + 4)
+        range = 4294967295
+        at += 5
+        overrun = false
+        match decode(unpacked) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        if overrun { return .Error(.Malformed("an LZMA chunk reads past its end")) }
+        at = start + packed
+        return finishChunk()
+    }
+
+    /// Adds the bytes of a finished chunk to the block's running check and output count.
+    function finishChunk(borrow mut self) -> Result<Void, ArchiveFailure> {
+        blockOutput += out.count
+        match checkType {
+            1 -> {
+                for byte in out { crc = crcs[(crc ^ Number(byte)) & 255] ^ (crc >> 8) }
+            }
+            4 -> {
+                for byte in out {
+                    crc64 = crc64s[(crc64 ^ Number(byte)) & 255] ^ (crc64 >> 8)
+                }
+            }
+            else -> {}
+        }
+        return .Ok
+    }
+
+    /// Checks the block's padding and check, then records the block in the index.
+    function blockEnd(borrow mut self) -> Result<Void, ArchiveFailure> {
+        if pendingLength > 0 { return .Error(.Malformed("an LZMA2 block ends inside a match")) }
+        let unpadded = at - blockStart + checkSize()
+        while (at - dataStart) % 4 != 0 {
+            if byteAt(at) != 0 { return .Error(.Malformed("xz block padding is not zero")) }
+            at += 1
+        }
+        if at + checkSize() > bytes.count { return .Error(.Malformed("an xz check is cut off")) }
+        let intact = match checkType {
+            1 -> (crc ^ 4294967295) == little32(at)
+            4 -> (crc64 ^ 18446744073709551615) == (little32(at) | (little32(at + 4) << 32))
+            else -> true
+        }
+        if !intact { return .Error(.Malformed("an xz block's check is wrong")) }
+        at += checkSize()
+        listed.append(unpadded)
+        listed.append(blockOutput)
+        phase = .Block
+        return .Ok
+    }
+
+    /// Empties the dictionary, and allows the chunks that follow to use it.
+    function resetDictionary(borrow mut self) {
+        window = []
+        position = 0
+        total = 0
+        needDictionaryReset = false
+    }
+
+    /// Reads the LZMA properties byte: the literal, position and literal position bits. Sizes the probabilities to match.
+    function readProperties(borrow mut self, byte: Number) -> Result<Void, ArchiveFailure> {
+        if byte >= 225 { return .Error(.Malformed("LZMA properties of \(byte)")) }
+        literalBits = byte % 9
+        let literalPositionBits = trunc(byte / 9) % 5
+        let positionBits = trunc(byte / 45)
+        if literalBits + literalPositionBits > 4 {
+            return .Error(.Malformed("LZMA2 literal bits above 4"))
+        }
+        positionMask = (1 << positionBits) - 1
+        literalPositionMask = (1 << literalPositionBits) - 1
+        let size = LzmaSlots.literal + (768 << (literalBits + literalPositionBits))
+        if probabilities.count != size {
+            probabilities = []
+            for slot in 0..size { probabilities.append(1024) }
+        }
+        return .Ok
+    }
+
+    /// Resets every probability and the LZMA state to their starting values.
+    function resetState(borrow mut self) {
+        for slot in 0..probabilities.count { probabilities[slot] = 1024 }
+        state = 0
+        rep0 = 0
+        rep1 = 0
+        rep2 = 0
+        rep3 = 0
+        pendingLength = 0
+    }
+
+    /// Puts one byte into the dictionary and the output.
+    function put(borrow mut self, byte: UN8) {
+        if position == window.count {
+            window.append(byte)
+        } else {
+            window[position] = byte
+        }
+        position += 1
+        if position == dictionarySize { position = 0 }
+        total += 1
+        out.append(byte)
+    }
+
+    /// The byte `distance + 1` back in the dictionary.
+    function back(borrow self, distance: Number) -> UN8 {
+        var from = position - distance - 1
+        if from < 0 { from += window.count }
+        return window[from]
+    }
+
+    /// Decodes one bit with the probability at `slot`.
+    function bit(borrow mut self, slot: Number) -> Number {
+        if range < 16777216 {
+            var next: Number = 0
+            if at < chunkEnd {
+                next = Number(bytes[at])
+                at += 1
+            } else {
+                overrun = true
+            }
+            range = (range << 8) & 4294967295
+            code = ((code << 8) | next) & 4294967295
+        }
+        let probability = probabilities[slot]
+        let bound = (range >> 11) * probability
+        if code < bound {
+            range = bound
+            probabilities[slot] = probability + ((2048 - probability) >> 5)
+            return 0
+        }
+        range -= bound
+        code -= bound
+        probabilities[slot] = probability - (probability >> 5)
+        return 1
+    }
+
+    /// Decodes `count` bits, each with a fixed probability of one half.
+    function directBits(borrow mut self, count: Number) -> Number {
+        var value: Number = 0
+        for each in 0..count {
+            if range < 16777216 {
+                var next: Number = 0
+                if at < chunkEnd {
+                    next = Number(bytes[at])
+                    at += 1
+                } else {
+                    overrun = true
+                }
+                range = (range << 8) & 4294967295
+                code = ((code << 8) | next) & 4294967295
+            }
+            range = range >> 1
+            if code >= range {
+                code -= range
+                value = (value << 1) | 1
+            } else {
+                value = value << 1
+            }
+        }
+        return value
+    }
+
+    /// Decodes a `count`-bit value, most significant bit first, with the probabilities at `base`.
+    function tree(borrow mut self, base: Number, count: Number) -> Number {
+        var node: Number = 1
+        for each in 0..count { node = (node << 1) | bit(base + node) }
+        return node - (1 << count)
+    }
+
+    /// Decodes a `count`-bit value, least significant bit first, with the probabilities at `base`.
+    function reverseTree(borrow mut self, base: Number, count: Number) -> Number {
+        var node: Number = 1
+        var value: Number = 0
+        for index in 0..count {
+            let read = bit(base + node)
+            node = (node << 1) | read
+            value = value | (read << index)
+        }
+        return value
+    }
+
+    /// Decodes a match length with the length coder at `base`, for the position state.
+    function length(borrow mut self, base: Number, positionState: Number) -> Number {
+        if bit(base) == 0 {
+            return 2 + tree(base + LzmaSlots.lengthLow + positionState * 8, 3)
+        }
+        if bit(base + 1) == 0 {
+            return 10 + tree(base + LzmaSlots.lengthMiddle + positionState * 8, 3)
+        }
+        return 18 + tree(base + LzmaSlots.lengthHigh, 8)
+    }
+
+    /// Decodes the distance of a match of `matched` bytes.
+    function distance(borrow mut self, matched: Number) -> Number {
+        let lengthState = min(matched - 2, 3)
+        let slot = tree(LzmaSlots.distanceSlot + lengthState * 64, 6)
+        if slot < 4 { return slot }
+        let count = (slot >> 1) - 1
+        var value = (2 | (slot & 1)) << count
+        if slot < 14 {
+            return value + reverseTree(LzmaSlots.distanceSpecial + value - slot - 1, count)
+        }
+        value += directBits(count - 4) << 4
+        return value + reverseTree(LzmaSlots.distanceAlign, 4)
+    }
+
+    /// Copies `count` bytes from distance `rep0` into the output, as far as `room` allows. The rest stays pending for the next chunk.
+    function repeat(borrow mut self, count: Number, room: Number) {
+        let now = min(count, room)
+        for each in 0..now { put(back(rep0)) }
+        pendingLength = count - now
+    }
+
+    /// Decodes `unpacked` bytes of an LZMA chunk into the output.
+    function decode(borrow mut self, unpacked: Number) -> Result<Void, ArchiveFailure> {
+        let end = out.count + unpacked
+        if pendingLength > 0 { repeat(pendingLength, unpacked) }
+        let isMatch = LzmaSlots.isMatch
+        let literalBase = LzmaSlots.literal
+        while out.count < end {
+            if overrun { return .Ok }
+            let positionState = total & positionMask
+            if bit(isMatch + (state << 4) + positionState) == 0 {
+                let previous = total > 0 ? Number(back(0)) : 0
+                let context = ((total & literalPositionMask) << literalBits)
+                    + (previous >> (8 - literalBits))
+                let base = literalBase + 768 * context
+                var symbol: Number = 1
+                if state >= 7 {
+                    var matchByte = Number(back(rep0))
+                    while symbol < 256 {
+                        let matchBit = (matchByte >> 7) & 1
+                        matchByte = matchByte << 1
+                        let read = bit(base + 256 + (matchBit << 8) + symbol)
+                        symbol = (symbol << 1) | read
+                        if read != matchBit { break }
+                    }
+                }
+                while symbol < 256 { symbol = (symbol << 1) | bit(base + symbol) }
+                put(UN8(symbol - 256))
+                state = state < 4 ? 0 : (state < 10 ? state - 3 : state - 6)
+                continue
+            }
+            var matched: Number = 0
+            if bit(LzmaSlots.isRep + state) == 1 {
+                if total == 0 { return .Error(.Malformed("an LZMA match before any byte")) }
+                if bit(LzmaSlots.isRepG0 + state) == 0 {
+                    if bit(LzmaSlots.isRep0Long + (state << 4) + positionState) == 0 {
+                        if rep0 >= window.count {
+                            return .Error(.Malformed("an LZMA match reaches before the dictionary"))
+                        }
+                        state = state < 7 ? 9 : 11
+                        put(back(rep0))
+                        continue
+                    }
+                } else {
+                    var chosen: Number = 0
+                    if bit(LzmaSlots.isRepG1 + state) == 0 {
+                        chosen = rep1
+                    } else {
+                        if bit(LzmaSlots.isRepG2 + state) == 0 {
+                            chosen = rep2
+                        } else {
+                            chosen = rep3
+                            rep3 = rep2
+                        }
+                        rep2 = rep1
+                    }
+                    rep1 = rep0
+                    rep0 = chosen
+                }
+                matched = length(LzmaSlots.repeatLength, positionState)
+                state = state < 7 ? 8 : 11
+            } else {
+                rep3 = rep2
+                rep2 = rep1
+                rep1 = rep0
+                matched = length(LzmaSlots.matchLength, positionState)
+                state = state < 7 ? 7 : 10
+                rep0 = distance(matched)
+            }
+            if rep0 >= window.count {
+                return .Error(.Malformed("an LZMA match reaches before the dictionary"))
+            }
+            repeat(matched, end - out.count)
+        }
+        return .Ok
+    }
+}
+
+/// A reader of the .xz file `bytes`.
+public function openXz(bytes: [UN8]) -> XzReader {
+    var crc64s: [UNumber] = []
+    for index in 0..256 {
+        var value = UNumber(index)
+        for each in 0..8 {
+            value = (value & 1) == 1 ? 14514072000185962306 ^ (value >> 1) : value >> 1
+        }
+        crc64s.append(value)
+    }
+    return XzReader { bytes: move bytes, crcs: crcTable(), crc64s: crc64s }
+}
+
+/// The whole of the .xz file `bytes`, decompressed.
+///
+/// Reads every block in order with `openXz`, checking each block's integrity
+/// check. The result is the concatenated uncompressed data.
+///
+/// # Errors
+/// - `.Malformed` when the stream contradicts the xz format, ends inside a
+///   block, or a block's integrity check does not match.
+/// - `.Unsupported` when the stream uses a filter or check this library does not read.
+///
+/// # Examples
+/// ```
+/// match decompressXz(bytes) {
+///     Ok(plain) -> use(plain)
+///     Error(failure) -> report(failure)
+/// }
+/// ```
+public function decompressXz(bytes: [UN8]) -> Result<[UN8], ArchiveFailure> {
+    var reader = openXz(move bytes)
+    var whole: [UN8] = []
+    while true {
+        let part = match reader.next() {
+            Ok(read) -> read
+            Error(failure) -> return .Error(failure)
+        }
+        if part.count == 0 { return .Ok(whole) }
+        whole.appendAll(part)
+    }
+    return .Ok(whole)
+}

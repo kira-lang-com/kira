@@ -1,0 +1,182 @@
+// The harness owns collection and the per-test protocol. The CLI runs each
+// action in a separate child so a test trap cannot stop the suite.
+
+// What `kira test` asks a child, as its first argument.
+enum TestAction {
+    List
+    Expect
+    Check
+    Body
+}
+
+function testAction(text: borrow String) -> TestAction? {
+    match text {
+        "list" -> return .Some(.List)
+        "expect" -> return .Some(.Expect)
+        "check" -> return .Some(.Check)
+        "body" -> return .Some(.Body)
+        else -> return .None
+    }
+}
+
+// The answer a child writes on its `__kira_test_result__:` line, numbered as
+// `kira test`'s driver reads it. `Check`, `ExpectFailure` and `Skip` answer
+// `expect`; the rest answer a run.
+enum TestAnswer: Int {
+    Passed = 0
+    Failed = 2
+    Unanswerable = 3
+    Check = 10
+    ExpectFailure = 11
+    Skip = 12
+}
+
+function writeTestAnswer(answer: borrow TestAnswer) -> Int {
+    print("__kira_test_result__:" + String(code(answer)))
+    return code(answer)
+}
+
+// How a test's expectation says it is run.
+function expectedAnswer(want: borrow Result<Any, TestFailure>) -> TestAnswer {
+    match want {
+        Ok(expected) -> return .Check
+        Error(failure) -> {
+            match failure {
+                Runtime(message) -> return .ExpectFailure
+                Diagnostic(error) -> return .Skip
+                Compile(text) -> return .Skip
+            }
+        }
+    }
+}
+
+// A test function's entry. It is checked by running it, never by a value or
+// an expected trap.
+comptime function testFunctionEntry(marker: borrow Identifier) -> Syntax {
+    return quote {
+        function __kira_test_#{marker}(action: borrow TestAction) -> TestAnswer {
+            match action {
+                Expect -> return expectAnswer(#{marker}().expectedTrap())
+                Check -> {
+                    #{marker}().run()
+                    return testFunctionAnswer()
+                }
+                // A trap test passes by trapping, so a body that returns fails.
+                Body -> {
+                    #{marker}().run()
+                    return .Failed
+                }
+                List -> return .Unanswerable
+            }
+        }
+    }
+}
+
+// What `expect` answers for a `TestFunction`: a trap test announces the
+// fragment its trap must contain and is run as a body; any other is checked.
+function expectAnswer(trap: borrow Optional<String>) -> TestAnswer {
+    match trap {
+        Some(fragment) -> {
+            print("__kira_test_trap__:" + fragment)
+            return .ExpectFailure
+        }
+        None -> return .Check
+    }
+}
+
+comptime macro TestRunner {
+    kind { collector }
+    expand(declarations: [Declaration]) -> Syntax {
+        if !Build.testing() {
+            return quote {}
+        }
+        var functions: [Syntax] = []
+        var names: [Syntax] = []
+        var dispatch: [Syntax] = []
+        for d in declarations {
+            if d.family == "Test" {
+                names.append(
+                    quote {
+                        print("__kira_test_name__:" + #{d.name.asString()})
+                    }
+                )
+                functions.append(
+                    quote {
+                        function __kira_test_#{d.name}(action: borrow TestAction) -> TestAnswer {
+                            let want: Result<Any, TestFailure> = #{d.name}.expect()
+                            match action {
+                                Expect -> return expectedAnswer(want)
+                                Check -> {
+                                    match want {
+                                        Ok(expected) -> {
+                                            let got: Any = #{d.name}.test()
+                                            if sameTestValue(got, expected) { return .Passed }
+                                            return .Failed
+                                        }
+                                        Error(failure) -> return .Unanswerable
+                                    }
+                                }
+                                Body -> {
+                                    // A body run passes by trapping, so a value
+                                    // coming back is the failure.
+                                    let got: Any = #{d.name}.test()
+                                    return .Failed
+                                }
+                                List -> return .Unanswerable
+                            }
+                        }
+                    }
+                )
+                dispatch.append(
+                    quote {
+                        if name == #{d.name.asString()} {
+                            return writeTestAnswer(__kira_test_#{d.name}(action))
+                        }
+                    }
+                )
+            }
+            if d.family == "TestFunction" {
+                let tested = testFunctionName(d.name)
+                names.append(quote { print("__kira_test_name__:" + #{tested.asString()}) })
+                functions.append(testFunctionEntry(d.name))
+                dispatch.append(
+                    quote {
+                        if name == #{tested.asString()} {
+                            return writeTestAnswer(__kira_test_#{d.name}(action))
+                        }
+                    }
+                )
+            }
+        }
+        return quote {
+            #{functions}
+
+            function kiraTestMain() -> Int {
+                match processArgument(0) {
+                    Some(written) -> {
+                        match testAction(written) {
+                            Some(action) -> {
+                                if action == .List {
+                                    #{names}
+                                    return writeTestAnswer(.Passed)
+                                }
+                                match processArgument(1) {
+                                    Some(name) -> {
+                                        #{dispatch}
+                                    }
+                                    // No test named: the driver asked wrong.
+                                    None -> {}
+                                }
+                            }
+                            // An action this runner predates.
+                            None -> {}
+                        }
+                    }
+                    // Run with no action, not by the driver.
+                    None -> {}
+                }
+                return writeTestAnswer(.Unanswerable)
+            }
+        }
+    }
+}

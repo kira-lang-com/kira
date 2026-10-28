@@ -1,0 +1,56 @@
+// An associated type is bound by each conforming type from the member that
+// satisfies a requirement written with it; `Value.ID` names it for whatever
+// type `Value` is, in a function's signature, in a struct's field, and where
+// a call infers `Value` from its other arguments.
+
+import Foundation
+
+trait Identified {
+    associatedtype ID
+    var id: ID { get }
+}
+
+trait Stocked {
+    associatedtype Unit = Int
+    function stock(borrow self) -> Int
+}
+
+struct Row: Identified, Stocked {
+    let id: String
+    let size: Int
+
+    function stock(borrow self) -> Int { return size }
+}
+
+struct Order: Identified {
+    let id: Int
+}
+
+struct Picked<Value: Identified> {
+    let rows: [Value]
+    let chosen: [Value.ID]
+}
+
+function idOf<Value: Identified>(value: borrow Value) -> Value.ID {
+    return value.id
+}
+
+function chosen<Value: Identified>(rows: [Value], selection: Set<Value.ID>) -> Int {
+    var count = 0
+    for row in rows {
+        if selection.contains(row.id) { count = count + 1 }
+    }
+    return count
+}
+
+@Main
+function main() -> Int {
+    let rows = [Row { id: "a", size: 1 }, Row { id: "b", size: 2 }, Row { id: "c", size: 3 }]
+    var selection = Set<String>()
+    selection.insert("b")
+    selection.insert("c")
+    let picked = Picked<Row> { rows: rows, chosen: ["a"] }
+    let unit: Row.Unit = 30
+    if idOf(Row { id: "x", size: 0 }) != "x" || picked.chosen[0] != "a" { return 0 }
+    return chosen(rows, selection) + idOf(Order { id: 10 }) + unit
+}

@@ -1,0 +1,19 @@
+// A payload that runs `drop` cannot be bound from a value that stays named:
+// both would drop it. `match move` hands the value to the match (3399).
+
+import Foundation
+
+struct Counted: Drop {
+    let counter: RawPtr
+    function drop(borrow mut self) { }
+}
+
+@Main
+function main() -> Int {
+    let named: Optional<Counted> = .Some(Counted(counter: heapAllocateRaw(8, 8)))
+    match named {
+        Some(held) -> { let _ = held.counter }
+        None -> {}
+    }
+    return 0
+}

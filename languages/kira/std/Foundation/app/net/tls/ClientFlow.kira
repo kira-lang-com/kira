@@ -1,0 +1,277 @@
+// The client side of the handshake (RFC 8446 section 2): ClientHello, then
+// the server's flight checked message by message, then the client's Finished.
+
+// A client handshake with its ClientHello already queued to send.
+function tlsStartClient(settings: TlsClientSettings) -> Result<TlsHandshake, TlsAlert> {
+    let random = try randomBytes(UNumber(Tls.randomBytes)) otherwise return .Error(.InternalError)
+    // Over TCP a 32-byte session ID gets the handshake past middleboxes that
+    // expect TLS 1.2 (RFC 8446 appendix D.4); QUIC forbids one.
+    var sessionId: [UN8] = []
+    if settings.carrier == .Records {
+        let chosen = try randomBytes(UNumber(Tls.legacySessionIdMaximum))
+        otherwise return .Error(.InternalError)
+        sessionId = chosen
+    }
+    let group = TlsOffer.groups[0]
+    let agreement = try startKeyAgreement(group) otherwise return .Error(.InternalError)
+    let identity: TlsServerIdentity? = .None
+    var handshake = TlsHandshake {
+        role: .Client,
+        carrier: settings.carrier,
+        serverName: copy settings.serverName,
+        protocols: copy settings.protocols,
+        seconds: settings.seconds,
+        anchors: copy settings.anchors,
+        transportParameters: copy settings.transportParameters,
+        identity: identity,
+        stage: .AwaitServerHello,
+        random: random,
+        sessionId: sessionId,
+        offers: [TlsShareOffer { group: group, agreement: agreement }]
+    }
+    try handshake.sendClientHello()
+    return .Ok(handshake)
+}
+
+// Whether `name` is an IP address, which SNI may not carry (RFC 6066
+// section 3).
+function tlsIsAddressLiteral(name: borrow String) -> Bool {
+    if name.contains(":") { return true }
+    for byte in name.utf8() {
+        let digit = byte >= 48 && byte <= 57
+        if !digit && byte != 46 { return false }
+    }
+    return true
+}
+
+extend TlsHandshake {
+    function helloExtensions(borrow self) -> Result<[TlsExtension], TlsAlert> {
+        var shares: [TlsKeyShare] = []
+        for offer in offers {
+            shares.append(TlsKeyShare { group: offer.group, share: copy offer.agreement.share })
+        }
+        let keyShares = try tlsOfferedShares(shares)
+        var extensions = [
+            tlsOfferedVersions(),
+            tlsGroupList(TlsOffer.groups),
+            tlsSchemeList(TlsOffer.schemes),
+            keyShares
+        ]
+        if !tlsIsAddressLiteral(serverName) {
+            let name = try tlsServerNameExtension(serverName)
+            extensions.append(name)
+        }
+        if protocols.count > 0 {
+            let alpn = try tlsProtocolList(protocols)
+            extensions.append(alpn)
+        }
+        if carrier == .Quic {
+            extensions.append(
+                TlsExtension { kind: .QuicTransportParameters, data: copy transportParameters }
+            )
+        }
+        match cookie {
+            Some(data) -> extensions.append(TlsExtension { kind: .Cookie, data: data })
+            None -> {}
+        }
+        return .Ok(extensions)
+    }
+
+    function sendClientHello(borrow mut self) -> Result<Void, TlsAlert> {
+        let extensions = try helloExtensions()
+        let hello = TlsClientHello {
+            random: copy random,
+            sessionId: copy sessionId,
+            suites: TlsOffer.suites,
+            extensions: extensions
+        }
+        let message = try tlsEncodeClientHello(hello)
+        send(.Initial, message)
+        return .Ok
+    }
+
+    function takeServerHello(
+        borrow mut self,
+        message: borrow TlsHandshakeMessage
+    ) -> Result<Void, TlsAlert> {
+        if message.kind != .ServerHello { return .Error(.UnexpectedMessage) }
+        let hello = try tlsDecodeServerHello(message.body)
+        if hello.sessionId != sessionId { return .Error(.IllegalParameter) }
+        let versions = try tlsRequireExtension(hello.extensions, .SupportedVersions)
+        if versions != tlsSelectedVersion().data { return .Error(.IllegalParameter) }
+        for extension in hello.extensions {
+            let allowed = extension.kind == .SupportedVersions || extension.kind == .KeyShare
+                || extension.kind == .Cookie && hello.retries()
+            if !allowed { return .Error(.UnsupportedExtension) }
+        }
+        let parameters = match tlsSuiteParameters(hello.suite) {
+            Some(value) -> value
+            None -> return .Error(.IllegalParameter)
+        }
+        match retrySuite {
+            Some(suite) -> if suite != hello.suite { return .Error(.IllegalParameter) }
+            None -> {}
+        }
+        if hello.retries() { return takeRetry(hello, parameters, message) }
+        let shareData = try tlsRequireExtension(hello.extensions, .KeyShare)
+        let chosen = try tlsReadChosenShare(shareData)
+        let shared = try agree(chosen)
+        transcript.add(message.encoded)
+        try enterHandshake(parameters, shared)
+        stage = .AwaitEncryptedExtensions
+        return .Ok
+    }
+
+    // The secret shared through the offer the server chose; the others are
+    // let go.
+    function agree(borrow mut self, chosen: borrow TlsKeyShare) -> Result<[UN8], TlsAlert> {
+        var shared: [UN8]? = .None
+        for offer in offers {
+            if offer.group == chosen.group && shared.isNone() {
+                let secret = try offer.agreement.finish(chosen.share)
+                otherwise return .Error(.IllegalParameter)
+                shared = .Some(secret)
+            } else {
+                match offer.agreement.release() {
+                    Ok -> {}
+                    Error(failure) -> absorb failure
+                }
+            }
+        }
+        offers = []
+        return match shared {
+            Some(value) -> .Ok(value)
+            None -> .Error(.IllegalParameter)
+        }
+    }
+
+    // A HelloRetryRequest: one more ClientHello with a share of the group
+    // the server asked for (RFC 8446 section 4.1.4).
+    function takeRetry(
+        borrow mut self,
+        hello: borrow TlsServerHello,
+        parameters: borrow TlsSuiteParameters,
+        message: borrow TlsHandshakeMessage
+    ) -> Result<Void, TlsAlert> {
+        if retrySuite.isSome() { return .Error(.UnexpectedMessage) }
+        let groupData = try tlsRequireExtension(hello.extensions, .KeyShare)
+        let group = try tlsReadRequestedGroup(groupData)
+        if !TlsOffer.groups.contains(group) { return .Error(.IllegalParameter) }
+        for offer in offers {
+            // Asking for a share already sent changes nothing.
+            if offer.group == group { return .Error(.IllegalParameter) }
+            match offer.agreement.release() {
+                Ok -> {}
+                Error(failure) -> absorb failure
+            }
+        }
+        let next = try startKeyAgreement(group) otherwise return .Error(.InternalError)
+        offers = [TlsShareOffer { group: group, agreement: next }]
+        cookie = tlsFindExtension(hello.extensions, .Cookie)
+        retrySuite = .Some(hello.suite)
+        try transcript.restartForRetry(parameters.hash) otherwise return .Error(.InternalError)
+        transcript.add(message.encoded)
+        return sendClientHello()
+    }
+
+    function takeEncryptedExtensions(
+        borrow mut self,
+        message: borrow TlsHandshakeMessage
+    ) -> Result<Void, TlsAlert> {
+        if message.kind != .EncryptedExtensions { return .Error(.UnexpectedMessage) }
+        let extensions = try tlsDecodeEncryptedExtensions(message.body)
+        match tlsFindExtension(extensions, .ApplicationProtocols) {
+            Some(data) -> {
+                let named = try tlsReadProtocols(data)
+                // The server names exactly one, and one this client offered
+                // (RFC 7301 section 3.1).
+                if named.count != 1 || !protocols.contains(named[0]) {
+                    return .Error(.IllegalParameter)
+                }
+                chosenProtocol = .Some(copy named[0])
+            }
+            None -> if carrier == .Quic { return .Error(.NoApplicationProtocol) }
+        }
+        let parameters = tlsFindExtension(extensions, .QuicTransportParameters)
+        match carrier {
+            Quic -> if parameters.isNone() { return .Error(.MissingExtension) }
+            Records -> if parameters.isSome() { return .Error(.UnsupportedExtension) }
+        }
+        peerTransport = parameters
+        transcript.add(message.encoded)
+        stage = .AwaitCertificate
+        return .Ok
+    }
+
+    function takeServerCertificate(
+        borrow mut self,
+        message: borrow TlsHandshakeMessage
+    ) -> Result<Void, TlsAlert> {
+        if message.kind == .CertificateRequest && certificateContext.isNone() {
+            var reader = WireReader { bytes: copy message.body }
+            let context = try reader.readVector(Tls.shortVector) otherwise return .Error(
+                .DecodeError
+            )
+            certificateContext = .Some(context)
+            transcript.add(message.encoded)
+            return .Ok
+        }
+        if message.kind != .Certificate { return .Error(.UnexpectedMessage) }
+        let chain = try tlsDecodeCertificate(message.body)
+        if chain.context.count != 0 { return .Error(.IllegalParameter) }
+        if chain.certificates.count == 0 { return .Error(.DecodeError) }
+        var listed = WireWriter {}
+        for certificate in chain.certificates { listed.writeVector(certificate, Tls.longVector) }
+        let check = ChainCheck { name: copy serverName, seconds: seconds, anchors: copy anchors }
+        match verifyCertificates(listed.bytes, check) {
+            Ok -> {}
+            Error(failure) -> return .Error(tlsAlertForCrypto(failure))
+        }
+        peerChain = chain.certificates
+        transcript.add(message.encoded)
+        stage = .AwaitCertificateVerify
+        return .Ok
+    }
+
+    function takeCertificateVerify(
+        borrow mut self,
+        message: borrow TlsHandshakeMessage
+    ) -> Result<Void, TlsAlert> {
+        if message.kind != .CertificateVerify { return .Error(.UnexpectedMessage) }
+        let proof = try tlsDecodeCertificateVerify(message.body)
+        if !TlsOffer.schemes.contains(proof.scheme) { return .Error(.IllegalParameter) }
+        let current = try handshakeKeys()
+        let hash = try transcriptHash(current.parameters)
+        let content = tlsSignedContent(.Server, hash)
+        try verifySignature(proof.scheme, peerChain[0], content, proof.signature)
+        otherwise return .Error(.DecryptError)
+        transcript.add(message.encoded)
+        stage = .AwaitServerFinished
+        return .Ok
+    }
+
+    function takeServerFinished(
+        borrow mut self,
+        message: borrow TlsHandshakeMessage
+    ) -> Result<Void, TlsAlert> {
+        if message.kind != .Finished { return .Error(.UnexpectedMessage) }
+        let expected = try finishedFor(.Server)
+        if !tlsFinishedMatches(message.body, expected) { return .Error(.DecryptError) }
+        transcript.add(message.encoded)
+        try enterApplication()
+        // A server that asked for a certificate gets an empty one: this
+        // client has none to give (RFC 8446 section 4.4.2).
+        match certificateContext {
+            Some(context) -> {
+                let empty = try tlsEncodeCertificate(
+                    TlsCertificateChain { context: context, certificates: [] }
+                )
+                send(.Handshake, empty)
+            }
+            None -> {}
+        }
+        let finished = try finishedFor(.Client)
+        send(.Handshake, tlsEncodeFinished(finished))
+        return complete()
+    }
+}

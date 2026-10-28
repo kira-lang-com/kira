@@ -1,0 +1,297 @@
+enum ArrayElementAction {
+    Retain
+    Destroy
+}
+
+extend FunctionLowering {
+    function arrayRuntimeVoid(borrow mut self, index: Int, arguments: [KirValue]) {
+        for argument in arguments { kir.argument(argument) }
+        kir.callVoid(functions[program.arrayFunctions[index]])
+    }
+
+    function arrayRuntimePointer(borrow mut self, index: Int, arguments: [KirValue]) -> KirValue {
+        for argument in arguments { kir.argument(argument) }
+        return kir.call(functions[program.arrayFunctions[index]], types.pointer)
+    }
+
+    function arrayIsUnique(borrow mut self, header: KirAddress, arrayType: Type) -> KirValue {
+        kir.argument(arrayData(header, arrayType))
+        return kir.call(functions[program.arrayFunctions[6]], types.boolean)
+    }
+
+    function ensureUniqueArray(borrow mut self, header: KirAddress, arrayType: Type) {
+        let element = program.structs[arrayType.declaration].typeArguments[0]
+        if !needsArrayCleanup(program, element) {
+            kir.store(arrayRuntimePointer(4, [arrayData(header, arrayType)]), kir.field(header, 0, types.pointer))
+            return
+        }
+        let shared = kir.block()
+        let ready = kir.block()
+        kir.branchIf(arrayIsUnique(header, arrayType), ready, shared)
+        enter(shared)
+        kir.store(arrayRuntimePointer(4, [arrayData(header, arrayType)]), kir.field(header, 0, types.pointer))
+        arrayElementsLoop(header, arrayType, .Retain)
+        flowInto(ready)
+        enter(ready)
+    }
+
+    function arrayElementsLoop(borrow mut self, header: KirAddress, arrayType: Type, action: ArrayElementAction) {
+        let elementType = program.structs[arrayType.declaration].typeArguments[0]
+        let counter = temporary(Type.int())
+        kir.store(kir.integer(types.integer64, 0), counter)
+        let limit = kir.load(kir.field(header, 1, types.integer64))
+        let test = kir.block()
+        let body = kir.block()
+        let done = kir.block()
+        flowInto(test)
+        enter(test)
+        let index = kir.load(counter)
+        kir.branchIf(kir.compare(kirPredicate(.Less, false), index, limit), body, done)
+        enter(body)
+        let element = arrayElement(header, arrayType, index)
+        match action {
+            Retain -> copyValue(element, element, elementType)
+            Destroy -> destroyValue(element, elementType)
+        }
+        kir.store(kir.binary(kirOperator(.Add, true), false, true, index, kir.integer(types.integer64, 1)), counter)
+        flowInto(test)
+        enter(done)
+    }
+
+    function destroyArray(borrow mut self, header: KirAddress, arrayType: Type) {
+        let element = program.structs[arrayType.declaration].typeArguments[0]
+        if needsArrayCleanup(program, element) {
+            let destroy = kir.block()
+            let done = kir.block()
+            kir.branchIf(arrayIsUnique(header, arrayType), destroy, done)
+            enter(destroy)
+            arrayElementsLoop(header, arrayType, .Destroy)
+            flowInto(done)
+            enter(done)
+        }
+        arrayRuntimeVoid(3, [arrayData(header, arrayType)])
+    }
+
+    function arrayData(borrow mut self, header: KirAddress, arrayType: Type) -> KirValue {
+        return kir.load(kir.field(header, 0, types.pointer))
+    }
+
+    function arrayElement(borrow mut self, header: KirAddress, arrayType: Type, index: KirValue) -> KirAddress {
+        let element = program.structs[arrayType.declaration].typeArguments[0]
+        let elementType = types.of(element)
+        let buffer = kir.typedMemory(arrayData(header, arrayType), kir_type_array(0, elementType))
+        return kir.element(buffer, index, elementType)
+    }
+
+    function arrayLiteral(borrow mut self, elements: [Int], arrayType: Type) -> KirAddress {
+        let header = temporary(arrayType)
+        let element = program.structs[arrayType.declaration].typeArguments[0]
+        let length = kir.integer(types.integer64, elements.count)
+        let bytes = kir.integer(types.integer64, elements.count * types.byteSize(element))
+        let data = arrayRuntimePointer(0, [bytes])
+        initializeBufferHeader(header, data, length)
+        if constantElements(elements, element) {
+            kir.copyRaw(kir.convert(convertBitcast, kir.pointer(constantBytes(elements, types.byteSize(element))), types.pointer), data, bytes)
+        } else {
+            for index in 0..elements.count {
+                write(elements[index], arrayElement(header, arrayType, kir.integer(types.integer64, index)))
+            }
+        }
+        markInitialized(header)
+        return header
+    }
+
+    // Whether a literal's elements are integer constants enough to be worth
+    // copying in from constant data, as a table such as a shader's words is,
+    // rather than stored one by one.
+    function constantElements(borrow self, elements: [Int], element: Type) -> Bool {
+        if elements.count < 16 || element.kind != .Integer { return false }
+        for index in elements {
+            if program.expressions[index].operation.integer().isNone() { return false }
+        }
+        return true
+    }
+
+    // A constant global holding each element's `width` bytes, low byte first.
+    function constantBytes(borrow mut self, elements: [Int], width: Int) -> KirAddress {
+        let global = kir_global_anonymous(types.module, kir_type_array(elements.count * width, types.integer8), 0)
+        for index in elements {
+            var word = 0
+            match program.expressions[index].operation.integer() {
+                Some(value) -> word = value
+                None -> {}
+            }
+            for byte in 0..width {
+                kir_global_byte(global, word & 255)
+                word = word >> 8
+            }
+        }
+        return kir_value_global_address(kir, global)
+    }
+
+    function arrayIndex(borrow mut self, array: Int, index: Int, span: Span) -> KirAddress {
+        let header = address(array)
+        let arrayType = program.typeOf(array)
+        let offset = value(index)
+        let length = kir.load(kir.field(header, 1, types.integer64))
+        let valid = kir.compare(kirPredicate(.Less, false), offset, length)
+        let report = TrapReport {
+            code = boundsTrap,
+            headline = "index out of range: the index is {0} but the count is {1}",
+            label = "this index",
+            note = joinText(["the array is a `", spelledType(program, arrayType), "` of {1} elements; an index must be at least 0 and less than its count"]),
+            help = "compare the index with `.count` before reading, or walk the elements with `for element in elements`"
+        }
+        trapUnlessReported(valid, span, report, [offset, length])
+        return arrayElement(header, arrayType, offset)
+    }
+
+    function arrayAppend(borrow mut self, array: Int, element: Int) {
+        let arrayType = program.typeOf(array)
+        let elementType = program.structs[arrayType.declaration].typeArguments[0]
+        let saved = temporary(elementType)
+        write(element, saved)
+        let header = address(array)
+        ensureUniqueArray(header, arrayType)
+        let countSlot = kir.field(header, 1, types.integer64)
+        let capacitySlot = kir.field(header, 2, types.integer64)
+        let count = kir.load(countSlot)
+        let capacity = kir.load(capacitySlot)
+        let full = kir.compare(kirPredicate(.GreaterEqual, false), count, capacity)
+        let grow = kir.block()
+        let ready = kir.block()
+        kir.branchIf(full, grow, ready)
+        enter(grow)
+        let doubled = kir.binary(kirOperator(.Multiply, true), true, true, capacity, kir.integer(types.integer64, 2))
+        let nextCapacity = kir.binary(kirOperator(.Add, true), true, true, doubled, kir.integer(types.integer64, 4))
+        let bytes = kir.binary(kirOperator(.Multiply, true), true, true, nextCapacity, kir.integer(types.integer64, types.byteSize(elementType)))
+        kir.store(arrayRuntimePointer(5, [arrayData(header, arrayType), bytes]), kir.field(header, 0, types.pointer))
+        kir.store(nextCapacity, capacitySlot)
+        flowInto(ready)
+        enter(ready)
+        // The temporary holds the element the array now owns: it moves in,
+        // and is not destroyed with the statement's temporaries.
+        moveValue(saved, arrayElement(header, arrayType, count), elementType)
+        forgetTracked(saved)
+        let next = kir.binary(kirOperator(.Add, true), true, true, count, kir.integer(types.integer64, 1))
+        kir.store(next, countSlot)
+    }
+
+    function copyArray(borrow mut self, from: KirAddress, to: KirAddress, arrayType: Type) {
+        kir.store(arrayRuntimePointer(2, [arrayData(from, arrayType)]), kir.field(to, 0, types.pointer))
+        for index in 1..4 {
+            let fieldType = types.of(program.structs[arrayType.declaration].fields[index].valueType)
+            kir.store(kir.load(kir.field(from, index, fieldType)), kir.field(to, index, fieldType))
+        }
+    }
+
+    function prepareArrayPlace(borrow mut self, index: Int) {
+        match program.expressions[index].operation {
+            ArrayIndex(base, offset) -> {
+                prepareArrayPlace(base)
+                let header = address(base)
+                ensureUniqueArray(header, program.typeOf(base))
+            }
+            Member(base, field) -> prepareArrayPlace(base)
+            Read -> {}
+            Integer -> {}
+            FloatLiteral -> {}
+            BoxAny -> {}
+            TypeIs -> {}
+            UnboxAny -> {}
+            FunctionReference -> {}
+            IndirectCall -> {}
+            MakeClosure -> {}
+            GlobalRead -> {}
+            TaskSpawn -> {}
+            TaskReady -> {}
+            TaskAwait -> {}
+            TaskCancel -> {}
+            TaskDetach -> {}
+            Async -> {}
+            RuntimeTrap -> {}
+            StringText -> {}
+            Sequence -> {}
+            Try -> {}
+            ChannelCreate -> {}
+            ChannelReceiver -> {}
+            ChannelSend -> {}
+            ChannelClose -> {}
+            ClassView -> {}
+            ClassCall -> {}
+            Boolean -> {}
+            StringLiteral -> {}
+            StringConcat -> {}
+            TraceText -> {}
+            HeapAllocateRaw -> {}
+            HeapFreeRaw -> {}
+            Print -> {}
+            HeapRead -> {}
+            HeapWrite -> {}
+            Atomic -> {}
+            HeapCopy -> {}
+            HeapFill -> {}
+            HeapOffset -> {}
+            HeapLayout -> {}
+            ArrayLiteral -> {}
+            ArrayAppend -> {}
+            Transfer -> {}
+            Call -> {}
+            Construct -> {}
+            Tagged -> {}
+            Unary -> {}
+            Arithmetic -> {}
+            Wrapping -> {}
+            Compare -> {}
+            EnumCode -> {}
+            EnumFromCode -> {}
+            Order -> {}
+            Hash -> {}
+            Logical -> {}
+            Select -> {}
+            Choice -> {}
+            Bitcast -> {}
+            Convert -> {}
+            ForeignImage -> {}
+            ForeignElements -> {}
+            ForeignCallback -> {}
+            ForeignRead -> {}
+            ForeignUnion -> {}
+        }
+    }
+
+    function arrayIteration(borrow mut self, element: Int, array: Int, body: [Int]) {
+        let arrayType = program.typeOf(array)
+        let snapshot = temporary(arrayType)
+        copyValue(address(array), snapshot, arrayType)
+        markInitialized(snapshot)
+        let counter = temporary(Type.int())
+        kir.store(kir.integer(types.integer64, 0), counter)
+        let limit = kir.load(kir.field(snapshot, 1, types.integer64))
+        let test = kir.block()
+        let bodyBlock = kir.block()
+        let step = kir.block()
+        let done = kir.block()
+        flowInto(test)
+        enter(test)
+        let index = kir.load(counter)
+        kir.branchIf(kir.compare(kirPredicate(.Less, false), index, limit), bodyBlock, done)
+        enter(bodyBlock)
+        releaseTracked(storage[element])
+        moveValue(arrayElement(snapshot, arrayType, index), storage[element], checked.locals[element].valueType)
+        markInitialized(storage[element])
+        breaks.append(done)
+        continues.append(step)
+        loopScopeDepths.append(lifetimeScopes.count)
+        statements(body)
+        flowInto(step)
+        breaks = withoutLast(breaks)
+        continues = withoutLast(continues)
+        popLoopScope()
+        enter(step)
+        kir.store(kir.binary(kirOperator(.Add, true), false, true, kir.load(counter), kir.integer(types.integer64, 1)), counter)
+        flowInto(test)
+        enter(done)
+        releaseTracked(snapshot)
+    }
+}

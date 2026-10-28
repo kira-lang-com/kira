@@ -1,0 +1,44 @@
+import Foundation
+
+comptime macro FieldCount {
+    kind { derive }
+    appliesTo { struct enum distinct }
+    expand(target: Declaration) -> Syntax {
+        let count = target.fields.count
+        return quote { function count_#{target.name}() -> Int { return #{count} } }
+    }
+}
+
+@Derive(FieldCount, Equatable, Clone, Copy)
+struct Point {
+    var x: Int
+    var y: Int
+}
+
+@Derive(Lerp, Copy)
+struct Channels {
+    var red: Float
+    var alpha: Float
+}
+
+@Derive(FieldCount)
+enum Choice { First Second(Int) }
+
+@Derive(FieldCount, Equatable, Clone, Hashable, Serializable, Ordered)
+distinct Port = U32
+
+@Main
+function main() -> Int {
+    let blended = lerp(Channels { red = 0.0, alpha = 1.0 }, Channels { red = 1.0, alpha = 0.0 }, 0.25)
+    if blended.red != 0.25 || blended.alpha != 0.75 { return 0 }
+    let point = Point { x = 3, y = 4 }
+    let copy = clone_Point(point)
+    if !eq_Point(point, copy) { return 0 }
+    let port = Port(U32(8080))
+    let portCopy = clone_Port(port)
+    if !eq_Port(port, portCopy) || hash_Port(port) != hash_Port(portCopy) { return 0 }
+    if serialize_Port(port) != "Port(U32(8080))" { return 0 }
+    if !eq_Port(port, deserialize_Port("Port(U32(8080))")) { return 0 }
+    if !lt_Port(Port(U32(80)), port) { return 0 }
+    return count_Point() + count_Choice() + count_Port()
+}

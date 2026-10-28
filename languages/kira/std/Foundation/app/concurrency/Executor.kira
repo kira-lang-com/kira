@@ -1,0 +1,291 @@
+import Heap
+
+// A single-threaded executor over `Future`: spawn async work, run it until
+// nothing is left that can make progress, and join the results.
+//
+//     let executor = Executor()
+//     let page = executor.spawn(fetch("/index"))
+//     let logo = executor.spawn(fetch("/logo"))
+//     executor.run()
+//     let both = page.join() + logo.join()
+//
+// Every task is one slot in a dense array, polled only when its waker has
+// queued it: a wake writes the task's index into a ring of plain words, so
+// running the executor walks two flat arrays and the futures themselves.
+// Std has no reactor, so a task waiting on I/O or time never wakes here --
+// that is Seyoul's executor. `run` returns once the queue is empty.
+
+// What the executor holds for one task: its future, erased to one step.
+class ExecutorTask {
+    // Polls the task once; true once it has finished.
+    function step(context: borrow Context) -> Bool {
+        return true
+    }
+
+    // Drops the task's future unfinished, cancelling it at its await.
+    function cancel() {}
+}
+
+// A task with an output, shared between the executor and the task's handle.
+class ExecutorJoin<Output> extends ExecutorTask {
+    var future: Async<Output>?
+    var output: Output? = .None
+    var finished: Bool = false
+    // The task awaiting this one through its handle.
+    var waiter: Waker? = .None
+
+    override function step(context: borrow Context) -> Bool {
+        let taken: Async<Output>? = move self.future
+        self.future = .None
+        match move taken {
+            Some(running) -> {
+                var driven = move running
+                match driven.poll(context) {
+                    Ready(value) -> {
+                        self.output = .Some(move value)
+                        self.finish()
+                        return true
+                    }
+                    Pending -> {
+                        self.future = .Some(move driven)
+                        return false
+                    }
+                }
+            }
+            None -> return true
+        }
+    }
+
+    override function cancel() {
+        let taken: Async<Output>? = move self.future
+        self.future = .None
+        let dropped = taken.isSome()
+        self.finish()
+    }
+
+    function finish() {
+        self.finished = true
+        let waiting: Waker? = move self.waiter
+        self.waiter = .None
+        match waiting {
+            Some(waker) -> waker.wakeUp()
+            None -> {}
+        }
+    }
+}
+
+// The handle `spawn` gives back: join the output once the executor has run
+// the task, or await it from another task.
+struct JoinHandle<Output>: Future<Output> {
+    let state: ExecutorJoin<Output>
+
+    function isFinished(borrow self) -> Bool {
+        return self.state.finished
+    }
+
+    // The task's output. Traps when the task has not finished, was
+    // cancelled, or was joined already.
+    function join(borrow self) -> Output {
+        let taken: Output? = move self.state.output
+        self.state.output = .None
+        match move taken {
+            Some(value) -> { return move value }
+            None -> {}
+        }
+        runtimeTrap()
+        return join()
+    }
+
+    // Cancels the task: its future is dropped at the await it waits at,
+    // and joining it traps.
+    function abort(borrow self) {
+        if !self.state.finished { self.state.cancel() }
+    }
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Output> {
+        if !self.state.finished {
+            self.state.waiter = .Some(context.waker)
+            return .Pending
+        }
+        let taken: Output? = move self.state.output
+        self.state.output = .None
+        match move taken {
+            Some(value) -> { return .Ready(move value) }
+            None -> {}
+        }
+        // Cancelled, or joined already.
+        runtimeTrap()
+        return .Pending
+    }
+}
+
+// The ring of woken task indices a waker writes to. `target` of every waker
+// the executor hands out is this header, which stays put while the ring
+// grows: word 0 the ring, 1 its capacity (a power of two), 2 the head, 3
+// the tail, 4 a byte per task, set while the task is queued.
+let executorRing = 0
+let executorCapacity = 8
+let executorHead = 16
+let executorTail = 24
+let executorQueued = 32
+
+function executorWord(header: RawPtr, at: Number) -> Number {
+    return Heap.readHeapWord(Heap.offsetHeapBytes(header, at))
+}
+
+function setExecutorWord(header: RawPtr, at: Number, value: Number) {
+    Heap.writeHeapWord(Heap.offsetHeapBytes(header, at), value)
+}
+
+function executorPointer(header: RawPtr, at: Number) -> RawPtr {
+    return Heap.pointerAt(executorWord(header, at))
+}
+
+// Queues task `slot` unless it is queued already.
+function executorWake(header: RawPtr, slot: Number) {
+    let queued = Heap.offsetHeapBytes(executorPointer(header, executorQueued), slot)
+    if Heap.readHeapByte(queued) != 0 { return }
+    Heap.writeHeapByte(queued, 1)
+    let tail = executorWord(header, executorTail)
+    let mask = executorWord(header, executorCapacity) - 1
+    Heap.writeHeapWord(
+        Heap.offsetHeapBytes(executorPointer(header, executorRing), (tail & mask) * 8),
+        slot
+    )
+    setExecutorWord(header, executorTail, tail + 1)
+}
+
+class Executor: Drop {
+    var tasks: [ExecutorTask?] = []
+    // Slots of finished tasks, reused by the next spawns: a stack of
+    // `spareCount` entries that never shrinks.
+    var spare: [Number] = []
+    var spareCount: Number = 0
+    var live: Number = 0
+    let header: RawPtr = executorHeader(16)
+
+    // Starts `future` as a task; it first runs at the next `run`.
+    function spawn<Output>(future: Async<Output>) -> JoinHandle<Output> {
+        let state = ExecutorJoin<Output> { future = .Some(move future) }
+        var slot = self.tasks.count
+        if self.spareCount > 0 {
+            self.spareCount -= 1
+            slot = self.spare[self.spareCount]
+            self.tasks[slot] = .Some(state)
+        } else {
+            self.reserve(slot + 1)
+            self.tasks.append(.Some(state))
+        }
+        self.live += 1
+        executorWake(self.header, slot)
+        return JoinHandle<Output> { state = state }
+    }
+
+    // Polls woken tasks until none is left to poll. Tasks still pending
+    // wait for a wake that std cannot give; `pending` counts them.
+    function run() {
+        while true {
+            let head = executorWord(self.header, executorHead)
+            if head == executorWord(self.header, executorTail) { return }
+            let mask = executorWord(self.header, executorCapacity) - 1
+            let slot = Heap.readHeapWord(
+                Heap.offsetHeapBytes(executorPointer(self.header, executorRing), (head & mask) * 8)
+            )
+            setExecutorWord(self.header, executorHead, head + 1)
+            // Cleared before the poll, so a wake during it queues it again.
+            Heap.writeHeapByte(
+                Heap.offsetHeapBytes(executorPointer(self.header, executorQueued), slot),
+                0
+            )
+            self.poll(slot)
+        }
+    }
+
+    // Spawns `future`, runs the executor, and answers its output.
+    function block<Output>(future: Async<Output>) -> Output {
+        let handle = self.spawn(move future)
+        self.run()
+        return handle.join()
+    }
+
+    // Tasks spawned and not yet finished.
+    function pending() -> Number {
+        return self.live
+    }
+
+    function poll(slot: Number) {
+        match self.tasks[slot] {
+            Some(task) -> {
+                let context = Context {
+                    waker = Waker { wake = executorWake, target = self.header, slot = slot }
+                }
+                if task.step(context) {
+                    self.tasks[slot] = .None
+                    if self.spareCount < self.spare.count {
+                        self.spare[self.spareCount] = slot
+                    } else {
+                        self.spare.append(slot)
+                    }
+                    self.spareCount += 1
+                    self.live -= 1
+                }
+            }
+            None -> {}
+        }
+    }
+
+    // Grows the ring and the queued bytes to hold `count` tasks, keeping
+    // the queued indices in order.
+    function reserve(count: Number) {
+        let capacity = executorWord(self.header, executorCapacity)
+        if count <= capacity { return }
+        var grown = capacity * 2
+        while grown < count { grown *= 2 }
+        let ring = Heap.allocateRaw(grown * 8, 8)
+        let oldRing = executorPointer(self.header, executorRing)
+        let head = executorWord(self.header, executorHead)
+        let tail = executorWord(self.header, executorTail)
+        for position in head..tail {
+            let slot = Heap.readHeapWord(
+                Heap.offsetHeapBytes(oldRing, (position & (capacity - 1)) * 8)
+            )
+            Heap.writeHeapWord(Heap.offsetHeapBytes(ring, (position - head) * 8), slot)
+        }
+        let queued = Heap.allocateRaw(grown, 8)
+        Heap.zeroBytes(queued, grown)
+        Heap.copyBytes(queued, executorPointer(self.header, executorQueued), capacity)
+        Heap.freeRaw(oldRing)
+        Heap.freeRaw(executorPointer(self.header, executorQueued))
+        setExecutorWord(self.header, executorRing, Heap.pointerAddress(ring))
+        setExecutorWord(self.header, executorQueued, Heap.pointerAddress(queued))
+        setExecutorWord(self.header, executorCapacity, grown)
+        setExecutorWord(self.header, executorHead, 0)
+        setExecutorWord(self.header, executorTail, tail - head)
+    }
+
+    function drop(borrow mut self) {
+        // Unfinished tasks are cancelled, so their frames are freed.
+        for index in 0..self.tasks.count {
+            match self.tasks[index] {
+                Some(task) -> task.cancel()
+                None -> {}
+            }
+        }
+        Heap.freeRaw(executorPointer(self.header, executorRing))
+        Heap.freeRaw(executorPointer(self.header, executorQueued))
+        Heap.freeRaw(self.header)
+    }
+}
+
+function executorHeader(capacity: Number) -> RawPtr {
+    let header = Heap.allocateRaw(40, 8)
+    let ring = Heap.allocateRaw(capacity * 8, 8)
+    let queued = Heap.allocateRaw(capacity, 8)
+    Heap.zeroBytes(queued, capacity)
+    setExecutorWord(header, executorRing, Heap.pointerAddress(ring))
+    setExecutorWord(header, executorCapacity, capacity)
+    setExecutorWord(header, executorHead, 0)
+    setExecutorWord(header, executorTail, 0)
+    setExecutorWord(header, executorQueued, Heap.pointerAddress(queued))
+    return header
+}

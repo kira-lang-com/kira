@@ -1,0 +1,67 @@
+// `let name: borrow T = value`, and `copy` in the same place. Binding an
+// array, an enum, an owned C pointer or a value that runs a `drop` takes the
+// value over, so a prefix promising to leave it alone cannot stand there; a
+// binding of anything else leaves its source alone already. `borrow mut` has
+// no caller to write back to. A `borrow` binding is a borrowed name: what may
+// not be done with a borrowed parameter may not be done with it either.
+
+extend Checker {
+    function checkBindingPrefix(borrow self, prefix: Optional<BindingPrefix>, valueType: Type) {
+        match prefix {
+            Some(written) -> {
+                if written.mode == .MutablyBorrowed || movesOnBind(valueType) { report(.BindingPrefix, written.span) }
+            }
+            None -> {}
+        }
+    }
+
+    function bindsBorrow(borrow self, prefix: Optional<BindingPrefix>, valueType: Type) -> Bool {
+        match prefix {
+            Some(written) -> return written.mode == .Borrowed && !movesOnBind(valueType)
+            None -> return false
+        }
+    }
+
+    function movesOnBind(borrow self, valueType: Type) -> Bool {
+        if valueType.kind == .Enumeration || isArrayType(program, valueType) { return true }
+        var open: [Int] = []
+        return ownsUniquely(valueType, open)
+    }
+
+    // Whether a value of `valueType` reaches a `drop` body or an owned C
+    // pointer. `open` holds the structs and enums being walked, encoded as
+    // declaration * 2 plus 1 for an enum, so a type reaching itself ends.
+    function ownsUniquely(borrow self, valueType: Type, open: borrow mut [Int]) -> Bool {
+        var key = 0
+        if valueType.kind == .Structure {
+            key = valueType.declaration * 2
+        } else if valueType.kind == .Enumeration {
+            key = valueType.declaration * 2 + 1
+        } else {
+            return false
+        }
+        for walked in open {
+            if walked == key { return false }
+        }
+        open.append(key)
+        if valueType.kind == .Enumeration {
+            for variant in program.enums[valueType.declaration].variants {
+                match variant.payload {
+                    Some(payload) -> {
+                        if ownsUniquely(payload, open) { return true }
+                    }
+                    None -> {}
+                }
+            }
+            return false
+        }
+        if program.dropFunctions[valueType.declaration] >= 0 || isOwnedPointerType(valueType) { return true }
+        for field in program.structs[valueType.declaration].fields {
+            if ownsUniquely(field.valueType, open) { return true }
+        }
+        for argument in program.structs[valueType.declaration].typeArguments {
+            if ownsUniquely(argument, open) { return true }
+        }
+        return false
+    }
+}

@@ -1,0 +1,149 @@
+function isChannelEnd(program: CheckedProgram, valueType: Type) -> Bool {
+    if valueType.kind != .Structure { return false }
+    let base = program.structs[valueType.declaration].genericBase
+    return isChannelEndName(base)
+}
+
+function channelRuntimeFunctions(declarations: Declarations) -> [Int] {
+    for structure in declarations.structs {
+        if !isChannelEndName(structure.genericBase) { continue }
+        var functions: [Int] = []
+        let names: [String] = ["createChannelData", "sendChannelData", "closeChannelData", "receiveChannelData"]
+        for name in names {
+            match declarations.findFunction(.None, name) {
+                Some(target) -> functions.append(target)
+                None -> report(.UndefinedFunction, structure.name.span)
+            }
+        }
+        return functions
+    }
+    return []
+}
+
+extend Checker {
+    function checkChannelConstructor(borrow mut self, sender: Type, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 0 {
+            report(.ChannelConstructorArguments, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let element = program.structs[sender.declaration].typeArguments[0]
+        // A value crosses boxed in an `Any`, so it owns its storage on the
+        // way: a string or struct arrives whole. A pointer, closure, task or
+        // class would share what the sender still holds.
+        if element.kind == .Pointer || !comparesByShape(declarations, element, []) {
+            report(.ChannelPayload, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        return add(.ChannelCreate, sender, span)
+    }
+
+    function checkChannelMember(borrow mut self, sender: Int, field: Identifier, span: Span) -> Int {
+        let declared = program.structs[typeOf(sender).declaration]
+        if declared.genericBase != "Sender" || field.text != "receiver" {
+            report(.ChannelOperation, field.span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let name = joinText(["Receiver<", declarations.typeSpelling(declared.typeArguments[0]), ">"])
+        match declarations.typeNamed(name) {
+            Some(receiver) -> return add(.ChannelReceiver(sender), receiver, span)
+            None -> report(.UnknownType, span)
+        }
+        return add(.Integer(0), Type.invalid(), span)
+    }
+
+    function checkChannelMethod(borrow mut self, channel: Int, method: Identifier, arguments: [Int], span: Span) -> Int {
+        let declared = program.structs[typeOf(channel).declaration]
+        let element = declared.typeArguments[0]
+        if declared.genericBase == "Sender" && method.text == "send" {
+            if arguments.count != 1 {
+                report(.ChannelSendArguments, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+            let value = coerce(expression(arguments[0], .Some(element)), element, .ArgumentTypeMismatch)
+            let signature = declarations.signatures[program.channelFunctions[1]]
+            let boxed = coerce(value, signature.parameters[1].valueType, .ArgumentTypeMismatch)
+            return add(.ChannelSend(channel, boxed), Type.void(), span)
+        }
+        if arguments.count != 0 {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        match declared.genericBase {
+            "Sender" -> { if method.text == "close" { return add(.ChannelClose(channel), Type.void(), span) } }
+            "Receiver" -> {
+                if method.text == "close" {
+                    match declarations.findFunction(.None, "closeChannelReceiver") {
+                        Some(target) -> return add(.Call(target, [add(.Member(channel, 0), Type.int(), span)]), Type.void(), span)
+                        None -> {}
+                    }
+                }
+                if method.text == "receive" {
+                    match declareChannelReceiver(element, span) {
+                        Some(target) -> {
+                            let id = add(.Member(channel, 0), Type.int(), span)
+                            return add(.Call(target, [id]), declarations.signatures[target].result, span)
+                        }
+                        None -> return add(.Integer(0), Type.invalid(), span)
+                    }
+                }
+            }
+            else -> {}
+        }
+        report(.ChannelOperation, method.span)
+        return add(.Integer(0), Type.invalid(), span)
+    }
+
+    function declareChannelReceiver(borrow mut self, element: Type, span: Span) -> Optional<Int> {
+        let resultName = joinText(["Result<", declarations.typeSpelling(element), ",ChannelFailure>"])
+        match declarations.typeNamed(resultName) {
+            Some(resultType) -> {
+                let source = declarations.signatures[program.channelFunctions[3]]
+                let sourceType = source.result
+                let anyType = program.enums[sourceType.declaration].variants[0].payload.unwrap()
+                let errorType = program.enums[sourceType.declaration].variants[1].payload.unwrap()
+                let target = declarations.signatures.count
+                let symbol = joinText(["__channel_receive#", signature().symbol, "@", decimalText(span.start)])
+                let name = Identifier { text = symbol, span = signature().name.span }
+                let argumentName = Identifier { text = "id", span = name.span }
+                let syntax = FunctionDeclaration { name = name, annotations = [], receiver = .Free, parameters = [], result = .None, body = [], span = span, typeParameters = [], scope = GenericScope.none() }
+                declarations.addSignature(Signature {
+                    name = name, symbol = symbol, member = "", owner = .None, receiver = .Free,
+                    parameters = [ParameterSignature { name = argumentName, valueType = Type.int(), mode = .Owned }],
+                    result = resultType, entry = false, declaration = syntax
+                })
+                let id = add(.Read(0), Type.int(), span)
+                let received = add(.Call(program.channelFunctions[3], [id]), sourceType, span)
+                let declaration = program.addStatement(.Declare(1, received))
+                let subject = add(.Read(1), sourceType, span)
+                let value = add(.Read(2), anyType, span)
+                let unboxed = add(.UnboxAny(value, internAnyType(element), .None), element, span)
+                let success = add(.Tagged(0, .Some(unboxed)), resultType, span)
+                let failure = add(.Tagged(1, .Some(add(.Read(3), errorType, span))), resultType, span)
+                let ok = program.addStatement(.Return(.Some(success)))
+                let error = program.addStatement(.Return(.Some(failure)))
+                let arms: [CheckedArm] = [
+                    CheckedArm { variant = 0, binding = .Some(2), body = [ok], literal = .None, value = .None, also = [], ranges = [], texts = [], decimals = [], decimalRanges = [] },
+                    CheckedArm { variant = 1, binding = .Some(3), body = [error], literal = .None, value = .None, also = [], ranges = [], texts = [], decimals = [], decimalRanges = [] }
+                ]
+                let dispatch = program.addStatement(.Dispatch(subject, arms))
+                var locals: [Local] = []
+                let types: [Type] = [Type.int(), sourceType, anyType, errorType]
+                for valueType in types {
+                    locals.append(Local {
+                        name = "", valueType = valueType, mutable = false, byReference = false, moved = false,
+                        cell = false, captured = false, passingMode = .Owned
+                    })
+                }
+                program.functions.append(CheckedFunction {
+                    symbol = symbol, name = name.span, result = resultType, parameterCount = 1, locals = locals,
+                    body = [declaration, dispatch], entry = false, lambda = false, captures = [], globalInitializer = false, service = false, foreign = .None, memberName = ""
+                })
+                return .Some(target)
+            }
+            None -> {
+                report(.UnknownType, span)
+                return .None
+            }
+        }
+    }
+}

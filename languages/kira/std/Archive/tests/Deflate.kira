@@ -1,0 +1,47 @@
+import Foundation
+
+// The checksums against known values, and the gzip writer against the gzip
+// reader at several levels, including the empty input.
+
+@Test
+function crc32MatchesTheCheckValue() {
+    expect!((crc32("123456789".utf8())) == (3421780262))
+    let empty: [UN8] = []
+    expect!((crc32(empty)) == (0))
+}
+
+@Test
+function adler32MatchesKnownValues() {
+    expect!((adler32("Wikipedia".utf8())) == (300286872))
+    let empty: [UN8] = []
+    expect!((adler32(empty)) == (1))
+}
+
+// Text with repeats, at a fast, a default and the best level: each comes
+// back as it went in, and the repeats make the output smaller.
+@Test
+function gzipRoundTripsAtEachLevel() {
+    var text: [UN8] = []
+    for index in 0..20000 {
+        text.appendAll("line \(index % 97) of the same text\n".utf8())
+    }
+    for level in [1, 6, 9] {
+        let packed = gzipCompress(text, level)
+        let outcome = match decompressGzip(move packed) {
+            Ok(bytes) -> bytes.count == text.count && bytes == text ? "same" : "different"
+            Error(failure) -> archiveFailureText(failure)
+        }
+        expect!((outcome) == "same")
+    }
+    expect!((gzipCompress(text, 9).count < text.count) == (true))
+}
+
+@Test
+function gzipRoundTripsTheEmptyInput() {
+    let empty: [UN8] = []
+    let outcome = match decompressGzip(gzipCompress(empty, 6)) {
+        Ok(bytes) -> "read \(bytes.count)"
+        Error(failure) -> archiveFailureText(failure)
+    }
+    expect!((outcome) == "read 0")
+}

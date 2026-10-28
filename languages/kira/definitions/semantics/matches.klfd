@@ -1,0 +1,521 @@
+// What the arms of one match have covered so far. `decimalsSeen` holds each
+// decimal arm's number as its mantissa then its scale, so two arms of the same
+// number are told apart however differently they were written.
+struct ArmCoverage {
+    var covered: [Int]
+    var decimalsSeen: [Int]
+    var otherwise: Bool
+}
+
+struct ArmPatterns {
+    let valid: Bool
+    let variant: Int
+    let payload: Optional<Type>
+    let tested: Optional<Int>
+    let also: [Int]
+    let ranges: [Int]
+    let decimals: [Int]
+    let decimalRanges: [Int]
+    let texts: [Int]
+}
+
+// `match`. The subject is an enum, whose arms name its variants, or an
+// integer or a Bool, whose arms are literals of its type; `else` takes every
+// value no other arm does. Each value is taken by one arm, and every value by
+// some arm: an integer subject needs `else`. A binding takes the variant's
+// payload and is visible only in its own arm.
+//
+// Used as a value, a `match` gives the value of the arm that runs: the
+// expression a lone-statement arm is, or the expression its block ends with.
+// An arm that cannot reach its end, returning or breaking, gives none. The
+// arms' values have the type the position expects, or the first one's.
+
+// What one arm pattern takes: a variant and its payload type, an integer or
+// Bool value, an integer range, a checked string literal, or every value.
+enum ArmKey {
+    Tag(Int, Optional<Type>)
+    Value(Int)
+    Interval(Int, Int)
+    // A decimal subject's arm is a number, taken as the `Number` it is: the
+    // expression that makes it, which is a constant, and its mantissa and
+    // scale, which is how two such arms are told to be the same arm.
+    Decimal(Int, Int, Int)
+    DecimalInterval(Int, Int)
+    Characters(Int)
+    Anything
+    Refused
+    // A side of `try X otherwise Y` whose `X` cannot fall back: reported once,
+    // and covering the rest so the match is not also reported incomplete.
+    Unfallible
+}
+
+struct CheckedChoice {
+    let arms: [CheckedArm]
+    let valueType: Type
+    let checked: Bool
+}
+
+extend Checker {
+    function checkMatch(borrow mut self, subject: Int, arms: [MatchArm], span: Span) -> CheckedStatement {
+        let checked = asNumber(expression(subject, .None))
+        let choice = checkArms(checked, arms, .None, false, span)
+        if !choice.checked { return .Evaluate(checked) }
+        return .Dispatch(checked, choice.arms)
+    }
+
+    function checkMatchValue(borrow mut self, subject: Int, arms: [MatchArm], expected: Optional<Type>, span: Span) -> Int {
+        let checked = asNumber(expression(subject, .None))
+        let choice = checkArms(checked, arms, expected, true, span)
+        if !choice.checked { return add(.Integer(0), Type.invalid(), span) }
+        return add(.Choice(checked, choice.arms), choice.valueType, span)
+    }
+
+    function checkArms(borrow mut self, subject: Int, arms: [MatchArm], expected: Optional<Type>, valued: Bool, span: Span) -> CheckedChoice {
+        let subjectType = typeOf(subject)
+        let literal = subjectType.isInteger() || subjectType.kind == .Boolean || subjectType.kind == .Decimal
+        if subjectType.kind != .Enumeration && !literal && !isStringType(program, subjectType) {
+            if !subjectType.isInvalid() { report(.MatchSubjectNotEnum, program.expressions[subject].span) }
+            return CheckedChoice { arms = [], valueType = Type.invalid(), checked = false }
+        }
+        var valueType = Type.invalid()
+        var typed = false
+        match expected {
+            Some(wanted) -> {
+                valueType = wanted
+                typed = true
+            }
+            None -> {}
+        }
+        var coverage = ArmCoverage { covered = [], decimalsSeen = [], otherwise = false }
+        var checkedArms: [CheckedArm] = []
+        let before = movedNow()
+        var paths: [[Bool]] = []
+        for given in arms {
+            var patterns: [ArmAlternative] = [ArmAlternative { variant = given.variant, pattern = given.pattern }]
+            for alternative in given.alternatives { patterns.append(alternative) }
+            let shape = armPatterns(subjectType, patterns, coverage)
+            if !shape.valid { continue }
+            let arm = absentSide(given, shape.payload)
+            var payload = shape.payload
+            if patterns.count > 1 {
+                match arm.binding {
+                    Some(name) -> report(.AlternativeBinding, name.span)
+                    None -> {}
+                }
+                payload = .None
+            }
+            restoreMoved(before)
+            openScope()
+            let binding = armBinding(arm, payload, patterns.count == 1 && voidedVariant(subjectType, shape.variant))
+            refuseDropCopy(subject, arm, binding)
+            var body: [Int] = []
+            var value: Optional<Int> = .None
+            var last = arm.body.count
+            var written = -1
+            if valued && last > 0 {
+                match trailingValue(arm.body[last - 1]) {
+                    Some(trailing) -> {
+                        written = trailing
+                        last = last - 1
+                    }
+                    None -> {}
+                }
+            }
+            for index in 0..last { checkStatementInto(arm.body[index], body) }
+            if written >= 0 {
+                if typed {
+                    value = .Some(coerce(expression(written, .Some(valueType)), valueType, .MatchArmsDisagree))
+                } else {
+                    let first = expression(written, .None)
+                    valueType = typeOf(first)
+                    typed = true
+                    value = .Some(first)
+                }
+            } else if valued && !leaves(body) {
+                report(.MatchArmWithoutValue, arm.variant.span)
+            }
+            closeScope()
+            if !leaves(body) { paths.append(movedNow()) }
+            checkedArms.append(CheckedArm {
+                variant = shape.variant, binding = binding, body = body, literal = shape.tested, value = value,
+                also = shape.also, ranges = shape.ranges, texts = shape.texts,
+                decimals = shape.decimals, decimalRanges = shape.decimalRanges
+            })
+        }
+        joinMoved(paths, before)
+        let open = subjectType.kind == .Enumeration && program.enums[subjectType.declaration].open
+        if !coverage.otherwise && (open || !coversEvery(subjectType, coverage.covered)) { report(.MatchNotExhaustive, span) }
+        checkFailureKept(subjectType, arms, coverage.covered, span)
+        return CheckedChoice { arms = checkedArms, valueType = valueType, checked = true }
+    }
+
+    // What one arm's patterns test, checked against every arm before it.
+    function armPatterns(borrow mut self, subjectType: Type, patterns: [ArmAlternative], coverage: borrow mut ArmCoverage) -> ArmPatterns {
+        var variant = -1
+        var payload: Optional<Type> = .None
+        var tested: Optional<Int> = .None
+        var also: [Int] = []
+        var ranges: [Int] = []
+        var decimals: [Int] = []
+        var decimalRanges: [Int] = []
+        var texts: [Int] = []
+        var valid = true
+        for pattern in patterns {
+            match armKey(subjectType, pattern) {
+                Tag(index, carried) -> {
+                    if variant < 0 {
+                        variant = index
+                        payload = carried
+                    } else {
+                        also.append(index)
+                    }
+                    if contains(coverage.covered, index) { report(.ArmRepeated, pattern.variant.span) }
+                    coverage.covered.append(index)
+                }
+                Value(value) -> {
+                    match tested {
+                        Some(first) -> also.append(value)
+                        None -> tested = .Some(value)
+                    }
+                    if contains(coverage.covered, value) { report(.ArmRepeated, pattern.variant.span) }
+                    coverage.covered.append(value)
+                }
+                Interval(low, high) -> {
+                    ranges.append(low)
+                    ranges.append(high)
+                }
+                Decimal(literal, mantissa, places) -> {
+                    for index in 0..coverage.decimalsSeen.count / 2 {
+                        if coverage.decimalsSeen[index * 2] == mantissa && coverage.decimalsSeen[index * 2 + 1] == places {
+                            report(.ArmRepeated, pattern.variant.span)
+                        }
+                    }
+                    coverage.decimalsSeen.append(mantissa)
+                    coverage.decimalsSeen.append(places)
+                    decimals.append(literal)
+                }
+                DecimalInterval(low, high) -> {
+                    decimalRanges.append(low)
+                    decimalRanges.append(high)
+                }
+                Characters(text) -> texts.append(text)
+                Anything -> {
+                    if subjectType.kind == .Enumeration && !program.enums[subjectType.declaration].open && ownSource(program.enums[subjectType.declaration].name.span.file) {
+                        report(.OwnedEnumFallback, pattern.variant.span)
+                    }
+                    if coverage.otherwise { report(.ArmRepeated, pattern.variant.span) }
+                    coverage.otherwise = true
+                }
+                Refused -> valid = false
+                Unfallible -> {
+                    valid = false
+                    coverage.otherwise = true
+                }
+            }
+        }
+        return ArmPatterns {
+            valid = valid, variant = variant, payload = payload, tested = tested, also = also,
+            ranges = ranges, decimals = decimals, decimalRanges = decimalRanges, texts = texts
+        }
+    }
+
+    // What one pattern takes from a subject of `subjectType`, or `Refused`
+    // once the mismatch is reported.
+    function armKey(borrow mut self, subjectType: Type, pattern: ArmAlternative) -> ArmKey {
+        let span = pattern.variant.span
+        match pattern.pattern {
+            Variant -> {
+                if subjectType.kind != .Enumeration {
+                    report(.ArmPatternMismatch, span)
+                    return .Refused
+                }
+                let matched = program.enums[subjectType.declaration]
+                match matched.variant(pattern.variant.text) {
+                    Some(index) -> return .Tag(index, matched.variants[index].payload)
+                    None -> {
+                        report(.UnknownArmVariant, span)
+                        return .Refused
+                    }
+                }
+            }
+            Integer(value) -> {
+                if subjectType.kind == .Decimal { return decimalArm(decimalText(value), span) }
+                if !subjectType.isInteger() {
+                    report(.ArmPatternMismatch, span)
+                    return .Refused
+                }
+                if !subjectType.holdsLiteral(value, false) {
+                    report(.LiteralOutOfRange, span)
+                    return .Refused
+                }
+                return .Value(value)
+            }
+            Range(low, high) -> {
+                if subjectType.kind == .Decimal {
+                    if high <= low { return .Refused }
+                    return decimalInterval(decimalText(low), decimalText(high), span)
+                }
+                if !subjectType.isInteger() {
+                    report(.ArmPatternMismatch, span)
+                    return .Refused
+                }
+                if !subjectType.holdsLiteral(low, false) || !subjectType.holdsLiteral(high - 1, false) || high <= low {
+                    report(.LiteralOutOfRange, span)
+                    return .Refused
+                }
+                return .Interval(low, high)
+            }
+            Decimal(written) -> {
+                if subjectType.kind != .Decimal {
+                    report(.ArmPatternMismatch, span)
+                    return .Refused
+                }
+                return decimalArm(written, span)
+            }
+            DecimalRange(low, high) -> {
+                if subjectType.kind != .Decimal {
+                    report(.ArmPatternMismatch, span)
+                    return .Refused
+                }
+                return decimalInterval(low, high, span)
+            }
+            Boolean(truth) -> {
+                if subjectType.kind != .Boolean {
+                    report(.ArmPatternMismatch, span)
+                    return .Refused
+                }
+                if truth { return .Value(1) }
+                return .Value(0)
+            }
+            TextLiteral(written) -> {
+                if !isStringType(program, subjectType) {
+                    report(.ArmPatternMismatch, span)
+                    return .Refused
+                }
+                return .Characters(expression(written, .Some(subjectType)))
+            }
+            Otherwise -> return .Anything
+            Kept -> {
+                match fallbackKey(subjectType, "Ok", "Some") {
+                    Some(key) -> return key
+                    None -> {
+                        if !subjectType.isInvalid() { report(.TryNeedsResult, span) }
+                        return .Unfallible
+                    }
+                }
+            }
+            Fallen -> {
+                match fallbackKey(subjectType, "Error", "None") {
+                    Some(key) -> return key
+                    None -> return .Unfallible
+                }
+            }
+        }
+    }
+
+    // The variant a side of `try X otherwise Y` takes: `fromResult` when `X`
+    // is a result, `fromOptional` when it is an optional value. Nothing else
+    // can fall back, and the kept side reports it.
+    function fallbackKey(borrow self, subjectType: Type, fromResult: String, fromOptional: String) -> Optional<ArmKey> {
+        if resultTypes(program, subjectType).isSome() { return .Some(variantKey(subjectType, fromResult)) }
+        if optionalPayload(program, subjectType).isSome() { return .Some(variantKey(subjectType, fromOptional)) }
+        return .None
+    }
+
+    function variantKey(borrow self, subjectType: Type, name: String) -> ArmKey {
+        let matched = program.enums[subjectType.declaration]
+        match matched.variant(name) {
+            Some(index) -> return .Tag(index, matched.variants[index].payload)
+            None -> return .Refused
+        }
+    }
+
+    // A fallback's fallen side on an optional value. `None` is an absence,
+    // not a failure: there is nothing to bind and nothing for the trail, so
+    // the side keeps only the fallback, after the record the parser put
+    // first.
+    function absentSide(borrow self, arm: MatchArm, payload: Optional<Type>) -> MatchArm {
+        if payload.isSome() || !arm.pattern.isFallen() { return arm }
+        var body: [Int] = []
+        for index in 1..arm.body.count { body.append(arm.body[index]) }
+        return MatchArm { variant = arm.variant, binding = .None, pattern = arm.pattern, alternatives = arm.alternatives, body = body }
+    }
+
+    // The value a statement ending an arm gives: an expression's, or a
+    // `match`'s used as a value.
+    function trailingValue(borrow mut self, statement: Int) -> Optional<Int> {
+        let written = tree.statements[statement]
+        match written.kind {
+            Evaluation(value) -> return .Some(value)
+            Match(subject, arms) -> return .Some(tree.addExpression(.MatchValue(subject, arms), written.span))
+            Binding -> return .None
+            Assignment -> return .None
+            CompoundAssignment -> return .None
+            If -> return .None
+            While -> return .None
+            For -> return .None
+            ForEach -> return .None
+            Attempt -> return .None
+            Return -> return .None
+            Break -> return .None
+            Continue -> return .None
+        }
+    }
+
+    // The arm a decimal pattern takes: the number it spells, and the mantissa
+    // and scale it has, which is how two decimal arms are told to be one arm
+    // written twice however differently they were written.
+    function decimalArm(borrow mut self, text: String, span: Span) -> ArmKey {
+        let words = numberWordsOf(text)
+        if words.count == 0 {
+            report(.LiteralOutOfRange, span)
+            return .Refused
+        }
+        return .Decimal(numberWordsValue(words[0], words[1], span), words[0], words[1])
+    }
+
+    function decimalInterval(borrow mut self, low: String, high: String, span: Span) -> ArmKey {
+        let from = numberWordsOf(low)
+        let to = numberWordsOf(high)
+        if from.count == 0 || to.count == 0 || !decimalBelow(from, to) {
+            report(.LiteralOutOfRange, span)
+            return .Refused
+        }
+        return .DecimalInterval(numberWordsValue(from[0], from[1], span), numberWordsValue(to[0], to[1], span))
+    }
+
+    // Whether the decimal `low` is below the decimal `high`, dividing where
+    // multiplying would carry the answer out of the words it is written in: two
+    // bounds of eighteen places each have eighteen places of product between
+    // them, and `0.123456789012345678..0.987654321098765432` has none at all.
+    function decimalBelow(borrow self, low: [Int], high: [Int]) -> Bool {
+        if low[1] == high[1] { return low[0] < high[0] }
+        var place = 1
+        var whole = 0
+        if low[1] < high[1] {
+            place = powi10(high[1] - low[1])
+            whole = high[0] / place
+            if low[0] != whole { return low[0] < whole }
+            return high[0] % place != 0
+        }
+        place = powi10(low[1] - high[1])
+        whole = low[0] / place
+        if whole != high[0] { return whole < high[0] }
+        return low[0] % place != 0
+    }
+
+    // Ten to the power of a difference of two scales, each at most eighteen,
+    // and so a power at most eighteen, which is a word.
+    function powi10(borrow self, scale: Int) -> Int {
+        var place = 1
+        for step in 0..scale { place = place * 10 }
+        return place
+    }
+
+    function coversEvery(borrow self, subjectType: Type, covered: [Int]) -> Bool {
+        if subjectType.kind == .Boolean { return contains(covered, 0) && contains(covered, 1) }
+        if subjectType.kind != .Enumeration { return false }
+        for variant in 0..program.enums[subjectType.declaration].variants.count {
+            if !contains(covered, variant) { return false }
+        }
+        return true
+    }
+
+    // A binding owns its payload. Taken from a temporary or a `move`, the
+    // payload is handed over; taken from a value that stays named, one that
+    // runs `drop` would be dropped by both.
+    function refuseDropCopy(borrow mut self, subject: Int, arm: MatchArm, binding: Optional<Int>) {
+        match binding {
+            Some(local) -> {
+                if !program.expressions[subject].operation.readsStorage() { return }
+                var seen: [Int] = []
+                if !ownsDrop(program, locals[local].valueType, seen) { return }
+                match arm.binding {
+                    Some(name) -> report(.MatchedDropCopy, name.span)
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+    }
+
+    // A binding on a variant declared with a payload that is `Void` here
+    // binds nothing, so generic code reads alike for every payload.
+    function armBinding(borrow mut self, arm: MatchArm, payload: Optional<Type>, voided: Bool) -> Optional<Int> {
+        match arm.binding {
+            Some(name) -> {
+                match payload {
+                    Some(carried) -> return .Some(declareLocal(name.text, carried, false, false))
+                    None -> {
+                        if !voided { report(.NothingToBind, name.span) }
+                    }
+                }
+            }
+            None -> {}
+        }
+        return .None
+    }
+
+    function voidedVariant(borrow self, subjectType: Type, variant: Int) -> Bool {
+        if subjectType.kind != .Enumeration || variant < 0 { return false }
+        return program.enums[subjectType.declaration].variants[variant].voided
+    }
+
+    // A handler arm of an `attempt`, which names the variant it takes.
+    function checkArm(borrow mut self, arm: MatchArm, variant: Variant, index: Int) -> CheckedArm {
+        openScope()
+        let binding = armBinding(arm, variant.payload, variant.voided)
+        var body: [Int] = []
+        for statement in arm.body {
+            checkStatementInto(statement, body)
+        }
+        closeScope()
+        return CheckedArm { variant = index, binding = binding, body = body, literal = .None, value = .None, also = [], ranges = [], texts = [], decimals = [], decimalRanges = [] }
+    }
+}
+
+// Whether a value of `valueType` runs a `drop`, its own or a field's or a
+// payload's, which makes two copies of it two drops. Shared storage, an
+// array's, a class's or a native state's, is counted rather than dropped: a
+// copy retains it, so its `drop` releases one count. `seen` holds the structs
+// and enums already looked into, each as twice its declaration, plus one for
+// an enum: one that ran a `drop` would have answered already, so each is
+// looked into once, however many types hold it or however it recurs.
+function ownsDrop(program: CheckedProgram, valueType: Type, seen: borrow mut [Int]) -> Bool {
+    var key = valueType.declaration * 2
+    if valueType.kind == .Enumeration { key += 1 }
+    if valueType.kind == .Structure || valueType.kind == .Enumeration {
+        for earlier in seen {
+            if earlier == key { return false }
+        }
+        seen.append(key)
+    }
+    match valueType.kind {
+        Structure -> {
+            let structure = program.structs[valueType.declaration]
+            if structure.genericBase == "Class" || structure.genericBase == "Array" || structure.genericBase == "NativeState" { return false }
+            if program.dropFunctions[valueType.declaration] >= 0 { return true }
+            for field in structure.fields {
+                if ownsDrop(program, field.valueType, seen) { return true }
+            }
+        }
+        Enumeration -> {
+            for variant in program.enums[valueType.declaration].variants {
+                match variant.payload {
+                    Some(payload) -> {
+                        if ownsDrop(program, payload, seen) { return true }
+                    }
+                    None -> {}
+                }
+            }
+        }
+        Integer -> {}
+        Decimal -> {}
+        Floating -> {}
+        Boolean -> {}
+        Pointer -> {}
+        Void -> {}
+        Invalid -> {}
+    }
+    return false
+}

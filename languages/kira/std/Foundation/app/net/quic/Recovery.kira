@@ -1,0 +1,185 @@
+// Loss detection and the probe timeout (RFC 9002 sections 5 and 6, and its
+// appendix A), per packet number space, with the RTT estimate they share.
+// All durations are microseconds.
+
+namespace QuicRecoveryTiming {
+    // RFC 9002 section 6.2.2.
+    let initialRtt: Number = 333000
+    let granularity: Number = 1000
+    // A packet is lost three packets or nine eighths of an RTT after a
+    // later one was acknowledged (section 6.1).
+    let packetThreshold: Number = 3
+    let timeNumerator: Number = 9
+    let timeDenominator: Number = 8
+    let variationFactor: Number = 4
+    // Exponential weights of the RTT filters (section 5.3).
+    let smoothingWeight: Number = 8
+    let variationWeight: Number = 4
+}
+
+struct QuicSentPacket {
+    let number: Number
+    let sentAt: QuicInstant
+    let size: Number
+    let elicitsAck: Bool
+    let inFlight: Bool
+    // What the packet carried that must be sent again if it is lost.
+    let frames: [QuicFrame]
+}
+
+struct QuicRttEstimator {
+    var latest: Number = 0
+    var smoothed: Number = QuicRecoveryTiming.initialRtt
+    var variation: Number = trunc(QuicRecoveryTiming.initialRtt / 2)
+    var minimum: Number = 0
+    var sampled: Bool = false
+
+    // A new sample; the peer's reported delay counts only once the
+    // handshake is confirmed, and never below the minimum (section 5.3).
+    function update(borrow mut self, sample: Number, ackDelay: Number, maxAckDelay: Number) {
+        latest = sample
+        if !sampled {
+            minimum = sample
+            smoothed = sample
+            variation = trunc(sample / 2)
+            sampled = true
+            return
+        }
+        minimum = min(minimum, sample)
+        let delay = min(ackDelay, maxAckDelay)
+        let adjusted = sample >= minimum + delay ? sample - delay : sample
+        let deviation = abs(smoothed - adjusted)
+        variation = trunc(
+            (
+                variation * (QuicRecoveryTiming.variationWeight - 1) + deviation
+            ) / QuicRecoveryTiming.variationWeight
+        )
+        smoothed = trunc(
+            (
+                smoothed * (QuicRecoveryTiming.smoothingWeight - 1) + adjusted
+            ) / QuicRecoveryTiming.smoothingWeight
+        )
+    }
+
+    function probeTimeout(borrow self, maxAckDelay: Number) -> Number {
+        return smoothed + max(
+            QuicRecoveryTiming.variationFactor * variation,
+            QuicRecoveryTiming.granularity
+        ) + maxAckDelay
+    }
+
+    function lossDelay(borrow self) -> Number {
+        let base = trunc(
+            max(
+                latest,
+                smoothed
+            ) * QuicRecoveryTiming.timeNumerator / QuicRecoveryTiming.timeDenominator
+        )
+        return max(base, QuicRecoveryTiming.granularity)
+    }
+}
+
+// One packet number space: what was sent and is not yet acknowledged or
+// lost, and what arrived.
+struct QuicPacketSpace {
+    var sent: [QuicSentPacket] = []
+    var nextNumber: Number = 0
+    var largestAcknowledged: Number? = .None
+    var lossTime: QuicInstant? = .None
+    var lastElicitingAt: QuicInstant? = .None
+    var received: QuicReceivedRanges = QuicReceivedRanges {}
+    var largestReceived: Number? = .None
+    var discarded: Bool = false
+
+    function elicitingInFlight(borrow self) -> Bool {
+        for packet in sent {
+            if packet.elicitsAck { return true }
+        }
+        return false
+    }
+
+    function record(borrow mut self, packet: QuicSentPacket) {
+        if packet.elicitsAck { lastElicitingAt = .Some(packet.sentAt) }
+        nextNumber = packet.number + 1
+        sent.append(packet)
+    }
+
+    function noteReceived(borrow mut self, number: Number, now: QuicInstant) {
+        received.add(number, now)
+        largestReceived = .Some(
+            match largestReceived {
+                Some(value) -> max(value, number)
+                None -> number
+            }
+        )
+    }
+
+    // The packets `ack` names, taken out of `sent`.
+    function takeAcknowledged(borrow mut self, ack: borrow QuicAckFrame) -> [QuicSentPacket] {
+        var acknowledged: [QuicSentPacket] = []
+        var kept: [QuicSentPacket] = []
+        for packet in sent {
+            if quicRangesHold(ack.ranges, packet.number) {
+                acknowledged.append(packet)
+            } else {
+                kept.append(packet)
+            }
+        }
+        sent = kept
+        return acknowledged
+    }
+
+    // Packets now judged lost, taken out of `sent`; the loss timer is set
+    // for the first that may yet be (RFC 9002 appendix A.10).
+    function takeLost(
+        borrow mut self,
+        rtt: borrow QuicRttEstimator,
+        now: QuicInstant
+    ) -> [QuicSentPacket] {
+        lossTime = .None
+        let largest = match largestAcknowledged {
+            Some(value) -> value
+            None -> return []
+        }
+        let delay = rtt.lossDelay()
+        var lost: [QuicSentPacket] = []
+        var kept: [QuicSentPacket] = []
+        for packet in sent {
+            if packet.number > largest {
+                kept.append(packet)
+            } else if now.since(
+                packet.sentAt
+            ) >= delay || largest - packet.number >= QuicRecoveryTiming.packetThreshold {
+                lost.append(packet)
+            } else {
+                kept.append(packet)
+                lossTime = quicEarliest(lossTime, .Some(packet.sentAt.plus(delay)))
+            }
+        }
+        sent = kept
+        return lost
+    }
+}
+
+function quicRangesHold(ranges: borrow [QuicAckRange], number: Number) -> Bool {
+    for range in ranges {
+        if number >= range.smallest && number <= range.largest { return true }
+    }
+    return false
+}
+
+struct QuicAckOutcome {
+    let acknowledged: [QuicSentPacket]
+    let lost: [QuicSentPacket]
+}
+
+enum QuicTimerKind {
+    Loss
+    Probe
+}
+
+struct QuicRecoveryTimer {
+    let at: QuicInstant
+    let level: TlsEncryptionLevel
+    let kind: QuicTimerKind
+}

@@ -1,0 +1,179 @@
+import Heap
+
+// How a value reads in a trail. `traceText(value)` is the compiler's: it walks
+// the value's type and writes it through the functions below into one buffer,
+// then takes back the text written since it started. A `traced()` body that
+// traces other values writes past its caller's mark, so each trace takes only
+// its own text.
+//
+// A type shown by its fields is written out to a few levels and a few
+// elements; a type whose fields mean little to a reader conforms to `Traced`
+// and says itself what a trail shows:
+//
+//     extend Mesh: Traced {
+//         function traced(borrow self) -> Trace {
+//             return Trace(name, vertices: vertices.count)
+//         }
+//     }
+//
+// `Trace(...)` takes what `log(...)` takes: an optional note, then fields
+// named by their label or their source text.
+
+/// What a value of a `Traced` type shows in a trail.
+struct Trace {
+    let note: String
+    let names: [String]
+    let values: [String]
+}
+
+/// A type that chooses what a trail shows of its values.
+trait Traced {
+    function traced(borrow self) -> Trace
+}
+
+// `Trace(...)` as the parser writes it.
+function traceOf(note: String, names: [String], values: [String]) -> Trace {
+    return Trace { note = move note, names = move names, values = move values }
+}
+
+// The most bytes of a string a trace quotes.
+function traceStringLimit() -> Int {
+    return 80
+}
+
+// How many `traced()` calls a trace may nest before it only names the type.
+function traceNestingLimit() -> Int {
+    return 4
+}
+
+function traceMark() -> Int {
+    runtimeContext.traceNesting = runtimeContext.traceNesting + 1
+    return runtimeContext.traceBuffer.count
+}
+
+function traceTake(mark: Int) -> String {
+    let empty: String = ""
+    let count = runtimeContext.traceBuffer.count - mark
+    let data = makeArrayData(count)
+    heapCopyBytes(data, heapOffset(runtimeContext.traceBuffer.data, mark), count)
+    runtimeContext.traceBuffer.count = mark
+    runtimeContext.traceNesting = runtimeContext.traceNesting - 1
+    return String { data = data, count = count, capacity = count, ops = empty.ops }
+}
+
+function traceNested() -> Bool {
+    return runtimeContext.traceNesting <= traceNestingLimit()
+}
+
+function traceBytes(data: RawPtr, count: Int) {
+    let needed = runtimeContext.traceBuffer.count + count
+    if needed > runtimeContext.traceBuffer.capacity {
+        var capacity = runtimeContext.traceBuffer.capacity * 2
+        if capacity < 128 { capacity = 128 }
+        while capacity < needed { capacity = capacity * 2 }
+        runtimeContext.traceBuffer.data = resizeArrayData(runtimeContext.traceBuffer.data, capacity)
+        runtimeContext.traceBuffer.capacity = capacity
+    }
+    heapCopyBytes(
+        heapOffset(runtimeContext.traceBuffer.data, runtimeContext.traceBuffer.count),
+        data,
+        count
+    )
+    runtimeContext.traceBuffer.count = needed
+}
+
+function traceAppend(text: borrow String) {
+    traceBytes(text.data, text.count)
+}
+
+function traceInteger(value: Int) {
+    traceAppend(stringFromInteger(value))
+}
+
+function traceNumber(value: borrow Number) {
+    traceAppend(numberToString(value))
+}
+
+function traceUnsigned(value: U64) {
+    traceAppend(stringFromUnsigned(value))
+}
+
+// A float always reads as one: `1.0`, not `1`.
+function traceFloat(value: Float) {
+    let text = stringFromFloat(value)
+    traceAppend(text)
+    for index in 0..text.count {
+        let byte = text.charAt(index)
+        if byte == 46 || byte == 101 || byte == 69 || byte == 110 || byte == 105 { return }
+    }
+    traceAppend(".0")
+}
+
+function traceBoolean(value: Bool) {
+    traceAppend(stringFromBoolean(value))
+}
+
+// `"text"`, escaped; a long string cut at a scalar boundary, with its length.
+function traceQuoted(value: borrow String) {
+    var end = value.count
+    if end > traceStringLimit() {
+        end = traceStringLimit()
+        while end > 0 && (value.charAt(end) & 192) == 128 { end = end - 1 }
+    }
+    traceAppend("\"")
+    var start: Int = 0
+    for index in 0..end {
+        let escape = traceEscape(value.charAt(index))
+        if escape.count == 0 { continue }
+        traceBytes(heapOffset(value.data, start), index - start)
+        traceAppend(escape)
+        start = index + 1
+    }
+    traceBytes(heapOffset(value.data, start), end - start)
+    if end < value.count {
+        traceAppend("…\" (" + stringFromInteger(value.count) + " bytes)")
+        return
+    }
+    traceAppend("\"")
+}
+
+// How a byte is written inside quotes, or empty when it is written as is.
+function traceEscape(byte: Int) -> String {
+    if byte == 34 { return "\\\"" }
+    if byte == 92 { return "\\\\" }
+    if byte == 10 { return "\\n" }
+    if byte == 9 { return "\\t" }
+    if byte == 13 { return "\\r" }
+    if byte < 32 || byte == 127 { return "\\u{" + stringFromInteger(byte) + "}" }
+    return ""
+}
+
+// After an array's shown elements: how many were left out.
+function traceElided(shown: Int, total: Int) {
+    if total <= shown { return }
+    if shown == 0 {
+        traceAppend(stringFromInteger(total))
+        traceAppend(total == 1 ? " element" : " elements")
+        return
+    }
+    traceAppend(", … " + stringFromInteger(total - shown) + " more")
+}
+
+// `Mesh(name: "hull", vertices: 1204)`, or with a note,
+// `Mesh "stale" (age: 3)`.
+function traceTraced(name: RawPtr, count: Int, trace: borrow Trace) {
+    traceBytes(name, count)
+    if trace.note.count > 0 {
+        traceAppend(" \"" + trace.note + "\"")
+        if trace.names.count == 0 { return }
+        traceAppend(" ")
+    }
+    traceAppend("(")
+    for index in 0..trace.names.count {
+        if index > 0 { traceAppend(", ") }
+        traceAppend(trace.names[index])
+        traceAppend(": ")
+        traceAppend(trace.values[index])
+    }
+    traceAppend(")")
+}

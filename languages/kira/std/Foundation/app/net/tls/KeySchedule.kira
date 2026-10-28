@@ -1,0 +1,246 @@
+// The TLS 1.3 key schedule (RFC 8446 section 7.1), which QUIC shares (RFC
+// 9001 section 5). The extract and expand steps are the kernel's HKDF; the
+// labels, the order of the stages and which transcript each secret binds are
+// here.
+
+// What a cipher suite fixes for the schedule and for record protection.
+struct TlsSuiteParameters {
+    let suite: CipherSuite
+    let hash: HashAlgorithm
+    let hashBytes: Number
+    let keyBytes: Number
+}
+
+namespace TlsSuiteSize {
+    let sha256: Number = 32
+    let sha384: Number = 48
+    let aes128Key: Number = 16
+    let aes256Key: Number = 32
+    let chachaKey: Number = 32
+}
+
+// The parameters of a suite this engine implements, or none.
+function tlsSuiteParameters(suite: CipherSuite) -> TlsSuiteParameters? {
+    return match suite {
+        Aes128GcmSha256 -> .Some(
+            TlsSuiteParameters {
+                suite: .Aes128GcmSha256,
+                hash: .Sha256,
+                hashBytes: TlsSuiteSize.sha256,
+                keyBytes: TlsSuiteSize.aes128Key
+            }
+        )
+        Aes256GcmSha384 -> .Some(
+            TlsSuiteParameters {
+                suite: .Aes256GcmSha384,
+                hash: .Sha384,
+                hashBytes: TlsSuiteSize.sha384,
+                keyBytes: TlsSuiteSize.aes256Key
+            }
+        )
+        ChaCha20Poly1305Sha256 -> .Some(
+            TlsSuiteParameters {
+                suite: .ChaCha20Poly1305Sha256,
+                hash: .Sha256,
+                hashBytes: TlsSuiteSize.sha256,
+                keyBytes: TlsSuiteSize.chachaKey
+            }
+        )
+        else -> .None
+    }
+}
+
+// The bytes of `text`, for labels and contexts.
+function tlsTextBytes(text: borrow String) -> [UN8] {
+    return text.utf8()
+}
+
+// HKDF-Expand-Label (RFC 8446 section 7.1): `secret` expanded under
+// "tls13 " + `label` and `context` to `length` bytes.
+function tlsExpandLabel(
+    hash: HashAlgorithm,
+    secret: borrow [UN8],
+    label: borrow String,
+    context: borrow [UN8],
+    length: Number
+) -> Result<[UN8], CryptoFailure> {
+    var info = WireWriter {}
+    info.writeInteger(length, 2)
+    info.writeVector(tlsTextBytes("tls13 " + label), Tls.shortVector)
+    info.writeVector(context, Tls.shortVector)
+    return hkdfExpand(hash, secret, info.bytes, Number(length))
+}
+
+// Derive-Secret: `secret` expanded under `label` and a transcript hash.
+function tlsDeriveSecret(
+    parameters: borrow TlsSuiteParameters,
+    secret: borrow [UN8],
+    label: borrow String,
+    transcriptHash: borrow [UN8]
+) -> Result<[UN8], CryptoFailure> {
+    return tlsExpandLabel(parameters.hash, secret, label, transcriptHash, parameters.hashBytes)
+}
+
+// `count` zero bytes: the absent PSK and the absent key share the schedule
+// extracts in their place.
+function tlsZeroBytes(count: Number) -> [UN8] {
+    var zeros: [UN8] = []
+    for _ in 0..count { zeros.append(0) }
+    return zeros
+}
+
+// The secret after the next stage's "derived" step and extract.
+function tlsNextStage(
+    parameters: borrow TlsSuiteParameters,
+    secret: borrow [UN8],
+    keying: borrow [UN8]
+) -> Result<[UN8], CryptoFailure> {
+    let empty: [UN8] = []
+    let emptyHash = try digest(parameters.hash, empty)
+    let salt = try tlsDeriveSecret(parameters, secret, "derived", emptyHash)
+    return hkdfExtract(parameters.hash, salt, keying)
+}
+
+// The early secret with no PSK.
+function tlsEarlySecret(parameters: borrow TlsSuiteParameters) -> Result<[UN8], CryptoFailure> {
+    let zeros = tlsZeroBytes(parameters.hashBytes)
+    return hkdfExtract(parameters.hash, zeros, zeros)
+}
+
+// The handshake secret from the early secret and the (EC)DHE shared secret.
+function tlsHandshakeSecret(
+    parameters: borrow TlsSuiteParameters,
+    shared: borrow [UN8]
+) -> Result<[UN8], CryptoFailure> {
+    let early = try tlsEarlySecret(parameters)
+    return tlsNextStage(parameters, early, shared)
+}
+
+function tlsMasterSecret(
+    parameters: borrow TlsSuiteParameters,
+    handshake: borrow [UN8]
+) -> Result<[UN8], CryptoFailure> {
+    return tlsNextStage(parameters, handshake, tlsZeroBytes(parameters.hashBytes))
+}
+
+// A Finished message's verify data over `transcriptHash` (RFC 8446 section
+// 4.4.4), from the sender's traffic secret.
+function tlsFinishedData(
+    parameters: borrow TlsSuiteParameters,
+    trafficSecret: borrow [UN8],
+    transcriptHash: borrow [UN8]
+) -> Result<[UN8], CryptoFailure> {
+    let empty: [UN8] = []
+    let key = try tlsExpandLabel(
+        parameters.hash,
+        trafficSecret,
+        "finished",
+        empty,
+        parameters.hashBytes
+    )
+    return hmac(parameters.hash, key, transcriptHash)
+}
+
+// The labels packet keys are expanded under: TLS records' or QUIC packets'
+// (RFC 9001 section 5.1).
+enum TlsKeyLabels {
+    Record
+    Quic
+}
+
+// One direction's packet protection: the AEAD key, the static IV every
+// nonce is made from, and for QUIC the header-protection key.
+struct TlsTrafficKeys {
+    let key: AeadKey
+    let iv: [UN8]
+    let header: [UN8]
+}
+
+function tlsTrafficKeys(
+    parameters: borrow TlsSuiteParameters,
+    secret: borrow [UN8],
+    labels: TlsKeyLabels
+) -> Result<TlsTrafficKeys, CryptoFailure> {
+    let empty: [UN8] = []
+    let (keyLabel, ivLabel) = match labels {
+        Record -> ("key", "iv")
+        Quic -> ("quic key", "quic iv")
+    }
+    let key = try tlsExpandLabel(parameters.hash, secret, keyLabel, empty, parameters.keyBytes)
+    let iv = try tlsExpandLabel(parameters.hash, secret, ivLabel, empty, Tls.nonceBytes)
+    var header: [UN8] = []
+    match labels {
+        Quic -> header = try tlsExpandLabel(
+            parameters.hash,
+            secret,
+            "quic hp",
+            empty,
+            parameters.keyBytes
+        )
+        // TLS records have no header protection.
+        Record -> {}
+    }
+    return .Ok(
+        TlsTrafficKeys {
+            key: AeadKey { suite: parameters.suite, key: key },
+            iv: iv,
+            header: header
+        }
+    )
+}
+
+// The next generation of a traffic secret (RFC 8446 section 7.2, RFC 9001
+// section 6.1).
+function tlsUpdatedSecret(
+    parameters: borrow TlsSuiteParameters,
+    secret: borrow [UN8],
+    labels: TlsKeyLabels
+) -> Result<[UN8], CryptoFailure> {
+    let empty: [UN8] = []
+    let label = match labels {
+        Record -> "traffic upd"
+        Quic -> "quic ku"
+    }
+    return tlsExpandLabel(parameters.hash, secret, label, empty, parameters.hashBytes)
+}
+
+// The nonce of record or packet `sequence`: the IV with the sequence number
+// XORed into its last bytes (RFC 8446 section 5.3).
+function tlsSequenceNonce(iv: borrow [UN8], sequence: Number) -> [UN8] {
+    var nonce = copy iv
+    var rest = sequence
+    var index = nonce.count - 1
+    while rest > 0 && index >= 0 {
+        nonce[index] = UN8(Number(nonce[index]) ^ (rest % Wire.byteValues))
+        rest = trunc(rest / Wire.byteValues)
+        index -= 1
+    }
+    return nonce
+}
+
+// Every handshake message so far, hashed whole when a secret needs it.
+struct TlsTranscript {
+    var bytes: [UN8] = []
+
+    function add(borrow mut self, message: borrow [UN8]) {
+        bytes.appendAll(message)
+    }
+
+    function hashed(borrow self, algorithm: HashAlgorithm) -> Result<[UN8], CryptoFailure> {
+        return digest(algorithm, bytes)
+    }
+
+    // After a HelloRetryRequest the first ClientHello is replaced by a
+    // message_hash message holding its hash (RFC 8446 section 4.4.1).
+    function restartForRetry(
+        borrow mut self,
+        algorithm: HashAlgorithm
+    ) -> Result<Void, CryptoFailure> {
+        let first = try digest(algorithm, bytes)
+        var replaced = WireWriter {}
+        replaced.writeByte(code(TlsHandshakeType.MessageHash))
+        replaced.writeVector(first, Tls.longVector)
+        bytes = replaced.bytes
+        return .Ok
+    }
+}

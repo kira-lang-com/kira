@@ -1,0 +1,451 @@
+import Foundation
+
+// WebTransport over HTTP/3 (draft-ietf-webtrans-http3-16): a session is an
+// extended CONNECT stream, and its streams and datagrams name it by that
+// stream's ID. Neither side announces WebTransport flow control, so a
+// connection carries one session at a time and flow control capsules are
+// ignored (section 5.1).
+
+namespace WebTransport {
+    let protocolName: String = "webtransport-h3"
+    // WT_APPLICATION_ERROR: an application's 32-bit code n travels as
+    // first + n + n / 0x1e, skipping HTTP/3's reserved code points 0x1f * N
+    // + 0x21 (section 4.4).
+    let firstApplicationError: Number = 0x52e4a40fa8db
+    let lastApplicationError: Number = 0x52e5ac983162
+    let largestApplicationError: Number = 0xffffffff
+    let codesBetweenReserved: Number = 0x1e
+    let reservedSpacing: Number = 0x1f
+    let reservedOffset: Number = 0x21
+    // A WT_CLOSE_SESSION message's longest, and its code's width (section 6).
+    let messageLimit: Number = 1024
+    let closeCodeBytes: Number = 4
+    // Streams and datagrams held for a session not yet established
+    // (section 4.6).
+    let heldStreams: Number = 16
+    let heldDatagrams: Number = 16
+    // A capsule is read whole up to this; a longer one that is not a close
+    // is skipped as it arrives.
+    let capsuleLimit: Number = 65536
+    // Statuses from 200 up to this accept a session (section 3.2).
+    let successEnd: Number = 300
+}
+
+namespace Utf8Bits {
+    let continuationMask: Number = 192
+    let continuation: Number = 128
+}
+
+@Open
+enum CapsuleType: Number {
+    CloseSession = 10307
+    DrainSession = 30894
+}
+
+struct TransportStreamOpened {
+    let session: QuicStreamNumber
+    let stream: QuicStreamNumber
+}
+
+struct TransportBytes {
+    let session: QuicStreamNumber
+    let stream: QuicStreamNumber
+    let bytes: [UN8]
+    let finished: Bool
+}
+
+struct TransportFailure {
+    let session: QuicStreamNumber
+    let stream: QuicStreamNumber
+    // The application's code; none when the code was not one, such as
+    // WT_SESSION_GONE.
+    let error: Number?
+}
+
+struct TransportDatagram {
+    let session: QuicStreamNumber
+    let bytes: [UN8]
+}
+
+struct TransportClose {
+    let session: QuicStreamNumber
+    let error: Number
+    let reason: String
+    // The error the CONNECT stream was reset with, when it ended abruptly.
+    let reset: Number? = .None
+}
+
+struct TransportSession {
+    // The CONNECT stream, whose ID is the session's.
+    let id: QuicStreamNumber
+    // A client's waits for its 2xx; a server's is accepted when made.
+    var established: Bool
+    var capsules: [UN8] = []
+    var skipLeft: Number = 0
+    // WT_CLOSE_SESSION arrived: any byte after it is an error.
+    var closeHeard: Bool = false
+    var ended: Bool = false
+}
+
+struct TransportStream {
+    let id: QuicStreamNumber
+    // None until a peer's stream header was read.
+    var session: QuicStreamNumber? = .None
+    // The header's bytes, which a reset still delivers (section 4.4).
+    var header: Number = 0
+    let local: Bool
+    // Bytes, and the end, not yet handed on.
+    var held: [UN8] = []
+    var heldEnd: Bool = false
+    var announced: Bool = false
+    var sendDone: Bool = false
+    var receiveDone: Bool = false
+
+    function sends(borrow self) -> Bool {
+        return id.kind() == .Bidirectional || local
+    }
+
+    function receives(borrow self) -> Bool {
+        return id.kind() == .Bidirectional || !local
+    }
+}
+
+extend Http3Session {
+    // Whether both sides meet WebTransport's requirements (section 3.1):
+    // its settings, datagrams, and reliable resets.
+    function transportReady(borrow self, quic: borrow QuicConnection) -> Bool {
+        let settings = match peerSettings {
+            Some(value) -> value
+            None -> return false
+        }
+        let parameters = match quic.peerParameters {
+            Some(value) -> value
+            None -> return false
+        }
+        let connect = role == .Server || settings.enableConnectProtocol
+        return settings.webTransport && settings.datagrams && connect && parameters.maxDatagramFrameSize > 0 && parameters.resetStreamAt
+    }
+
+    function transportIndex(borrow self, session: QuicStreamNumber) -> Number? {
+        for (index, transport) in transports.enumerated() {
+            if transport.id == session { return .Some(index) }
+        }
+        return .None
+    }
+
+    function transportStreamIndex(borrow self, id: QuicStreamNumber) -> Number? {
+        for (index, stream) in transportStreams.enumerated() {
+            if stream.id == id { return .Some(index) }
+        }
+        return .None
+    }
+
+    // Without flow control one session at a time (section 5.1).
+    function liveTransport(borrow self) -> Bool {
+        for transport in transports {
+            if !transport.ended { return true }
+        }
+        return false
+    }
+
+    // A client's session: the extended CONNECT for `head`'s target.
+    function openTransport(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        head: borrow RequestHead
+    ) -> Result<QuicStreamNumber, Http3Problem> {
+        if role != .Client { return .Error(.WrongRole) }
+        if !transportReady(quic) { return .Error(.Invalid(.WtRequirementsNotMet)) }
+        if liveTransport() { return .Error(.Invalid(.RequestRejected)) }
+        let request = RequestHead {
+            method: .Connect,
+            target: copy head.target,
+            fields: copy head.fields,
+            protocolName: .Some(WebTransport.protocolName)
+        }
+        let id = try sendRequest(quic, request, false)
+        transports.append(TransportSession { id: id, established: false })
+        return .Ok(id)
+    }
+
+    // A server accepts the session requested on stream `id` with `head`,
+    // a 2xx response. A second session is reset with H3_REQUEST_REJECTED
+    // (section 5.1).
+    function acceptTransport(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        id: QuicStreamNumber,
+        head: borrow ResponseHead
+    ) -> Result<Void, Http3Problem> {
+        if role != .Server { return .Error(.WrongRole) }
+        let index = match messageIndex(id) {
+            Some(value) -> value
+            None -> return .Error(.Stream(.UnknownStream))
+        }
+        let status = code(head.status)
+        if status < StatusRange.informationalEnd || status >= WebTransport.successEnd {
+            return .Error(.Invalid(.MessageError))
+        }
+        // A client that does not meet the requirements makes the session
+        // malformed (section 3.1).
+        let refusal: Http3Error? = !transportReady(quic) ? .Some(.MessageError) : (
+            liveTransport() ? .Some(.RequestRejected) : .None
+        )
+        match refusal {
+            Some(error) -> {
+                match quic.resetStream(id, code(error)) {
+                    Ok -> {}
+                    Error(failure) -> absorb failure
+                }
+                match quic.stopSending(id, code(error)) {
+                    Ok -> {}
+                    Error(failure) -> absorb failure
+                }
+                forgetMessage(id)
+                return .Error(.Invalid(error))
+            }
+            None -> {}
+        }
+        try respond(quic, id, head)
+        messages[index].capsules = true
+        transports.append(TransportSession { id: id, established: true })
+        releaseHeld(quic)
+        return .Ok
+    }
+
+    // A stream in session `session`, its header written: the stream type
+    // or the WT_STREAM signal, then the session (sections 4.2 and 4.3).
+    function openTransportStream(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        session: QuicStreamNumber,
+        kind: QuicStreamKind
+    ) -> Result<QuicStreamNumber, Http3Problem> {
+        try liveSession(session)
+        let id = match quic.openStream(kind) {
+            Ok(value) -> value
+            Error(problem) -> return .Error(.Stream(problem))
+        }
+        var writer = WireWriter {}
+        match kind {
+            Unidirectional -> writer.writeVarint(code(Http3StreamType.WebTransport))
+            Bidirectional -> writer.writeVarint(code(Http3FrameType.WtStream))
+        }
+        writer.writeVarint(session.raw)
+        try sendStream(quic, StreamBytes { id: id, bytes: writer.bytes, finish: false })
+        transportStreams.append(
+            TransportStream {
+                id: id,
+                session: .Some(session),
+                header: writer.count(),
+                local: true,
+                announced: true,
+                receiveDone: kind == .Unidirectional
+            }
+        )
+        return .Ok(id)
+    }
+
+    function liveSession(borrow self, session: QuicStreamNumber) -> Result<Void, Http3Problem> {
+        return match transportIndex(session) {
+            Some(index) -> transports[index].ended ? .Error(.Invalid(.WtSessionGone)) : .Ok
+            None -> .Error(.Stream(.UnknownStream))
+        }
+    }
+
+    // The session stream `id` belongs to, while it can send.
+    function sendingStream(borrow self, id: QuicStreamNumber) -> Result<Number, Http3Problem> {
+        let index = match transportStreamIndex(id) {
+            Some(value) -> value
+            None -> return .Error(.Stream(.UnknownStream))
+        }
+        let stream = copy transportStreams[index]
+        if !stream.sends() || stream.sendDone { return .Error(.Stream(.NotWritable)) }
+        return .Ok(index)
+    }
+
+    function writeTransport(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        id: QuicStreamNumber,
+        bytes: borrow [UN8],
+        finish: Bool
+    ) -> Result<Void, Http3Problem> {
+        let index = try sendingStream(id)
+        try sendStream(quic, StreamBytes { id: id, bytes: copy bytes, finish: finish })
+        if finish {
+            transportStreams[index].sendDone = true
+            retireStream(index)
+        }
+        return .Ok
+    }
+
+    // Resets the stream with the application's `error`, still delivering
+    // its header so the peer knows the session (section 4.4).
+    function resetTransport(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        id: QuicStreamNumber,
+        error: Number
+    ) -> Result<Void, Http3Problem> {
+        let index = try sendingStream(id)
+        let wire = try transportErrorCode(error)
+        match quic.resetStreamAt(id, wire, transportStreams[index].header) {
+            Ok -> {}
+            Error(problem) -> return .Error(.Stream(problem))
+        }
+        transportStreams[index].sendDone = true
+        retireStream(index)
+        return .Ok
+    }
+
+    function stopTransport(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        id: QuicStreamNumber,
+        error: Number
+    ) -> Result<Void, Http3Problem> {
+        let index = match transportStreamIndex(id) {
+            Some(value) -> value
+            None -> return .Error(.Stream(.UnknownStream))
+        }
+        if !transportStreams[index].receives() { return .Error(.Stream(.NotReadable)) }
+        let wire = try transportErrorCode(error)
+        match quic.stopSending(id, wire) {
+            Ok -> {}
+            Error(problem) -> return .Error(.Stream(problem))
+        }
+        return .Ok
+    }
+
+    // An HTTP datagram: the session's quarter stream ID, then the bytes
+    // (RFC 9297 section 2.1).
+    function sendTransportDatagram(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        session: QuicStreamNumber,
+        bytes: borrow [UN8]
+    ) -> Result<Void, Http3Problem> {
+        try liveSession(session)
+        var writer = WireWriter {}
+        writer.writeVarint(trunc(Number(session.raw) / QuicStreamBits.kinds))
+        writer.writeBytes(bytes)
+        return match quic.sendDatagram(writer.bytes) {
+            Ok -> .Ok
+            Error(problem) -> .Error(.Stream(problem))
+        }
+    }
+
+    // WT_CLOSE_SESSION, then the CONNECT stream's end (section 6).
+    function closeTransport(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        session: QuicStreamNumber,
+        error: Number,
+        reason: borrow String
+    ) -> Result<Void, Http3Problem> {
+        try liveSession(session)
+        if error < 0 || error > WebTransport.largestApplicationError {
+            return .Error(.Invalid(.MessageError))
+        }
+        try sendData(quic, session, closeCapsule(error, reason), true)
+        endTransport(quic, session, .None, false)
+        return .Ok
+    }
+
+    // The session is over: its streams are reset and stopped with
+    // WT_SESSION_GONE, and nothing new goes out on it (section 6).
+    function endTransport(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        session: QuicStreamNumber,
+        close: TransportClose?,
+        finishConnect: Bool
+    ) {
+        let index = match transportIndex(session) {
+            Some(value) -> value
+            None -> return
+        }
+        if transports[index].ended { return }
+        transports[index].ended = true
+        transports[index].capsules = []
+        var kept: [TransportStream] = []
+        for stream in transportStreams {
+            if stream.session != .Some(session) {
+                kept.append(copy stream)
+                continue
+            }
+            let gone = code(Http3Error.WtSessionGone)
+            if stream.sends() && !stream.sendDone {
+                match quic.resetStreamAt(stream.id, gone, stream.header) {
+                    Ok -> {}
+                    Error(failure) -> absorb failure
+                }
+            }
+            if stream.receives() && !stream.receiveDone {
+                match quic.stopSending(stream.id, gone) {
+                    Ok -> {}
+                    Error(failure) -> absorb failure
+                }
+            }
+        }
+        transportStreams = kept
+        var datagrams: [TransportDatagram] = []
+        for datagram in heldDatagrams {
+            if datagram.session != session { datagrams.append(copy datagram) }
+        }
+        heldDatagrams = datagrams
+        if finishConnect {
+            match quic.write(session, [], true) {
+                Ok -> {}
+                Error(failure) -> absorb failure
+            }
+        }
+        match close {
+            Some(value) -> events.append(.TransportClosed(value))
+            None -> {}
+        }
+    }
+}
+
+function closeCapsule(error: Number, reason: borrow String) -> [UN8] {
+    let bytes = reason.utf8()
+    var cut = min(bytes.count, WebTransport.messageLimit)
+    // A message cut short stays whole characters (section 6).
+    while cut > 0 && cut < bytes.count && (
+        Number(bytes[cut]) & Utf8Bits.continuationMask
+    ) == Utf8Bits.continuation {
+        cut -= 1
+    }
+    var payload = WireWriter {}
+    payload.writeInteger(error, WebTransport.closeCodeBytes)
+    payload.writeBytes(byteRun(bytes, 0, cut))
+    var writer = WireWriter {}
+    writer.writeVarint(code(CapsuleType.CloseSession))
+    writer.writeVarint(payload.count())
+    writer.writeBytes(payload.bytes)
+    return writer.bytes
+}
+
+// An application's 32-bit error code as HTTP/3 carries it (section 4.4).
+function transportErrorCode(error: Number) -> Result<Number, Http3Problem> {
+    if error < 0 || error > WebTransport.largestApplicationError {
+        return .Error(.Invalid(.MessageError))
+    }
+    return .Ok(
+        WebTransport.firstApplicationError + error + trunc(
+            error / WebTransport.codesBetweenReserved
+        )
+    )
+}
+
+// The application's code an HTTP/3 error carries, none when it is not
+// one.
+function applicationError(wire: Number) -> Number? {
+    if wire < WebTransport.firstApplicationError || wire > WebTransport.lastApplicationError {
+        return .None
+    }
+    if (wire - WebTransport.reservedOffset) % WebTransport.reservedSpacing == 0 { return .None }
+    let shifted = wire - WebTransport.firstApplicationError
+    return .Some(shifted - trunc(shifted / WebTransport.reservedSpacing))
+}

@@ -1,0 +1,39 @@
+import Testing
+
+@Test
+function formatsTemplatesAttributesLabelsAndDirectives() {
+    expect!(formats("""
+        #include <metal_stdlib>
+        using namespace metal;
+        template <typename T> T twice(T v){return v*2;}
+        kernel void k(device float* out [[buffer(0)]],texture2d<float, access::read> t [[texture(0)]]){
+        float values[3]={1.0,2.0,3.0};
+        for(int i=0;i<3;i++){out[i]+=values[i]*2.0;}
+        switch(i){case 0: out[0]=-out[0]; break;
+        default: break;}
+        uint b=as_type<uint>(out[0]);
+        }
+
+        """, """
+        #include <metal_stdlib>
+        using namespace metal;
+        template <typename T> T twice(T v) {
+            return v*2;
+        }
+        kernel void k(device float* out [[buffer(0)]], texture2d<float, access::read> t [[texture(0)]]) {
+            float values[3] = {1.0, 2.0, 3.0};
+            for (int i = 0; i < 3; i++) {
+                out[i] += values[i] * 2.0;
+            }
+            switch (i) {
+                case 0:
+                    out[0] = -out[0];
+                    break;
+                default:
+                    break;
+            }
+            uint b = as_type<uint>(out[0]);
+        }
+
+        """))
+}

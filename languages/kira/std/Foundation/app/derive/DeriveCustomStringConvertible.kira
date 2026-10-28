@@ -1,0 +1,58 @@
+// Foundation's `@Derive(CustomStringConvertible)`: the name of an enum's
+// case, as Swift's `String(describing:)` gives it.
+//
+//   @Derive(CustomStringConvertible)
+//   enum Direction {
+//       North
+//       East
+//   }
+//
+// generates
+//
+//   function description_Direction(value: borrow Direction) -> String
+//
+// so `description_Direction(.North)` is "North". The generated name is glued
+// to the enum's exact name, the same fixed contract the other Foundation
+// derives keep.
+//
+// # Why this exists
+//
+// A match from each case to its name written by hand is a second list of the
+// cases, spelled twice: a case added or renamed in the enum and not in the
+// match says the wrong thing in every log and every screen that shows it.
+// Generating the names from the declaration leaves one list, and it is the
+// enum.
+//
+// # Payload-carrying variants are refused
+//
+// A variant with a payload is described by its payload too, and there is no
+// one way to describe every payload. Foundation refuses rather than guesses.
+
+comptime macro CustomStringConvertible {
+    kind { derive }
+    appliesTo { enum }
+    expand(target: Declaration) -> Syntax {
+        var arms: [Syntax] = []
+        for variant in target.fields {
+            // A payload-less variant reflects with an empty written type.
+            if variant.type != "" {
+                deriveUnsupported(
+                    "Derive(CustomStringConvertible): a variant carrying a payload is described by its payload too, and there is no one way to describe every payload; write the description by hand",
+                    at: variant.syntax
+                )
+            }
+            arms.append(
+                quote {
+                    #{variant.name} -> return #{variant.name.asString()}
+                }
+            )
+        }
+        return quote {
+            function description_#{target.name}(value: borrow #{target.name}) -> String {
+                match value {
+                    #{arms}
+                }
+            }
+        }
+    }
+}

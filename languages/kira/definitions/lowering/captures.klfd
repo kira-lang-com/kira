@@ -1,0 +1,140 @@
+function lowerCaptureFrameHelpers(program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder]) {
+    for target in 0..program.functions.count {
+        let checked = program.functions[target]
+        if !checked.lambda || checked.captures.count == 0 { continue }
+        let payloadType = types.capturePayloadType(target)
+        match types.captureDrops[target] {
+            Some(drop) -> {
+                var lowering = FunctionLowering.startChecked(program, types, functions, helperChecked(checked.name, Type.void()), drop)
+                let body = drop.block()
+                lowering.enter(body)
+                let payload = drop.typedMemory(drop.parameter(0), payloadType)
+                for index in 0..checked.captures.count {
+                    let captured = checked.captures[index]
+                    if captured.cell {
+                        let data = drop.load(drop.field(payload, index, types.pointer))
+                        lowering.releaseCellData(data, captured.valueType, drop.integer(types.boolean, 1))
+                    } else {
+                        let field = drop.field(payload, index, types.of(captured.valueType))
+                        lowering.destroyValue(field, captured.valueType)
+                    }
+                }
+                drop.returnVoid()
+                drop.switchTo(lowering.entry)
+                drop.branch(body)
+            }
+            None -> abort()
+        }
+        match types.captureCopies[target] {
+            Some(copier) -> {
+                var lowering = FunctionLowering.startChecked(program, types, functions, helperChecked(checked.name, Type.void()), copier)
+                let body = copier.block()
+                lowering.enter(body)
+                let destination = copier.typedMemory(copier.parameter(0), payloadType)
+                let source = copier.typedMemory(copier.parameter(1), payloadType)
+                for index in 0..checked.captures.count {
+                    let captured = checked.captures[index]
+                    if captured.cell {
+                        let data = copier.load(copier.field(source, index, types.pointer))
+                        let retained = lowering.arrayRuntimePointer(2, [data])
+                        copier.store(retained, copier.field(destination, index, types.pointer))
+                    } else {
+                        let fieldType = types.of(captured.valueType)
+                        lowering.copyValue(copier.field(source, index, fieldType), copier.field(destination, index, fieldType), captured.valueType)
+                    }
+                }
+                copier.returnVoid()
+                copier.switchTo(lowering.entry)
+                copier.branch(body)
+            }
+            None -> abort()
+        }
+    }
+}
+
+extend FunctionLowering {
+    function makeClosure(borrow mut self, target: Int, captures: [Int], valueType: Type) -> KirAddress {
+        return createClosure(target, captures, valueType, false)
+    }
+
+    function makeValueClosure(borrow mut self, target: Int, captures: [Int], valueType: Type) -> KirAddress {
+        return createClosure(target, captures, valueType, true)
+    }
+
+    function createClosure(borrow mut self, target: Int, captures: [Int], valueType: Type, evaluated: Bool) -> KirAddress {
+        let header = temporary(valueType)
+        let reference = kir_value_function_reference(kir, functions[target])
+        kir.store(kir.convert(convertBitcast, reference, types.pointer), kir.field(header, 0, types.pointer))
+        let checked = program.functions[target]
+        if captures.count == 0 {
+            kir.store(kir_value_null(kir, types.pointer), kir.field(header, 1, types.pointer))
+            markInitialized(header)
+            return header
+        }
+        let context = arrayRuntimePointer(0, [kir.integer(types.integer64, types.captureBoxSizes[target])])
+        let box = kir.typedMemory(context, types.captureBoxType(target))
+        match types.captureDescriptors[target] {
+            Some(descriptor) -> {
+                let address = kir_value_global_address(kir, descriptor)
+                kir.store(kir.convert(convertBitcast, kir.pointer(address), types.pointer), kir.field(box, 0, types.pointer))
+            }
+            None -> abort()
+        }
+        let free = kir_value_function_reference(kir, functions[program.arrayFunctions[9]])
+        kir.store(kir.convert(convertBitcast, free, types.pointer), kir.field(box, 1, types.pointer))
+        let payload = kir.field(box, 2, types.capturePayloadType(target))
+        for index in 0..captures.count {
+            let captured = checked.captures[index]
+            if captured.cell {
+                let data = kir.load(storage[captures[index]])
+                kir.store(arrayRuntimePointer(2, [data]), kir.field(payload, index, types.pointer))
+            } else {
+                let destination = kir.field(payload, index, types.of(captured.valueType))
+                if evaluated {
+                    write(captures[index], destination)
+                } else {
+                    copyValue(localAddress(captures[index]), destination, captured.valueType)
+                }
+            }
+        }
+        kir.store(context, kir.field(header, 1, types.pointer))
+        markInitialized(header)
+        return header
+    }
+
+    function rawCallbackVoid(borrow mut self, code: KirValue, arguments: [KirValue]) {
+        for argument in arguments { kir_type_parameter(types.pointer) }
+        let codeType = kir_type_function(types.unit)
+        let typedCode = kir.convert(convertBitcast, code, codeType)
+        for argument in arguments { kir_value_indirect_parameter(kir, types.pointer) }
+        for argument in arguments { kir.argument(argument) }
+        kir_value_call_indirect_void(kir, typedCode)
+    }
+
+    function destroyContext(borrow mut self, context: KirValue) {
+        kir.argument(context)
+        let unique = kir.call(functions[program.arrayFunctions[6]], types.boolean)
+        let destroy = kir.block()
+        let release = kir.block()
+        kir.branchIf(unique, destroy, release)
+        enter(destroy)
+        let header = kir.typedMemory(context, kir_type_array(0, types.pointer))
+        let descriptor = kir.load(kir.element(header, kir.integer(types.integer64, 0), types.pointer))
+        let typed = kir.typedMemory(descriptor, types.descriptorTypes[0])
+        let callback = kir.load(kir.field(typed, 6, types.pointer))
+        let bits = kir.convert(convertBitcast, callback, types.integer64)
+        let invoke = kir.block()
+        kir.branchIf(kir.compare(kirPredicate(.NotEqual, false), bits, kir.integer(types.integer64, 0)), invoke, release)
+        enter(invoke)
+        let alignment = kir.load(kir.field(typed, 3, types.integer64))
+        let padded = kir.binary(kirOperator(.Add, true), false, true, kir.integer(types.integer64, 15), alignment)
+        let units = kir.binary(kirOperator(.Divide, false), false, false, padded, alignment)
+        let offset = kir.binary(kirOperator(.Multiply, true), false, true, units, alignment)
+        rawCallbackVoid(callback, [kir.offsetBytes(context, offset), descriptor])
+        flowInto(release)
+        enter(release)
+        let box = kir.typedMemory(context, kir_type_array(0, types.pointer))
+        let free = kir.load(kir.element(box, kir.integer(types.integer64, 1), types.pointer))
+        rawCallbackVoid(free, [context])
+    }
+}

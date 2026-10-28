@@ -1,0 +1,107 @@
+extend FunctionLowering {
+    function writeScalarConstruction(borrow mut self, index: Int, destination: KirAddress) -> Bool {
+        let valueType = program.typeOf(index)
+        if valueType.kind != .Structure || needsArrayCleanup(program, valueType) || isClassType(program, valueType) { return false }
+        let owner = program.structs[valueType.declaration]
+        match owner.shape {
+            Plain -> {}
+            CLayout -> return false
+            CUnion -> return false
+            CArray -> return false
+            Callback -> return false
+            CPointer -> return false
+        }
+        if owner.fields.count == 0 || owner.fields.count > 16 { return false }
+        var bytes = 0
+        for field in owner.fields {
+            if field.valueType.isAggregate() { return false }
+            bytes += types.byteSize(field.valueType)
+        }
+        if bytes != types.byteSize(valueType) { return false }
+        match program.expressions[index].operation {
+            Construct(fields) -> {
+                var pure = true
+                for field in fields { pure = pure && pureConstructionValue(field) }
+                let previousCaching = cachingConstruction
+                let previousLoads = constructionLoads
+                cachingConstruction = pure
+                constructionLoads = []
+                var values: [KirValue] = []
+                for field in fields { values.append(value(field)) }
+                cachingConstruction = previousCaching
+                constructionLoads = previousLoads
+                // Read all fields before writing because the result may alias an input.
+                for field in 0..fields.count {
+                    kir.store(values[field], kir.field(destination, field, types.of(owner.fields[field].valueType)))
+                }
+                markInitialized(destination)
+                return true
+            }
+            StringText -> return false
+            Sequence -> return false
+            Integer -> return false
+            FloatLiteral -> return false
+            BoxAny -> return false
+            TypeIs -> return false
+            UnboxAny -> return false
+            FunctionReference -> return false
+            IndirectCall -> return false
+            MakeClosure -> return false
+            GlobalRead -> return false
+            TaskSpawn -> return false
+            TaskReady -> return false
+            TaskAwait -> return false
+            TaskCancel -> return false
+            TaskDetach -> return false
+            Async -> return false
+            RuntimeTrap -> return false
+            Try -> return false
+            ChannelCreate -> return false
+            ChannelReceiver -> return false
+            ChannelSend -> return false
+            ChannelClose -> return false
+            ClassView -> return false
+            ClassCall -> return false
+            Boolean -> return false
+            StringLiteral -> return false
+            StringConcat -> return false
+            TraceText -> return false
+            HeapAllocateRaw -> return false
+            HeapFreeRaw -> return false
+            Print -> return false
+            HeapRead -> return false
+            HeapWrite -> return false
+            Atomic -> return false
+            HeapCopy -> return false
+            HeapFill -> return false
+            HeapOffset -> return false
+            HeapLayout -> return false
+            ArrayLiteral -> return false
+            ArrayIndex -> return false
+            ArrayAppend -> return false
+            Transfer -> return false
+            Read -> return false
+            Member -> return false
+            Call -> return false
+            Tagged -> return false
+            Unary -> return false
+            Arithmetic -> return false
+            Wrapping -> return false
+            Compare -> return false
+            Logical -> return false
+            Select -> return false
+            Choice -> return false
+            Bitcast -> return false
+            Convert -> return false
+            ForeignImage -> return false
+            ForeignElements -> return false
+            ForeignCallback -> return false
+            ForeignRead -> return false
+            ForeignUnion -> return false
+            EnumCode -> return false
+            EnumFromCode -> return false
+            Order -> return false
+            Hash -> return false
+        }
+    }
+}

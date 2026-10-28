@@ -1,0 +1,67 @@
+import Foundation
+
+// A class's own `Drop`: the body runs once, when the last handle to the
+// instance goes, before its fields are released. Prefix: clsd / Clsd.
+
+// What the drops below report to: a class the tests keep, so a drop can
+// count itself where the test reads it.
+class ClsdTally {
+    var drops: Number = 0
+    var last: Number = 0
+}
+
+class ClsdGuard: Drop {
+    let tally: ClsdTally
+    let tag: Number
+
+    function drop(borrow mut self) {
+        self.tally.drops += 1
+        self.tally.last = self.tag
+    }
+}
+
+struct ClsdHolder {
+    let held: ClsdGuard
+}
+
+function clsdScoped(tally: borrow ClsdTally, tag: Number) {
+    let held = ClsdGuard { tally = copy tally, tag = tag }
+}
+
+function clsdCopied(tally: borrow ClsdTally) -> Number {
+    let held = ClsdGuard { tally = copy tally, tag = 2 }
+    let holder = ClsdHolder { held = held }
+    let again = holder
+    return tally.drops
+}
+
+// A handle going out of scope is the last one: the body runs at the end of
+// the call.
+@Test
+function clsdTheLastHandleRunsTheDrop() {
+    let tally = ClsdTally()
+    clsdScoped(tally, 7)
+    let got = tally.drops * 10 + tally.last
+    expect!(got == 17)
+}
+
+// Copies share the instance: none of them runs the body while another holds
+// it, and the last runs it once.
+@Test
+function clsdCopiesShareOneDrop() {
+    let tally = ClsdTally()
+    let before = clsdCopied(tally)
+    let got = before * 10 + tally.drops
+    expect!(got == 1)
+}
+
+// Writing over the only handle drops the instance it held at the write.
+@Test
+function clsdAWriteDropsTheOldInstance() {
+    let tally = ClsdTally()
+    var kept: ClsdGuard? = .Some(ClsdGuard { tally = tally, tag = 4 })
+    let held = tally.drops
+    kept = .None
+    let got = held * 100 + tally.drops * 10 + tally.last
+    expect!(got == 14)
+}

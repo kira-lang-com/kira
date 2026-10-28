@@ -1,0 +1,21 @@
+// A member written `private` is used only inside the declaration writing it
+// -- the top-level declaration whose span holds the member -- and in its
+// file's extensions of the type owning it, as Swift's `private` is. A bare
+// name only reaches a member from inside, so a use through a value,
+// `value.member` or `value.method()`, is the one checked (3404).
+
+extend Checker {
+    function checkPrivateAccess(borrow self, member: Identifier, owner: Type, span: Span) {
+        if !isPrivateMember(tree, member.span) { return }
+        if span.file == member.span.file {
+            for site in tree.declarationSites {
+                if site.span.holds(member.span) && site.span.holds(span) { return }
+            }
+            match signature().owner {
+                Some(extended) -> { if extended.equals(owner) { return } }
+                None -> {}
+            }
+        }
+        report(.PrivateMember, span)
+    }
+}

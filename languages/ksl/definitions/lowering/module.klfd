@@ -1,0 +1,149 @@
+// Lowering: the checked program to one KSIR module through the shader
+// builder services.
+//
+// Only what a stage entry reaches is lowered: its functions, callees first,
+// and the types they name, each struct declared once before its first use.
+// Constants were folded by the checker; options become overrides.
+
+struct Lowering {
+    let module: Int
+    let program: CheckedProgram
+    var interface: [Bool]
+    var structHandles: [Int]
+    var globals: [Int]
+    var atomics: [Bool]
+    var overrides: [Int]
+    // Per checked function: its KSIR handle once lowered, -2 while it is.
+    var handles: [Int]
+    var functionNames: [String]
+    // The function being built, and per local the expression it names: a
+    // pointer, or for a parameter never written, the argument itself.
+    var current: Int
+    var builder: Int
+    var places: [Int]
+    var direct: [Bool]
+    var localNames: [String]
+}
+
+function lowerShader(session: Session, unit: Unit, program: Program, checked: CheckedProgram) -> ShaderModule {
+    var name = checked.shaderName
+    if utf8Count(name) == 0 { name = "ksl" }
+    let module = shader_module_new(session, unit, program, name)
+    var lowering = Lowering {
+        module = module, program = checked, interface = [], structHandles = [], globals = [], atomics = [],
+        overrides = [], handles = [], functionNames = [], current = -1, builder = -1, places = [], direct = [], localNames = []
+    }
+    lowering.classify()
+    lowering.declareOverrides()
+    lowering.declareGlobals()
+    if checked.hasShader { lowering.declareShader() }
+    return shader_module_finish(module)
+}
+
+extend Lowering {
+    // Which structs a stage passes, whose members carry interface bindings,
+    // and which resources an atomic reaches.
+    function classify(borrow mut self) {
+        for index in 0..program.structs.count {
+            interface.append(false)
+            structHandles.append(-1)
+        }
+        for stage in program.stages {
+            if stage.input >= 0 { interface[stage.input] = true }
+            if stage.output >= 0 { interface[stage.output] = true }
+        }
+        for index in 0..program.functions.count {
+            handles.append(-1)
+        }
+        for index in 0..program.resources.count {
+            atomics.append(false)
+            globals.append(-1)
+        }
+        for expression in program.expressions {
+            if expression.kind == .Builtin && expression.builtin == .AtomicAdd {
+                let target = program.expressions[expression.arguments[0]]
+                if target.kind == .Resource { atomics[target.target] = true }
+            }
+        }
+    }
+
+    function literal(borrow mut self, scope: Int, value: ConstValue) -> Int {
+        return shader_expr_literal(module, scope, value.scalar.name(), value.text)
+    }
+
+    // Each option's id is its position, so a host can specialize it by
+    // number on every target that keeps it.
+    function declareOverrides(borrow mut self) {
+        for index in 0..program.options.count {
+            let option = program.options[index]
+            let initial = literal(-1, option.value)
+            shader_span(module, option.span.file, option.span.start, option.span.end)
+            overrides.append(shader_override(module, option.name, index, typeHandle(option.optionType), initial))
+        }
+    }
+
+    function declareGlobals(borrow mut self) {
+        for index in 0..program.resources.count {
+            let resource = program.resources[index]
+            var space = "handle"
+            var text = ""
+            match resource.kind {
+                Uniform -> {
+                    space = "uniform"
+                    text = typeText(resource.resourceType)
+                }
+                Storage -> {
+                    space = "storage<load>"
+                    if resource.access == .ReadWrite { space = "storage<load store>" }
+                    text = typeText(resource.resourceType)
+                    if atomics[index] {
+                        space = "storage<load store atomic>"
+                        text = "array<atomic<u32>, runtime, stride 4>"
+                    }
+                }
+                Texture -> text = textureText(resource.resourceType.texture, resource.access)
+                Sampler -> text = typeText(resource.resourceType)
+            }
+            shader_span(module, resource.span.file, resource.span.start, resource.span.end)
+            let global = shader_global(module, resource.name, space, shader_type(module, text), -1, -1)
+            if resource.binding >= 0 {
+                shader_slot(module, global, joinText(["universal ", decimalText(resource.binding)]))
+            }
+            globals[index] = global
+        }
+    }
+
+    function declareShader(borrow mut self) {
+        var entries: [Int] = []
+        var kind = "graphics"
+        for stage in program.stages {
+            if stage.stage == .Compute { kind = "compute" }
+            if stage.entry >= 0 { entries.append(lowerEntry(stage)) }
+        }
+        for group in program.groups {
+            shader_group(module, group.name, groupClass(group.name))
+            for resource in group.resources {
+                shader_group_add(module, globals[resource])
+            }
+        }
+        for override in overrides {
+            shader_option(module, override)
+        }
+        for entry in entries {
+            shader_push(module, entry)
+        }
+        shader_shader(module, program.shaderName, kind)
+    }
+
+    // A KSIR function name not yet taken.
+    function freshFunctionName(borrow mut self, name: String) -> String {
+        var candidate = name
+        var suffix = 1
+        while contains(functionNames, candidate) {
+            candidate = joinText([name, "_", decimalText(suffix)])
+            suffix += 1
+        }
+        functionNames.append(candidate)
+        return candidate
+    }
+}

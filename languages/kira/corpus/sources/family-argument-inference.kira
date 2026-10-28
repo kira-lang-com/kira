@@ -1,0 +1,61 @@
+// A generic construct written in a slot that names its family with type
+// arguments takes its own from the slot, by its `extends`, as SwiftUI's
+// columns take their row type from the table: no type is written at the
+// call. An initializer is chosen by its labels and by what is passed, a key
+// path literal for a `KeyPath` parameter and a closure for any other.
+
+import Foundation
+
+struct Row {
+    let small: Int
+    let large: Int
+}
+
+construct Shape {
+    @Required function area() -> Int
+}
+
+construct ColumnContent {
+    @Required function measure(row: borrow Any) -> Int
+}
+
+construct Column<RowValue>(title: String, read: (borrow RowValue) -> Int) extends ColumnContent<RowValue> {
+    init(title: String, value: KeyPath<RowValue, Int>) {
+        return Column<RowValue>(title: title, read: { row in return value(row) })
+    }
+
+    init(title: String, content: (borrow RowValue) -> String) {
+        return Column<RowValue>(title: title, read: { row in return content(row).count })
+    }
+
+    function measure(row: borrow Any) -> Int {
+        if row is RowValue {
+            let value = row as RowValue
+            return read(value)
+        }
+        return 0
+    }
+}
+
+construct Sheet<Value>(rows: [Value]) extends Shape {
+    let columns: [some ColumnContent<Value>]
+
+    function area() -> Int {
+        var total = 0
+        for row in rows {
+            for column in columns { total = total + column.measure(row) }
+        }
+        return total
+    }
+}
+
+@Main
+function main() -> Int {
+    let sheet = Sheet([Row { small: 1, large: 10 }, Row { small: 2, large: 5 }]) {
+        Column("Small", value: \.small)
+        Column("Large") { row in
+            String(row.large * 2)
+        }
+    }
+    return sheet.area() + 23
+}

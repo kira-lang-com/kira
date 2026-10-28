@@ -1,0 +1,324 @@
+import Foundation
+
+// Kira Test coverage for channels: `Channel<T>()`, its two ends, and the
+// ordering a receive turns into a data dependency.
+//
+// The point of a channel is that a program can order its own work against work
+// already running somewhere else. Before it, an outsider could only enqueue.
+// These pin that: a receive comes back with the value the other side sent, and
+// it comes back *after* that side ran.
+
+function chxSendsAndReceivesInOrderAnswer() -> Number {
+    let tx = Channel<Int>()
+    let rx = tx.receiver
+    tx.send(1)
+    tx.send(2)
+    tx.send(3)
+    attempt {
+        let a = try rx.receive()
+        let b = try rx.receive()
+        let c = try rx.receive()
+    return a * 100 + b * 10 + c
+    } handle {
+        Closed { return 0 - 1 }
+    }
+}
+
+@Test
+function chxSendsAndReceivesInOrder() {
+    expect!(chxSendsAndReceivesInOrderAnswer() == 123)
+}
+// A drained closed channel is an ordinary end to a conversation, not a trap:
+// the handler covers it the way it covers every other failure.
+function chxClosedIsAFailureNotATrapAnswer() -> Number {
+    let tx = Channel<Int>()
+    let rx = tx.receiver
+    tx.send(7)
+    tx.close()
+    attempt {
+        let first = try rx.receive()
+        let second = try rx.receive()
+    return first + second
+    } handle {
+        Closed { return 99 }
+    }
+}
+
+@Test
+function chxClosedIsAFailureNotATrap() {
+    expect!(chxClosedIsAFailureNotATrapAnswer() == 99)
+}
+// A channel closed before anything crossed is closed at once.
+function chxAnEmptyClosedChannelIsClosedAnswer() -> Number {
+    let tx = Channel<Int>()
+    let rx = tx.receiver
+    tx.close()
+    attempt {
+        let value = try rx.receive()
+    return value
+    } handle {
+        Closed { return 5 }
+    }
+}
+
+@Test
+function chxAnEmptyClosedChannelIsClosed() {
+    expect!(chxAnEmptyClosedChannelIsClosedAnswer() == 5)
+}
+// The whole reason the feature exists: the receive comes back *after* the task
+// that fills it has run. A receive on an empty live channel hands the next
+// runnable task a turn, so this orders two contexts against each other rather
+// than hoping.
+async function chxFill(tx: Sender<Int>) -> Int {
+    tx.send(41)
+    return 1
+}
+
+function chxReceiveWaitsForTheTaskThatFillsItAnswer() -> Number {
+    let tx = Channel<Int>()
+    let rx = tx.receiver
+    var pending = Task { chxFill(tx) }
+    attempt {
+        let value = try rx.receive()
+        let ran = pending.await
+    return value + ran
+    } handle {
+        Closed { return 0 - 1 }
+    }
+}
+
+@Test
+function chxReceiveWaitsForTheTaskThatFillsIt() {
+    expect!(chxReceiveWaitsForTheTaskThatFillsItAnswer() == 42)
+}
+// Two channels are two channels: ends minted for one payload do not name the
+// other's storage.
+function chxTwoChannelsDoNotShareStorageAnswer() -> Number {
+    let first = Channel<Int>()
+    let second = Channel<Int>()
+    first.send(10)
+    second.send(20)
+    attempt {
+        let a = try first.receiver.receive()
+        let b = try second.receiver.receive()
+    return a * 10 + b
+    } handle {
+        Closed { return 0 - 1 }
+    }
+}
+
+@Test
+function chxTwoChannelsDoNotShareStorage() {
+    expect!(chxTwoChannelsDoNotShareStorageAnswer() == 120)
+}
+// A float payload crosses as itself, not as a rounding of itself.
+function chxCarriesAFloatPayloadAnswer() -> Number {
+    let tx = Channel<Float>()
+    let rx = tx.receiver
+    tx.send(0.5)
+    attempt {
+        let value = try rx.receive()
+        if value == 0.5 { return 1 }
+    return 0
+    } handle {
+        Closed { return 0 - 1 }
+    }
+}
+
+@Test
+function chxCarriesAFloatPayload() {
+    expect!(chxCarriesAFloatPayloadAnswer() == 1)
+}
+// A `distinct` payload keeps its identity across the wire: what comes out is
+// the named type that went in, not the number underneath.
+distinct ChxTicket = U32
+
+function chxCarriesADistinctPayloadAnswer() -> Number {
+    let tx = Channel<ChxTicket>()
+    let rx = tx.receiver
+    tx.send(ChxTicket(7))
+    attempt {
+        let value = try rx.receive()
+        if value == ChxTicket(7) { return 1 }
+    return 0
+    } handle {
+        Closed { return 0 - 1 }
+    }
+}
+
+@Test
+function chxCarriesADistinctPayload() {
+    expect!(chxCarriesADistinctPayloadAnswer() == 1)
+}
+// A receive nothing can answer is a trap, not a wait and not a closure. The
+// queue is empty, the sender is live, and nothing else is runnable, so no
+// later turn can change the answer. Reporting `Closed` would say the sender
+// went away when it did not, which is why the handler below is unreachable:
+// a passing run here is a trapping run.
+@Test
+function chxAReceiveNothingCanAnswerTraps() {
+    expectTrap!("")
+    let tx = Channel<Int>()
+    let rx = tx.receiver
+    attempt {
+        let value = try rx.receive()
+    let _ = value
+    } handle {
+        Closed { }
+    }
+}
+
+// Cancellation while blocked. The only work that could fill the channel is
+// called off before it ever runs, so the wait has no turn to hand out and the
+// receive learns its value is not coming instead of blocking on work that was
+// called off.
+@Test
+function chxACancelledFillerLeavesTheReceiveUnanswerable() {
+    expectTrap!("")
+    let tx = Channel<Int>()
+    let rx = tx.receiver
+    var filler = Task { chxFill(tx) }
+    filler.requestCancel()
+    attempt {
+        let value = try rx.receive()
+    let _ = value
+    } handle {
+        Closed { }
+    }
+}
+
+// Cancelling one filler is not cancelling the channel. The wait hands its turn
+// to whatever is still runnable, so the live filler answers and the receive
+// comes back with its value rather than trapping.
+function chxACancelledFillerDoesNotStopALiveOneAnswer() -> Number {
+    let tx = Channel<Int>()
+    let rx = tx.receiver
+    var cancelled = Task { chxFill(tx) }
+    cancelled.requestCancel()
+    var live = Task { chxFill(tx) }
+    attempt {
+        let value = try rx.receive()
+        let ran = live.await
+    return value + ran
+    } handle {
+        Closed { return 0 - 1 }
+    }
+}
+
+@Test
+function chxACancelledFillerDoesNotStopALiveOne() {
+    expect!(chxACancelledFillerDoesNotStopALiveOneAnswer() == 42)
+}
+// --- Payloads that own storage ----------------------------------------------
+// A queue slot is one machine word, and a value that owns storage has no word
+// of its own — so it crosses as a token naming it in the store, and the
+// receiver takes the value out and gives the token up. What arrives is the
+// value itself, not a share of the sender's.
+
+struct ChxNote {
+    var title: String
+    var rank: Int
+}
+
+async function chxFillText(tx: Sender<String>) -> Int {
+    tx.send("carried whole")
+    return 1
+}
+
+async function chxFillNote(tx: Sender<ChxNote>) -> Int {
+    tx.send(ChxNote(title: "boxed", rank: 41))
+    return 1
+}
+
+async function chxFillThree(tx: Sender<String>) -> Int {
+    tx.send("one")
+    tx.send("two")
+    tx.send("three")
+    return 1
+}
+
+function chxCarriesAStringPayloadAnswer() -> Number {
+    let tx = Channel<String>()
+    let rx = tx.receiver
+    var pending = Task { chxFillText(tx) }
+    attempt {
+        let got = try rx.receive()
+    return got.count + pending.await
+    } handle {
+        Closed { return 0 - 1 }
+    }
+}
+
+@Test
+function chxCarriesAStringPayload() {
+    expect!(chxCarriesAStringPayloadAnswer() == 14)
+}
+function chxCarriesAStringPayloadAsItselfAnswer() -> Number {
+    let tx = Channel<String>()
+    let rx = tx.receiver
+    var pending = Task { chxFillText(tx) }
+    attempt {
+        let got = try rx.receive()
+        let same = got == "carried whole"
+    return same ? pending.await : 0
+    } handle {
+        Closed { return 0 - 1 }
+    }
+}
+
+@Test
+function chxCarriesAStringPayloadAsItself() {
+    expect!(chxCarriesAStringPayloadAsItselfAnswer() == 1)
+}
+function chxCarriesAStructPayloadAnswer() -> Number {
+    let tx = Channel<ChxNote>()
+    let rx = tx.receiver
+    var pending = Task { chxFillNote(tx) }
+    attempt {
+        let got = try rx.receive()
+    return got.rank + got.title.count + pending.await
+    } handle {
+        Closed { return 0 - 1 }
+    }
+}
+
+@Test
+function chxCarriesAStructPayload() {
+    expect!(chxCarriesAStructPayloadAnswer() == 47)
+}
+// Order is order, whatever the payload is: three strings arrive in the order
+// they were sent, each one whole.
+function chxCarriesOwnedPayloadsInOrderAnswer() -> Number {
+    let tx = Channel<String>()
+    let rx = tx.receiver
+    var pending = Task { chxFillThree(tx) }
+    attempt {
+        let first = try rx.receive()
+        let second = try rx.receive()
+        let third = try rx.receive()
+        let ordered = first == "one" && second == "two" && third == "three"
+    return ordered ? pending.await : 0
+    } handle {
+        Closed { return 0 - 1 }
+    }
+}
+
+@Test
+function chxCarriesOwnedPayloadsInOrder() {
+    expect!(chxCarriesOwnedPayloadsInOrderAnswer() == 1)
+}
+// A receiver closing discards whatever is still queued, and each of those
+// slots owns the storage its token names. Three values are sent and none is
+// received, so the close is what has to release all three: without the drain
+// this leaks every one of them, silently, and the program still prints the
+// right answer. The heap-balance half of this is the parity case.
+@Test
+function chxClosingAReceiverDropsWhatItNeverDelivered() {
+    let tx = Channel<String>()
+    let rx = tx.receiver
+    var pending = Task { chxFillThree(tx) }
+    let ran = pending.await
+    rx.close()
+    let got = ran
+    expect!(got == 1)
+}

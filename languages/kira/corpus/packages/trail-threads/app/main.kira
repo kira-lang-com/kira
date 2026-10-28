@@ -1,0 +1,34 @@
+import Foundation
+import Heap
+
+// Four threads log at once into a category that is Off: nothing prints, but
+// each event records and evaluates its field under the trail's lock.
+enum Work: LogCategory {
+    Step
+
+    function threshold(borrow self) -> TrailThreshold {
+        return .Off
+    }
+}
+
+@Main
+function main() -> Number {
+    let cell = Heap.allocateRaw(8, 8)
+    atomicStore<N32>(cell, 0, .Relaxed)
+    var workers: [Thread] = []
+    for index in 0..4 {
+        workers.append(
+            spawnThread(
+                { in
+                    for step in 0..100 {
+                        log(category: Work.Step, "step", n: atomicAdd<N32>(cell, 1, .Relaxed))
+                    }
+                }
+            )
+        )
+    }
+    for index in 0..workers.count { workers[index].join() }
+    print(atomicLoad<N32>(cell, .Acquire))
+    Heap.freeRaw(cell)
+    return 0
+}

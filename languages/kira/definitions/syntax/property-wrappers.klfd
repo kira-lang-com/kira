@@ -1,0 +1,198 @@
+// Property wrappers over a generic struct, desugared by the definition
+// (KLF-RIDL section 30): `@State var count: Number = 0` names the generic
+// struct `State`, declared in the program or by a framework's contract, so
+// the wrapper needs no source of its own and crosses RIDL as any generic
+// struct does. The field becomes the struct's instance, `_count`,
+// and a property of the field's name and type reading the instance's
+// `get()` and, for a `var`, writing through its `set(value)`:
+//
+//     private let _count: State<Number> { State<Number> { wrappedValue: 0, key: "Form.count" } }
+//     var count: Number {
+//         get { return _count.get() }
+//         set(value) { _count.set(move value) }
+//     }
+//     let $count { _count.projectedValue() }
+//
+// The initial value sets `wrappedValue`, a wrapper with a `key` field is
+// given the declaration's and the field's names as its identity, and what
+// the annotation is written with sets the fields it labels; an argument with
+// no label sets the wrapper's next field after `wrappedValue` and `key`, in
+// the order the wrapper declares them, as SwiftUI's
+// `@Environment(\.scenePhase)` sets the key path. A wrapper with a
+// `projectedValue()` method gives the declaration `$count`, which reads it.
+// The instance is built where it is read, so its settings may name the
+// declaration's parameters. A field with no initial value and no arguments
+// stores the instance, which whoever builds the declaration gives under the
+// field's own name.
+
+// The generic struct a field annotation names, if it names one.
+function genericWrapper(tree: SyntaxTree, annotation: Annotation) -> Optional<StructDeclaration> {
+    if annotation.attribute.isSome() { return .None }
+    for declared in tree.genericStructs {
+        if declared.name.text == annotation.name.text { return .Some(declared) }
+    }
+    return .None
+}
+
+// Whether one of the declaration's fields is wrapped by a generic struct.
+function wrapsGenerically(tree: SyntaxTree, declaration: AnnotatedDeclaration) -> Bool {
+    for annotation in declaration.fieldAnnotations {
+        if genericWrapper(tree, annotation).isSome() { return true }
+    }
+    return false
+}
+
+// The wrapper's fields an argument with no label sets, in the order it
+// declares them: every one but `wrappedValue` and `key`.
+function positionalFields(declared: StructDeclaration) -> [String] {
+    var names: [String] = []
+    for field in declared.fields {
+        if field.name.text != "wrappedValue" && field.name.text != "key" { names.append(field.name.text) }
+    }
+    return names
+}
+
+function wrapperField(declared: StructDeclaration, name: String) -> Bool {
+    for field in declared.fields {
+        if field.name.text == name { return true }
+    }
+    return false
+}
+
+// Whether the wrapper declares the method `name`, in its body or in an
+// extension, as a framework's contract writes a generic struct's methods.
+function wrapperMethod(tree: SyntaxTree, declared: StructDeclaration, name: String) -> Bool {
+    for method in declared.methods {
+        if method.name.text == name { return true }
+    }
+    for extension in tree.extensions {
+        if extension.owner.name.text != declared.name.text { continue }
+        for method in extension.methods {
+            if method.name.text == name { return true }
+        }
+    }
+    return false
+}
+
+// The declaration's text with each field a generic struct wraps written as
+// its storage and its property, as a new source file.
+function wrappedDeclaration(session: Session, tree: SyntaxTree, declaration: AnnotatedDeclaration) -> Result<Int, Failure> {
+    let source = fileText(session, declaration.span.file as SourceFile)
+    var parts: [String] = []
+    for exported in tree.exports {
+        if exported.span.same(declaration.name.span) { parts.append("public ") }
+    }
+    var written = declaration.span.start
+    var keys: [String] = []
+    for field in declaredFields(tree, declaration.name) {
+        for annotation in field.annotations {
+            match genericWrapper(tree, annotation) {
+                Some(wrapper) -> {
+                    parts.append(utf8Slice(source, written, field.span.start))
+                    parts.append(try wrappedField(tree, source, declaration.name, field, annotation, wrapper))
+                    if wrapperField(wrapper, "key") { keys.append(wrapperKey(declaration.name, field)) }
+                    written = field.span.end
+                    break
+                }
+                None -> {}
+            }
+        }
+    }
+    // The keys the declaration's wrapped state lives under, as a method a
+    // framework asks a view it describes for, so the state of one taken out
+    // of the interface goes with it (SwiftUI's `@State` lifetime).
+    let closing = declaration.span.end - 1
+    if keys.count > 0 && utf8Slice(source, closing, declaration.span.end) == "}" {
+        parts.append(utf8Slice(source, written, closing))
+        parts.append(wrappedKeysMethod(keys))
+        parts.append("}")
+    } else {
+        parts.append(utf8Slice(source, written, declaration.span.end))
+    }
+    return .Ok(addSource(session, declaration.span.file as SourceFile, joinText(parts)))
+}
+
+// The identity a wrapper with a `key` field is given: the declaration's and
+// the field's names.
+function wrapperKey(owner: Identifier, field: FieldDeclaration) -> String {
+    return joinText([owner.text, ".", field.name.text])
+}
+
+function wrappedKeysMethod(keys: [String]) -> String {
+    var quoted: [String] = []
+    for key in keys { quoted.append(joinText(["\"", key, "\""])) }
+    return joinText(["\n    function wrappedStateKeys() -> [String] { return [", joinText(joinedSettings(quoted)), "] }\n"])
+}
+
+// The storage and the property `field` becomes under `wrapper`.
+function wrappedField(tree: SyntaxTree, source: String, owner: Identifier, field: FieldDeclaration, annotation: Annotation, wrapper: StructDeclaration) -> Result<String, Failure> {
+    if isInferredReference(field.annotation) {
+        return .Error(Failure { diagnostic = .WrappedPropertyType, span = field.name.span })
+    }
+    let name = field.name.text
+    let storage = joinText(["_", name])
+    let valueType = reflectedTypeText(field.annotation)
+    let instance = joinText([wrapper.name.text, "<", valueType, ">"])
+    var settings: [String] = []
+    match field.initial {
+        Some(value) -> {
+            let span = tree.expressions[value].span
+            settings.append(joinText(["wrappedValue: ", utf8Slice(source, span.start, span.end)]))
+        }
+        None -> {}
+    }
+    if wrapperField(wrapper, "key") {
+        settings.append(joinText(["key: \"", wrapperKey(owner, field), "\""]))
+    }
+    let positional = positionalFields(wrapper)
+    var next = 0
+    for argument in annotation.arguments {
+        match tree.expressions[argument].kind.labelled() {
+            Some(labelled) -> {
+                let span = tree.expressions[labelled.value].span
+                settings.append(joinText([labelled.name.text, ": ", utf8Slice(source, span.start, span.end)]))
+            }
+            None -> {
+                // More arguments with no label than the wrapper has fields
+                // for them.
+                if next >= positional.count {
+                    return .Error(Failure { diagnostic = .WrapperArgumentLabel, span = tree.expressions[argument].span })
+                }
+                let span = tree.expressions[argument].span
+                settings.append(joinText([positional[next], ": ", utf8Slice(source, span.start, span.end)]))
+                next += 1
+            }
+        }
+    }
+    var access = ""
+    if isPrivateMember(tree, field.name.span) { access = "private " }
+    var lines: [String] = []
+    if settings.count == 0 {
+        lines.append(joinText(["private let ", storage, ": ", instance]))
+    } else {
+        // Built where it is read, as the declaration's own members are, so
+        // what it is set to may name the declaration's parameters.
+        lines.append(joinText(["private let ", storage, ": ", instance, " { ", instance, " { ", joinText(joinedSettings(settings)), " } }"]))
+    }
+    if field.mutable {
+        lines.append(joinText([access, "var ", name, ": ", valueType, " {"]))
+        lines.append(joinText(["    get { return ", storage, ".get() }"]))
+        lines.append(joinText(["    set(value) { ", storage, ".set(move value) }"]))
+        lines.append("}")
+    } else {
+        lines.append(joinText([access, "let ", name, ": ", valueType, " { ", storage, ".get() }"]))
+    }
+    if wrapperMethod(tree, wrapper, "projectedValue") {
+        lines.append(joinText([access, "let $", name, " { ", storage, ".projectedValue() }"]))
+    }
+    return .Ok(joinLines(lines))
+}
+
+function joinedSettings(settings: [String]) -> [String] {
+    var parts: [String] = []
+    for index in 0..settings.count {
+        if index > 0 { parts.append(", ") }
+        parts.append(settings[index])
+    }
+    return parts
+}

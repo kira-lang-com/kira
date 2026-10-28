@@ -1,0 +1,83 @@
+// A call through a C function pointer (KLF section 26.4): the callback's code
+// word called with the platform convention, each argument passed as a call to
+// an extern function passes it. The checker has refused what a function type
+// cannot carry, so every seam here is one a pointer call takes.
+
+extend FunctionLowering {
+    function pointerCall(borrow mut self, target: Int, arguments: [Int], result: Type, destination: Optional<KirAddress>) -> KirValue {
+        let code = kir.load(kir.field(address(target), 0, types.pointer))
+        let span = program.expressions[target].span
+        let resultSeam = pointerCallSeam(program, result, false)
+        var parameters: [KirType] = []
+        var values: [KirValue] = []
+        let outerStorage = callStorage.count
+        for argument in arguments {
+            let valueType = program.typeOf(argument)
+            let seam = pointerCallSeam(program, valueType, true)
+            parameters.append(pointerCarrier(seam, valueType))
+            let word = foreignArgument(argument, seam, valueType, false)
+            if madeForCall(argument) { callStorage.append(word) }
+            values.append(word)
+        }
+        let returnType = pointerCarrier(resultSeam, result)
+        for parameter in parameters { kir_type_parameter(parameter) }
+        let callee = kir.convert(convertBitcast, code, kir_type_foreign_function(returnType))
+        for parameter in parameters { kir_value_indirect_parameter(kir, parameter) }
+        for value in values { kir.argument(value) }
+        let answer = pointerAnswer(callee, returnType, resultSeam, result, destination, span)
+        endCallStorage(outerStorage, true)
+        return answer
+    }
+
+    // The KIR type a value crosses a C function pointer as.
+    function pointerCarrier(borrow self, seam: Seam, valueType: Type) -> KirType {
+        match seam {
+            Word -> return types.of(valueType)
+            Field -> return types.of(fieldScalar(program, valueType))
+            Number -> return types.integer32
+            Elements -> return types.pointer
+            Nothing -> return types.unit
+            Image -> {
+                abort()
+                return types.unit
+            }
+        }
+    }
+
+    // What the call answers: a word as itself, and a field or an enum's
+    // number written to the destination its aggregate result has.
+    function pointerAnswer(borrow mut self, callee: KirValue, returnType: KirType, seam: Seam, result: Type, destination: Optional<KirAddress>, span: Span) -> KirValue {
+        let unused = kir.integer(types.integer64, 0)
+        if returnType == types.unit {
+            kir_value_call_indirect_void(kir, callee)
+            return unused
+        }
+        let answer = kir_value_call_indirect(kir, callee, returnType)
+        match destination {
+            Some(place) -> {
+                match seam {
+                    Field -> storeSeamWord(answer, result, place)
+                    Number -> enumFromNumber(answer, result, place, span)
+                    Word -> kir.store(answer, place)
+                    // The checker admits no other seam for a result.
+                    Elements -> abort()
+                    Nothing -> abort()
+                    Image -> abort()
+                }
+                return unused
+            }
+            None -> return answer
+        }
+    }
+}
+
+// The seam the checker found for a value crossing a C function pointer.
+function pointerCallSeam(program: CheckedProgram, valueType: Type, parameter: Bool) -> Seam {
+    match foreignSeam(program, valueType, parameter) {
+        Some(seam) -> return seam
+        None -> {
+            abort()
+            return .Nothing
+        }
+    }
+}

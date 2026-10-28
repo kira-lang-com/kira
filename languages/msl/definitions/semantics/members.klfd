@@ -1,0 +1,143 @@
+// Struct members and the attributes that place them in a stage interface.
+//
+// `short` and `ushort` are accepted only where Metal reads them from
+// vertex data or a built-in: a member with `[[attribute(n)]]` or an entry
+// parameter with a built-in attribute. Both are widened to 32 bits, which
+// holds every value they can carry.
+
+function widenedName(name: String) -> String {
+    if startsWith(name, "ushort") { return joinText(["uint", utf8Slice(name, 6, utf8Count(name))]) }
+    if startsWith(name, "short") { return joinText(["int", utf8Slice(name, 5, utf8Count(name))]) }
+    return name
+}
+
+// KSIR's interpolation and sampling for a Metal interpolation attribute.
+function interpolationOf(word: String) -> [String] {
+    match word {
+        "flat" -> return ["flat", ""]
+        "center_perspective" -> return ["perspective", "center"]
+        "center_no_perspective" -> return ["linear", "center"]
+        "centroid_perspective" -> return ["perspective", "centroid"]
+        "centroid_no_perspective" -> return ["linear", "centroid"]
+        "sample_perspective" -> return ["perspective", "sample"]
+        "sample_no_perspective" -> return ["linear", "sample"]
+        else -> return []
+    }
+}
+
+// The diagnostic for an attribute the subset refuses by name, or none.
+function refusedAttribute(name: String) -> Optional<Diagnostic> {
+    match name {
+        "id" -> return .Some(.ArgumentBuffer)
+        "function_constant" -> return .Some(.GatedParameter)
+        "raster_order_group" -> return .Some(.TileFunction)
+        "imageblock_data" -> return .Some(.TileFunction)
+        "payload" -> return .Some(.MeshShader)
+        "mesh_grid_properties" -> return .Some(.MeshShader)
+        "thread_index_in_simdgroup" -> return .Some(.SimdGroup)
+        "simdgroup_index_in_threadgroup" -> return .Some(.SimdGroup)
+        "threads_per_simdgroup" -> return .Some(.SimdGroup)
+        "thread_execution_width" -> return .Some(.SimdGroup)
+        "simdgroups_per_threadgroup" -> return .Some(.SimdGroup)
+        "thread_index_in_quadgroup" -> return .Some(.SimdGroup)
+        "quadgroup_index_in_threadgroup" -> return .Some(.SimdGroup)
+        else -> {
+            let none: Optional<Diagnostic> = .None
+            return none
+        }
+    }
+}
+
+extend Checker {
+    function checkStructMember(borrow mut self, member: MemberDeclaration) -> CheckedMember {
+        var written = tree.types[member.typeSyntax]
+        let attributed = attributeNamed(member.attributes, "attribute") >= 0
+        if attributed { written = widenedSyntax(written) }
+        let memberType = resolve(writtenIndex(written, member.typeSyntax))
+        if written.pointer || written.reference { report(.StoredPointer, member.span) }
+        if written.space != .NoSpace { report(.UnsupportedStruct, member.span) }
+        if !isVoid(memberType) && !isConstructible(memberType) && typeAt(memberType).shape != .Atomic {
+            report(.UnsupportedType, member.span)
+        }
+        return CheckedMember {
+            name = member.name, memberType = memberType, packed = startsWith(written.name, "packed_"),
+            binding = memberBinding(member.attributes, member.span)
+        }
+    }
+
+    // `written` with `short` and `ushort` widened, as a new arena entry
+    // when it changed.
+    function widenedSyntax(borrow mut self, written: TypeSyntax) -> TypeSyntax {
+        return TypeSyntax {
+            name = widenedName(written.name), typeArguments = written.typeArguments,
+            valueArguments = written.valueArguments, space = written.space, constant = written.constant,
+            pointer = written.pointer, reference = written.reference, extents = written.extents, span = written.span
+        }
+    }
+
+    function writtenIndex(borrow mut self, written: TypeSyntax, original: Int) -> Int {
+        if written.name == tree.types[original].name { return original }
+        tree.types.append(written)
+        return tree.types.count - 1
+    }
+
+    function memberBinding(borrow mut self, attributes: [Attribute], span: Span) -> MemberBinding {
+        var kind: BindingKind = .Unbound
+        var index = -1
+        var userName = ""
+        var interpolation = ""
+        var sampling = ""
+        for attribute in attributes {
+            match refusedAttribute(attribute.name) {
+                Some(diagnostic) -> report(diagnostic, attribute.span)
+                None -> {}
+            }
+            let words = interpolationOf(attribute.name)
+            if words.count == 2 {
+                interpolation = words[0]
+                sampling = words[1]
+                continue
+            }
+            match attribute.name {
+                "attribute" -> {
+                    kind = .Attribute
+                    index = attributeInteger(attribute, span)
+                }
+                "user" -> {
+                    kind = .User
+                    index = userLocation(attribute)
+                    if attribute.arguments.count == 1 { userName = tree.expressions[attribute.arguments[0]].text }
+                }
+                "position" -> kind = .Position
+                "color" -> {
+                    kind = .Color
+                    index = attributeInteger(attribute, span)
+                }
+                "depth" -> kind = .Depth
+                "sample_mask" -> kind = .SampleMask
+                "clip_distance" -> kind = .ClipDistance
+                "id" -> {}
+                "function_constant" -> {}
+                "raster_order_group" -> {}
+                else -> report(.UnsupportedAttribute, attribute.span)
+            }
+        }
+        return MemberBinding {
+            kind = kind, index = index, name = userName, interpolation = interpolation, sampling = sampling
+        }
+    }
+
+    // `[[user(locN)]]` names location N; any other name is placed later.
+    function userLocation(borrow mut self, attribute: Attribute) -> Int {
+        if attribute.arguments.count != 1 || tree.expressions[attribute.arguments[0]].kind != .Name {
+            report(.UnsupportedAttribute, attribute.span)
+            return -1
+        }
+        let written = tree.expressions[attribute.arguments[0]].text
+        if !startsWith(written, "loc") || utf8Count(written) == 3 { return -1 }
+        match integerValue(utf8Slice(written, 3, utf8Count(written))) {
+            Some(found) -> return found.value
+            None -> return -1
+        }
+    }
+}

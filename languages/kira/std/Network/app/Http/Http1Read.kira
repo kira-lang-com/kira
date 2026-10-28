@@ -1,0 +1,283 @@
+import Foundation
+
+// HTTP/1.1 messages in (RFC 9112), sans-I/O: bytes go in through `feed`,
+// heads, body bytes and ends come out of `event`. Framing is strict, since
+// two readers that frame one message differently are how requests are
+// smuggled: Transfer-Encoding beside Content-Length, a coding other than
+// chunked, differing lengths, obsolete line folding and bare CRs are all
+// refused (RFC 9112 sections 6.1 to 6.3 and 11.2).
+
+enum Http1Event {
+    Head(MessageHead)
+    Body([UN8])
+    Ended(Fields)
+}
+
+enum ReadStage {
+    Head
+    Length
+    ChunkSize
+    ChunkData
+    ChunkEnd
+    Trailers
+    UntilClose
+}
+
+struct Http1Reader {
+    let incoming: Incoming
+    // The scheme of the connection, which an HTTP/1.1 request does not
+    // carry.
+    let scheme: String
+    var buffer: [UN8] = []
+    var stage: ReadStage = .Head
+    var left: Number = 0
+    // The next response answers a HEAD request and has no body.
+    var answersHead: Bool = false
+    var events: [Http1Event] = []
+    var delivered: Number = 0
+
+    function event(borrow mut self) -> Http1Event? {
+        if delivered == events.count {
+            if delivered > 0 {
+                events = []
+                delivered = 0
+            }
+            return .None
+        }
+        let next = copy events[delivered]
+        delivered += 1
+        return .Some(next)
+    }
+
+    function feed(borrow mut self, bytes: borrow [UN8]) -> Result<Void, Http1Failure> {
+        buffer.appendAll(bytes)
+        while true {
+            let progressed = try step()
+            if !progressed { return .Ok }
+        }
+        return .Ok
+    }
+
+    // The peer closed the connection: the end of a body that runs to it,
+    // and anything else half read is incomplete.
+    function finish(borrow mut self) -> Result<Void, Http1Failure> {
+        if stage == .UntilClose {
+            takeAll()
+            events.append(.Ended(Fields {}))
+            stage = .Head
+            return .Ok
+        }
+        if stage != .Head || buffer.count > 0 { return .Error(.Incomplete) }
+        return .Ok
+    }
+
+    function step(borrow mut self) -> Result<Bool, Http1Failure> {
+        return match stage {
+            Head -> takeHead()
+            Length -> .Ok(takeCounted(false))
+            ChunkData -> .Ok(takeCounted(true))
+            ChunkSize -> takeChunkSize()
+            ChunkEnd -> takeChunkEnd()
+            Trailers -> takeTrailers()
+            UntilClose -> .Ok(takeAll())
+        }
+    }
+
+    function takeAll(borrow mut self) -> Bool {
+        if buffer.count == 0 { return false }
+        events.append(.Body(buffer))
+        buffer = []
+        return true
+    }
+
+    function takeCounted(borrow mut self, chunked: Bool) -> Bool {
+        if buffer.count == 0 { return false }
+        let take = min(left, buffer.count)
+        events.append(.Body(byteRun(buffer, 0, take)))
+        buffer = byteRun(buffer, take, buffer.count)
+        left -= take
+        if left == 0 {
+            if chunked {
+                stage = .ChunkEnd
+            } else {
+                endMessage(Fields {})
+            }
+        }
+        return true
+    }
+
+    function endMessage(borrow mut self, trailers: Fields) {
+        events.append(.Ended(trailers))
+        stage = .Head
+    }
+
+    // The next line, without its CRLF; none until it has all arrived.
+    function takeLine(borrow mut self) -> Result<[UN8]?, Http1Failure> {
+        let end = match lineEnd(buffer) {
+            Some(value) -> value
+            None -> {
+                if buffer.count > Http1.lineLimit { return .Error(.TooLarge) }
+                return .Ok(.None)
+            }
+        }
+        if end > Http1.lineLimit { return .Error(.TooLarge) }
+        let line = byteRun(buffer, 0, end)
+        buffer = byteRun(buffer, end + 2, buffer.count)
+        return .Ok(.Some(line))
+    }
+
+    function takeChunkSize(borrow mut self) -> Result<Bool, Http1Failure> {
+        let taken = try takeLine()
+        let line = match taken {
+            Some(value) -> value
+            None -> return .Ok(false)
+        }
+        let size = try chunkSize(line)
+        if size == 0 {
+            stage = .Trailers
+        } else {
+            left = size
+            stage = .ChunkData
+        }
+        return .Ok(true)
+    }
+
+    function takeChunkEnd(borrow mut self) -> Result<Bool, Http1Failure> {
+        let taken = try takeLine()
+        let line = match taken {
+            Some(value) -> value
+            None -> return .Ok(false)
+        }
+        if line.count != 0 { return .Error(.Malformed) }
+        stage = .ChunkSize
+        return .Ok(true)
+    }
+
+    function takeTrailers(borrow mut self) -> Result<Bool, Http1Failure> {
+        let end = match blockEnd(buffer) {
+            Some(value) -> value
+            None -> {
+                if buffer.count > Http1.headLimit { return .Error(.TooLarge) }
+                return .Ok(false)
+            }
+        }
+        let block = byteRun(buffer, 0, end)
+        buffer = byteRun(buffer, end, buffer.count)
+        let lines = try splitHeadLines(block)
+        var fields = Fields {}
+        for line in lines {
+            let field = try parseHttp1Field(line)
+            fields.entries.append(field)
+        }
+        endMessage(move fields)
+        return .Ok(true)
+    }
+}
+
+function http1Reader(incoming: Incoming, scheme: borrow String) -> Http1Reader {
+    return Http1Reader { incoming: incoming, scheme: copy scheme }
+}
+
+// Where the first CRLF starts; a CR not followed by LF is malformed, which
+// `splitHeadLines` checks.
+function lineEnd(bytes: borrow [UN8]) -> Number? {
+    if bytes.count < 2 { return .None }
+    for index in 0..bytes.count - 1 {
+        if Number(bytes[index]) == Http1.carriageReturn && Number(
+            bytes[index + 1]
+        ) == Http1.lineFeed {
+            return .Some(index)
+        }
+    }
+    return .None
+}
+
+// Where a block of lines ends: just past the empty line that closes it,
+// which is at once for an empty block.
+function blockEnd(bytes: borrow [UN8]) -> Number? {
+    if bytes.count >= 2 && Number(bytes[0]) == Http1.carriageReturn
+        && Number(bytes[1]) == Http1.lineFeed {
+        return .Some(2)
+    }
+    if bytes.count < 4 { return .None }
+    for index in 0..bytes.count - 3 {
+        let found = Number(bytes[index]) == Http1.carriageReturn
+            && Number(bytes[index + 1]) == Http1.lineFeed
+            && Number(bytes[index + 2]) == Http1.carriageReturn
+            && Number(bytes[index + 3]) == Http1.lineFeed
+        if found { return .Some(index + 4) }
+    }
+    return .None
+}
+
+// A block's lines, as text, without the empty line that ends it.
+function splitHeadLines(block: borrow [UN8]) -> Result<[String], Http1Failure> {
+    var lines: [String] = []
+    var rest = copy block
+    while true {
+        let end = match lineEnd(rest) {
+            Some(value) -> value
+            None -> return .Error(.Malformed)
+        }
+        if end == 0 { return .Ok(lines) }
+        let line = byteRun(rest, 0, end)
+        for byte in line {
+            if Number(byte) == Http1.carriageReturn || Number(byte) == Http1.lineFeed || byte == 0 {
+                return .Error(.Malformed)
+            }
+        }
+        let text = match textFromBytes(line) {
+            Some(value) -> value
+            None -> return .Error(.Malformed)
+        }
+        lines.append(text)
+        rest = byteRun(rest, end + 2, rest.count)
+    }
+    return .Ok(lines)
+}
+
+function parseHttp1Field(line: borrow String) -> Result<Field, Http1Failure> {
+    // Obsolete line folding is refused (RFC 9112 section 5.2).
+    if line.startsWith(" ") || line.startsWith("\t") { return .Error(.Malformed) }
+    let colon = match line.indexOf(":") {
+        Some(value) -> value
+        None -> return .Error(.Malformed)
+    }
+    let name = line.substring(0, colon)
+    // No whitespace between the name and the colon (section 5.1).
+    if name.count == 0 || name.contains(" ") || name.contains("\t") { return .Error(.Malformed) }
+    let value = line.substring(colon + 1, line.count).trim()
+    return .Ok(Field { name: name.lowercased(), value: value })
+}
+
+function chunkSize(line: borrow [UN8]) -> Result<Number, Http1Failure> {
+    var size: Number = 0
+    var digits: Number = 0
+    for byte in line {
+        let value = Number(byte)
+        // A chunk extension follows a semicolon and is ignored.
+        if value == Http1.semicolon || value == Http1.space || value == Http1.tab { break }
+        let digit = chunkHexDigit(value)
+        let known = match digit {
+            Some(found) -> found
+            None -> return .Error(.Malformed)
+        }
+        digits += 1
+        if digits > Http1.chunkDigits { return .Error(.TooLarge) }
+        size = size * Http1.hexRadix + known
+    }
+    if digits == 0 { return .Error(.Malformed) }
+    return .Ok(size)
+}
+
+function chunkHexDigit(value: Number) -> Number? {
+    let zero = StatusRange.zero
+    if value >= zero && value < zero + StatusRange.radix { return .Some(value - zero) }
+    if value >= Http1.lowerA && value < Http1.lowerA + Http1.hexLetters {
+        return .Some(value - Http1.lowerA + StatusRange.radix)
+    }
+    if value >= Http1.upperA && value < Http1.upperA + Http1.hexLetters {
+        return .Some(value - Http1.upperA + StatusRange.radix)
+    }
+    return .None
+}

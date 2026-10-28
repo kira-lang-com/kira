@@ -1,0 +1,157 @@
+import Foundation
+
+// Native callback state is reference-counted. Prefix: nsx / Nsx.
+//
+// The handle owns one reference and gives it up with its scope; every exported
+// token owns one and gives it up through `nativeUserDataRelease`; an explicit
+// retain pairs with one more release. The state lives exactly as long as one
+// owner remains, and every test here reduces that to a number a wrong count
+// would change.
+
+struct NsxCounter {
+    var hits: Int = 0
+}
+
+function nsxExport(start: Int) -> RawPtr {
+    let state = nativeState(NsxCounter { hits: start })
+    // The handle dies with this frame; the token keeps the state alive.
+    return nativeUserData(state)
+}
+
+function nsxBump(token: RawPtr) {
+    var view = nativeRecover<NsxCounter>(token)
+    view.hits = view.hits + 1
+}
+
+function nsxConsume(state: NsxCounter) -> Int {
+    let boxed = nativeState(state)
+    let token = nativeUserData(boxed)
+    nsxBump(token)
+    let seen = nativeRecover<NsxCounter>(token).hits
+    nativeUserDataRelease(token)
+    return seen
+}
+
+@Test
+function nsxATokenOutlivesTheHandleThatExportedIt() {
+    let token = nsxExport(10)
+    nsxBump(token)
+    nsxBump(token)
+    let seen = nativeRecover<NsxCounter>(token).hits
+    nativeUserDataRelease(token)
+    let got = seen
+    expect!(got == 12)
+}
+
+@Test
+function nsxARetainPairsWithOneRelease() {
+    let token = nsxExport(3)
+    nativeUserDataRetain(token)
+    nativeUserDataRelease(token)
+    nsxBump(token)
+    let seen = nativeRecover<NsxCounter>(token).hits
+    nativeUserDataRelease(token)
+    let got = seen
+    expect!(got == 4)
+}
+
+@Test
+function nsxTwoExportsAreTwoOwners() {
+    let handle = nativeState(NsxCounter { hits: 7 })
+    let first = nativeUserData(handle)
+    let second = nativeUserData(handle)
+    nativeUserDataRelease(first)
+    nsxBump(second)
+    let seen = nativeRecover<NsxCounter>(second).hits
+    nativeUserDataRelease(second)
+    let got = seen
+    expect!(got == 8)
+}
+
+@Test
+function nsxAHandleReleasesWithItsScopeInALoop() {
+    var total = 0
+    for i in 0..50 {
+        total = total + nsxConsume(NsxCounter { hits: i })
+    }
+    let got = total
+    expect!(got == 1275)
+}
+
+@Test
+function nsxAMovedHandleTransfersItsOwner() {
+    let first = nativeState(NsxCounter { hits: 20 })
+    let second = move first
+    let token = nativeUserData(second)
+    nsxBump(token)
+    let seen = nativeRecover<NsxCounter>(token).hits
+    nativeUserDataRelease(token)
+    let got = seen
+    expect!(got == 21)
+}
+
+@Test
+function nsxOverwritingAHandleReleasesTheOldOne() {
+    var slot = nativeState(NsxCounter { hits: 1 })
+    let kept = nativeUserData(slot)
+    slot = nativeState(NsxCounter { hits: 2 })
+    nsxBump(kept)
+    let token = nativeUserData(slot)
+    let seen = nativeRecover<NsxCounter>(kept).hits * 10 + nativeRecover<NsxCounter>(token).hits
+    nativeUserDataRelease(kept)
+    nativeUserDataRelease(token)
+    let got = seen
+    expect!(got == 22)
+}
+
+// The handle's reference ends where the handle is given up, here into a
+// function that drops it; the token's own reference keeps the state.
+function nsxGiveUp(state: NativeState<NsxCounter>) {}
+
+@Test
+function nsxGivingUpTheHandleIsOneRelease() {
+    let handle = nativeState(NsxCounter { hits: 5 })
+    let token = nativeUserData(handle)
+    nsxGiveUp(move handle)
+    nsxBump(token)
+    let seen = nativeRecover<NsxCounter>(token).hits
+    nativeUserDataRelease(token)
+    let got = seen
+    expect!(got == 6)
+}
+
+struct NsxOwnerBox {
+    var child: NativeState<NsxCounter>
+}
+
+@Test
+function nsxNestedNativeStateKeepsItsAffineOwner() {
+    let child = nativeState(NsxCounter { hits: 30 })
+    let outer = nativeState(NsxOwnerBox { child: move child })
+    var view = nativeRecover<NsxOwnerBox>(outer)
+    var childView = nativeRecover<NsxCounter>(view.child)
+    childView.hits = childView.hits + 2
+    let got = childView.hits
+    expect!(got == 32)
+}
+
+@Test
+function nsxReleasedStorageIsBoundedByLiveStates() {
+    let before = runtimeContext.nativeStates.count
+    var total: Int = 0
+    for i in 0..1000 { total = total + nsxConsume(NsxCounter { hits: i }) }
+    let got = total == 500500 && runtimeContext.nativeStates.count - before <= 1
+    expect!(got == true)
+}
+
+@Test
+function nsxReusingStorageKeepsTokensDistinct() {
+    let first = nsxExport(10)
+    nativeUserDataRelease(first)
+    let second = nsxExport(20)
+    let seen = rawPointerWord(first) != rawPointerWord(second)
+        && nativeRecover<NsxCounter>(second).hits == 20
+    nativeUserDataRelease(second)
+    let got = seen
+    expect!(got == true)
+}

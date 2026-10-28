@@ -1,0 +1,66 @@
+// Computed members of a struct, written as a construct's are: a `let` or
+// `var` whose name, or name and type, a block follows rather than a value.
+//
+// `var area: Number { width * height }` reads as the value its block ends
+// with; `let area { width * height }` takes that value's type; and
+// `var name: String { get { ... } set(value) { ... } }` is assigned through
+// its setter too. Each is the zero-parameter method tagged `Computed` that a
+// read of the member calls (`semantics/computed-members.klfd`), and the
+// setter a method of the same name tagged `ComputedSetter`.
+
+extend Parser {
+    // Whether the `let` or `var` at the cursor declares a computed member: a
+    // block comes before anything that ends a stored field or starts the
+    // next member. Only tokens are looked at, so nothing is read twice; a
+    // type is never read here, since reading one may split a `>>` token.
+    function computedMemberAhead(borrow self) -> Bool {
+        if peek(1).kind != .Identifier { return false }
+        var ahead = 2
+        while true {
+            let kind = peek(ahead).kind
+            if kind == .LeftBrace { return true }
+            if kind == .Equals || kind == .Let || kind == .Var || kind == .Function || kind == .At || kind == .RightBrace || kind == .End {
+                return false
+            }
+            ahead += 1
+        }
+        return false
+    }
+
+    // The computed member at the cursor, its getter and any setter added to
+    // `methods`. Answers its name.
+    function computedStructMember(borrow mut self, methods: borrow mut [FunctionDeclaration], start: Span) -> Result<Identifier, Failure> {
+        let mutable = advance().kind == .Var
+        let name = try identifier(.ExpectedMemberName)
+        var result = inferredReference(name.span)
+        let typed = eat(.Colon)
+        if typed { result = try typeReference() }
+        let accessors = at(.LeftBrace) && peek(1).kind == .Identifier && text(peek(1).span) == "get" && peek(2).kind == .LeftBrace
+        if accessors {
+            advance()
+            advance()
+        }
+        methods.append(FunctionDeclaration {
+            name = name, annotations = [implicitAnnotation(.Computed, name.span)],
+            receiver = .Free, parameters = [], result = .Some(result),
+            body = try block(), span = spanFrom(start), typeParameters = [], scope = GenericScope.none()
+        })
+        if !accessors { return .Ok(name) }
+        if atWord("set") {
+            if !mutable { return .Error(failure(.ComputedSetterOnLet)) }
+            if !typed { return .Error(Failure { diagnostic = .ComputedMemberType, span = name.span }) }
+            advance()
+            try expect(.LeftParen)
+            let value = try identifier(.ExpectedParameterName)
+            try expect(.RightParen)
+            methods.append(FunctionDeclaration {
+                name = name, annotations = [implicitAnnotation(.ComputedSetter, name.span)],
+                receiver = .Free,
+                parameters = [Parameter { name = value, mode = .Owned, annotation = result, copies = false, initial = .None }],
+                result = .None, body = try block(), span = spanFrom(start), typeParameters = [], scope = GenericScope.none()
+            })
+        }
+        try expect(.RightBrace)
+        return .Ok(name)
+    }
+}

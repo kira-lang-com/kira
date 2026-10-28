@@ -1,0 +1,410 @@
+import Heap
+
+// Programs this one starts, feeds, reads and waits for, on the kernel's
+// `klf.process` child services (framework D-386).
+//
+// A command is built in the kernel argument by argument, then started, which
+// answers a child. Any number run at once: each is waited for alone, or
+// whichever ends first is taken with `waitAnyChild`. A piped output is drained
+// by the kernel as the child writes it, so a child never stalls on a full pipe
+// while this program reads another one.
+
+@Service("klfsvc_process_spawn_create")
+function kernelSpawnCreate() -> Int
+
+@Service("klfsvc_process_spawn_argument")
+function kernelSpawnArgument(command: Int, data: RawPtr, count: Int) -> Int
+
+@Service("klfsvc_process_spawn_environment")
+function kernelSpawnEnvironment(command: Int, data: RawPtr, count: Int) -> Int
+
+@Service("klfsvc_process_spawn_clear_environment")
+function kernelSpawnClearEnvironment(command: Int) -> Int
+
+@Service("klfsvc_process_spawn_directory")
+function kernelSpawnDirectory(command: Int, path: RawPtr, count: Int) -> Int
+
+@Service("klfsvc_process_spawn_stream")
+function kernelSpawnStream(command: Int, stream: Int, mode: Int, path: RawPtr, count: Int) -> Int
+
+@Service("klfsvc_process_spawn_start")
+function kernelSpawnStart(command: Int) -> Int
+
+@Service("klfsvc_process_child_wait")
+function kernelChildWait(child: Int, timeout: Int) -> Int
+
+@Service("klfsvc_process_child_wait_any")
+function kernelChildWaitAny(timeout: Int) -> Int
+
+@Service("klfsvc_process_child_read")
+function kernelChildRead(
+    child: Int,
+    stream: Int,
+    destination: RawPtr,
+    capacity: Int,
+    timeout: Int
+) -> Int
+
+@Service("klfsvc_process_child_write")
+function kernelChildWrite(child: Int, data: RawPtr, count: Int) -> Int
+
+@Service("klfsvc_process_child_close_input")
+function kernelChildCloseInput(child: Int) -> Int
+
+@Service("klfsvc_process_child_signal")
+function kernelChildSignal(child: Int, signal: Int) -> Int
+
+@Service("klfsvc_process_child_release")
+function kernelChildRelease(child: Int) -> Int
+
+@Service("klfsvc_process_processor_count")
+function kernelProcessorCount() -> Int
+
+@Service("klfsvc_process_current_directory")
+function kernelCurrentDirectory(destination: RawPtr, capacity: Int) -> Int
+
+namespace ChildService {
+    let nanosecondsPerSecond: Number = 1000000000
+    // A wait that has no end.
+    let forever: Number = -1
+    // The answers that are not failures: a child still running, a pipe with
+    // nothing in it yet, and the base a signal's number is taken from.
+    let stillRunning: Number = -100
+    let nothingYet: Number = -101
+    let signalled: Number = -200
+    // What one read asks for, and what a working directory is first read into.
+    let readRoom: Number = 65536
+    let pathRoom: Number = 4096
+}
+
+// Why a process service failed, by its framework word.
+enum ProcessFailure {
+    Missing
+    Denied
+    InvalidHandle
+    InvalidPath
+    Io
+    NoProgram
+    NotPiped
+}
+
+// Where one of a child's standard streams goes.
+enum ChildStream {
+    // To this program's own stream.
+    Inherit
+    // Nowhere: reads end at once and writes are dropped.
+    Null
+    // To this program, through the child's `read` and `write`.
+    Pipe
+    // To the file at the path, created or emptied first for an output.
+    File(String)
+}
+
+// One variable the child sees.
+struct EnvironmentEntry {
+    let name: String
+    let value: String
+}
+
+// A program to start and how it starts.
+struct ProcessCommand {
+    // The program: a path, or a name looked up on the `PATH` it is given.
+    let program: String
+    var arguments: [String] = []
+    // Variables set over the environment it inherits.
+    var environment: [EnvironmentEntry] = []
+    // Whether it starts from no environment but `environment`.
+    var clearEnvironment: Bool = false
+    // Its working directory; this program's own when it has none.
+    var directory: String = ""
+    var input: ChildStream = .Inherit
+    var output: ChildStream = .Inherit
+    var errors: ChildStream = .Inherit
+
+    function start(borrow self) -> Result<ChildProcess, ProcessFailure> {
+        let command = kernelSpawnCreate()
+        var answer = kernelSpawnArgument(command, program.data, program.count)
+        for argument in arguments {
+            if answer < 0 { break }
+            answer = kernelSpawnArgument(command, argument.data, argument.count)
+        }
+        if answer >= 0 && clearEnvironment { answer = kernelSpawnClearEnvironment(command) }
+        for entry in environment {
+            if answer < 0 { break }
+            let text = entry.name + "=" + entry.value
+            answer = kernelSpawnEnvironment(command, text.data, text.count)
+        }
+        if answer >= 0 && directory.count > 0 {
+            answer = kernelSpawnDirectory(command, directory.data, directory.count)
+        }
+        if answer >= 0 { answer = spawnStream(command, 0, input) }
+        if answer >= 0 { answer = spawnStream(command, 1, output) }
+        if answer >= 0 { answer = spawnStream(command, 2, errors) }
+        if answer < 0 { return .Error(processFailure(answer)) }
+        let child = kernelSpawnStart(command)
+        if child < 0 { return .Error(processFailure(child)) }
+        return .Ok(ChildProcess { id: Number(child) })
+    }
+
+    // Starts the program with its output and errors piped, gives it `input`
+    // when there is any, and waits for it to end with all it wrote.
+    function run(borrow self, input: borrow [UN8]) -> Result<CommandResult, ProcessFailure> {
+        var piped = copy self
+        piped.output = .Pipe
+        piped.errors = .Pipe
+        if input.count > 0 { piped.input = .Pipe }
+        let child = match piped.start() {
+            Ok(started) -> started
+            Error(failure) -> return .Error(failure)
+        }
+        let result = collectChild(child, input)
+        match child.release() {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+        return result
+    }
+}
+
+// Feeds `input` to a started child, then reads both its outputs to their end
+// and waits for it.
+function collectChild(
+    child: borrow ChildProcess,
+    input: borrow [UN8]
+) -> Result<CommandResult, ProcessFailure> {
+    if input.count > 0 {
+        var sent: Number = 0
+        while sent < input.count {
+            match child.write(byteRange(input, sent, input.count - sent)) {
+                Ok(taken) -> sent += taken
+                Error(failure) -> return .Error(failure)
+            }
+        }
+        match child.closeInput() {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+    }
+    let output = match child.readAll(.Output) {
+        Ok(bytes) -> bytes
+        Error(failure) -> return .Error(failure)
+    }
+    let errors = match child.readAll(.Errors) {
+        Ok(bytes) -> bytes
+        Error(failure) -> return .Error(failure)
+    }
+    return match child.wait() {
+        Ok(exit) -> .Ok(CommandResult { exit: exit, output: output, errors: errors })
+        Error(failure) -> .Error(failure)
+    }
+}
+
+// How a child ended.
+enum ChildExit {
+    // It exited with this status.
+    Status(Number)
+    // This signal ended it.
+    Signalled(Number)
+}
+
+// What a command that ran to its end left.
+struct CommandResult {
+    let exit: ChildExit
+    let output: [UN8]
+    let errors: [UN8]
+
+    function succeeded() -> Bool {
+        return match exit {
+            Status(status) -> status == 0
+            Signalled(_) -> false
+        }
+    }
+}
+
+// The child output a read takes from.
+enum ChildOutput: UN32 {
+    Output = 1
+    Errors = 2
+}
+
+// What a read of a piped output found.
+enum ChildRead {
+    Bytes([UN8])
+    // Nothing has arrived within the wait, and the stream goes on.
+    Pending
+    // The stream has ended.
+    Ended
+}
+
+enum ProcessSignal: UN32 {
+    Interrupt = 1
+    Terminate = 2
+    Kill = 3
+}
+
+// A started program. `id` is the kernel's word for it, never reused while
+// this program runs, so the child `waitAnyChild` answers is matched by it.
+struct ChildProcess {
+    let id: Number
+
+    // Waits until it ends.
+    function wait(borrow self) -> Result<ChildExit, ProcessFailure> {
+        let answer = kernelChildWait(Number(id), ChildService.forever)
+        return childExit(answer)
+    }
+
+    // Waits up to `seconds`, answering nothing while it still runs.
+    function waitUpTo(borrow self, seconds: Number) -> Result<ChildExit?, ProcessFailure> {
+        let answer = kernelChildWait(Number(id), childTimeout(seconds))
+        if answer == ChildService.stillRunning { return .Ok(.None) }
+        return match childExit(answer) {
+            Ok(exit) -> .Ok(.Some(exit))
+            Error(failure) -> .Error(failure)
+        }
+    }
+
+    // What has arrived on a piped output, waiting up to `seconds` for some;
+    // no time waits until something arrives or the stream ends.
+    function read(
+        borrow self,
+        stream: ChildOutput,
+        seconds: Number?
+    ) -> Result<ChildRead, ProcessFailure> {
+        let timeout = match seconds {
+            Some(limit) -> childTimeout(limit)
+            None -> ChildService.forever
+        }
+        let room = ChildService.readRoom
+        let data = makeArrayData(room)
+        let answer = kernelChildRead(Number(id), code(stream), data, room, timeout)
+        if answer <= 0 { releaseArrayData(data) }
+        if answer == 0 { return .Ok(.Ended) }
+        if answer == ChildService.nothingYet { return .Ok(.Pending) }
+        if answer < 0 { return .Error(processFailure(answer)) }
+        let empty: [UN8] = []
+        return .Ok(.Bytes(Array { data = data, count = answer, capacity = room, ops = empty.ops }))
+    }
+
+    // Everything a piped output carries, to its end.
+    function readAll(borrow self, stream: ChildOutput) -> Result<[UN8], ProcessFailure> {
+        var all: [UN8] = []
+        while true {
+            match read(stream, .None) {
+                Ok(found) -> match found {
+                    Bytes(chunk) -> {
+                        for byte in chunk { all.append(byte) }
+                    }
+                    Pending -> continue
+                    Ended -> break
+                }
+                Error(failure) -> return .Error(failure)
+            }
+        }
+        return .Ok(all)
+    }
+
+    // Writes to the piped input, answering how many bytes it took.
+    function write(borrow self, bytes: borrow [UN8]) -> Result<UNumber, ProcessFailure> {
+        let answer = kernelChildWrite(Number(id), bytes.data, bytes.count)
+        if answer < 0 { return .Error(processFailure(answer)) }
+        return .Ok(Number(answer))
+    }
+
+    // Closes the piped input; the child reads its end.
+    function closeInput(borrow self) -> Result<Void, ProcessFailure> {
+        return processOutcome(kernelChildCloseInput(Number(id)))
+    }
+
+    function signal(borrow self, signal: ProcessSignal) -> Result<Void, ProcessFailure> {
+        return processOutcome(kernelChildSignal(Number(id), code(signal)))
+    }
+
+    // Forgets the child. One still running goes on without being waited for.
+    function release(borrow self) -> Result<Void, ProcessFailure> {
+        return processOutcome(kernelChildRelease(Number(id)))
+    }
+}
+
+// A child that has ended, each answered once, waiting up to `seconds` for
+// one; no time waits until one ends. Nothing when none ended in time.
+function waitAnyChild(seconds: Number?) -> ChildProcess? {
+    let timeout = match seconds {
+        Some(limit) -> childTimeout(limit)
+        None -> ChildService.forever
+    }
+    let answer = kernelChildWaitAny(timeout)
+    if answer <= 0 { return .None }
+    return .Some(ChildProcess { id: Number(answer) })
+}
+
+// How many threads the host runs at once for this program: its processors,
+// within any limit set on it. At least 1.
+function processorCount() -> UNumber {
+    return Number(kernelProcessorCount())
+}
+
+// The directory this program works in.
+function currentDirectory() -> Result<String, ProcessFailure> {
+    var capacity = ChildService.pathRoom
+    var buffer = allocateBytes(capacity)
+    var answer = kernelCurrentDirectory(buffer, capacity)
+    if answer > capacity {
+        freeBytes(buffer)
+        capacity = answer
+        buffer = allocateBytes(capacity)
+        answer = kernelCurrentDirectory(buffer, capacity)
+    }
+    if answer < 0 || answer > capacity {
+        freeBytes(buffer)
+        return .Error(answer < 0 ? processFailure(answer) : .Io)
+    }
+    let directory = stringFromCBytes(buffer, answer)
+    freeBytes(buffer)
+    return .Ok(directory)
+}
+
+function spawnStream(command: Number, stream: Number, target: borrow ChildStream) -> Number {
+    let none = ""
+    return match target {
+        Inherit -> kernelSpawnStream(command, stream, 0, none.data, 0)
+        Null -> kernelSpawnStream(command, stream, 1, none.data, 0)
+        Pipe -> kernelSpawnStream(command, stream, 2, none.data, 0)
+        File(path) -> kernelSpawnStream(command, stream, 3, path.data, path.count)
+    }
+}
+
+// `count` bytes of `bytes` from `start`.
+function byteRange(bytes: borrow [UN8], start: Number, count: Number) -> [UN8] {
+    var part: [UN8] = []
+    for index in 0..count { part.append(bytes[start + index]) }
+    return part
+}
+
+function childTimeout(seconds: Number) -> Number {
+    return Number(max(seconds, 0) * ChildService.nanosecondsPerSecond)
+}
+
+function childExit(answer: Number) -> Result<ChildExit, ProcessFailure> {
+    if answer >= 0 { return .Ok(.Status(Number(answer))) }
+    if answer <= ChildService.signalled {
+        return .Ok(.Signalled(Number(ChildService.signalled - answer)))
+    }
+    return .Error(processFailure(answer))
+}
+
+function processOutcome(answer: Number) -> Result<Void, ProcessFailure> {
+    if answer < 0 { return .Error(processFailure(answer)) }
+    return .Ok
+}
+
+function processFailure(word: Number) -> ProcessFailure {
+    return match word {
+            -1 -> .Missing
+            - 2 -> .Denied
+            - 4 -> .InvalidHandle
+            - 6 -> .InvalidPath
+            - 8 -> .NoProgram
+            - 9 -> .NotPiped
+        else -> .Io
+    }
+}

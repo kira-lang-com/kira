@@ -1,0 +1,451 @@
+// A struct field's default as the module's contract writes it (KLF-RIDL
+// section 20.3): the default's syntax printed back when it is a constant a
+// reader can write in, built of literals, enum cases, arrays, structs and
+// distincts, and the module's public constants. A call to one of the module's
+// own free functions whose body is a single `return` of such a constant,
+// built from its parameters, is that constant with the arguments written in:
+// `resolvedLength(0.0)` returning `ScaledMetric { points: points }` is written
+// `ScaledMetric { points: 0.0 }`. Anything else is left out, and the field has
+// no default for the reader. A public free function of the module, named
+// as a closure's default, is written by its name: the contract declares it.
+//
+// A public `let` crosses the same way when RIDL has no literal for its value
+// (section 20.3): a struct, a distinct, a variant or an array built of
+// constants. A constant it names is written in as its own value, so the
+// contract never names one it leaves out.
+
+// The parameters a folded call binds, by name, to the text of the argument
+// each was given, how many calls deep the fold is, and whether a constant
+// named is written in as its value rather than by its name.
+struct ContractScope {
+    let names: [String]
+    let texts: [String]
+    let depth: Int
+    let constants: ContractConstants
+
+    function none() -> ContractScope {
+        return ContractScope { names = [], texts = [], depth = 0, constants = .Named }
+    }
+
+    function writtenIn() -> ContractScope {
+        return ContractScope { names = [], texts = [], depth = 0, constants = .WrittenIn }
+    }
+}
+
+// How a contract value writes a public constant it reads: by name, for a
+// field default the surface checks against what it writes, or as the
+// constant's own value, for a constant written in a contract.
+enum ContractConstants {
+    Named
+    WrittenIn
+}
+
+// How many calls deep a default may fold before it is left out.
+let contractFoldDepth: Int = 8
+
+// The free functions by name, each filed in the bucket its name hashes to,
+// so folding a call reads a single bucket rather than every function.
+struct FreeFunctions {
+    var buckets: [[Int]]
+
+    // The one free function called `name`, or -1 when there is none or more
+    // than one.
+    function named(borrow self, tree: borrow SyntaxTree, name: String) -> Int {
+        var found = -1
+        for index in buckets[nameHash(name) % nameSetBuckets] {
+            if tree.functions[index].name.text != name { continue }
+            if found >= 0 { return -1 }
+            found = index
+        }
+        return found
+    }
+}
+
+function freeFunctions(tree: borrow SyntaxTree) -> FreeFunctions {
+    var buckets: [[Int]] = []
+    for bucket in 0..nameSetBuckets {
+        let empty: [Int] = []
+        buckets.append(empty)
+    }
+    for index in 0..tree.functions.count {
+        if tree.functions[index].receiver == .Free {
+            buckets[nameHash(tree.functions[index].name.text) % nameSetBuckets].append(index)
+        }
+    }
+    return FreeFunctions { buckets = buckets }
+}
+
+extend Checker {
+    // Per struct, per field, the default's text, or empty when it has none
+    // a contract can carry.
+    function contractDefaults(borrow self, declarations: Declarations) -> [[String]] {
+        let free = freeFunctions(tree)
+        var all: [[String]] = []
+        for structure in program.structs {
+            var texts: [String] = []
+            for field in structure.fields {
+                match field.initial {
+                    Some(value) -> {
+                        match contractValue(declarations, free, value, ContractScope.none()) {
+                            Some(text) -> texts.append(text)
+                            None -> texts.append("")
+                        }
+                    }
+                    None -> texts.append("")
+                }
+            }
+            all.append(texts)
+        }
+        return all
+    }
+
+    // Per source function, per parameter after the receiver, the default's
+    // text, or empty when it has none a contract can carry.
+    function parameterDefaults(borrow self, declarations: Declarations) -> [[String]] {
+        let free = freeFunctions(tree)
+        var all: [[String]] = []
+        for signature in declarations.signatures {
+            var texts: [String] = []
+            for parameter in signature.declaration.parameters {
+                match contractDefault(declarations, free, parameter, ContractScope.none()) {
+                    Some(text) -> texts.append(text)
+                    None -> texts.append("")
+                }
+            }
+            all.append(texts)
+        }
+        return all
+    }
+
+    function contractValue(
+        borrow self,
+        declarations: Declarations,
+        free: borrow FreeFunctions,
+        index: Int,
+        scope: ContractScope
+    ) -> Optional<String> {
+        match tree.expressions[index].kind {
+            IntegerLiteral(value, hexadecimal) -> {
+                if hexadecimal { return .Some(hexadecimalWord(value)) }
+                return .Some(decimalText(value))
+            }
+            FloatLiteral(text) -> return .Some(text)
+            BooleanLiteral(value) -> {
+                if value { return .Some("true") }
+                return .Some("false")
+            }
+            StringLiteral(text) -> {
+                match text {
+                    Some(value) -> return .Some(ridlString(value))
+                    None -> return .None
+                }
+            }
+            Unary(operator, operand) -> {
+                match operator {
+                    Negate -> {
+                        match contractValue(declarations, free, operand, scope) {
+                            Some(text) -> return .Some(joinText(["-", text]))
+                            None -> return .None
+                        }
+                    }
+                    Not -> return .None
+                    Complement -> return .None
+                }
+            }
+            Variant(name, payload) -> {
+                match payload {
+                    Some(value) -> {
+                        match contractValue(declarations, free, value, scope) {
+                            Some(text) -> return .Some(joinText([".", name.text, "(", text, ")"]))
+                            None -> return .None
+                        }
+                    }
+                    None -> return .Some(joinText([".", name.text]))
+                }
+            }
+            ArrayLiteral(items) -> {
+                match contractValues(declarations, free, items, scope) {
+                    Some(text) -> return .Some(joinText(["[", text, "]"]))
+                    None -> return .None
+                }
+            }
+            Call(name, arguments) -> {
+                if !contractStruct(declarations, name.text) {
+                    return contractCall(declarations, free, name.text, arguments, scope)
+                }
+                var given: [String] = []
+                let fields = structFields(declarations, name.text)
+                for slot in 0..arguments.count {
+                    if slot < fields.count { given.append(fields[slot].name.text) }
+                }
+                if !contractOmitted(declarations, free, name.text, given, scope) { return .None }
+                match contractValues(declarations, free, arguments, scope) {
+                    Some(text) -> return .Some(joinText([ridlName(name.text), "(", text, ")"]))
+                    None -> return .None
+                }
+            }
+            StructLiteral(name, typeArguments, fields) -> {
+                if typeArguments.count > 0 || !contractStruct(declarations, name.text) { return .None }
+                var given: [String] = []
+                for field in fields { given.append(field.name.text) }
+                if !contractOmitted(declarations, free, name.text, given, scope) { return .None }
+                if fields.count == 0 { return .Some(joinText([ridlName(name.text), " {}"])) }
+                var parts: [String] = []
+                for field in fields {
+                    match contractValue(declarations, free, field.value, scope) {
+                        Some(text) -> parts.append(joinText([field.name.text, ": ", text]))
+                        None -> return .None
+                    }
+                }
+                return .Some(joinText([ridlName(name.text), " { ", joinWith(parts, ", "), " }"]))
+            }
+            // A public `let`; the surface writes the default only when the
+            // `let` is a constant it writes too, which is known once lowered.
+            Name(name) -> {
+                for bound in 0..scope.names.count {
+                    if scope.names[bound] == name.text { return .Some(scope.texts[bound]) }
+                }
+                for global in program.surfaceGlobals {
+                    if program.globals[global].name.text != name.text { continue }
+                    match scope.constants {
+                        Named -> return .Some(name.text)
+                        WrittenIn -> {
+                            match program.constantLiteral(global) {
+                                Some(literal) -> return .Some(literal)
+                                None -> return contractGlobal(declarations, free, global, scope.depth + 1)
+                            }
+                        }
+                    }
+                }
+                let named = free.named(tree, name.text)
+                if named >= 0 {
+                    let declared = tree.functions[named]
+                    let own = ownDeclaration(declarations, declared.name.span.file)
+                    if own && declared.typeParameters.count == 0 && isExportedName(tree, declared.name.span) { return .Some(name.text) }
+                }
+                return .None
+            }
+            Quote -> return .None
+            Index -> return .None
+            Transfer -> return .None
+            Labelled -> return .None
+            TypeQuery -> return .None
+            Member -> return .None
+            ExpandedMacro -> return .None
+            MacroCall -> return .None
+            GenericCall -> return .None
+            MethodCall -> return .None
+            IndirectCall -> return .None
+            Lambda -> return .None
+            KeyPath -> return .None
+            Task -> return .None
+            Try -> return .None
+            Binary -> return .None
+            Conditional -> return .None
+            MatchValue -> return .None
+            Content -> return .None
+        }
+        return .None
+    }
+
+    // A public constant's value as its contract writes it, when it is one,
+    // read `depth` folds deep.
+    function contractGlobal(
+        borrow self,
+        declarations: Declarations,
+        free: borrow FreeFunctions,
+        global: Int,
+        depth: Int
+    ) -> Optional<String> {
+        if depth >= contractFoldDepth || declarations.globals[global].mutable { return .None }
+        return contractValue(
+            declarations,
+            free,
+            declarations.globals[global].syntax.binding.value,
+            ContractScope { names = [], texts = [], depth = depth, constants = .WrittenIn }
+        )
+    }
+
+    // Per global, its value as a contract writes it, or empty when it is not
+    // a public constant a contract can carry.
+    function contractConstants(borrow self, declarations: Declarations) -> [String] {
+        let free = freeFunctions(tree)
+        var texts: [String] = []
+        for global in 0..program.globals.count { texts.append("") }
+        for global in program.surfaceGlobals {
+            match contractGlobal(declarations, free, global, 0) {
+                Some(text) -> texts[global] = text
+                None -> {}
+            }
+        }
+        return texts
+    }
+
+    function contractValues(
+        borrow self,
+        declarations: Declarations,
+        free: borrow FreeFunctions,
+        items: [Int],
+        scope: ContractScope
+    ) -> Optional<String> {
+        var parts: [String] = []
+        for item in items {
+            match contractValue(declarations, free, item, scope) {
+                Some(text) -> parts.append(text)
+                None -> return .None
+            }
+        }
+        return .Some(joinWith(parts, ", "))
+    }
+
+    // The constant a call to the module's free function `name` folds to:
+    // its body is one `return` of a constant, read with each parameter
+    // standing for the argument given it, or for its own default where the
+    // call leaves the slot empty.
+    function contractCall(
+        borrow self,
+        declarations: Declarations,
+        free: borrow FreeFunctions,
+        name: String,
+        arguments: [Int],
+        scope: ContractScope
+    ) -> Optional<String> {
+        if scope.depth >= contractFoldDepth { return .None }
+        let found = free.named(tree, name)
+        if found < 0 { return .None }
+        let declared = tree.functions[found]
+        if declared.typeParameters.count > 0 || declared.body.count != 1 { return .None }
+        if arguments.count > declared.parameters.count { return .None }
+        var value = -1
+        match tree.statements[declared.body[0]].kind {
+            Return(returned) -> {
+                match returned {
+                    Some(expression) -> value = expression
+                    None -> return .None
+                }
+            }
+            Binding -> return .None
+            Assignment -> return .None
+            CompoundAssignment -> return .None
+            Evaluation -> return .None
+            If -> return .None
+            While -> return .None
+            For -> return .None
+            ForEach -> return .None
+            Match -> return .None
+            Attempt -> return .None
+            Break -> return .None
+            Continue -> return .None
+        }
+        var names: [String] = []
+        var texts: [String] = []
+        for slot in 0..declared.parameters.count {
+            let parameter = declared.parameters[slot]
+            var given: Optional<String> = .None
+            if slot < arguments.count {
+                given = contractValue(declarations, free, arguments[slot], scope)
+            } else {
+                given = contractDefault(declarations, free, parameter, scope)
+            }
+            match given {
+                Some(text) -> {
+                    names.append(parameter.name.text)
+                    texts.append(text)
+                }
+                None -> return .None
+            }
+        }
+        return contractValue(
+            declarations,
+            free,
+            value,
+            ContractScope { names = names, texts = texts, depth = scope.depth + 1, constants = scope.constants }
+        )
+    }
+
+    // A parameter's own default as a constant, read where the function is
+    // declared: none of the caller's parameters are in scope there.
+    function contractDefault(
+        borrow self,
+        declarations: Declarations,
+        free: borrow FreeFunctions,
+        parameter: Parameter,
+        scope: ContractScope
+    ) -> Optional<String> {
+        match parameter.initial {
+            Some(value) -> return contractValue(
+                declarations,
+                free,
+                value,
+                ContractScope { names = [], texts = [], depth = scope.depth + 1, constants = scope.constants }
+            )
+            None -> return .None
+        }
+    }
+
+    // Whether every field of struct `name` a value leaves out, those not in
+    // `given`, has a default the contract writes too: the reader fills an
+    // omitted field only from the default its contract gives it (section
+    // 20.3), so `Name {}` is written only when all of Name's fields have one.
+    function contractOmitted(
+        borrow self,
+        declarations: Declarations,
+        free: borrow FreeFunctions,
+        name: String,
+        given: [String],
+        scope: ContractScope
+    ) -> Bool {
+        if scope.depth >= contractFoldDepth { return false }
+        for field in structFields(declarations, name) {
+            var named = false
+            for text in given {
+                if text == field.name.text { named = true }
+            }
+            if named { continue }
+            match field.initial {
+                Some(value) -> {
+                    let written = contractValue(
+                        declarations,
+                        free,
+                        value,
+                        ContractScope { names = [], texts = [], depth = scope.depth + 1, constants = scope.constants }
+                    )
+                    if written.isNone() { return false }
+                }
+                None -> return false
+            }
+        }
+        return true
+    }
+
+    // The fields of struct `name`, none when it is not one.
+    function structFields(borrow self, declarations: Declarations, name: String) -> [Field] {
+        match declarations.typeNamed(name) {
+            Some(named) -> {
+                if named.kind == .Structure { return declarations.structs[named.declaration].fields }
+            }
+            None -> {}
+        }
+        let none: [Field] = []
+        return none
+    }
+
+    // Whether `name` is a struct a contract writes with its fields: not a
+    // class, whose fields are its module's own (section 21.5).
+    function contractStruct(borrow self, declarations: Declarations, name: String) -> Bool {
+        match declarations.typeNamed(name) {
+            Some(named) -> return named.kind == .Structure && declarations.structs[named.declaration].genericBase != "Class"
+            None -> return false
+        }
+    }
+}
+
+function joinWith(parts: [String], separator: String) -> String {
+    var joined: [String] = []
+    for index in 0..parts.count {
+        if index > 0 { joined.append(separator) }
+        joined.append(parts[index])
+    }
+    return joinText(joined)
+}
+

@@ -1,0 +1,393 @@
+// TLS 1.3 handshake messages (RFC 8446 section 4) and the extensions this
+// engine speaks, encoded and decoded once here. A decode failure answers the
+// alert RFC 8446 section 6.2 names for it: decode_error for a malformed
+// message, illegal_parameter for a well-formed one with a forbidden value.
+
+namespace TlsLimit {
+    // The largest handshake message accepted: room for a long certificate
+    // chain, and no more.
+    let messageBytes: Number = 262144
+    // Length prefix width of a handshake message body.
+    let messageLength: Number = 3
+    let extensionType: Number = 2
+    let suiteBytes: Number = 2
+    let groupBytes: Number = 2
+    let schemeBytes: Number = 2
+}
+
+struct TlsExtension {
+    let kind: TlsExtensionType
+    let data: [UN8]
+}
+
+struct TlsHandshakeMessage {
+    let kind: TlsHandshakeType
+    let body: [UN8]
+    // The header and body as they travelled, which the transcript holds.
+    let encoded: [UN8]
+}
+
+// `body` behind its handshake header.
+function tlsHandshakeMessage(kind: TlsHandshakeType, body: borrow [UN8]) -> TlsHandshakeMessage {
+    var writer = WireWriter {}
+    writer.writeByte(code(kind))
+    writer.writeVector(body, TlsLimit.messageLength)
+    return TlsHandshakeMessage { kind: kind, body: copy body, encoded: writer.bytes }
+}
+
+// Handshake bytes of one encryption level as they arrive, cut into messages;
+// a message may span several records or CRYPTO frames.
+struct TlsMessageBuffer {
+    var pending: [UN8] = []
+
+    function add(borrow mut self, bytes: borrow [UN8]) {
+        pending.appendAll(bytes)
+    }
+
+    function isEmpty(borrow self) -> Bool {
+        return pending.count == 0
+    }
+
+    // The next whole message, none while it is still arriving.
+    function next(borrow mut self) -> Result<TlsHandshakeMessage?, TlsAlert> {
+        if pending.count < Tls.messageHeaderBytes { return .Ok(.None) }
+        var reader = WireReader { bytes: copy pending }
+        let kind = try reader.readByte() otherwise return .Error(.DecodeError)
+        let length = try reader.readInteger(TlsLimit.messageLength) otherwise return .Error(
+            .DecodeError
+        )
+        if length > TlsLimit.messageBytes { return .Error(.HandshakeFailure) }
+        if reader.remaining() < length { return .Ok(.None) }
+        let whole = Tls.messageHeaderBytes + length
+        let body = byteRun(pending, Tls.messageHeaderBytes, whole)
+        let encoded = byteRun(pending, 0, whole)
+        pending = byteRun(pending, whole, pending.count)
+        return .Ok(
+            .Some(
+                TlsHandshakeMessage {
+                    kind: fromCode<TlsHandshakeType>(kind),
+                    body: body,
+                    encoded: encoded
+                }
+            )
+        )
+    }
+}
+
+function tlsReadExtensions(reader: borrow mut WireReader) -> Result<[TlsExtension], TlsAlert> {
+    var section = try reader.readSection(Tls.vector) otherwise return .Error(.DecodeError)
+    var extensions: [TlsExtension] = []
+    while !section.atEnd() {
+        let kind = try section.readInteger(TlsLimit.extensionType) otherwise return .Error(
+            .DecodeError
+        )
+        let data = try section.readVector(Tls.vector) otherwise return .Error(.DecodeError)
+        let typed: TlsExtensionType = fromCode<TlsExtensionType>(kind)
+        // A type may appear once in a message (RFC 8446 section 4.2).
+        if tlsFindExtension(extensions, typed).isSome() { return .Error(.IllegalParameter) }
+        extensions.append(TlsExtension { kind: typed, data: data })
+    }
+    return .Ok(extensions)
+}
+
+function tlsWriteExtensions(
+    writer: borrow mut WireWriter,
+    extensions: borrow [TlsExtension]
+) -> Result<Void, TlsAlert> {
+    let mark = writer.reserveLength(Tls.vector)
+    for extension in extensions {
+        writer.writeInteger(code(extension.kind), TlsLimit.extensionType)
+        writer.writeVector(extension.data, Tls.vector)
+    }
+    try writer.fillLength(mark) otherwise return .Error(.InternalError)
+    return .Ok
+}
+
+function tlsFindExtension(extensions: borrow [TlsExtension], kind: TlsExtensionType) -> [UN8]? {
+    for extension in extensions {
+        if extension.kind == kind { return .Some(copy extension.data) }
+    }
+    return .None
+}
+
+// An extension the peer must have sent; its absence is missing_extension.
+function tlsRequireExtension(
+    extensions: borrow [TlsExtension],
+    kind: TlsExtensionType
+) -> Result<[UN8], TlsAlert> {
+    return match tlsFindExtension(extensions, kind) {
+        Some(data) -> .Ok(data)
+        None -> .Error(.MissingExtension)
+    }
+}
+
+struct TlsClientHello {
+    let random: [UN8]
+    let sessionId: [UN8]
+    let suites: [CipherSuite]
+    let extensions: [TlsExtension]
+}
+
+function tlsEncodeClientHello(
+    hello: borrow TlsClientHello
+) -> Result<TlsHandshakeMessage, TlsAlert> {
+    var writer = WireWriter {}
+    writer.writeInteger(Tls.legacyVersion, Tls.vector)
+    writer.writeBytes(hello.random)
+    writer.writeVector(hello.sessionId, Tls.shortVector)
+    writer.writeInteger(hello.suites.count * TlsLimit.suiteBytes, Tls.vector)
+    for suite in hello.suites { writer.writeInteger(code(suite), TlsLimit.suiteBytes) }
+    // legacy_compression_methods: only "null".
+    writer.writeByte(1)
+    writer.writeByte(0)
+    try tlsWriteExtensions(writer, hello.extensions)
+    return .Ok(tlsHandshakeMessage(.ClientHello, writer.bytes))
+}
+
+function tlsDecodeClientHello(body: borrow [UN8]) -> Result<TlsClientHello, TlsAlert> {
+    var reader = WireReader { bytes: copy body }
+    let version = try reader.readInteger(Tls.vector) otherwise return .Error(.DecodeError)
+    if version != Tls.legacyVersion { return .Error(.ProtocolVersion) }
+    let random = try reader.readBytes(Tls.randomBytes) otherwise return .Error(.DecodeError)
+    let sessionId = try reader.readVector(Tls.shortVector) otherwise return .Error(.DecodeError)
+    if sessionId.count > Tls.legacySessionIdMaximum { return .Error(.IllegalParameter) }
+    var suiteList = try reader.readSection(Tls.vector) otherwise return .Error(.DecodeError)
+    var suites: [CipherSuite] = []
+    while !suiteList.atEnd() {
+        let suite = try suiteList.readInteger(TlsLimit.suiteBytes) otherwise return .Error(
+            .DecodeError
+        )
+        suites.append(fromCode<CipherSuite>(suite))
+    }
+    let compression = try reader.readVector(Tls.shortVector) otherwise return .Error(.DecodeError)
+    // TLS 1.3 refuses any compression method but "null" (RFC 8446 4.1.2).
+    if compression != [0] { return .Error(.IllegalParameter) }
+    let extensions = try tlsReadExtensions(reader)
+    if !reader.atEnd() { return .Error(.DecodeError) }
+    return .Ok(
+        TlsClientHello {
+            random: random,
+            sessionId: sessionId,
+            suites: suites,
+            extensions: extensions
+        }
+    )
+}
+
+struct TlsServerHello {
+    let random: [UN8]
+    let sessionId: [UN8]
+    let suite: CipherSuite
+    let extensions: [TlsExtension]
+
+    // Whether it is a HelloRetryRequest, which travels as a ServerHello.
+    function retries(borrow self) -> Bool {
+        return random == Tls.helloRetryRandom
+    }
+}
+
+function tlsEncodeServerHello(
+    hello: borrow TlsServerHello
+) -> Result<TlsHandshakeMessage, TlsAlert> {
+    var writer = WireWriter {}
+    writer.writeInteger(Tls.legacyVersion, Tls.vector)
+    writer.writeBytes(hello.random)
+    writer.writeVector(hello.sessionId, Tls.shortVector)
+    writer.writeInteger(code(hello.suite), TlsLimit.suiteBytes)
+    writer.writeByte(0)
+    try tlsWriteExtensions(writer, hello.extensions)
+    return .Ok(tlsHandshakeMessage(.ServerHello, writer.bytes))
+}
+
+function tlsDecodeServerHello(body: borrow [UN8]) -> Result<TlsServerHello, TlsAlert> {
+    var reader = WireReader { bytes: copy body }
+    let version = try reader.readInteger(Tls.vector) otherwise return .Error(.DecodeError)
+    if version != Tls.legacyVersion { return .Error(.ProtocolVersion) }
+    let random = try reader.readBytes(Tls.randomBytes) otherwise return .Error(.DecodeError)
+    let sessionId = try reader.readVector(Tls.shortVector) otherwise return .Error(.DecodeError)
+    let suite = try reader.readInteger(TlsLimit.suiteBytes) otherwise return .Error(.DecodeError)
+    let compression = try reader.readByte() otherwise return .Error(.DecodeError)
+    if compression != 0 { return .Error(.IllegalParameter) }
+    let extensions = try tlsReadExtensions(reader)
+    if !reader.atEnd() { return .Error(.DecodeError) }
+    return .Ok(
+        TlsServerHello {
+            random: random,
+            sessionId: sessionId,
+            suite: fromCode<CipherSuite>(suite),
+            extensions: extensions
+        }
+    )
+}
+
+// `supported_versions` as a client offers it: TLS 1.3 alone.
+function tlsOfferedVersions() -> TlsExtension {
+    var writer = WireWriter {}
+    writer.writeByte(Tls.vector)
+    writer.writeInteger(Tls.version13, Tls.vector)
+    return TlsExtension { kind: .SupportedVersions, data: writer.bytes }
+}
+
+// `supported_versions` as a server selects it.
+function tlsSelectedVersion() -> TlsExtension {
+    var writer = WireWriter {}
+    writer.writeInteger(Tls.version13, Tls.vector)
+    return TlsExtension { kind: .SupportedVersions, data: writer.bytes }
+}
+
+// Whether a client's `supported_versions` offers TLS 1.3.
+function tlsOffersVersion13(data: borrow [UN8]) -> Result<Bool, TlsAlert> {
+    var outer = WireReader { bytes: copy data }
+    var list = try outer.readSection(Tls.shortVector) otherwise return .Error(.DecodeError)
+    while !list.atEnd() {
+        let version = try list.readInteger(Tls.vector) otherwise return .Error(.DecodeError)
+        if version == Tls.version13 { return .Ok(true) }
+    }
+    return .Ok(false)
+}
+
+function tlsGroupList(groups: borrow [KeyGroup]) -> TlsExtension {
+    var writer = WireWriter {}
+    writer.writeInteger(groups.count * TlsLimit.groupBytes, Tls.vector)
+    for group in groups { writer.writeInteger(code(group), TlsLimit.groupBytes) }
+    return TlsExtension { kind: .SupportedGroups, data: writer.bytes }
+}
+
+function tlsReadGroups(data: borrow [UN8]) -> Result<[KeyGroup], TlsAlert> {
+    var outer = WireReader { bytes: copy data }
+    var list = try outer.readSection(Tls.vector) otherwise return .Error(.DecodeError)
+    var groups: [KeyGroup] = []
+    while !list.atEnd() {
+        let group = try list.readInteger(TlsLimit.groupBytes) otherwise return .Error(.DecodeError)
+        groups.append(fromCode<KeyGroup>(group))
+    }
+    return .Ok(groups)
+}
+
+function tlsSchemeList(schemes: borrow [SignatureScheme]) -> TlsExtension {
+    var writer = WireWriter {}
+    writer.writeInteger(schemes.count * TlsLimit.schemeBytes, Tls.vector)
+    for scheme in schemes { writer.writeInteger(code(scheme), TlsLimit.schemeBytes) }
+    return TlsExtension { kind: .SignatureAlgorithms, data: writer.bytes }
+}
+
+function tlsReadSchemes(data: borrow [UN8]) -> Result<[SignatureScheme], TlsAlert> {
+    var outer = WireReader { bytes: copy data }
+    var list = try outer.readSection(Tls.vector) otherwise return .Error(.DecodeError)
+    var schemes: [SignatureScheme] = []
+    while !list.atEnd() {
+        let scheme = try list.readInteger(TlsLimit.schemeBytes) otherwise return .Error(
+            .DecodeError
+        )
+        schemes.append(fromCode<SignatureScheme>(scheme))
+    }
+    return .Ok(schemes)
+}
+
+struct TlsKeyShare {
+    let group: KeyGroup
+    let share: [UN8]
+}
+
+function tlsWriteKeyShare(writer: borrow mut WireWriter, entry: borrow TlsKeyShare) {
+    writer.writeInteger(code(entry.group), TlsLimit.groupBytes)
+    writer.writeVector(entry.share, Tls.vector)
+}
+
+// A client's `key_share`: its offered shares.
+function tlsOfferedShares(shares: borrow [TlsKeyShare]) -> Result<TlsExtension, TlsAlert> {
+    var writer = WireWriter {}
+    let mark = writer.reserveLength(Tls.vector)
+    for entry in shares { tlsWriteKeyShare(writer, entry) }
+    try writer.fillLength(mark) otherwise return .Error(.InternalError)
+    return .Ok(TlsExtension { kind: .KeyShare, data: writer.bytes })
+}
+
+function tlsReadOfferedShares(data: borrow [UN8]) -> Result<[TlsKeyShare], TlsAlert> {
+    var outer = WireReader { bytes: copy data }
+    var list = try outer.readSection(Tls.vector) otherwise return .Error(.DecodeError)
+    var shares: [TlsKeyShare] = []
+    while !list.atEnd() {
+        let group = try list.readInteger(TlsLimit.groupBytes) otherwise return .Error(.DecodeError)
+        let share = try list.readVector(Tls.vector) otherwise return .Error(.DecodeError)
+        shares.append(TlsKeyShare { group: fromCode<KeyGroup>(group), share: share })
+    }
+    return .Ok(shares)
+}
+
+// A server's `key_share`: the one share it chose.
+function tlsChosenShare(entry: borrow TlsKeyShare) -> TlsExtension {
+    var writer = WireWriter {}
+    tlsWriteKeyShare(writer, entry)
+    return TlsExtension { kind: .KeyShare, data: writer.bytes }
+}
+
+function tlsReadChosenShare(data: borrow [UN8]) -> Result<TlsKeyShare, TlsAlert> {
+    var reader = WireReader { bytes: copy data }
+    let group = try reader.readInteger(TlsLimit.groupBytes) otherwise return .Error(.DecodeError)
+    let share = try reader.readVector(Tls.vector) otherwise return .Error(.DecodeError)
+    if !reader.atEnd() { return .Error(.DecodeError) }
+    return .Ok(TlsKeyShare { group: fromCode<KeyGroup>(group), share: share })
+}
+
+// A HelloRetryRequest's `key_share`: only the group the server wants.
+function tlsRequestedGroup(group: KeyGroup) -> TlsExtension {
+    var writer = WireWriter {}
+    writer.writeInteger(code(group), TlsLimit.groupBytes)
+    return TlsExtension { kind: .KeyShare, data: writer.bytes }
+}
+
+function tlsReadRequestedGroup(data: borrow [UN8]) -> Result<KeyGroup, TlsAlert> {
+    var reader = WireReader { bytes: copy data }
+    let group = try reader.readInteger(TlsLimit.groupBytes) otherwise return .Error(.DecodeError)
+    if !reader.atEnd() { return .Error(.DecodeError) }
+    return .Ok(fromCode<KeyGroup>(group))
+}
+
+// `server_name` with one host name (RFC 6066 section 3).
+function tlsServerNameExtension(name: borrow String) -> Result<TlsExtension, TlsAlert> {
+    var writer = WireWriter {}
+    let mark = writer.reserveLength(Tls.vector)
+    writer.writeByte(Tls.hostName)
+    writer.writeVector(name.utf8(), Tls.vector)
+    try writer.fillLength(mark) otherwise return .Error(.InternalError)
+    return .Ok(TlsExtension { kind: .ServerName, data: writer.bytes })
+}
+
+function tlsReadServerName(data: borrow [UN8]) -> Result<String?, TlsAlert> {
+    var outer = WireReader { bytes: copy data }
+    var list = try outer.readSection(Tls.vector) otherwise return .Error(.DecodeError)
+    while !list.atEnd() {
+        let kind = try list.readByte() otherwise return .Error(.DecodeError)
+        let name = try list.readVector(Tls.vector) otherwise return .Error(.DecodeError)
+        if kind == Tls.hostName { return .Ok(textFromBytes(name)) }
+    }
+    return .Ok(.None)
+}
+
+// The ALPN protocol list (RFC 7301 section 3.1).
+function tlsProtocolList(protocols: borrow [String]) -> Result<TlsExtension, TlsAlert> {
+    var writer = WireWriter {}
+    let mark = writer.reserveLength(Tls.vector)
+    for name in protocols { writer.writeVector(name.utf8(), Tls.shortVector) }
+    try writer.fillLength(mark) otherwise return .Error(.InternalError)
+    return .Ok(TlsExtension { kind: .ApplicationProtocols, data: writer.bytes })
+}
+
+function tlsReadProtocols(data: borrow [UN8]) -> Result<[String], TlsAlert> {
+    var outer = WireReader { bytes: copy data }
+    var list = try outer.readSection(Tls.vector) otherwise return .Error(.DecodeError)
+    var protocols: [String] = []
+    while !list.atEnd() {
+        let name = try list.readVector(Tls.shortVector) otherwise return .Error(.DecodeError)
+        // Empty protocol names are forbidden (RFC 7301 section 3.1).
+        if name.count == 0 { return .Error(.DecodeError) }
+        match textFromBytes(name) {
+            Some(text) -> protocols.append(text)
+            // A protocol that is not text cannot be one this side names, so
+            // it is passed over rather than refused.
+            None -> {}
+        }
+    }
+    return .Ok(protocols)
+}

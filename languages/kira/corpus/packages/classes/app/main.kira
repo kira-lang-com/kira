@@ -1,0 +1,36 @@
+import Foundation
+
+class Counter {
+    var value: Int
+
+    function bump() {
+        value = value + 1
+    }
+
+    function read() -> Int {
+        return value
+    }
+}
+
+class Handler {
+    let callback: (Int) -> Int
+
+    function run(value: Int) -> Int {
+        return callback(value)
+    }
+}
+
+@Main
+function main() -> Int {
+    let original = Counter(value: 3)
+    let alias = original
+    alias.bump()
+    let another = Counter(value: 4)
+    let bias = 10
+    let callback: (Int) -> Int = { value in return bias + value }
+    let handler = Handler(callback: move callback)
+    if original == alias && original != another {
+        return original.read() + handler.run(2)
+    }
+    return 0
+}

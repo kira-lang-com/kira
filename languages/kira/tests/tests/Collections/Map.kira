@@ -1,0 +1,53 @@
+import Foundation
+
+// `Map` keeps the order keys were first added (KLF section 6.4), stays apart
+// once copied (section 6.5), and keeps its entries through the rebuild that
+// drops removed positions.
+
+@Test
+function replacingAKeyKeepsItsPosition() {
+    var ages = Map<String, Number>()
+    ages.set("b", 2)
+    ages.set("a", 1)
+    ages.set("c", 3)
+    ages.set("b", 20)
+    expect!((ages.entries().count) == (3))
+    expect!((traceText(ages.keys())) == ("[\"b\", \"a\", \"c\"]"))
+    expect!((traceText(ages.values())) == ("[20, 1, 3]"))
+}
+
+@Test
+function removingAndAddingMovesAKeyToTheEnd() {
+    var ages = Map<String, Number>()
+    ages.set("a", 1)
+    ages.set("b", 2)
+    let removed = ages.remove("a")
+    ages.set("a", 10)
+    expect!((traceText(removed)) == ("Some(1)"))
+    expect!((traceText(ages.keys())) == ("[\"b\", \"a\"]"))
+    expect!((traceText(ages.remove("z"))) == ("None"))
+}
+
+@Test
+function copiedMapsStayApart() {
+    var original = Map<Number, String>()
+    original.set(1, "one")
+    var copy = original
+    copy.set(2, "two")
+    original.remove(1)
+    expect!((traceText(original.count())) == ("0"))
+    expect!((traceText(copy.keys())) == ("[1, 2]"))
+}
+
+@Test
+function entriesSurviveCompactionAfterRemovals() {
+    var squares = Map<Number, Number>()
+    for value in 0..100 { squares.set(value, value * value) }
+    for value in 0..97 { squares.remove(value) }
+    var total: Number = 0
+    for entry in squares.entries() { total += entry.value }
+    expect!((traceText(squares.keys())) == ("[97, 98, 99]"))
+    expect!((traceText(total)) == ("28814"))
+    expect!((traceText(squares.value(98))) == ("Some(9604)"))
+    expect!((traceText(squares.contains(5))) == ("false"))
+}

@@ -1,0 +1,799 @@
+// Generic instances the checker mints as it meets them.
+//
+// The instances a program names in its declarations are minted before
+// analysis (generics.klfd). Inside a generic body, and for a generic function
+// or a constructor whose arguments decide its type, what the type parameters
+// stand for is only known once a call or a body is checked, so those
+// instances are minted here. A type joins the declarations with its methods
+// and the conformances its template claims, and a function joins the function
+// table; each body an instance adds is queued and checked after the source
+// functions.
+
+extend Checker {
+    // A type the body being checked writes, its type parameters replaced by
+    // what this instance binds them to.
+    function resolveType(borrow mut self, reference: TypeReference) -> Type {
+        let concrete = scoped(reference)
+        mintInstances(concrete)
+        return declarations.resolve(concrete)
+    }
+
+    function scoped(borrow self, reference: TypeReference) -> TypeReference {
+        let scope = signature().declaration.scope
+        return substituteGenericReference(reference, scope.parameters, scope.arguments)
+    }
+
+    // Every instance `reference` names, its arguments' first. An instance
+    // that names itself again finds itself already declared, so only a
+    // template that keeps naming larger instances of itself never stops; it
+    // is refused once an instance nests deeper than any program writes.
+    function mintInstances(borrow mut self, reference: TypeReference) {
+        let canonical = canonicalAliasReference(declarations.aliases, reference, 0)
+        if canonical.arguments.count == 0 || declarations.typeNamed(canonical.instanceName).isSome() { return }
+        if nesting(canonical) > 32 {
+            report(.InstantiationWithoutEnd, reference.name.span)
+            return
+        }
+        for argument in canonical.arguments { mintInstances(argument) }
+        if canonical.name.text == "Closure" {
+            match closureTemplate(tree.structs) {
+                Some(template) -> mintStruct(specializeClosure(template, canonical, instanceSuffix(canonical.instanceName)))
+                None -> {}
+            }
+            return
+        }
+        match genericStruct(tree.genericStructs, canonical.name.text) {
+            Some(template) -> {
+                if mintable(template.genericParameters, canonical) {
+                    mintStruct(specializeStruct(template, canonical, instanceSuffix(canonical.instanceName)))
+                }
+                return
+            }
+            None -> {}
+        }
+        match genericEnum(tree.genericEnums, canonical.name.text) {
+            Some(template) -> {
+                if mintable(template.genericParameters, canonical) {
+                    mintEnum(specializeEnum(template, canonical, instanceSuffix(canonical.instanceName)))
+                }
+            }
+            None -> {}
+        }
+    }
+
+    // The bounds of every instance minted before analysis, against the
+    // arguments its use site wrote.
+    function checkInstanceBounds(borrow self) {
+        for declared in tree.structs {
+            if !declared.specialized { continue }
+            match genericStruct(tree.genericStructs, templateName(declared.name.text)) {
+                Some(template) -> checkBounds(declarations, tree, template.name.text, template.genericParameters, declared.typeArguments)
+                None -> {}
+            }
+        }
+        for declared in tree.enums {
+            if !declared.specialized { continue }
+            match genericEnum(tree.genericEnums, templateName(declared.name.text)) {
+                Some(template) -> checkBounds(declarations, tree, template.name.text, template.genericParameters, declared.typeArguments)
+                None -> {}
+            }
+        }
+    }
+
+    function mintable(borrow self, parameters: [Identifier], reference: TypeReference) -> Bool {
+        if parameters.count != reference.arguments.count {
+            report(.TypeArgumentCount, reference.name.span)
+            return false
+        }
+        checkBounds(declarations, tree, reference.name.text, parameters, reference.arguments)
+        return true
+    }
+
+    // The type is named before its fields resolve, so a field may hold an
+    // instance that names this one.
+    function mintStruct(borrow mut self, declared: StructDeclaration) {
+        let index = declarations.structs.count
+        if declared.genericBase == "Construct" { constructIndices.append(tree.structs.count) }
+        tree.structs.append(declared)
+        declarations.addStruct(declared)
+        program.structs = declarations.structs
+        program.dropFunctions.append(-1)
+        for field in declared.fields { mintInstances(field.annotation) }
+        declarations.completeStruct(index, declared)
+        program.structs = declarations.structs
+        inferStructFields(index)
+        for ancestor in declared.ancestors { mintInstances(ancestor) }
+        mintMethods(declared.methods, Type.structure(index))
+        program.dropFunctions[index] = dropFunctionOf(tree, declarations, index)
+        if declared.genericBase == "Construct" { joinFamilies(index) }
+    }
+
+    function mintEnum(borrow mut self, declared: EnumDeclaration) {
+        let index = declarations.enums.count
+        tree.enums.append(declared)
+        declarations.addEnum(declared)
+        program.enums = declarations.enums
+        for case in declared.cases {
+            match case.payload {
+                Some(payload) -> mintInstances(payload)
+                None -> {}
+            }
+        }
+        declarations.completeEnum(index, declared)
+        program.enums = declarations.enums
+        mintMethods(declared.methods, Type.enumeration(index))
+    }
+
+    // An instance's methods, but for its generic ones: those name their own
+    // type parameters, so each is minted from the instance when a call binds
+    // them (`mintMethod`), as a generic method of a plain type is.
+    function mintMethods(borrow mut self, methods: [FunctionDeclaration], owner: Type) {
+        for method in methods {
+            if method.typeParameters.count == 0 { mintSignatureInstances(method) }
+        }
+        for method in methods {
+            if method.typeParameters.count == 0 { declareFunction(declarations, tree, method, .Some(owner)) }
+        }
+        conformMintedInstance(declarations, tree, owner)
+        program.structs = declarations.structs
+        program.enums = declarations.enums
+        registerSignatures()
+    }
+
+    function mintSignatureInstances(borrow mut self, declared: FunctionDeclaration) {
+        for parameter in declared.parameters { mintInstances(parameter.annotation) }
+        match declared.result {
+            Some(result) -> mintInstances(result)
+            None -> {}
+        }
+    }
+
+    // A function entry and a queued check for every signature declared since
+    // the last one the program has.
+    function registerSignatures(borrow mut self) {
+        for index in program.functions.count..declarations.signatures.count {
+            let signature = declarations.signatures[index]
+            program.functions.append(CheckedFunction {
+                symbol = signature.symbol, name = signature.name.span, result = signature.result,
+                parameterCount = signature.parameters.count, locals = [], body = [], entry = false,
+                lambda = false, captures = [], globalInitializer = false, service = false, foreign = .None, memberName = signature.member
+            })
+            pending.append(index)
+        }
+    }
+
+    function genericFunctionNamed(borrow self, name: String) -> Optional<FunctionDeclaration> {
+        for template in tree.genericFunctions {
+            if template.name.text == name { return .Some(template) }
+        }
+        return .None
+    }
+
+    // A call to a generic function. Type arguments not written are inferred
+    // from the arguments, each checked against its parameter's type as far as
+    // the arguments before it decide it.
+    // A type the call is expected to have hints its arguments, so
+    // `wrap(.Error(x))` checks `.Error(x)` against the result it must make;
+    // the types themselves are still those the arguments have.
+    function genericCall(borrow mut self, template: FunctionDeclaration, written: [TypeReference], arguments: [Int], expected: Optional<Type>, span: Span) -> Int {
+        declarations.requireVisible(file(), template.name.span.file, span)
+        let parameters = template.typeParameters
+        if written.count > parameters.count {
+            report(.TypeArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        if arguments.count != template.parameters.count {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        var bound: [Optional<Type>] = []
+        for index in 0..parameters.count {
+            var binding: Optional<Type> = .None
+            if index < written.count { binding = .Some(resolveType(written[index])) }
+            bound.append(binding)
+        }
+        var hinted: [Optional<Type>] = []
+        for parameter in parameters {
+            let unknown: Optional<Type> = .None
+            hinted.append(unknown)
+        }
+        match expected {
+            Some(wanted) -> {
+                match template.result {
+                    Some(result) -> { if !wanted.isInvalid() { infer(result, wanted, parameters, hinted) } }
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+        var values: [Int] = []
+        for index in 0..arguments.count {
+            let annotation = template.parameters[index].annotation
+            inferLambdaParameters(arguments[index], annotation, parameters, bound)
+            var hint = boundType(annotation, parameters, bound)
+            if hint.isNone() { hint = boundType(annotation, parameters, hinted) }
+            let hinted = pushFamilyHint(annotation, parameters, bound)
+            let value = boundExpression(arguments[index], hint, annotation, parameters, bound)
+            popFamilyHint(hinted)
+            infer(annotation, typeOf(value), parameters, bound)
+            values.append(value)
+        }
+        inferFromBounds(template.name.text, parameters, bound)
+        var references: [TypeReference] = []
+        match inferredReferences(declarations, bound, span) {
+            Some(inferred) -> references = inferred
+            None -> return add(.Integer(0), Type.invalid(), span)
+        }
+        match mintFunction(template, references, span) {
+            Some(target) -> return callChecked(target, .None, values, span)
+            None -> return add(.Integer(0), Type.invalid(), span)
+        }
+    }
+
+    // Parameters the arguments leave unbound, decided by the bounds on those
+    // they did bind: in `blockOn<F: Future<Output>, Output>(future: F)` the
+    // argument binds `F`, and `F`'s own `Future<...>` conformance binds
+    // `Output`.
+    function inferFromBounds(borrow mut self, template: String, parameters: [Identifier], bound: borrow mut [Optional<Type>]) {
+        for declared in tree.bounds {
+            if declared.template != template || declared.parameter >= bound.count { continue }
+            if declared.traitName.arguments.count == 0 { continue }
+            match bound[declared.parameter] {
+                Some(actual) -> {
+                    match conformanceArguments(declarations, tree, actual, declared.traitName.name.text) {
+                        Some(claimed) -> {
+                            if claimed.count != declared.traitName.arguments.count { continue }
+                            for index in 0..claimed.count {
+                                infer(declared.traitName.arguments[index], resolveType(claimed[index]), parameters, bound)
+                            }
+                        }
+                        None -> {}
+                    }
+                }
+                None -> {}
+            }
+        }
+    }
+
+    // A value checked against `annotation` while some of `parameters` are
+    // unbound, `hint` being what it names once they are. A key path written
+    // `\.member` against a function type whose parameter is known already
+    // reads from that, and the type it reads binds the rest, as `Value` is in
+    // `Environment<Value> { keyPath: \.scenePhase }`.
+    //
+    // Where the parameter's type is not yet decided, a key path whose root is
+    // reads its members from it, and a closure whose parameters are takes
+    // them, its result the type of what its body ends with: what decides the
+    // rest.
+    function boundExpression(borrow mut self, value: Int, hint: Optional<Type>, annotation: TypeReference, parameters: [Identifier], bound: [Optional<Type>]) -> Int {
+        if hint.isNone() {
+            // A labelled argument is its value, as the call matches labels.
+            match tree.expressions[value].kind.argumentLabel() {
+                Some(labelled) -> return boundExpression(labelled.value, hint, annotation, parameters, bound)
+                None -> {}
+            }
+            let canonical = canonicalAliasReference(declarations.aliases, annotation, 0)
+            match tree.expressions[value].kind.keyPath() {
+                Some(declared) -> {
+                    if canonical.arguments.count == 2 && (canonical.name.text == "Closure" || canonical.name.text == "KeyPath") {
+                        let root = boundType(canonical.arguments[0], parameters, bound)
+                        if canonical.name.text == "KeyPath" { return keyPathValue(declared, .None, root) }
+                        let none: Optional<Type> = .None
+                        return keyPathFrom(declared, root, none)
+                    }
+                }
+                None -> {}
+            }
+            match tree.expressions[value].kind.lambda() {
+                Some(declared) -> {
+                    if canonical.name.text == "Closure" && canonical.arguments.count == declared.parameters.count + 1 {
+                        var taken: [ParameterSignature] = []
+                        for index in 0..declared.parameters.count {
+                            var mode: PassingMode = .Owned
+                            if index < canonical.modes.count { mode = canonical.modes[index] }
+                            match boundType(canonical.arguments[index], parameters, bound) {
+                                Some(parameterType) -> taken.append(ParameterSignature { name = declared.parameters[index], valueType = parameterType, mode = mode })
+                                None -> return expression(value, hint)
+                            }
+                        }
+                        let unknown: Optional<Type> = .None
+                        return lambdaClosure(declared, taken, unknown)
+                    }
+                }
+                None -> {}
+            }
+        }
+        return expression(value, hint)
+    }
+
+    // The type `annotation` names once the parameters bound so far are
+    // substituted, or nothing while it still names an unbound one.
+    function boundType(borrow mut self, annotation: TypeReference, parameters: [Identifier], bound: [Optional<Type>]) -> Optional<Type> {
+        var known: [Identifier] = []
+        var arguments: [TypeReference] = []
+        var unbound: [String] = []
+        for index in 0..parameters.count {
+            match bound[index] {
+                Some(valueType) -> {
+                    known.append(parameters[index])
+                    arguments.append(declarations.reference(valueType, declarations.typeNameSpan(valueType)))
+                }
+                None -> unbound.append(parameters[index].text)
+            }
+        }
+        // The annotation is the template's own, so a parameter it names is the
+        // parameter even when a type shares its spelling.
+        if mentionsName(annotation, unbound) { return .None }
+        return .Some(resolveType(substituteGenericReference(annotation, known, arguments)))
+    }
+
+    // Binds the parameters `written` names to the parts of `actual` in the
+    // same places. A parameter keeps the first type it is bound to; a later
+    // disagreement is a type mismatch the call reports.
+    function infer(borrow self, written: TypeReference, actual: Type, parameters: [Identifier], bound: borrow mut [Optional<Type>]) {
+        if written.arguments.count == 0 && written.qualifier.isNone() {
+            for index in 0..parameters.count {
+                if parameters[index].text == written.name.text {
+                    if bound[index].isNone() { bound[index] = .Some(actual) }
+                    return
+                }
+            }
+            return
+        }
+        // An alias binds through the type it stands for, `KeyPath<Root, Value>`
+        // through `(borrow Root) -> Value`.
+        let canonical = canonicalAliasReference(declarations.aliases, written, 0)
+        match instanceArguments(declarations, actual, canonical.name.text) {
+            Some(arguments) -> {
+                if arguments.count != canonical.arguments.count { return }
+                let actualArguments = typeArgumentsOf(actual)
+                for index in 0..canonical.arguments.count {
+                    infer(canonical.arguments[index], actualArguments[index], parameters, bound)
+                }
+            }
+            None -> {}
+        }
+    }
+
+    function typeArgumentsOf(borrow self, actual: Type) -> [Type] {
+        if actual.kind == .Structure { return declarations.structs[actual.declaration].typeArguments }
+        if actual.kind == .Enumeration { return declarations.enums[actual.declaration].typeArguments }
+        return []
+    }
+
+    // The instance of `template` for `arguments`, declared the first time it
+    // is called.
+    function mintFunction(borrow mut self, template: FunctionDeclaration, arguments: [TypeReference], span: Span) -> Optional<Int> {
+        let symbol = referenceInstanceName(template.name.text, arguments, [])
+        match declarations.findFunction(.None, symbol) {
+            Some(existing) -> return .Some(existing)
+            None -> {}
+        }
+        for argument in arguments {
+            if nesting(argument) > 32 {
+                report(.InstantiationWithoutEnd, span)
+                return .None
+            }
+        }
+        checkBounds(declarations, tree, template.name.text, template.typeParameters, arguments)
+        let specialized = specializeMethods([template], template.typeParameters, arguments)[0]
+        let instance = FunctionDeclaration {
+            name = Identifier { text = symbol, span = template.name.span }, annotations = specialized.annotations,
+            receiver = specialized.receiver, parameters = specialized.parameters, result = specialized.result,
+            body = specialized.body, span = specialized.span, typeParameters = [], scope = specialized.scope
+        }
+        mintSignatureInstances(instance)
+        let target = declarations.signatures.count
+        declareFunction(declarations, tree, instance, .None)
+        registerSignatures()
+        return .Some(target)
+    }
+
+    // `Template(field: value)` with no type arguments written or expected:
+    // the fields' values decide them.
+    function inferredConstruction(borrow mut self, template: StructDeclaration, name: Identifier, arguments: [Int], span: Span) -> Int {
+        // A template with initializers is made through the one its arguments
+        // match, as a construct that is not generic is.
+        match templateInit(template, arguments) {
+            Some(init) -> return initializedConstruction(template, init, name, arguments, span)
+            None -> {}
+        }
+        var written: [FieldValue] = []
+        var positional = 0
+        for argument in arguments {
+            var given = FieldValue { name = name, value = argument }
+            match tree.expressions[argument].kind.argumentLabel() {
+                Some(labelled) -> given = labelled
+                None -> {
+                    if positional >= template.fields.count {
+                        report(.ArgumentCount, span)
+                        return add(.Integer(0), Type.invalid(), span)
+                    }
+                    given = FieldValue { name = template.fields[positional].name, value = argument }
+                    positional += 1
+                }
+            }
+            written.append(given)
+        }
+        return inferredLiteral(template, name, written, span)
+    }
+
+    // `Template { field: value }` with no type arguments written or expected:
+    // the fields' values decide them, each checked against what the fields
+    // before it have already bound.
+    function inferredLiteral(borrow mut self, template: StructDeclaration, name: Identifier, written: [FieldValue], span: Span) -> Int {
+        let parameters = template.genericParameters
+        var bound = hintedBindings(template)
+        var fields: [FieldValue] = []
+        for given in written {
+            match templateField(template, given.name.text) {
+                Some(field) -> {
+                    let hinted = pushFamilyHint(field.annotation, parameters, bound)
+                    let value = boundExpression(given.value, boundType(field.annotation, parameters, bound), field.annotation, parameters, bound)
+                    popFamilyHint(hinted)
+                    infer(field.annotation, typeOf(value), parameters, bound)
+                    fields.append(FieldValue { name = given.name, value = value })
+                }
+                None -> {
+                    report(.UnknownField, given.name.span)
+                    return add(.Integer(0), Type.invalid(), span)
+                }
+            }
+        }
+        match inferredReferences(declarations, bound, name.span) {
+            Some(references) -> {
+                let instance = resolveType(TypeReference {
+                    qualifier = .None, name = name, arguments = references, modes = [],
+                    instanceName = referenceInstanceName(name.text, references, [])
+                })
+                if instance.kind != .Structure { return add(.Integer(0), Type.invalid(), span) }
+                return assembleStruct(instance.declaration, name, fields, span)
+            }
+            None -> return add(.Integer(0), Type.invalid(), span)
+        }
+    }
+}
+
+extend Checker {
+    // While an argument for a parameter written `some Family<...>` (or a list
+    // of them) is checked, the family and its arguments as far as `bound`
+    // decides them; answers whether it pushed one.
+    function pushFamilyHint(borrow mut self, annotation: TypeReference, parameters: [Identifier], bound: [Optional<Type>]) -> Bool {
+        var family = annotation
+        if family.name.text == "Array" && family.arguments.count == 1 { family = family.arguments[0] }
+        match familyName(family) {
+            Some(named) -> {
+                for written in tree.familyArguments {
+                    if written.owner != "" || !written.span.same(family.name.span) { continue }
+                    var arguments: [Type] = []
+                    for argument in written.arguments {
+                        match boundType(argument, parameters, bound) {
+                            Some(argumentType) -> arguments.append(argumentType)
+                            None -> return false
+                        }
+                    }
+                    // The family as the slot spells it, as the construct's
+                    // `extends` does: names the checker sees may be scoped.
+                    familyHints.append(FamilyHint { family = written.family, arguments = arguments })
+                    return true
+                }
+            }
+            None -> {}
+        }
+        return false
+    }
+
+    function popFamilyHint(borrow mut self, pushed: Bool) {
+        if !pushed { return }
+        var kept: [FamilyHint] = []
+        for index in 0..familyHints.count - 1 { kept.append(familyHints[index]) }
+        familyHints = kept
+    }
+
+    // A template's type parameters as the innermost slot it is written in
+    // binds them: its `extends Family<...>` matched against the slot's
+    // `some Family<...>`. Unbound where there is no such slot.
+    function hintedBindings(borrow self, template: StructDeclaration) -> [Optional<Type>] {
+        let parameters = template.genericParameters
+        var bound: [Optional<Type>] = []
+        for parameter in parameters {
+            let unbound: Optional<Type> = .None
+            bound.append(unbound)
+        }
+        var index = familyHints.count
+        while index > 0 {
+            index -= 1
+            let hint = familyHints[index]
+            for written in tree.familyArguments {
+                let ownTemplate = written.owner != "" && (written.ownerSpan.same(template.name.span) || written.ownerSpan.same(template.baseNameSpan))
+                if !ownTemplate || written.family != hint.family || written.arguments.count != hint.arguments.count { continue }
+                for position in 0..written.arguments.count {
+                    infer(written.arguments[position], hint.arguments[position], parameters, bound)
+                }
+                return bound
+            }
+        }
+        return bound
+    }
+
+    // The initializer of `template` whose parameters the arguments match:
+    // as many of them as it takes, less those with defaults, each labelled
+    // argument at the parameter of its label.
+    function templateInit(borrow mut self, template: StructDeclaration, arguments: [Int]) -> Optional<FunctionDeclaration> {
+        for method in template.methods {
+            if method.name.text != "init" { continue }
+            if arguments.count > method.parameters.count { continue }
+            var fits = true
+            for index in 0..method.parameters.count {
+                if index >= arguments.count {
+                    if method.parameters[index].initial.isNone() { fits = false }
+                    continue
+                }
+                var value = arguments[index]
+                match tree.expressions[arguments[index]].kind.argumentLabel() {
+                    Some(labelled) -> {
+                        if labelled.name.text != method.parameters[index].name.text { fits = false }
+                        value = labelled.value
+                    }
+                    None -> {}
+                }
+                // A key path literal fills a `KeyPath` parameter and a closure
+                // literal any other function parameter, as Swift tells
+                // `TableColumn("Name", value: \.name)` from
+                // `TableColumn("Name") { row in ... }`.
+                let keyPathParameter = canonicalName(method.parameters[index].annotation) == "KeyPath"
+                if tree.expressions[value].kind.isKeyPathLiteral() && !keyPathParameter { fits = false }
+                if tree.expressions[value].kind.isLambdaLiteral() && keyPathParameter { fits = false }
+                // Of inits taking the same labels, the one whose parameter has
+                // the argument's shape, as Swift tells `selection:
+                // Binding<Value.ID?>` from `selection: Binding<Set<Value.ID>>`.
+                let annotation = method.parameters[index].annotation
+                if fits && annotation.arguments.count > 0 && !isContentReference(annotation) && !tree.expressions[value].kind.isLambdaLiteral() && !tree.expressions[value].kind.isKeyPathLiteral() {
+                    var parameters = template.genericParameters
+                    for parameter in method.typeParameters { parameters.append(parameter) }
+                    if !shapeFits(annotation, trialTypes([value])[0], parameters) { fits = false }
+                }
+            }
+            if fits { return .Some(method) }
+        }
+        return .None
+    }
+
+    // `Template(arguments)` through its initializer `init`: the slot it is
+    // written in and the arguments decide the type arguments, the template's
+    // and a generic init's own, each argument checked against its parameter
+    // as far as those before it decide it; then the instance's own
+    // initializer makes the value, a parameter left out taking its default.
+    function initializedConstruction(borrow mut self, template: StructDeclaration, init: FunctionDeclaration, name: Identifier, arguments: [Int], span: Span) -> Int {
+        var parameters = template.genericParameters
+        for parameter in init.typeParameters { parameters.append(parameter) }
+        var bound = hintedBindings(template)
+        for parameter in init.typeParameters {
+            let unbound: Optional<Type> = .None
+            bound.append(unbound)
+        }
+        var values: [Int] = []
+        for index in 0..arguments.count {
+            var argument = arguments[index]
+            match tree.expressions[argument].kind.argumentLabel() {
+                Some(labelled) -> argument = labelled.value
+                None -> {}
+            }
+            let annotation = init.parameters[index].annotation
+            inferLambdaParameters(argument, annotation, parameters, bound)
+            let hinted = pushFamilyHint(annotation, parameters, bound)
+            let value = boundExpression(argument, boundType(annotation, parameters, bound), annotation, parameters, bound)
+            popFamilyHint(hinted)
+            infer(annotation, typeOf(value), parameters, bound)
+            values.append(value)
+        }
+        let own = template.genericParameters.count
+        var templateBound: [Optional<Type>] = []
+        var initBound: [Optional<Type>] = []
+        for index in 0..bound.count {
+            if index < own { templateBound.append(bound[index]) } else { initBound.append(bound[index]) }
+        }
+        inferFromBounds(template.name.text, template.genericParameters, templateBound)
+        match inferredReferences(declarations, templateBound, name.span) {
+            Some(references) -> {
+                let instance = resolveType(TypeReference {
+                    qualifier = .None, name = name, arguments = references, modes = [],
+                    instanceName = referenceInstanceName(name.text, references, [])
+                })
+                if instance.kind != .Structure { return add(.Integer(0), Type.invalid(), span) }
+                match instanceInit(instance, init, initBound, span) {
+                    Some(target) -> return callWithDefaults(target, values, span)
+                    None -> {}
+                }
+                report(.ArgumentCount, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+            None -> return add(.Integer(0), Type.invalid(), span)
+        }
+    }
+
+    // The initializer of `instance` that is the template's `init`: the one of
+    // the same parameters, or, for a generic init, its instance for the type
+    // arguments `bound` decides.
+    function instanceInit(borrow mut self, instance: Type, init: FunctionDeclaration, bound: [Optional<Type>], span: Span) -> Optional<Int> {
+        // Two inits may take the same names, as `selection:` of one row and of
+        // a set do; the instance's is the one declared where the template's is.
+        if init.typeParameters.count == 0 {
+            for candidate in declarations.overloadsOf(.Some(instance), "init") {
+                let declared = declarations.signatures[candidate].declaration
+                if sameParameterNames(declared, init) && declared.span.same(init.span) { return .Some(candidate) }
+            }
+            return .None
+        }
+        match genericMethod(instance, "init") {
+            Some(method) -> {
+                if !sameParameterNames(method, init) { return .None }
+                match inferredReferences(declarations, bound, span) {
+                    Some(references) -> return mintMethod(instance, method, references, span)
+                    None -> return .None
+                }
+            }
+            None -> return .None
+        }
+    }
+
+    // A call of `target` with the values for its first parameters, the rest
+    // taking their defaults.
+    function callWithDefaults(borrow mut self, target: Int, values: [Int], span: Span) -> Int {
+        let callee = declarations.signatures[target]
+        var checked = values
+        let written = callee.parameters.count - callee.declaration.parameters.count
+        for slot in values.count..callee.parameters.count {
+            let declared = slot - written
+            var initial: Optional<Int> = .None
+            if declared >= 0 { initial = callee.declaration.parameters[declared].initial }
+            match initial {
+                Some(value) -> checked.append(isolatedDefault(value, callee.parameters[slot].valueType, .ArgumentTypeMismatch))
+                None -> {
+                    report(.ArgumentCount, span)
+                    return add(.Integer(0), Type.invalid(), span)
+                }
+            }
+        }
+        return callChecked(target, .None, checked, span)
+    }
+
+    // `Owner<Arguments>(arguments)` through the owner's generic `init`: its
+    // own type parameters bound from the arguments, then its instance called.
+    // Nothing when no generic init takes these arguments.
+    function genericInitCall(borrow mut self, owner: Type, arguments: [Int], span: Span) -> Optional<Int> {
+        let declared = tree.structs[owner.declaration]
+        match templateInit(declared, arguments) {
+            Some(init) -> {
+                if init.typeParameters.count == 0 { return .None }
+                let parameters = init.typeParameters
+                var bound: [Optional<Type>] = []
+                for parameter in parameters {
+                    let unbound: Optional<Type> = .None
+                    bound.append(unbound)
+                }
+                var values: [Int] = []
+                for index in 0..arguments.count {
+                    var argument = arguments[index]
+                    match tree.expressions[argument].kind.argumentLabel() {
+                        Some(labelled) -> argument = labelled.value
+                        None -> {}
+                    }
+                    let annotation = init.parameters[index].annotation
+                    inferLambdaParameters(argument, annotation, parameters, bound)
+                    let value = boundExpression(argument, boundType(annotation, parameters, bound), annotation, parameters, bound)
+                    infer(annotation, typeOf(value), parameters, bound)
+                    values.append(value)
+                }
+                match inferredReferences(declarations, bound, span) {
+                    Some(references) -> {
+                        match mintMethod(owner, init, references, span) {
+                            Some(target) -> return .Some(callWithDefaults(target, values, span))
+                            None -> {}
+                        }
+                    }
+                    None -> {}
+                }
+                return .Some(add(.Integer(0), Type.invalid(), span))
+            }
+            None -> return .None
+        }
+    }
+}
+
+extend Checker {
+    // Whether a value of `actual` can fill a parameter written `written`, as
+    // far as its shape says: the same generic type at every level that names
+    // one, anything where `written` is a type parameter, an associated type
+    // of one, or a function type.
+    function shapeFits(borrow self, written: TypeReference, actual: Type, parameters: [Identifier]) -> Bool {
+        if actual.isInvalid() || written.arguments.count == 0 { return true }
+        let canonical = canonicalAliasReference(declarations.aliases, written, 0)
+        if canonical.name.text == "Closure" { return true }
+        match instanceArguments(declarations, actual, canonical.name.text) {
+            Some(arguments) -> {
+                if arguments.count != canonical.arguments.count { return false }
+                let actualArguments = typeArgumentsOf(actual)
+                for index in 0..canonical.arguments.count {
+                    if !shapeFits(canonical.arguments[index], actualArguments[index], parameters) { return false }
+                }
+                return true
+            }
+            None -> return false
+        }
+    }
+}
+
+// The name a parameter's type is written with.
+function canonicalName(reference: TypeReference) -> String {
+    return reference.name.text
+}
+
+// Whether two declarations of an initializer take the same parameters, by
+// name and in order: a template's and the same one on an instance of it.
+function sameParameterNames(left: FunctionDeclaration, right: FunctionDeclaration) -> Bool {
+    if left.parameters.count != right.parameters.count { return false }
+    for index in 0..left.parameters.count {
+        if left.parameters[index].name.text != right.parameters[index].name.text { return false }
+    }
+    return true
+}
+
+// The type arguments `bound` decides, as the references an instance of a
+// template is named by, or nothing while one of them is still undecided.
+function inferredReferences(declarations: Declarations, bound: [Optional<Type>], span: Span) -> Optional<[TypeReference]> {
+    var references: [TypeReference] = []
+    for binding in bound {
+        match binding {
+            Some(valueType) -> {
+                if valueType.isInvalid() { return .None }
+                // A call inside another module's generic body still resolves
+                // the caller's type, which the call site's file may not import.
+                references.append(declarations.declaredReference(valueType, span))
+            }
+            None -> {
+                report(.TypeArgumentsNotInferred, span)
+                return .None
+            }
+        }
+    }
+    return .Some(references)
+}
+
+// Whether `declared` is an instance of the template called `name`.
+function instantiates(declared: StructType, name: String) -> Bool {
+    return declared.genericBase == name || (declared.specialized && templateName(declared.name.text) == name)
+}
+
+// A template field by the name a constructor labels it with; a class's
+// fields are also found by the name their declaring class gave them.
+function templateField(template: StructDeclaration, name: String) -> Optional<FieldDeclaration> {
+    for field in template.fields {
+        if field.name.text == name { return .Some(field) }
+    }
+    if template.genericBase != "Class" { return .None }
+    var found: Optional<FieldDeclaration> = .None
+    for field in template.fields {
+        if classFieldBaseName(field.name.text) == name {
+            if found.isSome() { return .None }
+            found = .Some(field)
+        }
+    }
+    return found
+}
+
+function identifierTexts(identifiers: [Identifier]) -> [String] {
+    var texts: [String] = []
+    for identifier in identifiers { texts.append(identifier.text) }
+    return texts
+}
+
+// How deeply a reference nests type arguments, `Int` 0 and `Box<Box<Int>>` 2.
+function nesting(reference: TypeReference) -> Int {
+    var deepest = 0
+    for argument in reference.arguments {
+        let depth = nesting(argument) + 1
+        if depth > deepest { deepest = depth }
+    }
+    return deepest
+}

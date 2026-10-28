@@ -1,0 +1,263 @@
+// QUIC transport parameters (RFC 9000 section 18), carried in the TLS
+// quic_transport_parameters extension. Absent parameters take the RFC's
+// defaults, which are the field defaults here.
+
+namespace QuicParameterLimit {
+    let defaultUdpPayload: Number = 65527
+    let defaultAckDelayExponent: Number = 3
+    let defaultMaxAckDelay: Number = 25
+    let defaultConnectionIds: Number = 2
+    let largestAckDelayExponent: Number = 20
+    // max_ack_delay must stay below 2^14 milliseconds (RFC 9000 section
+    // 18.2).
+    let ackDelayCeiling: Number = 16384
+}
+
+struct QuicTransportParameters {
+    var originalDestination: [UN8]? = .None
+    var maxIdleTimeout: Number = 0
+    var statelessResetToken: [UN8]? = .None
+    var maxUdpPayloadSize: Number = QuicParameterLimit.defaultUdpPayload
+    var initialMaxData: Number = 0
+    var initialMaxStreamDataBidiLocal: Number = 0
+    var initialMaxStreamDataBidiRemote: Number = 0
+    var initialMaxStreamDataUni: Number = 0
+    var initialMaxStreamsBidi: Number = 0
+    var initialMaxStreamsUni: Number = 0
+    var ackDelayExponent: Number = QuicParameterLimit.defaultAckDelayExponent
+    var maxAckDelay: Number = QuicParameterLimit.defaultMaxAckDelay
+    var disableActiveMigration: Bool = false
+    var activeConnectionIdLimit: Number = QuicParameterLimit.defaultConnectionIds
+    var initialSource: [UN8]? = .None
+    var retrySource: [UN8]? = .None
+    var maxDatagramFrameSize: Number = 0
+    // RESET_STREAM_AT is understood (draft-ietf-quic-reliable-stream-reset
+    // section 3).
+    var resetStreamAt: Bool = false
+}
+
+// The parameters an endpoint with `limits` announces.
+function quicAnnouncedParameters(
+    limits: borrow QuicLimits,
+    source: borrow [UN8]
+) -> QuicTransportParameters {
+    return QuicTransportParameters {
+        maxIdleTimeout: Number(limits.maxIdleMilliseconds),
+        maxUdpPayloadSize: Number(limits.maxUdpPayload),
+        initialMaxData: Number(limits.connectionData),
+        initialMaxStreamDataBidiLocal: Number(limits.streamData),
+        initialMaxStreamDataBidiRemote: Number(limits.streamData),
+        initialMaxStreamDataUni: Number(limits.streamData),
+        initialMaxStreamsBidi: Number(limits.bidirectionalStreams),
+        initialMaxStreamsUni: Number(limits.unidirectionalStreams),
+        ackDelayExponent: Number(limits.ackDelayExponent),
+        maxAckDelay: Number(limits.maxAckDelayMilliseconds),
+        activeConnectionIdLimit: Number(limits.activeConnectionIds),
+        initialSource: .Some(copy source),
+        maxDatagramFrameSize: Number(limits.maxDatagramFrame),
+        resetStreamAt: true
+    }
+}
+
+function quicWriteParameter(
+    writer: borrow mut WireWriter,
+    id: QuicTransportParameterId,
+    value: borrow [UN8]
+) {
+    writer.writeVarint(code(id))
+    writer.writeVarint(value.count)
+    writer.writeBytes(value)
+}
+
+function quicWriteNumberParameter(
+    writer: borrow mut WireWriter,
+    id: QuicTransportParameterId,
+    value: Number
+) {
+    var inner = WireWriter {}
+    inner.writeVarint(value)
+    quicWriteParameter(writer, id, inner.bytes)
+}
+
+function quicWriteOptionalParameter(
+    writer: borrow mut WireWriter,
+    id: QuicTransportParameterId,
+    value: borrow [UN8]?
+) {
+    match value {
+        Some(bytes) -> quicWriteParameter(writer, id, bytes)
+        None -> {}
+    }
+}
+
+function quicEncodeParameters(parameters: borrow QuicTransportParameters) -> [UN8] {
+    var writer = WireWriter {}
+    quicWriteOptionalParameter(
+        writer,
+        .OriginalDestinationConnectionId,
+        parameters.originalDestination
+    )
+    quicWriteNumberParameter(writer, .MaxIdleTimeout, parameters.maxIdleTimeout)
+    quicWriteOptionalParameter(writer, .StatelessResetToken, parameters.statelessResetToken)
+    quicWriteNumberParameter(writer, .MaxUdpPayloadSize, parameters.maxUdpPayloadSize)
+    quicWriteNumberParameter(writer, .InitialMaxData, parameters.initialMaxData)
+    quicWriteNumberParameter(
+        writer,
+        .InitialMaxStreamDataBidiLocal,
+        parameters.initialMaxStreamDataBidiLocal
+    )
+    quicWriteNumberParameter(
+        writer,
+        .InitialMaxStreamDataBidiRemote,
+        parameters.initialMaxStreamDataBidiRemote
+    )
+    quicWriteNumberParameter(writer, .InitialMaxStreamDataUni, parameters.initialMaxStreamDataUni)
+    quicWriteNumberParameter(writer, .InitialMaxStreamsBidi, parameters.initialMaxStreamsBidi)
+    quicWriteNumberParameter(writer, .InitialMaxStreamsUni, parameters.initialMaxStreamsUni)
+    quicWriteNumberParameter(writer, .AckDelayExponent, parameters.ackDelayExponent)
+    quicWriteNumberParameter(writer, .MaxAckDelay, parameters.maxAckDelay)
+    if parameters.disableActiveMigration { quicWriteParameter(writer, .DisableActiveMigration, []) }
+    quicWriteNumberParameter(writer, .ActiveConnectionIdLimit, parameters.activeConnectionIdLimit)
+    quicWriteOptionalParameter(writer, .InitialSourceConnectionId, parameters.initialSource)
+    quicWriteOptionalParameter(writer, .RetrySourceConnectionId, parameters.retrySource)
+    if parameters.maxDatagramFrameSize > 0 {
+        quicWriteNumberParameter(writer, .MaxDatagramFrameSize, parameters.maxDatagramFrameSize)
+    }
+    if parameters.resetStreamAt { quicWriteParameter(writer, .ResetStreamAt, []) }
+    return writer.bytes
+}
+
+function quicParameterNumber(value: borrow [UN8]) -> Result<Number, QuicTransportError> {
+    var reader = WireReader { bytes: copy value }
+    let number = try reader.readVarint() otherwise return .Error(.TransportParameterError)
+    if !reader.atEnd() { return .Error(.TransportParameterError) }
+    return .Ok(number)
+}
+
+function quicConnectionIdParameter(value: borrow [UN8]) -> Result<[UN8]?, QuicTransportError> {
+    if value.count > Quic.maximumConnectionId { return .Error(.TransportParameterError) }
+    return .Ok(.Some(copy value))
+}
+
+// The peer's parameters; `fromServer` says which side sent them, since a
+// client may not send the server's own (RFC 9000 section 18.2).
+function quicDecodeParameters(
+    bytes: borrow [UN8],
+    fromServer: Bool
+) -> Result<QuicTransportParameters, QuicTransportError> {
+    var reader = WireReader { bytes: copy bytes }
+    var parameters = QuicTransportParameters {}
+    var seen: [Number] = []
+    while !reader.atEnd() {
+        let id = try reader.readVarint() otherwise return .Error(.TransportParameterError)
+        let length = try reader.readVarint() otherwise return .Error(.TransportParameterError)
+        let value = try reader.readBytes(length) otherwise return .Error(.TransportParameterError)
+        if seen.contains(id) { return .Error(.TransportParameterError) }
+        seen.append(id)
+        let known: QuicTransportParameterId = fromCode<QuicTransportParameterId>(id)
+        try quicApplyParameter(parameters, known, value, fromServer)
+    }
+    try quicCheckParameters(parameters)
+    return .Ok(parameters)
+}
+
+function quicApplyParameter(
+    parameters: borrow mut QuicTransportParameters,
+    id: QuicTransportParameterId,
+    value: borrow [UN8],
+    fromServer: Bool
+) -> Result<Void, QuicTransportError> {
+    match id {
+        OriginalDestinationConnectionId -> {
+            if !fromServer { return .Error(.TransportParameterError) }
+            parameters.originalDestination = try quicConnectionIdParameter(value)
+        }
+        StatelessResetToken -> {
+            if !fromServer || value.count != Quic.statelessResetTokenBytes {
+                return .Error(.TransportParameterError)
+            }
+            parameters.statelessResetToken = .Some(copy value)
+        }
+        RetrySourceConnectionId -> {
+            if !fromServer { return .Error(.TransportParameterError) }
+            parameters.retrySource = try quicConnectionIdParameter(value)
+        }
+        // Migration to a preferred address comes later; until then it is
+        // accepted from a server and not used.
+        PreferredAddress -> if !fromServer { return .Error(.TransportParameterError) }
+        DisableActiveMigration -> {
+            if value.count != 0 { return .Error(.TransportParameterError) }
+            parameters.disableActiveMigration = true
+        }
+        // Its value is empty; anything else is an error (draft section 3).
+        ResetStreamAt -> {
+            if value.count != 0 { return .Error(.TransportParameterError) }
+            parameters.resetStreamAt = true
+        }
+        InitialSourceConnectionId -> parameters.initialSource = try quicConnectionIdParameter(value)
+        else -> try quicApplyNumber(parameters, id, value)
+    }
+    return .Ok
+}
+
+function quicApplyNumber(
+    parameters: borrow mut QuicTransportParameters,
+    id: QuicTransportParameterId,
+    value: borrow [UN8]
+) -> Result<Void, QuicTransportError> {
+    // A parameter this endpoint does not know is ignored (RFC 9000 section
+    // 7.4.2), before its value is read as a number.
+    let number = match id {
+        MaxIdleTimeout -> try quicParameterNumber(value)
+        MaxUdpPayloadSize -> try quicParameterNumber(value)
+        InitialMaxData -> try quicParameterNumber(value)
+        InitialMaxStreamDataBidiLocal -> try quicParameterNumber(value)
+        InitialMaxStreamDataBidiRemote -> try quicParameterNumber(value)
+        InitialMaxStreamDataUni -> try quicParameterNumber(value)
+        InitialMaxStreamsBidi -> try quicParameterNumber(value)
+        InitialMaxStreamsUni -> try quicParameterNumber(value)
+        AckDelayExponent -> try quicParameterNumber(value)
+        MaxAckDelay -> try quicParameterNumber(value)
+        ActiveConnectionIdLimit -> try quicParameterNumber(value)
+        MaxDatagramFrameSize -> try quicParameterNumber(value)
+        else -> return .Ok
+    }
+    match id {
+        MaxIdleTimeout -> parameters.maxIdleTimeout = number
+        MaxUdpPayloadSize -> parameters.maxUdpPayloadSize = number
+        InitialMaxData -> parameters.initialMaxData = number
+        InitialMaxStreamDataBidiLocal -> parameters.initialMaxStreamDataBidiLocal = number
+        InitialMaxStreamDataBidiRemote -> parameters.initialMaxStreamDataBidiRemote = number
+        InitialMaxStreamDataUni -> parameters.initialMaxStreamDataUni = number
+        InitialMaxStreamsBidi -> parameters.initialMaxStreamsBidi = number
+        InitialMaxStreamsUni -> parameters.initialMaxStreamsUni = number
+        AckDelayExponent -> parameters.ackDelayExponent = number
+        MaxAckDelay -> parameters.maxAckDelay = number
+        ActiveConnectionIdLimit -> parameters.activeConnectionIdLimit = number
+        MaxDatagramFrameSize -> parameters.maxDatagramFrameSize = number
+        else -> {}
+    }
+    return .Ok
+}
+
+// The bounds RFC 9000 section 18.2 sets on the values.
+function quicCheckParameters(
+    parameters: borrow QuicTransportParameters
+) -> Result<Void, QuicTransportError> {
+    if parameters.maxUdpPayloadSize < Quic.minimumDatagram {
+        return .Error(.TransportParameterError)
+    }
+    if parameters.ackDelayExponent > QuicParameterLimit.largestAckDelayExponent {
+        return .Error(.TransportParameterError)
+    }
+    if parameters.maxAckDelay >= QuicParameterLimit.ackDelayCeiling {
+        return .Error(.TransportParameterError)
+    }
+    if parameters.activeConnectionIdLimit < QuicParameterLimit.defaultConnectionIds {
+        return .Error(.TransportParameterError)
+    }
+    if parameters.initialMaxStreamsBidi > Quic.maximumStreams || parameters.initialMaxStreamsUni > Quic.maximumStreams {
+        return .Error(.TransportParameterError)
+    }
+    return .Ok
+}

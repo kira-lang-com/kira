@@ -1,0 +1,109 @@
+function isAnyType(program: CheckedProgram, valueType: Type) -> Bool {
+    if valueType.kind != .Structure { return false }
+    return program.structs[valueType.declaration].name.text == "Any"
+}
+
+function canonicalAnyType(valueType: Type) -> Type {
+    if valueType.isInteger() { return Type.int() }
+    if valueType.kind == .Floating { return Type.floating(64) }
+    return valueType
+}
+
+// What every unit calls `valueType`: a scalar by its kind and size, and a
+// struct or enum by its name, which spells its module and type arguments.
+function typeIdentity(structs: borrow [StructType], enums: borrow [EnumType], valueType: Type) -> String {
+    let size = decimalText(valueType.bits)
+    match valueType.kind {
+        Integer -> return joinText([valueType.signed ? "int " : "uint ", size])
+        Floating -> return joinText(["float ", size])
+        Decimal -> return joinText([valueType.signed ? "number " : "unsigned number ", size])
+        Boolean -> return "bool"
+        Pointer -> return "pointer"
+        Void -> return "void"
+        Structure -> return joinText(["struct ", structs[valueType.declaration].name.text])
+        Enumeration -> return joinText(["enum ", enums[valueType.declaration].name.text])
+        Invalid -> return "invalid"
+    }
+}
+
+extend Checker {
+    // The number an `Any` holding `valueType` carries. Every unit numbers a
+    // type alike, as an `Any` one unit boxes is read by the others.
+    function internAnyType(borrow mut self, valueType: Type) -> Int {
+        let canonical = canonicalAnyType(valueType)
+        for index in 0..program.anyTypes.count {
+            if program.anyTypes[index].equals(canonical) { return program.anyTypeIds[index] }
+        }
+        let id = instanceSuffix(typeIdentity(declarations.structs, declarations.enums, canonical))
+        program.anyTypes.append(canonical)
+        program.anyTypeIds.append(id)
+        return id
+    }
+
+    function checkTypeQuery(borrow mut self, mode: TypeQueryMode, operand: Int, reference: TypeReference, span: Span) -> Int {
+        let target = resolveType(reference)
+        let checked = expression(operand, .None)
+        let actual = typeOf(checked)
+        if actual.isInvalid() || target.isInvalid() { return add(.Integer(0), Type.invalid(), span) }
+        // A crossing family's declarations are any module's (KLF-RIDL
+        // section 19 rule 5: no dynamic cast), so there is no list to test
+        // against.
+        if isWitnessedType(program, actual) {
+            report(.CrossingFamilyQuery, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        match existentialCase(program, target, actual) {
+            Some(variant) -> return familyQuery(mode, checked, variant, target, span)
+            None -> {}
+        }
+        let typeId = internAnyType(target)
+        match mode {
+            Is -> return add(.TypeIs(checked, typeId), Type.boolean(), span)
+            Cast -> {
+                if isAnyType(program, actual) { return add(.UnboxAny(checked, typeId, .None), target, span) }
+                if actual.equals(target) { return checked }
+                let sourceNumeric = actual.isInteger() || actual.kind == .Floating
+                let targetNumeric = target.isInteger() || target.kind == .Floating
+                if sourceNumeric && targetNumeric { return add(.Convert(checked), target, span) }
+                report(.BindingTypeMismatch, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+
+    // `is` and `as` on a family value (section 27): `Any Family` is an enum
+    // with one case per declaration, carrying its struct, so the test is
+    // whether the value is the case `variant`, and the cast is that case's
+    // payload, which traps when the value is another declaration. Both are
+    // the `match` they would be written as.
+    function familyQuery(borrow mut self, mode: TypeQueryMode, checked: Int, variant: Int, target: Type, span: Span) -> Int {
+        openScope()
+        var held: Optional<Int> = .None
+        var taken = add(.Boolean(true), Type.boolean(), span)
+        if mode == .Cast {
+            let binding = declareLocal("__member", target, false, false)
+            held = .Some(binding)
+            taken = add(.Read(binding), target, span)
+        }
+        closeScope()
+        var otherwise: [Int] = []
+        var refused = add(.Boolean(false), Type.boolean(), span)
+        if mode == .Cast {
+            otherwise.append(program.addStatement(.Evaluate(add(.RuntimeTrap(.FamilyCast(target)), Type.void(), span))))
+        }
+        var arms: [CheckedArm] = [familyArm(variant, held, [], .Some(taken))]
+        if mode == .Cast {
+            arms.append(familyArm(-1, .None, otherwise, .None))
+            return add(.Choice(checked, arms), target, span)
+        }
+        arms.append(familyArm(-1, .None, [], .Some(refused)))
+        return add(.Choice(checked, arms), Type.boolean(), span)
+    }
+}
+
+function familyArm(variant: Int, binding: Optional<Int>, body: [Int], value: Optional<Int>) -> CheckedArm {
+    return CheckedArm {
+        variant = variant, binding = binding, body = body, literal = .None, value = value,
+        also = [], ranges = [], texts = [], decimals = [], decimalRanges = []
+    }
+}

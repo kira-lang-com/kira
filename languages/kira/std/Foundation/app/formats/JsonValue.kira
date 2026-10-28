@@ -1,0 +1,151 @@
+// JSON, as a value.
+//
+// A document is a tree of `JsonValue`, and every way of asking it a question
+// answers an optional: a field that is absent, an index past the end, and a
+// value of the wrong shape all answer `.None` rather than trap. JSON arrives
+// from somewhere else — a file someone edited, a service that changed its
+// schema between deployments — so a reader that trapped on a surprise would
+// turn every remote change into a crash in a program that could have carried on.
+//
+// A number is a `Number`, which holds every literal a document carries as an
+// identity or a count exactly: `3`, `3.0` and `30e-1` are the same value, as
+// the format says they are.
+
+enum JsonValue {
+    Null
+    Boolean(Bool)
+    Number(Number)
+    Text(String)
+    Array([JsonValue])
+    Object([JsonMember])
+
+    // Whether this is `null`. "Absent", "null" and "0" are three different
+    // answers: use this with `has` when the difference decides something.
+    function isNull(borrow self) -> Bool {
+        match self {
+            Null -> return true
+            Boolean(flag) -> return false
+            Number(number) -> return false
+            Text(text) -> return false
+            Array(items) -> return false
+            Object(members) -> return false
+        }
+    }
+
+    // The boolean this holds. Only a real `true` or `false` answers: a
+    // truthiness rule would make a document's meaning depend on a convention
+    // the document never stated.
+    function boolean(borrow self) -> Bool? {
+        match self {
+            Boolean(flag) -> return .Some(flag)
+            Null -> return .None
+            Number(number) -> return .None
+            Text(text) -> return .None
+            Array(items) -> return .None
+            Object(members) -> return .None
+        }
+    }
+
+    function number(borrow self) -> Number? {
+        match self {
+            Number(number) -> return .Some(number)
+            Null -> return .None
+            Boolean(flag) -> return .None
+            Text(text) -> return .None
+            Array(items) -> return .None
+            Object(members) -> return .None
+        }
+    }
+
+    // The text this holds. A number or a boolean does not answer: rendering
+    // one as text would hide a document carrying the wrong shape.
+    function text(borrow self) -> String? {
+        match self {
+            Text(text) -> return .Some(text)
+            Null -> return .None
+            Boolean(flag) -> return .None
+            Number(number) -> return .None
+            Array(items) -> return .None
+            Object(members) -> return .None
+        }
+    }
+
+    function items(borrow self) -> [JsonValue]? {
+        match self {
+            Array(items) -> return .Some(items)
+            Null -> return .None
+            Boolean(flag) -> return .None
+            Number(number) -> return .None
+            Text(text) -> return .None
+            Object(members) -> return .None
+        }
+    }
+
+    function members(borrow self) -> [JsonMember]? {
+        match self {
+            Object(members) -> return .Some(members)
+            Null -> return .None
+            Boolean(flag) -> return .None
+            Number(number) -> return .None
+            Text(text) -> return .None
+            Array(items) -> return .None
+        }
+    }
+
+    // The element at `index` of an array.
+    function at(borrow self, index: Number) -> JsonValue? {
+        match items() {
+            Some(items) -> {
+                if index < 0 || index >= items.count { return .None }
+                return .Some(items[index])
+            }
+            None -> return .None
+        }
+    }
+
+    // The member named `name`: the *last* one with that name, which is what a
+    // document repeating a name means by it. Every writer that collapses
+    // duplicates keeps the last, and both are still in the tree, so writing
+    // the value back out preserves what arrived.
+    function field(borrow self, name: borrow String) -> JsonValue? {
+        match members() {
+            Some(members) -> {
+                for offset in 0..members.count {
+                    let member = members[members.count - 1 - offset]
+                    if member.name == name { return .Some(member.value) }
+                }
+                return .None
+            }
+            None -> return .None
+        }
+    }
+
+    // Whether the object carries a member named `name`, however it reads: a
+    // member set to `null` and one never written are opposite answers to a
+    // caller deciding whether to fill in a default.
+    function has(borrow self, name: borrow String) -> Bool {
+        return field(name).isSome()
+    }
+
+    // Every member name, in document order, with repeats kept.
+    function names(borrow self) -> [String]? {
+        match members() {
+            Some(members) -> {
+                var names: [String] = []
+                for member in members { names.append(member.name) }
+                return .Some(names)
+            }
+            None -> return .None
+        }
+    }
+}
+
+// One `"name": value` pair.
+//
+// An object is a list rather than a map because JSON is: names may repeat, and
+// they have an order the document chose. Keeping both is what lets a value be
+// written back out as it arrived.
+struct JsonMember {
+    let name: String
+    let value: JsonValue
+}

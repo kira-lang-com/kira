@@ -1,0 +1,32 @@
+function addChannelTypeReferences(references: [TypeReference]) -> [TypeReference] {
+    var expanded = references
+    for reference in references {
+        if !isChannelEndName(reference.name.text) || reference.arguments.count != 1 { continue }
+        let element = reference.arguments[0]
+        let receiver = TypeReference {
+            qualifier = .None,
+            name = Identifier { text = "Receiver", span = reference.name.span },
+            arguments = [element], modes = [], instanceName = genericInstanceName("Receiver", [element])
+        }
+        appendTypeReferences(expanded, receiver)
+        let failure = TypeReference {
+            qualifier = .None,
+            name = Identifier { text = "ChannelFailure", span = reference.name.span },
+            arguments = [], modes = [], instanceName = "ChannelFailure"
+        }
+        let result = TypeReference {
+            qualifier = .None,
+            name = Identifier { text = "Result", span = reference.name.span },
+            arguments = [element, failure], modes = [], instanceName = genericInstanceName("Result", [element, failure])
+        }
+        appendTypeReferences(expanded, result)
+    }
+    return expanded
+}
+
+function isChannelEndName(name: String) -> Bool {
+    match name {
+        "Sender", "Receiver" -> return true
+        else -> return false
+    }
+}

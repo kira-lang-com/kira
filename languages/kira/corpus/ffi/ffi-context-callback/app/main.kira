@@ -1,0 +1,61 @@
+// A lambda as an `@FFI.Callback`. One with a `context:` holds the lambda's
+// captures, and C hands its `context` back on every call; one without
+// takes a lambda that captures nothing.
+
+@FFI.Callback { abi: c, params: [value: I32, data: RawPtr], result: I32, context: data }
+struct Visitor {}
+
+@FFI.Callback { abi: c, params: [I32], result: I32 }
+struct Unary {}
+
+@FFI.Extern { library: klfseam, symbol: seam_each, abi: c }
+function each(values: [I32], count: I32, visit: Visitor, data: RawPtr): I32
+
+@FFI.Extern { library: klfseam, symbol: seam_apply, abi: c }
+function apply(unary: Unary, value: I32): I32
+
+// Released with the last callback that holds the lambda capturing it.
+struct Tracer: Drop {
+    let tag: Int
+    function drop(borrow mut self) {
+        print(self.tag)
+        return
+    }
+}
+
+function traced(): Int {
+    let tracer = Tracer(tag: 7)
+    let visitor: Visitor = { value in value + Int32(tracer.tag) }
+    let again = visitor
+    print(each([1], 1, again, again.context))
+    print(each([2], 1, visitor, visitor.context))
+    return 0
+}
+
+function twice(value: I32): I32 {
+    return value * 2
+}
+
+function visitorFor(label: String): Visitor {
+    return { value in value + Int32(label.count) }
+}
+
+@Main
+function main() {
+    let base: I32 = 100
+    let scale: I32 = 3
+    let visitor: Visitor = { value in value * scale + base }
+    print(each([1, 2, 3], 3, visitor, visitor.context))
+    let shared = visitor
+    print(each([10], 1, shared, shared.context))
+    let plain: Visitor = { value in value + 1 }
+    print(each([1, 2], 2, plain, plain.context))
+    let named: Visitor = twice
+    print(each([4], 1, named, named.context))
+    let labelled = visitorFor("seven!!")
+    print(each([1, 1], 2, labelled, labelled.context))
+    let unary: Unary = { value in value * value }
+    print(apply(unary, 9))
+    print(apply(twice, 21))
+    print(traced())
+}

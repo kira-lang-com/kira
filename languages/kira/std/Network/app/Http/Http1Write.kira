@@ -1,0 +1,140 @@
+import Foundation
+
+// HTTP/1.1 messages out (RFC 9112): the start line, fields, then a body
+// framed by Content-Length when its size is known, or chunked when it is
+// not.
+
+namespace Http1 {
+    let version: String = "HTTP/1.1"
+    let lineEnd: String = "\r\n"
+    // A head longer than this is refused when read.
+    let headLimit: Number = 65536
+    let lineLimit: Number = 8192
+    let carriageReturn: Number = 13
+    let lineFeed: Number = 10
+    let space: Number = 32
+    let tab: Number = 9
+    let colon: Number = 58
+    let semicolon: Number = 59
+    let hexRadix: Number = 16
+    // 'a' and 'A', and the six letters that are hex digits.
+    let lowerA: Number = 97
+    let upperA: Number = 65
+    let hexLetters: Number = 6
+    // The most hex digits of a chunk size read: below 2^63.
+    let chunkDigits: Number = 15
+}
+
+// Why an HTTP/1.1 message could not be written or read.
+enum Http1Failure {
+    Malformed
+    // A line, a head or a chunk size past the limits.
+    TooLarge
+    // The connection ended inside a message.
+    Incomplete
+}
+
+// How a message's body is framed on the wire.
+enum BodyFraming {
+    // No body, as for a GET or a 204.
+    Empty
+    Length(Number)
+    Chunked
+}
+
+function http1RequestHead(
+    head: borrow RequestHead,
+    framing: BodyFraming
+) -> Result<[UN8], Http1Failure> {
+    let token = match methodToken(head.method) {
+        Some(value) -> value
+        None -> return .Error(.Malformed)
+    }
+    let target = head.method == .Connect ? copy head.target.authority : copy head.target.path
+    // A space or line break in the target or host would split the request
+    // line or add a field.
+    for part in [target, copy head.target.authority] {
+        if part.count == 0 || part.contains(" ") || part.contains("\r") || part.contains("\n") {
+            return .Error(.Malformed)
+        }
+    }
+    var text = "\(token) \(target) \(Http1.version)\(Http1.lineEnd)"
+    text += "host: \(head.target.authority)\(Http1.lineEnd)"
+    try appendHttp1Fields(text, head.fields)
+    text += framingLine(framing)
+    text += Http1.lineEnd
+    return .Ok(text.utf8())
+}
+
+function http1ResponseHead(
+    head: borrow ResponseHead,
+    framing: BodyFraming
+) -> Result<[UN8], Http1Failure> {
+    let status = code(head.status)
+    var text = "\(Http1.version) \(status) \(Http1.lineEnd)"
+    try appendHttp1Fields(text, head.fields)
+    text += framingLine(framing)
+    text += Http1.lineEnd
+    return .Ok(text.utf8())
+}
+
+function framingLine(framing: borrow BodyFraming) -> String {
+    return match framing {
+        Empty -> ""
+        Length(length) -> "content-length: \(length)\(Http1.lineEnd)"
+        Chunked -> "transfer-encoding: chunked\(Http1.lineEnd)"
+    }
+}
+
+// Fields, without those the framing writes itself.
+function appendHttp1Fields(
+    text: borrow mut String,
+    fields: borrow Fields
+) -> Result<Void, Http1Failure> {
+    for field in fields.entries {
+        if field.name == "host" || field.name == "content-length" || field.name == "transfer-encoding" {
+            continue
+        }
+        if field.name.count == 0 || field.name.startsWith(":") || field.name.contains(
+            " "
+        ) || field.name.contains(":") {
+            return .Error(.Malformed)
+        }
+        if field.value.contains("\r") || field.value.contains("\n") || field.value.contains("\0") {
+            return .Error(.Malformed)
+        }
+        text += "\(field.name): \(field.value)\(Http1.lineEnd)"
+    }
+    return .Ok
+}
+
+// One chunk of a chunked body; an empty one would end it, so it writes
+// nothing.
+function http1Chunk(bytes: borrow [UN8]) -> [UN8] {
+    if bytes.count == 0 { return [] }
+    var out = "\(hexText(bytes.count))\(Http1.lineEnd)".utf8()
+    out.appendAll(bytes)
+    out.appendAll(Http1.lineEnd.utf8())
+    return out
+}
+
+// The last chunk, the trailers, and the end of the message.
+function http1LastChunk(trailers: borrow Fields) -> Result<[UN8], Http1Failure> {
+    var text = "0\(Http1.lineEnd)"
+    try appendHttp1Fields(text, trailers)
+    text += Http1.lineEnd
+    return .Ok(text.utf8())
+}
+
+function hexText(value: Number) -> String {
+    let digits = "0123456789abcdef"
+    if value == 0 { return "0" }
+    var text = ""
+    var rest = value
+    while rest > 0 {
+        let digit = rest % Http1.hexRadix
+        text = digits.substring(digit, digit + 1) + text
+        rest = trunc(rest / Http1.hexRadix)
+    }
+    return text
+}

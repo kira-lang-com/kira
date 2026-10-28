@@ -1,0 +1,307 @@
+import Foundation
+
+// A binary split in two, as `llvm-strip --strip-unneeded` and `llvm-objcopy
+// --only-keep-debug` split it: what a program needs to run, and what a
+// debugger reads beside it.
+
+/// The executable or shared library `bytes` without its debug information: every debug section, the symbol table and the strings only it uses are left out. What the segments hold is kept byte for byte, so the program runs as before.
+///
+/// The sections it keeps outside the segments follow, then their names, then the section headers.
+public function stripDebugInformation(bytes: borrow [UN8]) -> Result<[UN8], ElfFailure> {
+    let image = match readSplittable(bytes) {
+        Ok(read) -> read
+        Error(failure) -> return .Error(failure)
+    }
+    let sections = image.sections
+    var removed: [Bool] = []
+    for (index, section) in sections.enumerated() {
+        removed.append(
+            index != 0 && !section.allocated() && (
+                debugSection(section.name) || section.kind == ElfFormat.symbols
+            )
+        )
+    }
+    for (index, section) in sections.enumerated() {
+        if removed[index] || section.allocated() || !relocationSection(section) { continue }
+        let target = section.info < sections.count && removed[section.info]
+        if removed[section.link] || target { removed[index] = true }
+    }
+    for (index, section) in sections.enumerated() {
+        if index == 0 || index == image.names || section.allocated() { continue }
+        if section.kind != ElfFormat.strings { continue }
+        var linked = false
+        var linkedByRemoved = false
+        for (other, linking) in sections.enumerated() {
+            if linking.link != index || other == index { continue }
+            if removed[other] { linkedByRemoved = true } else { linked = true }
+        }
+        if linkedByRemoved && !linked { removed[index] = true }
+    }
+    // The segments' bytes, with the headers and every section loaded.
+    var end = ElfFormat.header
+    for program in image.programs { end = max(end, program.offset + program.size) }
+    for section in sections {
+        if section.allocated() && section.holdsBytes() {
+            end = max(end, section.offset + section.size)
+        }
+    }
+    var placed: [Number] = []
+    var kept: [Number] = []
+    var names: [String] = []
+    for (index, section) in sections.enumerated() {
+        placed.append(removed[index] ? -1 : kept.count)
+        if removed[index] { continue }
+        kept.append(index)
+        names.append(copy section.name)
+    }
+    let table = nameTable(names)
+    var output = bytes.prefix(end)
+    var headers: [[UN8]] = []
+    for (position, index) in kept.enumerated() {
+        let section = sections[index]
+        var header = sectionHeaderBytes(bytes, index)
+        if index == image.names {
+            padElf(output, max(section.alignment, 1))
+            putElfWord(header, 24, output.count, 8)
+            putElfWord(header, 32, table.bytes.count, 8)
+            output.appendAll(table.bytes)
+        } else if section.holdsBytes() && section.offset + section.size > end {
+            padElf(output, max(section.alignment, 1))
+            putElfWord(header, 24, output.count, 8)
+            appendElfRange(output, bytes, section.offset, section.size)
+        }
+        putElfWord(header, 0, table.offsets[position], 4)
+        putElfWord(header, 40, max(placed[section.link], 0), 4)
+        if relocationSection(section) || (section.flags & ElfFormat.infoLink) != 0 {
+            if section.info < sections.count {
+                putElfWord(header, 44, max(placed[section.info], 0), 4)
+            }
+        }
+        headers.append(header)
+    }
+    padElf(output, 8)
+    putElfWord(output, 40, output.count, 8)
+    putElfWord(output, 60, kept.count, 2)
+    putElfWord(output, 62, placed[image.names], 2)
+    for header in headers { output.appendAll(header) }
+    return .Ok(output)
+}
+
+/// The debug information of the executable or shared library `bytes`, as a file of its own that a debugger reads beside the stripped one. A loaded segment keeps its place in that segment.
+public function debugInformation(bytes: borrow [UN8]) -> Result<[UN8], ElfFailure> {
+    let image = match readSplittable(bytes) {
+        Ok(read) -> read
+        Error(failure) -> return .Error(failure)
+    }
+    let sections = image.sections
+    let programs = image.programs
+    let headersEnd = ElfFormat.header + programs.count * ElfFormat.programHeader
+    // Whether each section keeps its bytes, and the loaded segment it is in.
+    var holds: [Bool] = []
+    var loads: [Number] = []
+    for (index, section) in sections.enumerated() {
+        holds.append(
+            index != 0 && section.holdsBytes() && (
+                !section.allocated() || section.kind == ElfFormat.note
+            )
+        )
+        var load: Number = -1
+        for (number, program) in programs.enumerated() {
+            if load < 0 && program.kind == ElfFormat.loaded && withinSegment(section, program) {
+                load = number
+            }
+        }
+        loads.append(index == 0 ? -1 : load)
+    }
+    // The first section of each segment, the one its bytes start with.
+    var firsts: [Number] = []
+    for program in programs {
+        var first: Number = -1
+        for (index, section) in sections.enumerated() {
+            if index == 0 || !withinSegment(section, program) { continue }
+            if first < 0 || section.offset < sections[first].offset { first = index }
+        }
+        firsts.append(first)
+    }
+    // Sections in the order of their bytes, then where each goes.
+    var order: [Number] = []
+    for index in 1..sections.count { order.append(index) }
+    let sorted = order.sorted({ a, b in return sections[a].offset < sections[b].offset })
+    var offsets: [Number] = []
+    for index in 0..sections.count { offsets.append(0) }
+    var end = headersEnd
+    for index in sorted {
+        let section = sections[index]
+        let load = loads[index]
+        let first = load < 0 ? -1 : firsts[load]
+        if first == index {
+            end = congruent(end, programs[load].alignment, section.address)
+        }
+        if !holds[index] {
+            offsets[index] = end
+            continue
+        }
+        if first < 0 {
+            end = elfAligned(end, section.alignment)
+        } else if first != index {
+            end = section.offset - sections[first].offset + offsets[first]
+        }
+        offsets[index] = end
+        end += section.size
+    }
+    // The segments: each starts at its first section and holds up to the
+    // last bytes of its sections, the headers too when it did.
+    var programOffsets: [Number] = []
+    var programSizes: [Number] = []
+    for (number, program) in programs.enumerated() {
+        let first = firsts[number]
+        var offset: Number = first < 0 ? 0 : offsets[first]
+        var size: Number = 0
+        for (index, section) in sections.enumerated() {
+            if index == 0 || !withinSegment(section, program) { continue }
+            let held = holds[index] ? section.size : 0
+            if offsets[index] + held > offset { size = max(size, offsets[index] + held - offset) }
+        }
+        if program.offset < headersEnd && headersEnd <= program.offset + program.size {
+            size += offset - program.offset
+            offset = program.offset
+            size = max(size, headersEnd - offset)
+        }
+        if program.kind == ElfFormat.programHeaders {
+            offset = ElfFormat.header
+            size = headersEnd - offset
+        }
+        programOffsets.append(offset)
+        programSizes.append(size)
+        end = max(end, offset + size)
+    }
+    let tableAt = elfAligned(end, 8)
+    var output: [UN8] = []
+    for index in 0..(tableAt + sections.count * ElfFormat.sectionHeader) { output.append(0) }
+    copyElfRange(output, 0, bytes, 0, ElfFormat.header)
+    for (number, program) in programs.enumerated() {
+        let at = ElfFormat.header + number * ElfFormat.programHeader
+        copyElfRange(
+            output,
+            at,
+            bytes,
+            image.programOffset + number * ElfFormat.programHeader,
+            ElfFormat.programHeader
+        )
+        putElfWord(output, at + 8, programOffsets[number], 8)
+        putElfWord(output, at + 32, programSizes[number], 8)
+    }
+    for (index, section) in sections.enumerated() {
+        let at = tableAt + index * ElfFormat.sectionHeader
+        copyElfRange(
+            output,
+            at,
+            bytes,
+            image.sectionOffset + index * ElfFormat.sectionHeader,
+            ElfFormat.sectionHeader
+        )
+        if index == 0 { continue }
+        if section.allocated() && section.holdsBytes() && !holds[index] {
+            putElfWord(output, at + 4, ElfFormat.noBits, 4)
+        }
+        putElfWord(output, at + 24, offsets[index], 8)
+        if holds[index] {
+            copyElfRange(output, offsets[index], bytes, section.offset, section.size)
+        }
+    }
+    putElfWord(output, 32, programs.count > 0 ? ElfFormat.header : 0, 8)
+    putElfWord(output, 40, tableAt, 8)
+    return .Ok(output)
+}
+
+// Whether `section` is in `program`, as a loader sees it: its bytes within
+// the segment's, or for one without bytes, its addresses within the
+// segment's memory, thread-local storage in its own segment alone.
+function withinSegment(section: borrow ElfSection, program: borrow ElfProgram) -> Bool {
+    let size = max(section.size, 1)
+    if section.kind == ElfFormat.noBits {
+        if !section.allocated() || section.address < 0 || program.address < 0 { return false }
+        let local = (section.flags & ElfFormat.threadLocalFlag) != 0
+        if local != (program.kind == ElfFormat.threadLocal) { return false }
+        return program.address <= section.address && section.address + size <= program.address + program.memorySize
+    }
+    return program.offset <= section.offset && section.offset + size <= program.offset + program.size
+}
+
+// The least offset from `offset` on that is `address` modulo `alignment`,
+// as a loaded segment's offset must be.
+function congruent(offset: Number, alignment: Number, address: Number) -> Number {
+    if alignment <= 1 || address < 0 { return offset }
+    let wanted = address % alignment
+    let at = offset % alignment
+    return offset - at + wanted + (wanted < at ? alignment : 0)
+}
+
+// The headers of `bytes`, when it is an executable or a shared library.
+function readSplittable(bytes: borrow [UN8]) -> Result<ElfImage, ElfFailure> {
+    let image = match readElf(bytes) {
+        Ok(read) -> read
+        Error(failure) -> return .Error(failure)
+    }
+    if image.kind != ElfFormat.executable && image.kind != ElfFormat.shared {
+        return .Error(.Unsupported("only an executable or a shared library is split"))
+    }
+    return .Ok(image)
+}
+
+// Whether a section of this name holds debug information.
+function debugSection(name: borrow String) -> Bool {
+    return name.startsWith(".debug") || name.startsWith(".zdebug") || name == ".gdb_index"
+}
+
+function relocationSection(section: borrow ElfSection) -> Bool {
+    return section.kind == ElfFormat.relocations || section.kind == ElfFormat.relocationsWithAddends
+}
+
+// The 64 bytes of section header `index`.
+function sectionHeaderBytes(bytes: borrow [UN8], index: Number) -> [UN8] {
+    var header: [UN8] = []
+    let at = elfWord(bytes, 40, 8) + index * ElfFormat.sectionHeader
+    appendElfRange(header, bytes, at, ElfFormat.sectionHeader)
+    return header
+}
+
+// A string table of `names`, and where each is in it: a name that ends
+// another, as `.plt` ends `.rela.plt`, is read from the longer one's tail.
+struct NameTable {
+    let bytes: [UN8]
+    let offsets: [Number]
+}
+
+function nameTable(names: borrow [String]) -> NameTable {
+    let order = names.sorted({ a, b in return a.utf8().count > b.utf8().count })
+    var bytes: [UN8] = [0]
+    var entries: [String] = []
+    var starts: [Number] = []
+    for name in order {
+        if name.count == 0 { continue }
+        var found = false
+        for entry in entries {
+            if entry.endsWith(name) { found = true }
+        }
+        if found { continue }
+        entries.append(copy name)
+        starts.append(bytes.count)
+        bytes.appendAll(name.utf8())
+        bytes.append(0)
+    }
+    var offsets: [Number] = []
+    for name in names {
+        var offset: Number = 0
+        if name.count > 0 {
+            for (position, entry) in entries.enumerated() {
+                if entry.endsWith(name) {
+                    offset = starts[position] + entry.utf8().count - name.utf8().count
+                    break
+                }
+            }
+        }
+        offsets.append(offset)
+    }
+    return NameTable { bytes: bytes, offsets: offsets }
+}

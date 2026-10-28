@@ -1,0 +1,384 @@
+import Foundation
+
+// Installing a toolchain into `<toolchains-root>/<channel>/<version>/`.
+//
+// # The install is atomic at the directory level
+//
+// Nothing is written under `<channel>/` until the archive has been extracted
+// and validated in a staging directory that belongs to this process alone. The
+// last step is a single `rename` of the validated tree into place, so a failed
+// or interrupted install leaves no half-toolchain a launcher could dispatch to.
+// The staging directory is removed on every path out, success or failure.
+//
+// # What is guaranteed not to be touched
+//
+// Everything outside `<channel>/<version>/` and `current.toml`: a staging
+// directory belongs to a concurrent install, and no verb here reads or writes
+// anything else under the root.
+
+// What an install produced.
+public struct Installed {
+    // Which compiler's tree this landed in, named for the messages that follow.
+    var compiler: String = ""
+    var channel: Channel = .Release
+    var version: String = ""
+    var root: String = ""
+    // Whether the version was already present, so nothing was fetched.
+    var alreadyInstalled: Bool = false
+    // The digest that was verified, when the source published one. Empty means
+    // the source published none and the archive was installed unverified —
+    // reported to the user rather than passed over, since "no checksum" and
+    // "checksum matched" are not the same install.
+    var digest: String = ""
+}
+
+// Why an install could not be completed.
+public enum InstallFailure {
+    SourceFailed(SourceFailure)
+    TarUnavailable
+    ChecksumMismatch(String)
+    ExtractFailed(String)
+    UnrecognizedArchiveLayout(String)
+    MissingPart(String)
+    InvalidVersion(String)
+    IncompleteInstall(String)
+    Staging(String)
+}
+
+// What installing produced.
+public enum InstallOutcome {
+    Installed(Installed)
+    Failed(InstallFailure)
+}
+
+// Installs a toolchain and selects it.
+//
+// Resolving `latest` lists the channel; an exact version is fetched directly, so
+// an install of a known version costs one transfer rather than a listing plus a
+// transfer. A version that is already installed skips the fetch and is selected
+// as it stands — `install` always implies `use`.
+public function installToolchain(
+    compiler: borrow Compiler,
+    source: borrow ReleaseSource,
+    spec: borrow VersionSpec,
+    channel: borrow Channel
+) -> InstallOutcome {
+    let resolved = resolveVersion(source, spec, channel)
+    match resolved {
+        Failed(failure) -> { return .Failed(.SourceFailed(failure)) }
+        Found(version) -> {
+            if !isSingleComponent(version) { return .Failed(.InvalidVersion(version)) }
+            return installVersion(compiler, source, channel, version)
+        }
+    }
+    return .Failed(.InvalidVersion(""))
+}
+
+public function resolveVersion(
+    source: borrow ReleaseSource,
+    spec: borrow VersionSpec,
+    channel: borrow Channel
+) -> ResolvedVersion {
+    if !spec.latest { return .Found(spec.version) }
+    let available = availableVersions(source, channel)
+    match available {
+        Failed(failure) -> { return .Failed(failure) }
+        Found(versions) -> {
+            if versions.count == 0 { return .Failed(.ChannelEmpty(channelName(channel))) }
+            return .Found(versions[0])
+        }
+    }
+    return .Failed(.ChannelEmpty(channelName(channel)))
+}
+
+public enum ResolvedVersion {
+    Found(String)
+    Failed(SourceFailure)
+}
+
+public function installVersion(
+    compiler: borrow Compiler,
+    source: borrow ReleaseSource,
+    channel: borrow Channel,
+    version: borrow String
+) -> InstallOutcome {
+    let destination = toolchainRoot(compiler, channel, version)
+    var installed = Installed {
+        compiler: compiler.name,
+        channel: channel,
+        version: version,
+        root: destination,
+        alreadyInstalled: true,
+        digest: ""
+    }
+
+    // `isDirectory` alone would report success for a half-written or
+    // hand-damaged tree and select it, handing the launcher a toolchain it
+    // cannot run.
+    if isDirectory(destination) {
+        match validateToolchain(compiler, destination) {
+            None -> { return selectInstalled(compiler, installed) }
+            Some(detail) -> {
+                return .Failed(
+                    .IncompleteInstall(
+                        "`" + destination + "` is not a usable " + compiler.name + " (" + detail + "); run `knvm " + compiler.name + " uninstall " + version + "` and install again"
+                    )
+                )
+            }
+        }
+    }
+
+    let staging = joinPath(stagingRoot(), processTag())
+    if !makeDirectoryTree(staging) { return .Failed(.Staging(staging)) }
+
+    let fetched = fetchArchive(source, compiler, channel, version, staging)
+    match fetched {
+        Failed(failure) -> {
+            removeTree(staging)
+            return .Failed(.SourceFailed(failure))
+        }
+        Fetched(archive) -> {
+            match verifyArchive(source, compiler, channel, version, archive) {
+                Failed(failure) -> {
+                    removeTree(staging)
+                    return .Failed(failure)
+                }
+                Verified(digest) -> {
+                    installed.digest = digest
+                    return landArchive(
+                        compiler,
+                        channel,
+                        version,
+                        archive,
+                        staging,
+                        destination,
+                        installed
+                    )
+                }
+            }
+        }
+    }
+    return .Failed(.Staging(staging))
+}
+
+// Checks a fetched archive against the digest its release publishes.
+//
+// A mismatch is fatal: refusing here happens inside a staging directory this
+// process owns, so the toolchains root is untouched. An absent sidecar is not:
+// it only downgrades the install to unverified, because a release published
+// before sidecars existed must stay installable.
+public function verifyArchive(
+    source: borrow ReleaseSource,
+    compiler: borrow Compiler,
+    channel: borrow Channel,
+    version: borrow String,
+    archive: borrow String
+) -> VerificationResult {
+    match publishedChecksum(source, compiler, channel, version) {
+        Ok(expected) -> {
+            match expected {
+                Some(published) -> return verifiedAgainst(published, archive)
+                None -> return .Verified("")
+            }
+        }
+        Error(failure) -> return .Failed(.SourceFailed(failure))
+    }
+}
+
+// The archive checked against the digest published for it.
+public function verifiedAgainst(published: borrow Digest, archive: borrow String) -> VerificationResult {
+    match digestOfFile(archive) {
+        Some(computed) -> {
+            if sameDigest(published, computed) { return .Verified(digestHex(published)) }
+            return .Failed(
+                .ChecksumMismatch(
+                    "`" + archive + "` does not match the checksum published for it\n" + "  published: " + digestHex(
+                        published
+                    ) + "\n" + "  downloaded: " + digestHex(
+                        computed
+                    ) + "\n" + "The download is corrupt or the artifact was changed after publication; " + "nothing was installed"
+                )
+            )
+        }
+        None -> return .Failed(.ExtractFailed("could not read `" + archive + "`"))
+    }
+}
+
+public enum VerificationResult {
+    Verified(String)
+    Failed(InstallFailure)
+}
+
+// Unpacks, validates and moves the toolchain into place.
+public function landArchive(
+    compiler: borrow Compiler,
+    channel: borrow Channel,
+    version: borrow String,
+    archive: borrow String,
+    staging: borrow String,
+    destination: borrow String,
+    installed: borrow Installed
+) -> InstallOutcome {
+    let unpacked = joinPath(staging, "unpacked")
+    match unpackArchive(archive, unpacked) {
+        Failed(failure) -> {
+            removeTree(staging)
+            return .Failed(failure)
+        }
+        Extracted -> {
+            let payload = locatePayload(compiler, unpacked, archive)
+            match payload {
+                None -> {
+                    removeTree(staging)
+                    return .Failed(.UnrecognizedArchiveLayout(archive))
+                }
+                Some(root) -> {
+                    let usable = validateToolchain(compiler, root)
+                    match usable {
+                        Some(detail) -> {
+                            removeTree(staging)
+                            return .Failed(.MissingPart(detail))
+                        }
+                        None -> {
+                            let landed = landTree(root, destination, joinPath(staging, "retired"))
+                            match landed {
+                                Failed(failure) -> {
+                                    removeTree(staging)
+                                    return .Failed(failure)
+                                }
+                                Replaced -> {
+                                    var landed = installed
+                                    landed.alreadyInstalled = false
+                                    removeTree(staging)
+                                    return selectInstalled(compiler, landed)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return .Failed(.Staging(staging))
+}
+
+// `payload` moved to `destination`, with whatever was there moved aside first.
+//
+// Unix refuses a rename onto a non-empty directory, so a version whose tree is
+// already there is renamed out of the way rather than deleted: if landing the
+// new tree then fails, the old one goes back.
+//
+// `retired` is where the old tree waits, and it must not be inside `payload` —
+// `binstall` lands its staging directory itself, so a retired tree under it
+// would arrive inside the toolchain.
+public function landTree(
+    payload: borrow String,
+    destination: borrow String,
+    retired: borrow String
+) -> LandingResult {
+    let parent = directoryOfPath(destination)
+    if !parent.isEmpty() && !makeDirectoryTree(parent) { return .Failed(.Staging(parent)) }
+
+    if !pathExists(destination) {
+        if succeeded(renamePath(payload, destination)) { return .Replaced }
+        return .Failed(.Staging(destination))
+    }
+
+    if !makeDirectoryTree(directoryOfPath(retired)) { return .Failed(.Staging(retired)) }
+    if !succeeded(renamePath(destination, retired)) { return .Failed(.Staging(destination)) }
+    if succeeded(renamePath(payload, destination)) { return .Replaced }
+    succeeded(renamePath(retired, destination))
+    return .Failed(.Staging(destination))
+}
+
+public enum LandingResult {
+    Replaced
+    Failed(InstallFailure)
+}
+
+// Records the selection an install implies, and registers a language that an
+// install from the feed brought to a machine that never built it.
+public function selectInstalled(compiler: borrow Compiler, installed: borrow Installed) -> InstallOutcome {
+    if compiler.name != klfCompilerName && !isRegistered(compiler) {
+        if !register(compiler) { return .Failed(.Staging(compilerRoot(compiler))) }
+    }
+    let selection = Selection {
+        channel: installed.channel,
+        version: installed.version,
+        primary: compiler.binary
+    }
+    if !writeSelection(compiler, selection) {
+        return .Failed(.Staging(currentToolchainPath(compiler)))
+    }
+    return .Installed(installed)
+}
+
+// Unpacks a `.tar.gz` into `destination` with the system `tar`.
+public function unpackArchive(archive: borrow String, destination: borrow String) -> UnpackResult {
+    if !makeDirectoryTree(destination) { return .Failed(.Staging(destination)) }
+    var arguments: [String] = []
+    arguments.append("-xzf")
+    arguments.append(archive)
+    arguments.append("-C")
+    arguments.append(destination)
+    let status = runTool("tar", arguments)
+    if status == 0 { return .Extracted }
+    if status == toolNotRunnable { return .Failed(.TarUnavailable) }
+    return .Failed(
+        .ExtractFailed("could not unpack `" + archive + "`: tar exited with " + String(status))
+    )
+}
+
+public enum UnpackResult {
+    Extracted
+    Failed(InstallFailure)
+}
+
+// The toolchain root inside an unpacked archive.
+//
+// Accepts both an archive whose members sit at its top level and the usual one
+// that wraps them in a single `<compiler>-<version>/` directory.
+public function locatePayload(
+    compiler: borrow Compiler,
+    unpacked: borrow String,
+    archive: borrow String
+) -> Optional<String> {
+    if isDirectory(joinPath(unpacked, binaryDirectoryName)) { return .Some(unpacked) }
+    var found = ""
+    for name in entriesOf(unpacked) {
+        let child = joinPath(unpacked, name)
+        if !isDirectory(child) { continue }
+        if !found.isEmpty() { return .None }
+        found = child
+    }
+    if found.isEmpty() { return .None }
+    if !isDirectory(joinPath(found, binaryDirectoryName)) { return .None }
+    return .Some(found)
+}
+
+// Refuses a tree that is not a usable toolchain of this compiler.
+//
+// What is checked is what makes the tree work, and what that is differs per
+// compiler, so it is asked of the compiler rather than written out here: the
+// launcher dispatches to `bin/<binary>`, and the sources the compiler was built
+// from are what a user reads when the compiler is wrong. Answers nothing when
+// the tree is good, and names the first part that is missing when it is not.
+public function validateToolchain(compiler: borrow Compiler, root: borrow String) -> Optional<String> {
+    for index in 0..compiler.parts.count {
+        let part = compiler.parts[index]
+        let path = joinPath(root, part)
+        if pathExists(path) { continue }
+        return .Some("no `" + part + "` at " + path)
+    }
+    return .None
+}
+
+// A name for the scratch space this invocation owns, so two of them never share
+// a directory.
+//
+// The wall clock, not the process id: the services answer for the time and none
+// of them answers for the id, and two installs starting in the same nanosecond is
+// a collision a version manager does not need to survive.
+public function processTag() -> String {
+    return String(unixMillis())
+}

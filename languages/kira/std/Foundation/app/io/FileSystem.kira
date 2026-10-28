@@ -1,0 +1,123 @@
+import Heap
+
+enum FileFailure {
+    Missing(String)
+    NotFile(String)
+    NotDirectory(String)
+    ReadFailed(String)
+    InvalidText(String)
+    WriteFailed(String)
+    CreateFailed(String)
+    RenameFailed(String)
+    RemoveFailed(String)
+    InvalidRange
+}
+
+struct FileContents {
+    let text: String
+    let size: Number
+}
+
+struct DirectoryListing {
+    let entries: [String]
+
+    function count() -> Number {
+        return Number(entries.count)
+    }
+
+    function entry(index: Number) -> String? {
+        if index < 0 || index >= entries.count { return .None }
+        return .Some(entries[index])
+    }
+}
+
+struct File {
+    let path: String
+
+    function isOpen() -> Bool {
+        return regularFileExists(path)
+    }
+
+    function readAll() -> Result<FileContents, FileFailure> {
+        return readFile(path)
+    }
+}
+
+function openFile(requested: borrow String) -> Result<File, FileFailure> {
+    let path = bundledReadPath(requested)
+    if !pathExists(path) { return .Error(.Missing(copy requested)) }
+    if !regularFileExists(path) { return .Error(.NotFile(copy requested)) }
+    return .Ok(File { path: move path })
+}
+
+function readFile(requested: borrow String) -> Result<FileContents, FileFailure> {
+    let path = bundledReadPath(requested)
+    if !pathExists(path) { return .Error(.Missing(copy requested)) }
+    if !regularFileExists(path) { return .Error(.NotFile(copy requested)) }
+    let size = sizeOfFile(path)
+    let bytes = fileBytes(path, 0, size)
+    if bytes.count != size { return .Error(.ReadFailed(copy requested)) }
+    match textFromBytes(bytes) {
+        Some(text) -> return .Ok(FileContents { text: text, size: size })
+        None -> return .Error(.InvalidText(copy requested))
+    }
+}
+
+function writeFile(path: borrow String, text: borrow String) -> Result<Void, FileFailure> {
+    if !writeChunks(path, text.data, text.count) { return .Error(.WriteFailed(copy path)) }
+    return .Ok
+}
+
+function fileExists(path: borrow String) -> Bool {
+    return regularFileExists(bundledReadPath(path))
+}
+
+function pathExists(path: borrow String) -> Bool {
+    return kernelPathExists(path.data, path.count) != 0
+}
+
+function isDirectory(path: borrow String) -> Bool {
+    return kernelIsDirectory(path.data, path.count) != 0
+}
+
+function makeDirectory(path: borrow String) -> Result<Void, FileFailure> {
+    if kernelMakeDirectory(path.data, path.count) == 0 { return .Error(.CreateFailed(copy path)) }
+    return .Ok
+}
+
+function renamePath(oldPath: borrow String, newPath: borrow String) -> Result<Void, FileFailure> {
+    if kernelRenamePath(oldPath.data, oldPath.count, newPath.data, newPath.count) == 0 {
+        return .Error(.RenameFailed(copy oldPath))
+    }
+    return .Ok
+}
+
+function removePath(path: borrow String) -> Result<Void, FileFailure> {
+    if kernelRemovePath(path.data, path.count) == 0 { return .Error(.RemoveFailed(copy path)) }
+    return .Ok
+}
+
+function fileSize(requested: borrow String) -> Result<Number, FileFailure> {
+    let path = bundledReadPath(requested)
+    if !pathExists(path) { return .Error(.Missing(copy requested)) }
+    if !regularFileExists(path) { return .Error(.NotFile(copy requested)) }
+    return .Ok(Number(sizeOfFile(path)))
+}
+
+function listDirectory(path: borrow String) -> Result<DirectoryListing, FileFailure> {
+    if !pathExists(path) { return .Error(.Missing(copy path)) }
+    if !isDirectory(path) { return .Error(.NotDirectory(copy path)) }
+    return .Ok(DirectoryListing { entries: directoryEntries(path) })
+}
+
+function readFileRange(
+    requested: borrow String,
+    offset: Number,
+    count: Number
+) -> Result<[UN8], FileFailure> {
+    if offset < 0 || count < 0 { return .Error(.InvalidRange) }
+    let path = bundledReadPath(requested)
+    if !pathExists(path) { return .Error(.Missing(copy requested)) }
+    if !regularFileExists(path) { return .Error(.NotFile(copy requested)) }
+    return .Ok(fileBytes(path, offset, count))
+}

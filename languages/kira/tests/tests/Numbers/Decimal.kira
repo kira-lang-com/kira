@@ -1,0 +1,74 @@
+import Foundation
+
+// The exact decimal `Number`: construction from String and Float; the four
+// arithmetic operators; the orderings and equality; and the conversions out.
+// The headline case is `0.1 + 0.2`, which is `0.3`, not a binary float's
+// `0.30000000000000004`.
+
+@Test
+function decimalAdditionIsExact() {
+    expect!((Number("0.1") + Number("0.2")) == (Number("0.3")))
+    expect!((String(Number("0.1") + Number("0.2"))) == ("0.3"))
+}
+
+@Test
+function decimalSubtractionIsExact() {
+    expect!((Number("0.3") - Number("0.1")) == (Number("0.2")))
+    expect!((Number("3") - Number("0.5")) == (Number("2.5")))
+}
+
+@Test
+function decimalMultiplicationAndDivision() {
+    expect!((Number("7") * Number("1.5")) == (Number("10.5")))
+    expect!((Number("1") / Number("4")) == (Number("0.25")))
+    expect!((trunc(Number("7") * Number("1.5"))) == (10))
+}
+
+@Test
+function decimalTrailingZerosAreEqual() {
+    expect!((Number("1.0")) == (Number("1.00")))
+    expect!((Number("100")) == (Number("100.000")))
+}
+
+@Test
+function decimalOrderingFollowsTheValue() {
+    expect!(Number("2.5") < Number("2.51"))
+    expect!(Number("2.51") > Number("2.5"))
+    expect!(Number("2.5") <= Number("2.50"))
+    expect!(Number("2.5") >= Number("2.50"))
+    expect!(Number("1") != Number("2"))
+    expect!(!(Number("5") < Number("5")))
+}
+
+@Test
+function decimalConversionTruncatesTowardZero() {
+    expect!((trunc(Number("9.99"))) == (9))
+    expect!((trunc(Number("-9.99"))) == (-9))
+    expect!((Number(42)) == (Number("42")))
+    expect!((String(Number("0.1") + Number("0.2"))) == ("0.3"))
+}
+
+@Test
+function decimalShortestFormDropsTrailingZeros() {
+    expect!((String(Number("1.00"))) == ("1"))
+    expect!((String(Number("2.50"))) == ("2.5"))
+}
+
+@Test
+function decimalMixedScaleSumLands() {
+    expect!((Number("10") + Number("0.000000000000000000")) == (Number("10")))
+}
+
+@Test
+function decimalMinimumReadsBackAsItself() {
+    expect!((String(Number("-9223372036854775808"))) == ("-9223372036854775808"))
+}
+
+// A literal fraction is the decimal it is written as. A Float variable holds
+// the binary value, and its Number is the nearest decimal to that value.
+@Test
+function floatVariableIsNotTheWrittenDecimal() {
+    let binary: Float = 0.1
+    expect!(Number(binary) != Number("0.1"))
+    expect!(Number(0.1) == Number("0.1"))
+}

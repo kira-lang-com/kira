@@ -1,0 +1,189 @@
+// The structural three-way order, as Kira's runtime walks it: -1, 0 or 1. A
+// signed integer orders by value, a float by the ordered comparisons, so a
+// NaN orders equal to everything, a boolean `false` before `true`, and a
+// string by its bytes. A struct orders by its first differing field in
+// declaration order, an array element by element and then by length, and an
+// enum by variant and then payload. A struct or an enum orders in its own
+// helper, so a recursive type is walked by calls.
+
+extend FunctionLowering {
+    function orderValues(borrow mut self, left: KirAddress, right: KirAddress, valueType: Type) -> KirValue {
+        match valueType.kind {
+            Integer -> return threeWay(kir.load(left), kir.load(right), valueType.signed)
+            Decimal -> return kir.integer(types.integer64, 0)
+            Floating -> {
+                let less = kir_value_float_compare(kir, kirPredicate(.Less, true), kir.load(left), kir.load(right))
+                let greater = kir_value_float_compare(kir, kirPredicate(.Greater, true), kir.load(left), kir.load(right))
+                return signOf(less, greater)
+            }
+            Boolean -> return threeWay(kir.load(left), kir.load(right), false)
+            Pointer -> {
+                let first = kir.convert(convertBitcast, kir.load(left), types.integer64)
+                let second = kir.convert(convertBitcast, kir.load(right), types.integer64)
+                return threeWay(first, second, false)
+            }
+            Void -> return kir.integer(types.integer64, 0)
+            Invalid -> return kir.integer(types.integer64, 0)
+            Enumeration -> return orderingHelperCall(left, right, valueType)
+            Structure -> {
+                // A `Number` orders by value, not by its words.
+                if program.isNumberWords(valueType) {
+                    kir.argument(kir.pointer(left))
+                    kir.argument(kir.pointer(right))
+                    return kir.call(functions[program.numberFunctions[1]], types.integer64)
+                }
+                return orderingHelperCall(left, right, valueType)
+            }
+        }
+    }
+
+    function orderingHelperCall(borrow mut self, left: KirAddress, right: KirAddress, valueType: Type) -> KirValue {
+        kir.argument(kir.pointer(left))
+        kir.argument(kir.pointer(right))
+        return kir.call(types.orderings[types.helperIndex(program, valueType)], types.integer64)
+    }
+
+    function threeWay(borrow mut self, left: KirValue, right: KirValue, signed: Bool) -> KirValue {
+        return signOf(kir.compare(kirPredicate(.Less, signed), left, right), kir.compare(kirPredicate(.Greater, signed), left, right))
+    }
+
+    // `greater - less`, the sign the two comparisons of one pair answer.
+    function signOf(borrow mut self, less: KirValue, greater: KirValue) -> KirValue {
+        let below = kir.convert(convertZeroExtend, less, types.integer64)
+        let above = kir.convert(convertZeroExtend, greater, types.integer64)
+        return kir.binary(kirOperator(.Subtract, true), false, true, above, below)
+    }
+
+    function orderNominalBody(borrow mut self, left: KirAddress, right: KirAddress, valueType: Type) -> KirValue {
+        if isStringType(program, valueType) {
+            kir.argument(kir.pointer(left))
+            kir.argument(kir.pointer(right))
+            return kir.call(functions[program.stringFunctions[6]], types.integer64)
+        }
+        if isArrayType(program, valueType) { return orderArrayBody(left, right, valueType) }
+        if valueType.kind == .Enumeration { return orderEnumBody(left, right, valueType) }
+        let fields = program.structs[valueType.declaration].fields
+        let result = temporary(Type.int())
+        kir.store(kir.integer(types.integer64, 0), result)
+        let done = kir.block()
+        for index in 0..comparedFields(program, valueType) {
+            let fieldType = fields[index].valueType
+            let sign = orderValues(kir.field(left, index, types.of(fieldType)), kir.field(right, index, types.of(fieldType)), fieldType)
+            kir.store(sign, result)
+            let next = kir.block()
+            kir.branchIf(kir.compare(kirPredicate(.Equal, false), sign, kir.integer(types.integer64, 0)), next, done)
+            enter(next)
+        }
+        flowInto(done)
+        enter(done)
+        return kir.load(result)
+    }
+
+    function orderArrayBody(borrow mut self, left: KirAddress, right: KirAddress, arrayType: Type) -> KirValue {
+        let length = kir.load(kir.field(left, 1, types.integer64))
+        let otherLength = kir.load(kir.field(right, 1, types.integer64))
+        let result = temporary(Type.int())
+        kir.store(threeWay(length, otherLength, true), result)
+        let shorter = kir.compare(kirPredicate(.Less, true), length, otherLength)
+        let shared = temporary(Type.int())
+        kir.store(otherLength, shared)
+        let keepLeft = kir.block()
+        let walk = kir.block()
+        kir.branchIf(shorter, keepLeft, walk)
+        enter(keepLeft)
+        kir.store(length, shared)
+        flowInto(walk)
+        enter(walk)
+        let counter = temporary(Type.int())
+        kir.store(kir.integer(types.integer64, 0), counter)
+        let test = kir.block()
+        let body = kir.block()
+        let differs = kir.block()
+        let done = kir.block()
+        flowInto(test)
+        enter(test)
+        let index = kir.load(counter)
+        kir.branchIf(kir.compare(kirPredicate(.Less, true), index, kir.load(shared)), body, done)
+        enter(body)
+        let elementType = program.structs[arrayType.declaration].typeArguments[0]
+        let sign = orderValues(arrayElement(left, arrayType, index), arrayElement(right, arrayType, index), elementType)
+        kir.store(kir.binary(kirOperator(.Add, true), false, true, index, kir.integer(types.integer64, 1)), counter)
+        let same = kir.compare(kirPredicate(.Equal, false), sign, kir.integer(types.integer64, 0))
+        kir.branchIf(same, test, differs)
+        enter(differs)
+        kir.store(sign, result)
+        flowInto(done)
+        enter(done)
+        return kir.load(result)
+    }
+
+    function orderEnumBody(borrow mut self, left: KirAddress, right: KirAddress, valueType: Type) -> KirValue {
+        let result = temporary(Type.int())
+        let tagSign = threeWay(kir.tag(left), kir.tag(right), false)
+        kir.store(tagSign, result)
+        let variants = program.enums[valueType.declaration].variants
+        if !carriesPayload(program, valueType) { return kir.load(result) }
+        let dispatch = kir.block()
+        let done = kir.block()
+        kir.branchIf(kir.compare(kirPredicate(.Equal, false), tagSign, kir.integer(types.integer64, 0)), dispatch, done)
+        enter(dispatch)
+        var blocks: [KirBlockBuilder] = []
+        for index in 0..variants.count {
+            let block = kir.block()
+            blocks.append(block)
+            kir.switchCase(index, block)
+        }
+        kir.switchEnum(left)
+        for index in 0..variants.count {
+            enter(blocks[index])
+            match variants[index].payload {
+                Some(payload) -> kir.store(orderValues(payloadPlace(left, valueType, index), payloadPlace(right, valueType, index), payload), result)
+                None -> {}
+            }
+            flowInto(done)
+        }
+        enter(done)
+        return kir.load(result)
+    }
+
+    // The payload-less variant at index `code` of `enumType`, the first for
+    // an index out of range.
+    function enumFromCode(borrow mut self, code: KirValue, enumType: Type) -> KirAddress {
+        let made = temporary(enumType)
+        if program.enums[enumType.declaration].open {
+            kir.store(kir.convert(convertTruncate, code, types.integer32), kir_address_cast(kir, made, types.integer32))
+            return made
+        }
+        kir.inject(made, 0)
+        let variants = program.enums[enumType.declaration].variants
+        let done = kir.block()
+        for index in 1..variants.count {
+            let chosen = kir.block()
+            let next = kir.block()
+            kir.branchIf(kir.compare(kirPredicate(.Equal, false), code, kir.integer(types.integer64, index)), chosen, next)
+            enter(chosen)
+            kir.inject(made, index)
+            flowInto(done)
+            enter(next)
+        }
+        flowInto(done)
+        enter(done)
+        return made
+    }
+}
+
+function lowerOrderingHelper(program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder], valueType: Type) {
+    let helper = types.orderings[types.helperIndex(program, valueType)]
+    var order = FunctionLowering.startChecked(program, types, functions, helperChecked(helperSpan(program, valueType), Type.int()), helper)
+    let body = order.kir.block()
+    order.enter(body)
+    if uninhabited(program, valueType) {
+        order.kir.unreachable()
+    } else {
+        let left = order.kir.memory(order.kir.parameter(0), types.of(valueType))
+        let right = order.kir.memory(order.kir.parameter(1), types.of(valueType))
+        order.kir.returnValue(order.orderNominalBody(left, right, valueType))
+    }
+    order.kir.switchTo(order.entry)
+    order.kir.branch(body)
+}

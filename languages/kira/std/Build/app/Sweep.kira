@@ -1,0 +1,494 @@
+import Foundation
+import Kten
+
+// Clearing the shared cache of what no project needs (DESIGN.md section
+// 6.1.1). A project needs the record of each action's last run there and the
+// files of every artifact those runs read or made; whatever no project needs
+// goes at the end of a build.
+
+namespace SweepNames {
+    let projects: String = "projects"
+    let running: String = "running"
+    let lock: String = "sweep"
+    // The bytes kept since the last full sweep.
+    let unswept: String = "unswept"
+}
+
+// How much the store keeps before a build looks for what no project needs.
+// Finding that reads the listing of every tree a project needs, seconds a
+// build would otherwise spend on every edit; the garbage is bounded by this
+// instead.
+let sweepAfterBytes: Number = 268435456
+
+// What one project needs of the shared cache.
+struct Needs {
+    var keys: [String] = []
+    var made: [Made] = []
+}
+
+// The file's exclusive lock, held while the answered handle stays open, or
+// nothing when another holds it and `wait` is off.
+function holdLock(path: borrow String, wait: Bool) -> Result<FileHandle?, BuildFailure> {
+    let file = match openFileHandle(path, .ReadWrite) {
+        Ok(opened) -> opened
+        Error(failure) -> return .Error(.Files("cannot open \(path): \(traceText(failure))"))
+    }
+    return match file.lock(wait) {
+        Ok(held) -> {
+            if held { return .Ok(.Some(file)) }
+            match file.close() {
+                Ok -> {}
+                Error(failure) -> absorb failure
+            }
+            return .Ok(.None)
+        }
+        Error(failure) -> .Error(.Files("cannot lock \(path): \(traceText(failure))"))
+    }
+}
+
+// What the needs of the project at `root` are kept under.
+function projectName(root: borrow String) -> Result<String, BuildFailure> {
+    return sha256Hex(root.utf8())
+}
+
+// The artifact a `File` or `Tree` case of a `last/` entry names.
+function madeOfKten(value: borrow Kten) -> Made? {
+    let variant = match value.variant() {
+        Ok(found) -> found
+        Error(failure) -> {
+            absorb failure
+            return .None
+        }
+    }
+    if variant.payload.count == 0 { return .None }
+    let digest = match variant.payload[0].text() {
+        Ok(text) -> text
+        Error(failure) -> {
+            absorb failure
+            return .None
+        }
+    }
+    return match variant.name {
+        "File" -> .Some(Made { digest: digest, tree: false, mode: 0 })
+        "Tree" -> .Some(Made { digest: digest, tree: true, mode: 0 })
+        else -> .None
+    }
+}
+
+// What the project whose state is `state` needs: from `last/`, which holds
+// an entry for each action of its graph that ran or was found in the cache.
+function needsOf(state: borrow String) -> Needs {
+    var needs = Needs {}
+    let directory = joinPath(state, "last")
+    let names = match listDirectory(directory) {
+        Ok(listing) -> copy listing.entries
+        Error(failure) -> {
+            absorb failure
+            return needs
+        }
+    }
+    for name in names {
+        let last = match readKtenFile(joinPath(directory, name)) {
+            Ok(read) -> read
+            Error(failure) -> {
+                absorb failure
+                continue
+            }
+        }
+        match ktenTextField(last, "key") {
+            Some(key) -> needs.keys.append(key)
+            None -> continue
+        }
+        let inputs = match last.field("inputs") {
+            Ok(list) -> match list.items() {
+                Ok(found) -> found
+                Error(failure) -> continue
+            }
+            Error(failure) -> continue
+        }
+        for item in inputs {
+            match item.field("input") {
+                Ok(input) -> match madeOfKten(input) {
+                    Some(made) -> needs.made.append(made)
+                    None -> {}
+                }
+                Error(failure) -> absorb failure
+            }
+        }
+    }
+    return needs
+}
+
+function needsKten(root: borrow String, needs: borrow Needs) -> Kten {
+    var keys: [Kten] = []
+    for key in needs.keys { keys.append(.Text(copy key)) }
+    var made: [Kten] = []
+    for known in needs.made {
+        let kind = known.tree ? "Tree" : "File"
+        made.append(ktenCase(kind, [.Text(copy known.digest)]))
+    }
+    return ktenObject(
+        "Project",
+        [
+            ktenField("root", .Text(copy root)),
+            ktenField("keys", .List(keys)),
+            ktenField("made", .List(made))
+        ]
+    )
+}
+
+extend ContentStore {
+    // Marks a build of `project` as working in the cache for as long as the
+    // answered handle stays open: no sweep starts while one is. The mark is
+    // taken under the sweep lock, so it waits out a sweep at work.
+    function markRunning(borrow self, project: borrow String) -> Result<FileHandle, BuildFailure> {
+        let name = match projectName(project) {
+            Ok(hex) -> hex
+            Error(failure) -> return .Error(failure)
+        }
+        let directory = joinPath(self.root, SweepNames.running)
+        match makePathTree(directory) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        let sweep = match holdLock(joinPath(self.root, SweepNames.lock), true) {
+            Ok(held) -> held
+            Error(failure) -> return .Error(failure)
+        }
+        let mark = holdLock(joinPath(directory, name), true)
+        match sweep {
+            Some(held) -> {
+                match held.close() {
+                    Ok -> {}
+                    Error(failure) -> absorb failure
+                }
+            }
+            None -> {}
+        }
+        return match mark {
+            Ok(held) -> match held {
+                Some(file) -> .Ok(file)
+                None -> .Error(.Files("cannot mark \(project) as building"))
+            }
+            Error(failure) -> .Error(failure)
+        }
+    }
+
+    // Keeps what `project` needs now, lets its mark go, and removes what no
+    // project needs, unless another build is at work.
+    function sweep(
+        borrow self,
+        project: borrow String,
+        state: borrow String,
+        mark: borrow FileHandle
+    ) {
+        match keepNeeds(project, state) {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+        match mark.close() {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+        let lock = match holdLock(joinPath(self.root, SweepNames.lock), false) {
+            Ok(held) -> match held {
+                Some(file) -> file
+                None -> return
+            }
+            Error(failure) -> {
+                absorb failure
+                return
+            }
+        }
+        if !othersRunning() && unsweptBytes() >= sweepAfterBytes {
+            removeUnneeded()
+            match removePath(joinPath(self.root, SweepNames.unswept)) {
+                Ok -> {}
+                Error(failure) -> absorb failure
+            }
+        }
+        match lock.close() {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+    }
+
+    // Counts `bytes` just kept toward the next full sweep.
+    function noteKept(borrow self, bytes: Number) {
+        let total = unsweptBytes() + bytes
+        match writeKtenFile(
+            joinPath(self.root, SweepNames.unswept),
+            ktenObject("Unswept", [ktenField("bytes", .Number(total))])
+        ) {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+    }
+
+    function unsweptBytes(borrow self) -> Number {
+        // None kept since the last full sweep, which removed the count.
+        let path = joinPath(self.root, SweepNames.unswept)
+        if !fileExists(path) { return 0 }
+        return match readKtenFile(path) {
+            Ok(kept) -> ktenNumberField(kept, "bytes").or(0)
+            Error(failure) -> {
+                absorb failure
+                0
+            }
+        }
+    }
+
+    function keepNeeds(
+        borrow self,
+        project: borrow String,
+        state: borrow String
+    ) -> Result<Void, BuildFailure> {
+        let name = match projectName(project) {
+            Ok(hex) -> hex
+            Error(failure) -> return .Error(failure)
+        }
+        let directory = joinPath(self.root, SweepNames.projects)
+        match makePathTree(directory) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        let path = joinPath(directory, name)
+        let part = path + ".part"
+        match writeKtenFile(part, needsKten(project, needsOf(state))) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        return match renamePath(part, path) {
+            Ok -> .Ok
+            Error(failure) -> .Error(.Files("cannot keep \(path): \(traceText(failure))"))
+        }
+    }
+
+    // Whether a build holds its mark. Called under the sweep lock, which a
+    // build takes before marking.
+    function othersRunning(borrow self) -> Bool {
+        let directory = joinPath(self.root, SweepNames.running)
+        let names = match listDirectory(directory) {
+            Ok(listing) -> copy listing.entries
+            Error(failure) -> {
+                absorb failure
+                return false
+            }
+        }
+        for name in names {
+            match holdLock(joinPath(directory, name), false) {
+                Ok(held) -> match held {
+                    Some(file) -> {
+                        match file.close() {
+                            Ok -> {}
+                            Error(failure) -> absorb failure
+                        }
+                    }
+                    None -> return true
+                }
+                Error(failure) -> {
+                    absorb failure
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    // The needs every project kept, dropping those of a project whose state
+    // is gone.
+    function keptNeeds(borrow self) -> [Needs] {
+        let directory = joinPath(self.root, SweepNames.projects)
+        let names = match listDirectory(directory) {
+            Ok(listing) -> copy listing.entries
+            Error(failure) -> {
+                absorb failure
+                return []
+            }
+        }
+        var every: [Needs] = []
+        for name in names {
+            let path = joinPath(directory, name)
+            let kept = match readKtenFile(path) {
+                Ok(read) -> read
+                Error(failure) -> {
+                    absorb failure
+                    match removePath(path) {
+                        Ok -> {}
+                        Error(failure) -> absorb failure
+                    }
+                    continue
+                }
+            }
+            let root = ktenTextField(kept, "root").or("")
+            if root.count == 0 || !isDirectory(joinPath(root, ".kira-build")) {
+                match removePath(path) {
+                    Ok -> {}
+                    Error(failure) -> absorb failure
+                }
+                continue
+            }
+            var needs = Needs {}
+            match kept.field("keys") {
+                Ok(list) -> match list.items() {
+                    Ok(items) -> {
+                        for item in items {
+                            match item.text() {
+                                Ok(key) -> needs.keys.append(key)
+                                Error(failure) -> absorb failure
+                            }
+                        }
+                    }
+                    Error(failure) -> absorb failure
+                }
+                Error(failure) -> absorb failure
+            }
+            match kept.field("made") {
+                Ok(list) -> match list.items() {
+                    Ok(items) -> {
+                        for item in items {
+                            match madeOfKten(item) {
+                                Some(made) -> needs.made.append(made)
+                                None -> {}
+                            }
+                        }
+                    }
+                    Error(failure) -> absorb failure
+                }
+                Error(failure) -> absorb failure
+            }
+            every.append(needs)
+        }
+        return every
+    }
+
+    // Marks `made` and, for a tree, its files, as needed, and the tree as
+    // still verified when its listing was read and every file kept.
+    function keepMade(
+        borrow self,
+        made: borrow Made,
+        blobs: borrow mut Map<String, Bool>,
+        verified: borrow mut Map<String, Bool>
+    ) {
+        if blobs.value(made.digest).or(false) { return }
+        blobs.set(copy made.digest, true)
+        if !made.tree { return }
+        match treeEntries(made.digest) {
+            Ok(entries) -> {
+                for entry in entries {
+                    if entry.kind == .File { blobs.set(copy entry.content, true) }
+                }
+                verified.set(copy made.digest, true)
+            }
+            Error(failure) -> absorb failure
+        }
+    }
+
+    function removeUnneeded(borrow self) {
+        var records = Map<String, Bool>()
+        var blobs = Map<String, Bool>()
+        var verified = Map<String, Bool>()
+        var retained = keptNeeds()
+        match pinnedNeeds() {
+            Ok(pins) -> retained.appendAll(pins)
+            Error(failure) -> {
+                printError("kira build: cache collection stopped: \(failureText(failure))")
+                return
+            }
+        }
+        for needs in retained {
+            for made in needs.made { keepMade(made, blobs, verified) }
+            for key in needs.keys {
+                if records.value(key).or(false) { continue }
+                records.set(copy key, true)
+                match readKtenFile(recordPath(key)) {
+                    Ok(record) -> match record.field("outputs") {
+                        Ok(list) -> match list.items() {
+                            Ok(items) -> {
+                                for item in items {
+                                    let made = Made {
+                                        digest: ktenTextField(item, "digest").or(""),
+                                        tree: ktenTextField(item, "kind").or("") == "tree",
+                                        mode: 0
+                                    }
+                                    keepMade(made, blobs, verified)
+                                }
+                            }
+                            Error(failure) -> absorb failure
+                        }
+                        Error(failure) -> absorb failure
+                    }
+                    Error(failure) -> absorb failure
+                }
+            }
+        }
+        removeOthers(joinPath(root, "actions"), records)
+        removeOthers(joinPath(root, "store"), blobs)
+        removeOthers(joinPath(root, "verified"), verified)
+        removeActionVariants(root, records)
+        removeUnusedViews(root, blobs)
+        dropLoneMarks()
+    }
+
+    // Removes the running mark of each project that needs nothing any more.
+    // Called under the sweep lock, with no mark held.
+    function dropLoneMarks(borrow self) {
+        let directory = joinPath(root, SweepNames.running)
+        let names = match listDirectory(directory) {
+            Ok(listing) -> copy listing.entries
+            Error(failure) -> {
+                absorb failure
+                return
+            }
+        }
+        for name in names {
+            if pathExists(joinPath(joinPath(root, SweepNames.projects), name)) { continue }
+            match removePath(joinPath(directory, name)) {
+                Ok -> {}
+                Error(failure) -> absorb failure
+            }
+        }
+    }
+}
+
+// Removes every file under the store directory `directory` whose name is
+// not in `kept`, and each subdirectory left empty.
+function removeOthers(directory: borrow String, kept: borrow Map<String, Bool>) {
+    let prefixes = match listDirectory(directory) {
+        Ok(listing) -> copy listing.entries
+        Error(failure) -> {
+            absorb failure
+            return
+        }
+    }
+    for prefix in prefixes {
+        let subdirectory = joinPath(directory, prefix)
+        let names = match listDirectory(subdirectory) {
+            Ok(listing) -> copy listing.entries
+            Error(failure) -> {
+                absorb failure
+                continue
+            }
+        }
+        var left = 0
+        for name in names {
+            if kept.value(prefix + name).or(false) {
+                left += 1
+                continue
+            }
+            match removePath(joinPath(subdirectory, name)) {
+                Ok -> {}
+                Error(failure) -> {
+                    absorb failure
+                    left += 1
+                }
+            }
+        }
+        if left == 0 {
+            match removePath(subdirectory) {
+                Ok -> {}
+                Error(failure) -> absorb failure
+            }
+        }
+    }
+}

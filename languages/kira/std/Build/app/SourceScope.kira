@@ -1,0 +1,36 @@
+import Foundation
+
+// A command opts into source relocation by naming the root of its source
+// hierarchy. Paths outside it retain their absolute identity.
+function relativeSourcePath(path: borrow String, root: borrow String) -> String? {
+    if root.count == 0 { return .None }
+    let full = plainPath(path)
+    let scope = plainPath(root)
+    if full == scope { return .Some(".") }
+    let prefix = scope == "/" ? "/" : scope + "/"
+    if !full.startsWith(prefix) { return .None }
+    return .Some(full.substring(prefix.count, full.count))
+}
+
+function commandSourcePath(
+    graph: borrow Graph,
+    command: borrow CommandAction,
+    path: borrow String
+) -> Result<String, BuildFailure> {
+    if command.sourceRoot.count == 0 { return .Ok(copy path) }
+    let root = try physicalPath(joinPath(graph.root, command.sourceRoot))
+    let source = try physicalPath(path)
+    // The marker distinguishes scoped paths from external absolute paths.
+    match relativeSourcePath(source, root) {
+        Some(relative) -> return .Ok("source:" + relative)
+        None -> return .Ok(copy path)
+    }
+}
+
+function actionSourceRoot(graph: borrow Graph, action: Number) -> Result<String, BuildFailure> {
+    return match graph.actions[action] {
+        Run(command) -> command.sourceRoot.count == 0
+            ? .Ok("") : physicalPath(joinPath(graph.root, command.sourceRoot))
+        Native(native) -> .Ok("")
+    }
+}

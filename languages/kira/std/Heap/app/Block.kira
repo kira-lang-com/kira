@@ -1,0 +1,100 @@
+// A block of bytes on the heap that its holder owns: it is freed once, when
+// its last holder lets it go. Hand one over with `move` and lend it with
+// `borrow`; copying one is an error. Every read and write is checked against
+// the block's bounds through its `view`.
+struct ByteBlock: Drop {
+    var start: RawPtr
+    var count: Int
+    var alignment: Int
+
+    function view(borrow self) -> MemoryView {
+        return MemoryView { start = self.start, count = self.count }
+    }
+
+    function pointer(borrow self) -> RawPtr {
+        return self.start
+    }
+
+    function layout(borrow self) -> MemoryLayout {
+        return MemoryLayout { size = self.count, alignment = self.alignment }
+    }
+
+    // The block grown or shrunk to `count` bytes, keeping the bytes both
+    // sizes share. Bytes it grows by are zero.
+    function resize(borrow mut self, count: Int) {
+        if count == self.count { return }
+        let grown = reallocate(self.start, self.layout(), count)
+        if count > self.count {
+            heapFillBytes(heapOffset(grown, self.count), U8(0), count - self.count)
+        }
+        self.start = grown
+        self.count = count
+    }
+
+    // A second block holding the same bytes.
+    function duplicate(borrow self) -> ByteBlock {
+        let copy = allocate(self.layout())
+        heapCopyBytes(copy, self.start, self.count)
+        return ByteBlock { start = copy, count = self.count, alignment = self.alignment }
+    }
+
+    // The memory handed to the caller, who frees it with `deallocate`; the
+    // block is left empty and frees nothing.
+    function release(borrow mut self) -> RawPtr {
+        let owned = self.start
+        self.start = allocate(memoryLayout(0, 1))
+        self.count = 0
+        self.alignment = 1
+        return owned
+    }
+
+    function drop(borrow mut self) {
+        heapFreeRaw(self.start)
+    }
+}
+
+// A block of `count` zero bytes on `alignment`.
+function zeroedBlock(count: Int, alignment: Int) -> ByteBlock {
+    let layout = memoryLayout(count, alignment)
+    return ByteBlock { start = allocateZeroed(layout), count = count, alignment = alignment }
+}
+
+// A block whose bytes are left as they were; for a block about to be
+// written over in full.
+function uninitializedBlock(count: Int, alignment: Int) -> ByteBlock {
+    let layout = memoryLayout(count, alignment)
+    return ByteBlock { start = allocate(layout), count = count, alignment = alignment }
+}
+
+// A block holding a copy of `count` bytes at `source`.
+function blockCopying(source: RawPtr, count: Int) -> ByteBlock {
+    requireRange(source, count)
+    let block = uninitializedBlock(count, 16)
+    heapCopyBytes(block.start, source, count)
+    return move block
+}
+
+// Memory taken over from a caller who allocated it with `allocate`: the
+// block frees it.
+function adoptBlock(start: RawPtr, count: Int, alignment: Int) -> ByteBlock {
+    if isNull(start) { runtimeTrap() }
+    requireRange(start, count)
+    let layout = memoryLayout(count, alignment)
+    return ByteBlock { start = start, count = layout.size, alignment = layout.alignment }
+}
+
+function blockLoad<T>(block: borrow ByteBlock, at: Int) -> T {
+    requireWithin(block.count, at, sizeOf<T>())
+    return heapLoad<T>(block.start, at)
+}
+
+function blockStore<T>(block: borrow ByteBlock, at: Int, value: T) {
+    requireWithin(block.count, at, sizeOf<T>())
+    heapStore<T>(block.start, at, value)
+}
+
+// A zeroed block sized for `count` values of `T` on `T`'s alignment.
+function blockOf<T>(count: Int) -> ByteBlock {
+    let layout = arrayLayout<T>(count)
+    return zeroedBlock(layout.size, layout.alignment)
+}

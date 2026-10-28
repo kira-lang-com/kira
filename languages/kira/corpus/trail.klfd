@@ -1,0 +1,76 @@
+construct Trail() extends Corpus {
+    let cases: [CorpusCase] = [
+        CorpusCase {
+            name = "log-records-lazily",
+            sources = ["packages/trail"],
+            stdout = "info[Case.main]: starting\n  --> app/main.kira:23:5\n   = name: \"hull\"\ninfo[Case.main]: done\n  --> app/main.kira:26:5\n   = total: 72\n   = ratio: 0.5\n   = open: false\n   = first: 1\n1\n",
+            exit = 72
+        },
+        CorpusCase {
+            name = "exit-function-after-trap",
+            sources = ["packages/trail-ending"],
+            stdout = "1\n10\n",
+            exit = 1
+        },
+        CorpusCase {
+            name = "unknown-log-level",
+            sources = ["packages/trail-errors"],
+            accept = false,
+            diagnostics = ["2094:3"]
+        },
+        CorpusCase {
+            name = "exit-function-signature",
+            sources = ["packages/exit-function-errors"],
+            accept = false,
+            diagnostics = ["3393:2"]
+        },
+        CorpusCase {
+            name = "trace-text-shapes",
+            sources = ["packages/trail-trace"],
+            stdout = "42\n1.0\ntrue\n\"tab\\there \\\"quoted\\\"\"\nPoint { x: 2.5, y: 3 }\n[1, 2, 3, … 2 more]\n[]\nShape.Dot(Point { x: 0.5, y: 1 })\nShape.Empty\nMesh(name: \"hull\", vertices: 2)\nShape.Hull(Mesh \"empty\" (name: \"bare\"))\nOuter { deep: Deep { inner: Inner { point: Point { … } } } }\nHolding(7)\n\"abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd…\" (120 bytes)\n",
+            exit = 0
+        },
+        CorpusCase {
+            name = "failure-paths-keep-their-values",
+            sources = ["packages/trail-failures"],
+            stdout = "100\nhandled[Case.main]: handled Truncated\n  --> app/main.kira:34:9\n   |\n34 |         Truncated { return .Error(.TruncatedHeader) }\n   |         ^^^^^^^^^ handled here\n   = failure: InflateFailure.Truncated\n   |\n  ::: app/main.kira:24:20\n   |\n24 |     if size < 10 { return .Error(.Truncated) }\n   |                    ^^^^^^^^^^^^^^^^^^^^^^^^^ made here\n   = error: InflateFailure.Truncated\nabsorbed[Case.main]: fell back to `0`\n  --> app/main.kira:45:18\n   |\n45 |     let loaded = try catalog(size) otherwise 0\n   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ absorbed here\n   = failure: CatalogError.TruncatedHeader\n   |\n  ::: app/main.kira:34:21\n   |\n34 |         Truncated { return .Error(.TruncatedHeader) }\n   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ converted here\n   = error: CatalogError.TruncatedHeader\n   |\n  ::: app/main.kira:34:9\n   |\n34 |         Truncated { return .Error(.TruncatedHeader) }\n   |         ^^^^^^^^^ handled here\n   = failure: InflateFailure.Truncated\n   |\n  ::: app/main.kira:24:20\n   |\n24 |     if size < 10 { return .Error(.Truncated) }\n   |                    ^^^^^^^^^^^^^^^^^^^^^^^^^ made here\n   = error: InflateFailure.Truncated\n0\n101\nhandled[Case.main]: handled Malformed\n  --> app/main.kira:35:9\n   |\n35 |         Malformed(byte) { return .Error(.Unreadable(stringFromInteger(byte))) }\n   |         ^^^^^^^^^ handled here\n   = failure: InflateFailure.Malformed(500)\n   |\n  ::: app/main.kira:25:21\n   |\n25 |     if size > 100 { return .Error(.Malformed(size)) }\n   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ made here\n   = error: InflateFailure.Malformed(500)\nabsorbed[Case.main]: fell back to `return 0 - 1`\n  --> app/main.kira:50:18\n   |\n50 |     let loaded = try catalog(size) otherwise return 0 - 1\n   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ absorbed here\n   = failure: CatalogError.Unreadable(\"500\")\n   |\n  ::: app/main.kira:35:27\n   |\n35 |         Malformed(byte) { return .Error(.Unreadable(stringFromInteger(byte))) }\n   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ converted here\n   = error: CatalogError.Unreadable(\"500\")\n   |\n  ::: app/main.kira:35:9\n   |\n35 |         Malformed(byte) { return .Error(.Unreadable(stringFromInteger(byte))) }\n   |         ^^^^^^^^^ handled here\n   = failure: InflateFailure.Malformed(500)\n   |\n  ::: app/main.kira:25:21\n   |\n25 |     if size > 100 { return .Error(.Malformed(size)) }\n   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ made here\n   = error: InflateFailure.Malformed(500)\n-1\nabsorbed[Case.main]: absorbed\n  --> app/main.kira:58:13\n   |\n58 |             absorb failure\n   |             ^^^^^^^^^^^^^^ absorbed here\n   = failure: InflateFailure.Malformed(500)\n   |\n  ::: app/main.kira:25:21\n   |\n25 |     if size > 100 { return .Error(.Malformed(size)) }\n   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ made here\n   = error: InflateFailure.Malformed(500)\n0\nhandled[Case.main]: handled Truncated\n  --> app/main.kira:34:9\n   |\n34 |         Truncated { return .Error(.TruncatedHeader) }\n   |         ^^^^^^^^^ handled here\n   = failure: InflateFailure.Truncated\n   |\n  ::: app/main.kira:24:20\n   |\n24 |     if size < 10 { return .Error(.Truncated) }\n   |                    ^^^^^^^^^^^^^^^^^^^^^^^^^ made here\n   = error: InflateFailure.Truncated\nCatalogError.TruncatedHeader\nhandled[Case.main]: handled Malformed\n  --> app/main.kira:35:9\n   |\n35 |         Malformed(byte) { return .Error(.Unreadable(stringFromInteger(byte))) }\n   |         ^^^^^^^^^ handled here\n   = failure: InflateFailure.Malformed(200)\n   |\n  ::: app/main.kira:25:21\n   |\n25 |     if size > 100 { return .Error(.Malformed(size)) }\n   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ made here\n   = error: InflateFailure.Malformed(200)\nCatalogError.Unreadable(\"200\")\nInflateFailure.Malformed(-4)\n",
+            exit = 0
+        },
+        CorpusCase {
+            name = "log-categories",
+            sources = ["packages/trail-categories"],
+            stdout = "info[Categories.main]: peer accepted\n  --> app/main.kira:41:5\n   = peer: 7\nwarn[Categories.main]: alert\n  --> app/main.kira:44:5\n   |\n44 |     log warn(category: Tls.Alerts, \"alert\", code: tally.counted(40))\n   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n   = code: 40\ntrace[Categories.main]: record\n  --> app/main.kira:47:5\n   = length: 13\n2\n",
+            exit = 2
+        },
+        CorpusCase {
+            name = "log-category-not-a-case",
+            sources = ["packages/trail-category-errors"],
+            accept = false,
+            diagnostics = ["2105:6"]
+        },
+        CorpusCase {
+            name = "log-category-wrong-enum",
+            sources = ["packages/trail-category-wrong-enum"],
+            accept = false,
+            diagnostics = ["3061:10"]
+        },
+        CorpusCase {
+            name = "log-control-api",
+            sources = ["packages/trail-control"],
+            stdout = "error\nerror\nok\nok\nok\ninfo[Control.main]: dns two\n  --> app/main.kira:39:5\n   = n: 3\nFoundation.diagnostics.Trail\nControl.Net.Tls\nControl.Net.Dns\n3\n",
+            exit = 0
+        },
+        CorpusCase {
+            name = "log-threads-smoke",
+            sources = ["packages/trail-threads"],
+            stdout = "400\n",
+            exit = 0
+        },
+        CorpusCase {
+            name = "discarded-failure",
+            sources = ["packages/trail-discarded"],
+            accept = false,
+            diagnostics = ["3394:17", "3394:21", "3394:25"]
+        }
+    ]
+}

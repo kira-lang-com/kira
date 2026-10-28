@@ -1,0 +1,70 @@
+import Foundation
+
+// The tar writer and the extractor: a long path is split across the ustar
+// name fields, a long name goes through a pax header, and a link unpacks as
+// a link to the same contents.
+
+@Test
+function tarRoundTripsLongPathsAndNames() {
+    let path = scratchPath("tar-round-trip.tar")
+    let root = scratchPath("tar-round-trip-root")
+    absorb removePath(path)
+    absorb removePath(root)
+    var deep = "d"
+    for index in 0..30 { deep = deep + "/s\(index)" }
+    var long = "n"
+    for index in 0..150 { long = long + "x" }
+    var writer = match createTarWriter(path) {
+        Ok(created) -> created
+        Error(failure) -> {
+            expect!((archiveFailureText(failure)) == "")
+            return
+        }
+    }
+    let added = [
+        writer.addDirectory(deep, 448),
+        writer.addFile(deep + "/f", 420, "deep\n".utf8()),
+        writer.addFile(long, 384, "long\n".utf8()),
+        writer.addLink("l", long)
+    ]
+    for result in added {
+        match result {
+            Ok -> {}
+            Error(failure) -> {
+                expect!((archiveFailureText(failure)) == "")
+                return
+            }
+        }
+    }
+    let length = match writer.finish() {
+        Ok(size) -> size
+        Error(failure) -> {
+            expect!((archiveFailureText(failure)) == "")
+            return
+        }
+    }
+    // Tar pads its output to 512-byte blocks.
+    expect!((length % 512) == (0))
+    match extractArchive(path, .Tar, root) {
+        Ok -> {}
+        Error(failure) -> {
+            expect!((archiveFailureText(failure)) == "")
+            return
+        }
+    }
+    let deepText = match readFile(root + "/" + deep + "/f") {
+        Ok(read) -> read.text.trim()
+        Error(failure) -> "?"
+    }
+    let longText = match readFile(root + "/" + long) {
+        Ok(read) -> read.text.trim()
+        Error(failure) -> "?"
+    }
+    let linked = match readFile(root + "/l") {
+        Ok(read) -> read.text.trim()
+        Error(failure) -> "?"
+    }
+    expect!((deepText) == "deep")
+    expect!((longText) == "long")
+    expect!((linked) == "long")
+}

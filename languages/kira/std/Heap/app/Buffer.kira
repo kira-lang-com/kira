@@ -1,0 +1,64 @@
+struct HeapBuffer {
+    var allocation: RawPtr
+}
+
+function makeHeapBuffer(byteCount: Int) -> HeapBuffer {
+    let allocation = heapAllocateRaw(byteCount + 16, 16)
+    heapWriteInt(allocation, 1)
+    heapWriteInt(heapOffset(allocation, 8), byteCount)
+    return HeapBuffer { allocation = allocation }
+}
+
+function heapBufferData(buffer: borrow HeapBuffer) -> RawPtr {
+    return heapOffset(buffer.allocation, 16)
+}
+
+function heapBufferSize(buffer: borrow HeapBuffer) -> Int {
+    return heapReadInt(heapOffset(buffer.allocation, 8))
+}
+
+// The count is shared by every thread that holds the buffer, so each change is
+// one atomic step. A read-modify-write of it can lose a count, and a buffer
+// freed while a copy still holds it is freed twice.
+function heapBufferIsUnique(buffer: borrow HeapBuffer) -> Bool {
+    return atomicLoad<Int>(buffer.allocation, .Acquire) == 1
+}
+
+function retainHeapBuffer(buffer: borrow HeapBuffer) -> HeapBuffer {
+    atomicAdd<Int>(buffer.allocation, 1, .Relaxed)
+    return HeapBuffer { allocation = buffer.allocation }
+}
+
+// The last release frees the buffer. Its acquire half orders every write the
+// other holders made before the free; its release half publishes this thread's
+// writes to the holders that release after it.
+function releaseHeapBuffer(buffer: borrow HeapBuffer) {
+    let previous = atomicSubtract<Int>(buffer.allocation, 1, .AcquireRelease)
+    if previous == 1 {
+        heapFreeRaw(buffer.allocation)
+    }
+}
+
+function cloneHeapBuffer(buffer: borrow HeapBuffer, byteCount: Int) -> HeapBuffer {
+    let replacement = makeHeapBuffer(byteCount)
+    let source = heapBufferData(buffer)
+    let destination = heapBufferData(replacement)
+    let oldSize = heapBufferSize(buffer)
+    let copied = oldSize < byteCount ? oldSize : byteCount
+    heapCopyBytes(destination, source, copied)
+    return replacement
+}
+
+function ensureUniqueHeapBuffer(buffer: borrow mut HeapBuffer) {
+    if heapReadInt(buffer.allocation) > 1 {
+        let replacement = cloneHeapBuffer(buffer, heapBufferSize(buffer))
+        releaseHeapBuffer(buffer)
+        buffer.allocation = replacement.allocation
+    }
+}
+
+function resizeHeapBuffer(buffer: borrow mut HeapBuffer, byteCount: Int) {
+    let replacement = cloneHeapBuffer(buffer, byteCount)
+    releaseHeapBuffer(buffer)
+    buffer.allocation = replacement.allocation
+}

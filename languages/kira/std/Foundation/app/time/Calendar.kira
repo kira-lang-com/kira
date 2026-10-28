@@ -1,0 +1,61 @@
+// Calendar dates in UTC on the proleptic Gregorian calendar, by Howard
+// Hinnant's civil-date algorithms, for every program that shows or reads a
+// date.
+
+namespace CivilTime {
+    let nanosecondsPerSecond: Number = 1000000000
+    let secondsPerMinute: Number = 60
+    let secondsPerHour: Number = 3600
+    let secondsPerDay: Number = 86400
+    // 1970-01-01 was a Thursday.
+    let epochWeekday: Number = 4
+}
+
+// A day on the calendar; `month` and `day` count from 1.
+struct CivilDate {
+    var year: Number
+    var month: Number
+    var day: Number
+
+    // The day number from 1970-01-01, negative before it.
+    function days(borrow self) -> Number {
+        let year = self.month <= 2 ? self.year - 1 : self.year
+        let era = floor(year / 400)
+        let yearOfEra = year - era * 400
+        let shiftedMonth = self.month > 2 ? self.month - 3 : self.month + 9
+        let dayOfYear = trunc((153 * shiftedMonth + 2) / 5) + self.day - 1
+        let dayOfEra = yearOfEra * 365 + trunc(yearOfEra / 4) - trunc(yearOfEra / 100) + dayOfYear
+        return era * 146097 + dayOfEra - 719468
+    }
+}
+
+// The civil date `days` days after 1970-01-01.
+function civilDate(days: Number) -> CivilDate {
+    let shifted = days + 719468
+    let era = floor(shifted / 146097)
+    let dayOfEra = shifted - era * 146097
+    let yearOfEra = trunc(
+        (
+            dayOfEra - trunc(dayOfEra / 1460) + trunc(dayOfEra / 36524) - trunc(dayOfEra / 146096)
+        ) / 365
+    )
+    let dayOfYear = dayOfEra - (365 * yearOfEra + trunc(yearOfEra / 4) - trunc(yearOfEra / 100))
+    let monthIndex = trunc((5 * dayOfYear + 2) / 153)
+    let day = dayOfYear - trunc((153 * monthIndex + 2) / 5) + 1
+    let month = monthIndex < 10 ? monthIndex + 3 : monthIndex - 9
+    return CivilDate { year: yearOfEra + era * 400 + (month <= 2 ? 1 : 0), month: month, day: day }
+}
+
+// The weekday of the day `days` after 1970-01-01, from 0 for Sunday to 6
+// for Saturday.
+function weekdayOf(days: Number) -> Number {
+    return days + CivilTime.epochWeekday - floor((days + CivilTime.epochWeekday) / 7) * 7
+}
+
+// `value`'s decimal digits after enough zeros to make `width` of them, as a
+// clock writes `09:05`.
+function zeroPadded(value: Number, width: Number) -> String {
+    var text = String(value)
+    while text.count < width { text = "0" + text }
+    return text
+}

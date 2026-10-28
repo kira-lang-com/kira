@@ -1,0 +1,284 @@
+// `package.kira`: the package's declaration, a construct extending `Package`.
+// A construct without arguments writes no parentheses. Kira's own spelling,
+// `Package Geometry { let kind = .Library }`, declares the same members
+// without their types, and ignores a member `Package` does not declare.
+//
+//     construct Geometry extends Package {
+//         let kind: PackageKind = .Library
+//         let moduleRoot: String = "Geometry"
+//         let dependencies: [Dependency] = [
+//             Dependency { name: "Numbers", path: "../numbers" }
+//         ]
+//     }
+//
+// `Package` declares every member with its default, so a package writes only
+// what it changes: `kind` is `.App`, `moduleRoot` is the construct's name,
+// `version` is empty and `dependencies` and `nativeLibraries` are `[]`. Each
+// member is typed; a member `Package` does not declare (4003) or one written
+// at another type (4004) is an error.
+//
+// `nativeLibraries` declares the C code a package's `@FFI` declarations
+// reach (`native-libraries.klfd`).
+//
+// A program reaches the operating system through services, never through
+// system calls of its own. `let systemCalls: Bool = true` is the one way a
+// package says it is the system itself, whose `@FFI.Syscall` declarations
+// make them (3409 anywhere else).
+
+struct Manifest {
+    let name: Identifier
+    let library: Bool
+    // What `import` spells to reach this package.
+    let moduleRoot: String
+    let version: String
+    let dependencies: [Dependency]
+    let nativeLibraries: [NativeLibrary]
+    // The files the program reads at run time, by their path in the package.
+    let assets: [String]
+    // Whether its `@FFI.Syscall` declarations may reach the kernel directly.
+    let systemCalls: Bool
+}
+
+
+enum DependencySource {
+    Path
+    Registry
+    Git
+}
+
+// A dependency, named by a string whose span `name` keeps for diagnostics.
+struct Dependency {
+    let name: Identifier
+    let source: DependencySource
+    let path: String
+    // The span of the `path` string, for the diagnostics that name it.
+    let pathSpan: Span
+}
+
+function readManifest(text: String, file: Int) -> Result<Manifest, Failure> {
+    var reader = Parser {
+        source = text,
+        tokens = try lex(text, file),
+        position = 0,
+        tree = SyntaxTree.empty(),
+        imports = [],
+        structLiterals = true, quotes = false, macroNames = [], handling = 0,
+        declared = false, excluded = false
+    }
+    return reader.manifest()
+}
+
+extend Parser {
+    // `construct Name extends Package { members }` or `Package Name {
+    // members }`, and nothing after it.
+    function manifest(borrow mut self) -> Result<Manifest, Failure> {
+        let typed = !atWord("Package")
+        if typed { try expectAs(.Construct, .MalformedManifest) } else { advance() }
+        let name = try identifier(.MalformedManifest)
+        if typed {
+            try expectAs(.Extends, .MalformedManifest)
+            if !atWord("Package") { return .Error(failure(.MalformedManifest)) }
+            advance()
+        }
+        try expectAs(.LeftBrace, .MalformedManifest)
+        var library = false
+        var moduleRoot = name.text
+        var version = ""
+        var dependencies: [Dependency] = []
+        var nativeLibraries: [NativeLibrary] = []
+        var assets: [String] = []
+        var systemCalls = false
+        while !at(.RightBrace) {
+            try expectAs(.Let, .MalformedManifest)
+            let key = try identifier(.MalformedManifest)
+            match key.text {
+                "kind" -> {
+                    try memberValue(key, "PackageKind", typed)
+                    library = try packageKind()
+                }
+                "moduleRoot" -> {
+                    try memberValue(key, "String", typed)
+                    let value = try stringValue()
+                    moduleRoot = value.text
+                }
+                "version" -> {
+                    try memberValue(key, "String", typed)
+                    version = (try stringValue()).text
+                }
+                "dependencies" -> {
+                    try memberValue(key, "[Dependency]", typed)
+                    dependencies = try dependencyList()
+                }
+                "nativeLibraries" -> {
+                    try memberValue(key, "[NativeLibrary]", typed)
+                    nativeLibraries = try nativeLibraryList(typed)
+                }
+                "kira" -> {
+                    try memberValue(key, "String", typed)
+                    try stringValue()
+                }
+                // `sdk`: the SDK the launcher passes as `--sdk`, found by name
+                // (knvm-core `Sdk.kira`); the compiler reads it as no member.
+                "sdk" -> {
+                    try memberValue(key, "String", typed)
+                    try stringValue()
+                }
+                "assets" -> {
+                    try memberValue(key, "[String]", typed)
+                    assets = try stringList()
+                }
+                "packages" -> {
+                    try memberValue(key, "[String]", typed)
+                    try skipMemberValue()
+                }
+                "systemCalls" -> {
+                    try memberValue(key, "Bool", typed)
+                    systemCalls = try boolValue()
+                }
+                "allowThinFfiShim" -> {
+                    try memberValue(key, "Bool", typed)
+                    try skipMemberValue()
+                }
+                "defaults" -> {
+                    try memberValue(key, "Defaults", typed)
+                    try skipMemberValue()
+                }
+                else -> {
+                    return .Error(Failure { diagnostic = .UnknownPackageMember, span = key.span })
+                }
+            }
+        }
+        advance()
+        if !at(.End) { return .Error(failure(.MalformedManifest)) }
+        return .Ok(Manifest {
+            name = name, library = library, moduleRoot = moduleRoot, version = version,
+            dependencies = dependencies, nativeLibraries = nativeLibraries, assets = assets,
+            systemCalls = systemCalls
+        })
+    }
+
+    // `: Type =` after a member name, or `=` alone in a `Package Name`
+    // manifest, which leaves its types out.
+    function memberValue(borrow mut self, key: Identifier, expected: String, typed: Bool) -> Result<Bool, Failure> {
+        if typed || at(.Colon) { return memberType(key, expected) }
+        try expectAs(.Equals, .MalformedManifest)
+        return .Ok(true)
+    }
+
+    // A member value the package does not use, up to the next `let` or the
+    // closing brace outside any bracket.
+    function skipMemberValue(borrow mut self) -> Result<Bool, Failure> {
+        var depth = 0
+        var count = 0
+        while count == 0 || depth > 0 || (!at(.Let) && !at(.RightBrace)) {
+            if at(.End) { return .Error(failure(.MalformedManifest)) }
+            let kind = advance().kind
+            if kind == .LeftParen || kind == .LeftBrace || kind == .LeftBracket { depth += 1 }
+            if kind == .RightParen || kind == .RightBrace || kind == .RightBracket { depth -= 1 }
+            count += 1
+        }
+        return .Ok(true)
+    }
+
+    // `: Type =` after a member name, where `Type` must be the one `Package`
+    // declares for it, spelled `Name` or `[Name]`.
+    function memberType(borrow mut self, key: Identifier, expected: String) -> Result<Bool, Failure> {
+        try expectAs(.Colon, .MalformedManifest)
+        let start = current().span
+        var written = ""
+        if eat(.LeftBracket) {
+            let element = try identifier(.MalformedManifest)
+            try expectAs(.RightBracket, .MalformedManifest)
+            written = joinText(["[", element.text, "]"])
+        } else {
+            let named = try identifier(.MalformedManifest)
+            written = named.text
+        }
+        if written != expected {
+            return .Error(Failure { diagnostic = .PackageMemberType, span = spanFrom(start) })
+        }
+        try expectAs(.Equals, .MalformedManifest)
+        return .Ok(true)
+    }
+
+    // `.App` or `.Library`, also written `PackageKind.App`: whether the
+    // package is a library.
+    function packageKind(borrow mut self) -> Result<Bool, Failure> {
+        if atWord("PackageKind") { advance() }
+        try expectAs(.Dot, .PackageMemberType)
+        if atWord("Library") {
+            advance()
+            return .Ok(true)
+        }
+        if atWord("App") {
+            advance()
+            return .Ok(false)
+        }
+        return .Error(failure(.PackageMemberType))
+    }
+
+    // `true` or `false`.
+    function boolValue(borrow mut self) -> Result<Bool, Failure> {
+        if eat(.True) { return .Ok(true) }
+        if eat(.False) { return .Ok(false) }
+        return .Error(failure(.PackageMemberType))
+    }
+
+    // A string literal's text between its quotes, with the literal's span.
+    function stringValue(borrow mut self) -> Result<Identifier, Failure> {
+        let token = try expectAs(.StringLiteral, .PackageMemberType)
+        let text = utf8Slice(source, token.span.start + 1, token.span.end - 1)
+        return .Ok(Identifier { text = text, span = token.span })
+    }
+
+    function dependencyList(borrow mut self) -> Result<[Dependency], Failure> {
+        try expectAs(.LeftBracket, .PackageMemberType)
+        var dependencies: [Dependency] = []
+        while !at(.RightBracket) {
+            dependencies.append(try dependency())
+            if !eat(.Comma) { break }
+        }
+        try expectAs(.RightBracket, .MalformedManifest)
+        return .Ok(dependencies)
+    }
+
+    // `Dependency { name: "Core", path: "../core" }`, a struct literal. A
+    // `version` makes it a registry dependency, and a `url` without a `path` a
+    // git one, which the launcher fetches at its `rev` and hands the compiler
+    // as `--dependency` (knvm-core `Sdk.kira`). `sdk` names the SDK that may
+    // provide the dependency instead; the launcher reads it, the compiler not.
+    function dependency(borrow mut self) -> Result<Dependency, Failure> {
+        let start = current().span
+        if !atWord("Dependency") { return .Error(failure(.PackageMemberType)) }
+        advance()
+        try expectAs(.LeftBrace, .MalformedManifest)
+        var name = Identifier { text = "", span = start }
+        var source: DependencySource = .Path
+        var path = ""
+        var gitUrl = ""
+        var pathSpan = start
+        while !at(.RightBrace) {
+            let key = try identifier(.MalformedManifest)
+            if !eat(.Colon) { try expectAs(.Equals, .MalformedManifest) }
+            let value = try stringValue()
+            match key.text {
+                "name" -> name = value
+                "path" -> {
+                    path = value.text
+                    pathSpan = value.span
+                }
+                "version" -> source = .Registry
+                "url" -> gitUrl = value.text
+                "rev", "tag", "sdk" -> {}
+                else -> return .Error(Failure { diagnostic = .UnknownPackageMember, span = key.span })
+            }
+            if !eat(.Comma) { break }
+        }
+        try expectAs(.RightBrace, .MalformedManifest)
+        if utf8Count(path) == 0 && utf8Count(gitUrl) > 0 { source = .Git }
+        if utf8Count(name.text) == 0 || (source == .Path && utf8Count(path) == 0) {
+            return .Error(Failure { diagnostic = .MalformedManifest, span = spanFrom(start) })
+        }
+        return .Ok(Dependency { name = name, source = source, path = path, pathSpan = pathSpan })
+    }
+}

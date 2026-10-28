@@ -1,0 +1,647 @@
+import Foundation
+
+// A composefs image: an EROFS file system, as Linux's fs/erofs/erofs_fs.h
+// lays it out, holding a tree's directories, links and file metadata but no
+// file data. Each file of it is a hole of the file's size carrying the
+// overlayfs attributes `trusted.overlay.metacopy`, with the file's fs-verity
+// digest, and `trusted.overlay.redirect`, naming the file at the same path in
+// the layer holding the data. Overlayfs mounted with the image as its layer
+// and that tree as a data-only layer under `verity=require` serves each
+// file's data only while its fs-verity digest is the one the image names.
+//
+// The image is 4 KiB blocks: the superblock at 1024 in block 0, then every
+// inode, compact unless its size or link count needs the extended form, with
+// its attributes, a file's chunk map and a directory's or link's last partial
+// block inline, then the whole directory blocks. Every entry is owned by id 0
+// and dated 0, and the same tree gives the same bytes every time.
+
+namespace ErofsFormat {
+    let magic: Number = 3774210530
+    let superblockAt: Number = 1024
+    let superblock: Number = 128
+    let blockLog: Number = 12
+    let block: Number = 4096
+    // Inodes start at block 1; a node number counts 32-byte slots from there.
+    let metadataBlock: Number = 1
+    let slot: Number = 32
+    let compactInode: Number = 32
+    let extendedInode: Number = 64
+    // The largest size and link count a compact inode holds, plus 1.
+    let compactSize: Number = 4294967296
+    let compactLinks: Number = 65536
+    // The data layouts, shifted past the inode version bit.
+    let flatPlain: Number = 0
+    let flatInline: Number = 2
+    let chunkBased: Number = 4
+    // The chunk map entry for a chunk with no blocks.
+    let nullAddress: Number = 4294967295
+    let chunkMapEntry: Number = 4
+    // The most a chunk's size exceeds a block by, as a shift.
+    let chunkShiftLimit: Number = 31
+    // EROFS_FEATURE_INCOMPAT_CHUNKED_FILE.
+    let chunkedFile: Number = 4
+    let dirent: Number = 12
+    // The dirent file types.
+    let typeFile: Number = 1
+    let typeDirectory: Number = 2
+    let typeLink: Number = 7
+    // The mode's file type bits.
+    let modeFile: Number = 32768
+    let modeDirectory: Number = 16384
+    let modeLink: Number = 40960
+    let permissionBits: Number = 4095
+    let longestName: Number = 255
+    // The attribute body header, an entry's header, and their alignment.
+    let attributeHeader: Number = 12
+    let attributeEntry: Number = 4
+    let attributeAlign: Number = 4
+    // The `trusted.` name prefix's index.
+    let trusted: Number = 4
+    let metacopyName: String = "overlay.metacopy"
+    let redirectName: String = "overlay.redirect"
+    // The metacopy value: its version, its length with the digest, its flags
+    // and the digest's algorithm, FS_VERITY_HASH_ALG_SHA256.
+    let metacopyVersion: Number = 0
+    let metacopyHeader: Number = 4
+    let metacopySha256: Number = 1
+    let digestSize: Number = 32
+}
+
+// One entry of the image.
+struct ComposefsNode {
+    let parent: Number
+    let name: String
+    let kind: ArchiveEntryKind
+    let mode: UNumber
+    let size: UNumber = 0
+    let verity: [UN8] = []
+    let target: String = ""
+    let redirect: String = ""
+}
+
+// Where `finish` puts one entry: its place in the inode area, the bytes of
+// its attributes, and its data: a directory's listing or a link's target,
+// the whole blocks of which go after the inodes, from `firstBlock`, and the
+// rest inline.
+struct ComposefsPlace {
+    var offset: Number = 0
+    var extended: Bool = false
+    var attributes: [UN8] = []
+    var data: [UN8] = []
+    var inline: Bool = false
+    var wholeBlocks: Number = 0
+    var firstBlock: Number = 0
+    var links: Number = 1
+}
+
+/// A writer of a composefs image: an EROFS file system holding a tree's directories, links and file metadata but no file data.
+public struct ComposefsWriter {
+    /// Where the image's bytes go.
+    var sink: ArchiveSink
+    /// Every entry added so far. The root comes first.
+    var nodes: [ComposefsNode] = [
+        ComposefsNode { parent: 0, name: "", kind: .Directory, mode: 493 }
+    ]
+    /// Each path's index in `nodes`.
+    var paths: Map<String, Number> = Map<String, Number>()
+    /// Filled by `finish`: where each entry goes in the image.
+    var places: [ComposefsPlace] = []
+
+    /// A directory at `path` with permission bits `mode`. The path "" is the root, whose mode this sets.
+    function addDirectory(
+        borrow mut self,
+        path: borrow String,
+        mode: UNumber
+    ) -> Result<Void, ArchiveFailure> {
+        if path.count == 0 {
+            nodes[0] = ComposefsNode { parent: 0, name: "", kind: .Directory, mode: mode }
+            return .Ok
+        }
+        let parent = match parentOf(path) {
+            Ok(found) -> found
+            Error(failure) -> return .Error(failure)
+        }
+        return addNode(
+            path,
+            ComposefsNode {
+                parent: parent,
+                name: composefsName(path),
+                kind: .Directory,
+                mode: mode
+            }
+        )
+    }
+
+    /// A file at `path` of `size` bytes, with permission bits `mode`. Its data is the file at the same path in the data layer, and its fs-verity digest is `verity`, which must be a SHA-256 digest.
+    function addFile(
+        borrow mut self,
+        path: borrow String,
+        mode: UNumber,
+        size: UNumber,
+        verity: borrow [UN8]
+    ) -> Result<Void, ArchiveFailure> {
+        if verity.count != ErofsFormat.digestSize {
+            return .Error(.Malformed("\(path) has no SHA-256 fs-verity digest"))
+        }
+        let parent = match parentOf(path) {
+            Ok(found) -> found
+            Error(failure) -> return .Error(failure)
+        }
+        return addNode(
+            path,
+            ComposefsNode {
+                parent: parent,
+                name: composefsName(path),
+                kind: .File,
+                mode: mode,
+                size: size,
+                verity: copy verity,
+                redirect: "/\(path)"
+            }
+        )
+    }
+
+    /// A symbolic link at `path` pointing to `target`.
+    function addLink(
+        borrow mut self,
+        path: borrow String,
+        target: borrow String
+    ) -> Result<Void, ArchiveFailure> {
+        let parent = match parentOf(path) {
+            Ok(found) -> found
+            Error(failure) -> return .Error(failure)
+        }
+        return addNode(
+            path,
+            ComposefsNode {
+                parent: parent,
+                name: composefsName(path),
+                kind: .Link,
+                mode: 511,
+                target: copy target
+            }
+        )
+    }
+
+    /// Lays the image out, writes it and closes the file, answering the image's length.
+    function finish(borrow mut self) -> Result<UNumber, ArchiveFailure> {
+        let count = nodes.count
+        let listed = nodes
+        var indices: [Number] = []
+        for index in 0..count { indices.append(index) }
+        let sorted = indices.sorted(
+            { left, right in
+                let first = listed[left]
+                let second = listed[right]
+                if first.parent != second.parent { return first.parent < second.parent }
+                return orderStrings(first.name, second.name) < 0
+            }
+        )
+        var firstChild: [Number] = []
+        var children: [Number] = []
+        for index in 0..count {
+            firstChild.append(0)
+            children.append(0)
+            places.append(ComposefsPlace {})
+        }
+        for (position, index) in sorted.enumerated() {
+            if index == 0 { continue }
+            let parent = nodes[index].parent
+            if children[parent] == 0 { firstChild[parent] = position }
+            children[parent] += 1
+        }
+        // The inodes go root first, then each directory's entries before
+        // the directories under it, so a directory's inodes sit together.
+        var order: [Number] = []
+        var frontier: [Number] = [0]
+        while frontier.count > 0 {
+            var below: [Number] = []
+            for index in frontier {
+                order.append(index)
+                for position in firstChild[index]..(firstChild[index] + children[index]) {
+                    below.append(sorted[position])
+                }
+            }
+            frontier = below
+        }
+        for index in 0..count { prepare(index, sorted, firstChild, children) }
+        var offset: Number = 0
+        for index in order { offset = placeInode(index, offset) }
+        let inodeBlocks = blocksFor(offset)
+        var nextBlock = ErofsFormat.metadataBlock + inodeBlocks
+        for index in order {
+            places[index].firstBlock = places[index].wholeBlocks > 0 ? nextBlock : 0
+            nextBlock += places[index].wholeBlocks
+        }
+        // The listings name node numbers, which only now are known.
+        for index in 0..count {
+            match nodes[index].kind {
+                Directory -> places[index].data = listing(index, sorted, firstChild, children)
+                File, Link -> {}
+            }
+        }
+        var header: [UN8] = []
+        for byte in 0..ErofsFormat.superblockAt { header.append(0) }
+        header.appendAll(superblock(count, nextBlock))
+        while header.count < ErofsFormat.block { header.append(0) }
+        sink.append(header)
+        var area: [UN8] = []
+        for index in order {
+            while area.count < places[index].offset { area.append(0) }
+            area.appendAll(inode(index))
+            let place = places[index]
+            area.appendAll(place.attributes)
+            match nodes[index].kind {
+                File -> {
+                    if nodes[index].size > 0 {
+                        appendLittle(area, ErofsFormat.nullAddress, ErofsFormat.chunkMapEntry)
+                    }
+                }
+                Directory, Link -> {
+                    if place.inline {
+                        let start = place.wholeBlocks * ErofsFormat.block
+                        area.appendAll(byteRun(place.data, start, place.data.count))
+                    }
+                }
+            }
+        }
+        while area.count < inodeBlocks * ErofsFormat.block { area.append(0) }
+        sink.append(area)
+        match sink.spill() {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        for index in order {
+            let place = places[index]
+            for blockIndex in 0..place.wholeBlocks {
+                let start = blockIndex * ErofsFormat.block
+                let end = min(start + ErofsFormat.block, place.data.count)
+                var block = byteRun(place.data, start, end)
+                while block.count < ErofsFormat.block { block.append(0) }
+                sink.append(block)
+            }
+            match sink.spill() {
+                Ok -> {}
+                Error(failure) -> return .Error(failure)
+            }
+        }
+        return sink.finish()
+    }
+
+    /// Works out an entry's attributes, link count and how much data it has. A directory's listing is sized here and written once the nodes are placed.
+    function prepare(
+        borrow mut self,
+        index: Number,
+        sorted: borrow [Number],
+        firstChild: borrow [Number],
+        children: borrow [Number]
+    ) {
+        let node = nodes[index]
+        var place = ComposefsPlace {}
+        match node.kind {
+            File -> {
+                if node.size > 0 { place.attributes = overlayAttributes(node) }
+                place.extended = node.size >= ErofsFormat.compactSize
+            }
+            Link -> place.data = node.target.utf8()
+            Directory -> {
+                var subdirectories: Number = 0
+                for position in firstChild[index]..(firstChild[index] + children[index]) {
+                    match nodes[sorted[position]].kind {
+                        Directory -> subdirectories += 1
+                        File, Link -> {}
+                    }
+                }
+                place.links = 2 + subdirectories
+                place.extended = place.links >= ErofsFormat.compactLinks
+                let size = listingSize(index, sorted, firstChild, children)
+                var sized: [UN8] = []
+                for byte in 0..size { sized.append(0) }
+                place.data = sized
+            }
+        }
+        places[index] = place
+    }
+
+    /// Places the inode of `index` at or after `offset`, answering where the next may go. Data whose last partial block does not fit beside the inode goes in whole blocks instead.
+    function placeInode(borrow mut self, index: Number, offset: Number) -> Number {
+        var place = places[index]
+        let fixed = (place.extended ? ErofsFormat.extendedInode : ErofsFormat.compactInode)
+            + place.attributes.count + chunkMapSize(nodes[index])
+        let tail = place.data.count % ErofsFormat.block
+        var at = offset
+        var inlineSize: Number = 0
+        place.wholeBlocks = trunc((place.data.count - tail) / ErofsFormat.block)
+        if tail > 0 {
+            // A directory's last name ends at a zero byte, which lookup reads
+            // up to, or at the end of the block.
+            let needed = fixed + tail + 1
+            if at % ErofsFormat.block + needed > ErofsFormat.block && needed <= ErofsFormat.block {
+                at = blocksFor(at) * ErofsFormat.block
+            }
+            if at % ErofsFormat.block + needed <= ErofsFormat.block {
+                place.inline = true
+                inlineSize = tail + 1
+            } else {
+                place.wholeBlocks += 1
+            }
+        }
+        place.offset = at
+        let end = at + fixed + inlineSize
+        places[index] = place
+        return roundUp(end, ErofsFormat.slot)
+    }
+
+    /// The inode of `index`.
+    function inode(borrow self, index: Number) -> [UN8] {
+        let node = nodes[index]
+        let place = places[index]
+        let layout = match node.kind {
+            File -> node.size > 0 ? ErofsFormat.chunkBased : ErofsFormat.flatPlain
+            Directory, Link -> place.inline ? ErofsFormat.flatInline : ErofsFormat.flatPlain
+        }
+        let size = match node.kind {
+            File -> node.size
+            Directory, Link -> place.data.count
+        }
+        let union = match node.kind {
+            File -> node.size > 0 ? chunkShift(node.size) : 0
+            Directory, Link -> place.firstBlock
+        }
+        let typeBits = match node.kind {
+            File -> ErofsFormat.modeFile
+            Directory -> ErofsFormat.modeDirectory
+            Link -> ErofsFormat.modeLink
+        }
+        let mode = typeBits + (Number(node.mode) & ErofsFormat.permissionBits)
+        let attributeCount = place.attributes.count == 0 ? 0
+        : trunc(
+            (place.attributes.count - ErofsFormat.attributeHeader) / ErofsFormat.attributeAlign
+        ) + 1
+        var bytes: [UN8] = []
+        appendLittle(bytes, layout * 2 + (place.extended ? 1 : 0), 2)
+        appendLittle(bytes, attributeCount, 2)
+        appendLittle(bytes, mode, 2)
+        if place.extended {
+            appendLittle(bytes, 0, 2)
+            appendLittle(bytes, size, 8)
+            appendLittle(bytes, union, 4)
+            appendLittle(bytes, index + 1, 4)
+            appendLittle(bytes, 0, 4)
+            appendLittle(bytes, 0, 4)
+            appendLittle(bytes, 0, 8)
+            appendLittle(bytes, 0, 4)
+            appendLittle(bytes, place.links, 4)
+            for byte in 0..16 { bytes.append(0) }
+        } else {
+            appendLittle(bytes, place.links, 2)
+            appendLittle(bytes, size, 4)
+            appendLittle(bytes, 0, 4)
+            appendLittle(bytes, union, 4)
+            appendLittle(bytes, index + 1, 4)
+            appendLittle(bytes, 0, 2)
+            appendLittle(bytes, 0, 2)
+            appendLittle(bytes, 0, 4)
+        }
+        return bytes
+    }
+
+    /// The listing of the directory `index`: its entries, `.` and `..` among them, in byte order of their names, packed into blocks, each block holding its entries' records and then their names.
+    function listing(
+        borrow self,
+        index: Number,
+        sorted: borrow [Number],
+        firstChild: borrow [Number],
+        children: borrow [Number]
+    ) -> [UN8] {
+        let entries = directoryEntries(index, sorted, firstChild, children)
+        var bytes: [UN8] = []
+        var at: Number = 0
+        while at < entries.count {
+            let end = blockEnd(entries, at)
+            var records: [UN8] = []
+            var names: [UN8] = []
+            let nameStart = (end - at) * ErofsFormat.dirent
+            for position in at..end {
+                let (name, target) = entries[position]
+                appendLittle(records, trunc(places[target].offset / ErofsFormat.slot), 8)
+                appendLittle(records, nameStart + names.count, 2)
+                records.append(UN8(direntType(nodes[target].kind)))
+                records.append(0)
+                names.appendAll(name.utf8())
+            }
+            if end < entries.count {
+                while records.count + names.count < ErofsFormat.block { names.append(0) }
+            }
+            bytes.appendAll(records)
+            bytes.appendAll(names)
+            at = end
+        }
+        return bytes
+    }
+
+    /// How long the listing of the directory `index` is.
+    function listingSize(
+        borrow self,
+        index: Number,
+        sorted: borrow [Number],
+        firstChild: borrow [Number],
+        children: borrow [Number]
+    ) -> Number {
+        let entries = directoryEntries(index, sorted, firstChild, children)
+        var size: Number = 0
+        var at: Number = 0
+        while at < entries.count {
+            let end = blockEnd(entries, at)
+            var used: Number = 0
+            for position in at..end {
+                used += ErofsFormat.dirent + entries[position].0.utf8().count
+            }
+            size += end < entries.count ? ErofsFormat.block : used
+            at = end
+        }
+        return size
+    }
+
+    /// The entries of the directory `index` as names and the nodes they name, in byte order.
+    function directoryEntries(
+        borrow self,
+        index: Number,
+        sorted: borrow [Number],
+        firstChild: borrow [Number],
+        children: borrow [Number]
+    ) -> [(String, Number)] {
+        var entries: [(String, Number)] = [(".", index), ("..", nodes[index].parent)]
+        for position in firstChild[index]..(firstChild[index] + children[index]) {
+            let child = sorted[position]
+            entries.append((copy nodes[child].name, child))
+        }
+        return entries.sorted({ left, right in return orderStrings(left.0, right.0) < 0 })
+    }
+
+    /// The superblock of an image of `inodes` entries and `blocks` blocks.
+    function superblock(borrow self, inodes: Number, blocks: Number) -> [UN8] {
+        var chunked = false
+        for node in nodes {
+            match node.kind {
+                File -> if node.size > 0 { chunked = true }
+                Directory, Link -> {}
+            }
+        }
+        var bytes: [UN8] = []
+        appendLittle(bytes, ErofsFormat.magic, 4)
+        appendLittle(bytes, 0, 4)
+        appendLittle(bytes, 0, 4)
+        bytes.append(UN8(ErofsFormat.blockLog))
+        bytes.append(0)
+        appendLittle(bytes, trunc(places[0].offset / ErofsFormat.slot), 2)
+        appendLittle(bytes, inodes, 8)
+        appendLittle(bytes, 0, 8)
+        appendLittle(bytes, 0, 4)
+        appendLittle(bytes, blocks, 4)
+        appendLittle(bytes, ErofsFormat.metadataBlock, 4)
+        appendLittle(bytes, 0, 4)
+        for byte in 0..32 { bytes.append(0) }
+        appendLittle(bytes, chunked ? ErofsFormat.chunkedFile : 0, 4)
+        while bytes.count < ErofsFormat.superblock { bytes.append(0) }
+        return bytes
+    }
+
+    /// The directory node holding `path`. Fails when `path` is already in the image or is not a usable path inside it.
+    function parentOf(borrow self, path: borrow String) -> Result<Number, ArchiveFailure> {
+        if paths.contains(path) {
+            return .Error(.Malformed("the composefs image holds \(path) twice"))
+        }
+        let name = composefsName(path)
+        if name.count == 0 || name == "." || name == ".." || path.startsWith("/") {
+            return .Error(.Malformed("\(path) is no path inside a composefs image"))
+        }
+        if name.utf8().count > ErofsFormat.longestName {
+            return .Error(.Malformed("the name of \(path) is too long for EROFS"))
+        }
+        if name.count == path.count { return .Ok(0) }
+        let directory = path.substring(0, path.count - name.count - 1)
+        let parent = match paths.value(directory) {
+            Some(found) -> found
+            None -> return .Error(.Malformed("\(path) comes before its directory"))
+        }
+        return match nodes[parent].kind {
+            Directory -> .Ok(parent)
+            File, Link -> .Error(.Malformed("\(path) is under \(directory), which is no directory"))
+        }
+    }
+
+    /// Adds `node` at `path`, recording the path's index in `paths`.
+    function addNode(
+        borrow mut self,
+        path: borrow String,
+        node: ComposefsNode
+    ) -> Result<Void, ArchiveFailure> {
+        paths.set(copy path, nodes.count)
+        nodes.append(move node)
+        return .Ok
+    }
+}
+
+/// A composefs writer writing the file `path`, which must not exist yet.
+public function createComposefsWriter(
+    path: borrow String
+) -> Result<ComposefsWriter, ArchiveFailure> {
+    return match createArchiveSink(path) {
+        Ok(sink) -> .Ok(ComposefsWriter { sink: sink })
+        Error(failure) -> .Error(failure)
+    }
+}
+
+// The attribute body of a file: no shared attributes, then the metacopy
+// value carrying the fs-verity digest and the redirect to the data.
+function overlayAttributes(node: borrow ComposefsNode) -> [UN8] {
+    var metacopy: [UN8] = []
+    metacopy.append(UN8(ErofsFormat.metacopyVersion))
+    metacopy.append(UN8(ErofsFormat.metacopyHeader + ErofsFormat.digestSize))
+    metacopy.append(0)
+    metacopy.append(UN8(ErofsFormat.metacopySha256))
+    metacopy.appendAll(node.verity)
+    var bytes: [UN8] = []
+    for byte in 0..ErofsFormat.attributeHeader { bytes.append(0) }
+    appendAttribute(bytes, ErofsFormat.metacopyName, metacopy)
+    appendAttribute(bytes, ErofsFormat.redirectName, node.redirect.utf8())
+    return bytes
+}
+
+// One `trusted.` attribute entry, padded to its alignment.
+function appendAttribute(bytes: borrow mut [UN8], name: borrow String, value: borrow [UN8]) {
+    let nameBytes = name.utf8()
+    bytes.append(UN8(nameBytes.count))
+    bytes.append(UN8(ErofsFormat.trusted))
+    appendLittle(bytes, value.count, 2)
+    bytes.appendAll(nameBytes)
+    bytes.appendAll(value)
+    while bytes.count % ErofsFormat.attributeAlign != 0 { bytes.append(0) }
+}
+
+// Where the block of a listing starting at entry `at` ends: as many entries
+// as fit, records and names, in one block.
+function blockEnd(entries: borrow [(String, Number)], at: Number) -> Number {
+    var used: Number = 0
+    for end in at..entries.count {
+        let size = ErofsFormat.dirent + entries[end].0.utf8().count
+        if used + size > ErofsFormat.block { return end }
+        used += size
+    }
+    return entries.count
+}
+
+// The size of a file's chunk map: one entry naming no blocks, its chunk as
+// large as the file.
+function chunkMapSize(node: borrow ComposefsNode) -> Number {
+    return match node.kind {
+        File -> node.size > 0 ? ErofsFormat.chunkMapEntry * chunkCount(node.size) : 0
+        Directory, Link -> 0
+    }
+}
+
+// How far a chunk's size exceeds a block's, as a shift: the smallest that
+// holds the whole file, within the format's limit.
+function chunkShift(size: UNumber) -> Number {
+    var chunk = ErofsFormat.block
+    for shift in 0..ErofsFormat.chunkShiftLimit {
+        if chunk >= size { return shift }
+        chunk *= 2
+    }
+    return ErofsFormat.chunkShiftLimit
+}
+
+function chunkCount(size: UNumber) -> Number {
+    var chunk = ErofsFormat.block
+    for step in 0..chunkShift(size) { chunk *= 2 }
+    return blocksOf(size, chunk)
+}
+
+function direntType(kind: ArchiveEntryKind) -> Number {
+    return match kind {
+        File -> ErofsFormat.typeFile
+        Directory -> ErofsFormat.typeDirectory
+        Link -> ErofsFormat.typeLink
+    }
+}
+
+function blocksFor(size: Number) -> Number {
+    return blocksOf(size, ErofsFormat.block)
+}
+
+function blocksOf(size: Number, unit: Number) -> Number {
+    return trunc((size + unit - 1 - (size + unit - 1) % unit) / unit)
+}
+
+function roundUp(size: Number, unit: Number) -> Number {
+    return blocksOf(size, unit) * unit
+}
+
+// The last part of `path`.
+function composefsName(path: borrow String) -> String {
+    return match path.lastIndexOf("/") {
+        Some(slash) -> path.substring(slash + 1, path.count)
+        None -> copy path
+    }
+}

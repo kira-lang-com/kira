@@ -1,0 +1,119 @@
+// Once checked, a `Number` is the two words Foundation's `NumberWords` holds,
+// a mantissa and a scale. Every type that names a `Number` names that struct
+// instead, so lowering passes, copies, compares and hashes one as it does any
+// struct of two `Int`s, and a `Bitcast` between the two is a copy. An
+// ordering and a trace still know it for a `Number` by its declaration.
+
+extend CheckedProgram {
+    // The type lowering sees for `valueType`. A sized number is the integer
+    // of its width (KLF-RIDL section 21.1), so its arithmetic is integer
+    // arithmetic and an array of `UN8` is a byte buffer.
+    function wordsFor(borrow self, valueType: Type) -> Type {
+        if valueType.isSizedNumber() { return valueType.storage() }
+        if valueType.kind == .Decimal && numberWords >= 0 { return Type.structure(numberWords) }
+        return valueType
+    }
+
+    // The name of the sized number `valueType` is, which its words no longer
+    // say; empty for any other type.
+    function sizedName(borrow self, valueType: Type) -> String {
+        if valueType.kind == .Decimal && valueType.bits != 64 { return valueType.numberName() }
+        return ""
+    }
+
+    function sizedNames(borrow self, types: borrow [Type]) -> [String] {
+        var names: [String] = []
+        for each in types { names.append(sizedName(each)) }
+        return names
+    }
+
+    function isNumberWords(borrow self, valueType: Type) -> Bool {
+        return valueType.kind == .Structure && numberWords >= 0 && valueType.declaration == numberWords
+    }
+
+    function lowerNumberTypes(borrow mut self) {
+        if numberWords < 0 { return }
+        for index in 0..expressions.count {
+            expressions[index].valueType = wordsFor(expressions[index].valueType)
+        }
+        for index in 0..functions.count {
+            functions[index].resultSizedName = sizedName(functions[index].result)
+            functions[index].result = wordsFor(functions[index].result)
+            for local in 0..functions[index].locals.count {
+                functions[index].locals[local].sizedName = sizedName(functions[index].locals[local].valueType)
+                functions[index].locals[local].valueType = wordsFor(functions[index].locals[local].valueType)
+            }
+            for capture in 0..functions[index].captures.count {
+                functions[index].captures[capture].valueType = wordsFor(functions[index].captures[capture].valueType)
+            }
+            match functions[index].asyncResume {
+                Some(spec) -> functions[index].asyncResume = .Some(AsyncResume {
+                    output = wordsFor(spec.output), returnsNothing = spec.returnsNothing, parameters = spec.parameters
+                })
+                None -> {}
+            }
+        }
+        for index in 0..structs.count {
+            structs[index].argumentSizedNames = sizedNames(structs[index].typeArguments)
+            for field in 0..structs[index].fields.count {
+                structs[index].fields[field].sizedName = sizedName(structs[index].fields[field].valueType)
+                structs[index].fields[field].valueType = wordsFor(structs[index].fields[field].valueType)
+            }
+            for argument in 0..structs[index].typeArguments.count {
+                structs[index].typeArguments[argument] = wordsFor(structs[index].typeArguments[argument])
+            }
+        }
+        for index in 0..enums.count {
+            for variant in 0..enums[index].variants.count {
+                match enums[index].variants[variant].payload {
+                    Some(payload) -> {
+                        enums[index].variants[variant].sizedName = sizedName(payload)
+                        enums[index].variants[variant].payload = .Some(wordsFor(payload))
+                    }
+                    None -> {}
+                }
+            }
+            enums[index].argumentSizedNames = sizedNames(enums[index].typeArguments)
+            for argument in 0..enums[index].typeArguments.count {
+                enums[index].typeArguments[argument] = wordsFor(enums[index].typeArguments[argument])
+            }
+        }
+        for index in 0..globals.count {
+            globals[index].valueType = wordsFor(globals[index].valueType)
+        }
+        for index in 0..anyTypes.count {
+            anyTypes[index] = wordsFor(anyTypes[index])
+        }
+        for index in 0..ridlTemplates.count {
+            for field in 0..ridlTemplates[index].fields.count {
+                ridlTemplates[index].fields[field].pieces = numberPieces(ridlTemplates[index].fields[field].pieces)
+            }
+            for method in 0..ridlTemplates[index].methods.count {
+                for parameter in 0..ridlTemplates[index].methods[method].parameters.count {
+                    ridlTemplates[index].methods[method].parameters[parameter].pieces = numberPieces(ridlTemplates[index].methods[method].parameters[parameter].pieces)
+                }
+                ridlTemplates[index].methods[method].result = numberPieces(ridlTemplates[index].methods[method].result)
+            }
+            for instance in 0..ridlTemplates[index].instances.count {
+                ridlTemplates[index].instances[instance] = numberPieces(ridlTemplates[index].instances[instance])
+            }
+        }
+    }
+
+    // A generic declaration's pieces with each number type the words it is,
+    // and a sized number written by its name (KLF-RIDL section 27.5).
+    function numberPieces(borrow self, pieces: borrow [RidlPiece]) -> [RidlPiece] {
+        var lowered: [RidlPiece] = []
+        for piece in pieces {
+            match piece {
+                Written(text) -> lowered.append(.Written(text))
+                Generic(name) -> lowered.append(.Generic(name))
+                Resolved(leaf) -> {
+                    let sized = sizedName(leaf)
+                    if utf8Count(sized) > 0 { lowered.append(.Written(sized)) } else { lowered.append(.Resolved(wordsFor(leaf))) }
+                }
+            }
+        }
+        return lowered
+    }
+}

@@ -1,0 +1,97 @@
+import Foundation
+
+// Making, copying and emptying directories.
+//
+// A version manager moves whole trees around, and the platform services it has
+// are one directory at a time: `make_directory` creates no parents and there is
+// no copy at all. Both gaps are closed here, in the one place that needs them.
+
+// Every directory above `path`, made. A directory already there is success: a
+// path walked up from an existing directory is mostly existing directories.
+public function makeDirectoryTree(path: borrow String) -> Bool {
+    if path.isEmpty() { return false }
+    if isDirectory(path) { return true }
+    let parent = directoryOfPath(path)
+    if parent == path { return false }
+    if !parent.isEmpty() && parent != "/" && !makeDirectoryTree(parent) { return false }
+    return succeeded(makeDirectory(path))
+}
+
+// `from` copied onto `to`, directories and all, as bytes.
+//
+// The executable bit does not travel: the platform's copy is a read and a
+// write, and a caller that needs the bit stages the file where it was built and
+// renames it into place, which keeps it.
+public function copyTree(from: borrow String, to: borrow String) -> Bool {
+    if isDirectory(from) { return copyDirectoryTree(from, to) }
+    return copyFileBytes(from, to)
+}
+
+public function copyDirectoryTree(from: borrow String, to: borrow String) -> Bool {
+    if !makeDirectoryTree(to) { return false }
+    for name in entriesOf(from) {
+        if !copyTree(joinPath(from, name), joinPath(to, name)) { return false }
+    }
+    return true
+}
+
+public function copyFileBytes(from: borrow String, to: borrow String) -> Bool {
+    let parent = directoryOfPath(to)
+    if !parent.isEmpty() && !makeDirectoryTree(parent) { return false }
+    let size = sizeOf(from)
+    let bytes = bytesOf(from, 0, size)
+    if bytes.count == 0 && size > 0 { return false }
+    return succeeded(writeFileBytes(to, bytes))
+}
+
+// `path` and everything under it, gone.
+public function removeTree(path: borrow String) -> Bool {
+    if !pathExists(path) { return true }
+    return succeeded(removePath(path))
+}
+
+// Every file under `path`, as paths relative to it.
+//
+// The order is the platform's, which is why callers that need a stable order
+// sort: a directory listing is a snapshot of something that moves underneath.
+public function filesUnder(path: borrow String) -> [String] {
+    var found: [String] = []
+    var pending: [String] = [path]
+    var read: Number = 0
+    while read < pending.count {
+        let directory = pending[read]
+        read = read + 1
+        for name in entriesOf(directory) {
+            let child = joinPath(directory, name)
+            if isDirectory(child) {
+                pending.append(child)
+            } else {
+                found.append(child)
+            }
+        }
+    }
+    return found
+}
+
+// The total size of the regular files under `path`.
+public function treeSize(path: borrow String) -> Number {
+    var total: Number = 0
+    for file in filesUnder(path) {
+        total = total + sizeOf(file)
+    }
+    return total
+}
+
+// Whether `child` is `parent` or sits under it.
+//
+// Compared component by component rather than by prefix, so `/home/kira-tool`
+// is not inside `/home/kira`: a prefix test is how a validator ends up
+// accepting a tree it was never asked about.
+public function isInsideDirectory(child: borrow String, parent: borrow String) -> Bool {
+    let trimmedParent = trimTrailingSeparators(parent)
+    if trimmedParent.isEmpty() { return true }
+    if child == trimmedParent { return true }
+    if child.count <= trimmedParent.count { return false }
+    if !child.startsWith(trimmedParent) { return false }
+    return child.charAt(trimmedParent.count) == 47
+}

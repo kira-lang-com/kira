@@ -1,0 +1,166 @@
+enum RawCopyKind {
+    Member
+    Element
+    Conversion
+    Multiply
+    Less
+}
+
+struct RawCopyOperands {
+    let left: Int
+    let right: Int
+}
+
+struct RawCopyDeclaration {
+    let local: Int
+    let value: Int
+}
+
+struct RawCopyLoop {
+    let condition: Int
+    let body: [Int]
+}
+
+extend Operation {
+    function rawCopyOperands(borrow self, kind: RawCopyKind) -> Optional<RawCopyOperands> {
+        match self {
+            Member(base, field) -> {
+                if kind == .Member { return .Some(RawCopyOperands { left = base, right = field }) }
+                return .None
+            }
+            ArrayIndex(base, index) -> {
+                if kind == .Element { return .Some(RawCopyOperands { left = base, right = index }) }
+                return .None
+            }
+            Convert(operand) -> {
+                if kind == .Conversion { return .Some(RawCopyOperands { left = operand, right = -1 }) }
+                return .None
+            }
+            Arithmetic(operator, left, right) -> {
+                if kind == .Multiply && operator == .Multiply { return .Some(RawCopyOperands { left = left, right = right }) }
+                return .None
+            }
+            Compare(operator, left, right) -> {
+                if kind == .Less && operator == .Less { return .Some(RawCopyOperands { left = left, right = right }) }
+                return .None
+            }
+            StringText -> return .None
+            Sequence -> return .None
+            Integer -> return .None
+            FloatLiteral -> return .None
+            BoxAny -> return .None
+            TypeIs -> return .None
+            UnboxAny -> return .None
+            FunctionReference -> return .None
+            IndirectCall -> return .None
+            MakeClosure -> return .None
+            GlobalRead -> return .None
+            TaskSpawn -> return .None
+            TaskReady -> return .None
+            TaskAwait -> return .None
+            TaskCancel -> return .None
+            TaskDetach -> return .None
+            Async -> return .None
+            RuntimeTrap -> return .None
+            Try -> return .None
+            ChannelCreate -> return .None
+            ChannelReceiver -> return .None
+            ChannelSend -> return .None
+            ChannelClose -> return .None
+            ClassView -> return .None
+            ClassCall -> return .None
+            Boolean -> return .None
+            StringLiteral -> return .None
+            StringConcat -> return .None
+            TraceText -> return .None
+            HeapAllocateRaw -> return .None
+            HeapFreeRaw -> return .None
+            Print -> return .None
+            HeapRead -> return .None
+            HeapWrite -> return .None
+            Atomic -> return .None
+            HeapCopy -> return .None
+            HeapFill -> return .None
+            HeapOffset -> return .None
+            HeapLayout -> return .None
+            ArrayLiteral -> return .None
+            ArrayAppend -> return .None
+            Transfer -> return .None
+            Read -> return .None
+            Call -> return .None
+            Construct -> return .None
+            Tagged -> return .None
+            Unary -> return .None
+            Wrapping -> return .None
+            Logical -> return .None
+            Select -> return .None
+            Choice -> return .None
+            Bitcast -> return .None
+            ForeignImage -> return .None
+            ForeignElements -> return .None
+            ForeignCallback -> return .None
+            ForeignRead -> return .None
+            ForeignUnion -> return .None
+            EnumCode -> return .None
+            EnumFromCode -> return .None
+            Order -> return .None
+            Hash -> return .None
+        }
+    }
+}
+
+extend CheckedStatement {
+    function rawCopyDeclaration(borrow self) -> Optional<RawCopyDeclaration> {
+        match self {
+            Declare(local, value) -> return .Some(RawCopyDeclaration { local = local, value = value })
+            InitializeGlobal -> return .None
+            Assign -> return .None
+            Evaluate -> return .None
+            Branch -> return .None
+            Loop -> return .None
+            Count -> return .None
+            Iterate -> return .None
+            Dispatch -> return .None
+            Attempt -> return .None
+            Return -> return .None
+            Break -> return .None
+            Continue -> return .None
+        }
+    }
+
+    function rawCopyLoop(borrow self) -> Optional<RawCopyLoop> {
+        match self {
+            Loop(condition, body) -> return .Some(RawCopyLoop { condition = condition, body = body })
+            Declare -> return .None
+            InitializeGlobal -> return .None
+            Assign -> return .None
+            Evaluate -> return .None
+            Branch -> return .None
+            Count -> return .None
+            Iterate -> return .None
+            Dispatch -> return .None
+            Attempt -> return .None
+            Return -> return .None
+            Break -> return .None
+            Continue -> return .None
+        }
+    }
+
+    function rawCopyEvaluation(borrow self) -> Optional<Int> {
+        match self {
+            Evaluate(value) -> return .Some(value)
+            Declare -> return .None
+            InitializeGlobal -> return .None
+            Assign -> return .None
+            Branch -> return .None
+            Loop -> return .None
+            Count -> return .None
+            Iterate -> return .None
+            Dispatch -> return .None
+            Attempt -> return .None
+            Return -> return .None
+            Break -> return .None
+            Continue -> return .None
+        }
+    }
+}

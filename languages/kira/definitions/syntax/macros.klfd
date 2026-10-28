@@ -1,0 +1,72 @@
+struct MacroParameter {
+    let name: Identifier
+    let place: Bool
+}
+
+struct MacroName {
+    let name: String
+    let replacement: Identifier
+}
+
+struct MacroDeclaration {
+    let name: Identifier
+    let parameters: [MacroParameter]
+    let source: String
+    let tokens: [Token]
+    let start: Int
+    let end: Int
+}
+
+extend Parser {
+    function macroName(borrow self, name: Identifier) -> Identifier {
+        for binding in macroNames {
+            if binding.name == name.text { return binding.replacement }
+        }
+        return name
+    }
+
+    function macroDeclaration(borrow mut self) -> Result<Span, Failure> {
+        let start = advance().span
+        let name = try identifier(.ExpectedDeclaration)
+        try expect(.LeftParen)
+        var parameters: [MacroParameter] = []
+        while !at(.RightParen) {
+            let parameter = try identifier(.ExpectedParameterName)
+            try expect(.Colon)
+            let category = try identifier(.ExpectedTypeName)
+            match category.text {
+                "expr", "place" -> {}
+                else -> return .Error(Failure { diagnostic = .OutsideSubset, span = category.span })
+            }
+            parameters.append(MacroParameter { name = parameter, place = category.text == "place" })
+            if !eat(.Comma) { break }
+        }
+        try expect(.RightParen)
+        try expect(.LeftBrace)
+        if !atWord("expand") { return .Error(failure(.ExpectedMember)) }
+        advance()
+        let bodyStart = position
+        try expect(.LeftBrace)
+        var depth = 1
+        while depth > 0 {
+            match advance().kind.delimiter() {
+                Open -> depth += 1
+                Close -> depth -= 1
+                End -> return .Error(failure(.Expected))
+                Hole -> {}
+                Other -> {}
+            }
+        }
+        let bodyEnd = position - 1
+        try expect(.RightBrace)
+        for declared in tree.macros {
+            if declared.name.text == name.text {
+                return .Error(Failure { diagnostic = .DuplicateFunction, span = name.span })
+            }
+        }
+        tree.macros.append(MacroDeclaration {
+            name = name, parameters = parameters, source = source, tokens = tokens, start = bodyStart, end = bodyEnd
+        })
+        return .Ok(spanFrom(start))
+    }
+}

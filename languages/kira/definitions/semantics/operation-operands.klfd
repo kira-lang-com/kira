@@ -1,0 +1,595 @@
+extend Operation {
+    // The value a member is read from.
+    function memberBase(borrow self) -> Optional<Int> {
+        match self {
+            FunctionReference -> return .None
+            IndirectCall -> return .None
+            MakeClosure -> return .None
+            GlobalRead -> return .None
+            TaskSpawn -> return .None
+            TaskReady -> return .None
+            TaskAwait -> return .None
+            TaskCancel -> return .None
+            TaskDetach -> return .None
+            Async -> return .None
+            RuntimeTrap -> return .None
+            StringText -> return .None
+            Sequence -> return .None
+            Try -> return .None
+            ChannelCreate -> return .None
+            ChannelReceiver -> return .None
+            ChannelSend -> return .None
+            ChannelClose -> return .None
+            ClassView -> return .None
+            ClassCall -> return .None
+            Integer -> return .None
+            FloatLiteral -> return .None
+            BoxAny -> return .None
+            TypeIs -> return .None
+            UnboxAny -> return .None
+            Boolean -> return .None
+            StringLiteral -> return .None
+            StringConcat -> return .None
+            TraceText -> return .None
+            HeapAllocateRaw -> return .None
+            HeapFreeRaw -> return .None
+            Print -> return .None
+            HeapRead -> return .None
+            HeapWrite -> return .None
+            Atomic -> return .None
+            HeapCopy -> return .None
+            HeapFill -> return .None
+            HeapOffset -> return .None
+            HeapLayout -> return .None
+            ArrayLiteral -> return .None
+            ArrayIndex -> return .None
+            ArrayAppend -> return .None
+            Transfer -> return .None
+            Read -> return .None
+            Member(base, field) -> return .Some(base)
+            Call -> return .None
+            Construct -> return .None
+            Tagged -> return .None
+            Unary -> return .None
+            Arithmetic -> return .None
+            Wrapping -> return .None
+            Compare -> return .None
+            EnumCode -> return .None
+            EnumFromCode -> return .None
+            Order -> return .None
+            Hash -> return .None
+            Logical -> return .None
+            Select -> return .None
+            Choice -> return .None
+            Bitcast -> return .None
+            Convert -> return .None
+            ForeignImage -> return .None
+            ForeignElements -> return .None
+            ForeignCallback -> return .None
+            ForeignRead -> return .None
+            ForeignUnion -> return .None
+        }
+    }
+
+    // The step a place takes from the value it is part of: a member or an
+    // array element.
+    function placePart(borrow self) -> PlacePart {
+        match self {
+            FunctionReference -> return .Whole
+            IndirectCall -> return .Whole
+            MakeClosure -> return .Whole
+            GlobalRead -> return .Whole
+            TaskSpawn -> return .Whole
+            TaskReady -> return .Whole
+            TaskAwait -> return .Whole
+            TaskCancel -> return .Whole
+            TaskDetach -> return .Whole
+            Async -> return .Whole
+            RuntimeTrap -> return .Whole
+            StringText -> return .Whole
+            Sequence -> return .Whole
+            Try -> return .Whole
+            ChannelCreate -> return .Whole
+            ChannelReceiver -> return .Whole
+            ChannelSend -> return .Whole
+            ChannelClose -> return .Whole
+            ClassView -> return .Whole
+            ClassCall -> return .Whole
+            Integer -> return .Whole
+            FloatLiteral -> return .Whole
+            BoxAny -> return .Whole
+            TypeIs -> return .Whole
+            UnboxAny -> return .Whole
+            Boolean -> return .Whole
+            StringLiteral -> return .Whole
+            StringConcat -> return .Whole
+            TraceText -> return .Whole
+            HeapAllocateRaw -> return .Whole
+            HeapFreeRaw -> return .Whole
+            Print -> return .Whole
+            HeapRead -> return .Whole
+            HeapWrite -> return .Whole
+            Atomic -> return .Whole
+            HeapCopy -> return .Whole
+            HeapFill -> return .Whole
+            HeapOffset -> return .Whole
+            HeapLayout -> return .Whole
+            ArrayLiteral -> return .Whole
+            ArrayIndex(base, index) -> return .Element(PlaceStepOperands { base = base, part = index })
+            ArrayAppend -> return .Whole
+            Transfer -> return .Whole
+            Read -> return .Whole
+            Member(base, field) -> return .Field(PlaceStepOperands { base = base, part = field })
+            Call -> return .Whole
+            Construct -> return .Whole
+            Tagged -> return .Whole
+            Unary -> return .Whole
+            Arithmetic -> return .Whole
+            Wrapping -> return .Whole
+            Compare -> return .Whole
+            EnumCode -> return .Whole
+            EnumFromCode -> return .Whole
+            Order -> return .Whole
+            Hash -> return .Whole
+            Logical -> return .Whole
+            Select -> return .Whole
+            Choice -> return .Whole
+            Bitcast -> return .Whole
+            Convert -> return .Whole
+            ForeignImage -> return .Whole
+            ForeignElements -> return .Whole
+            ForeignCallback -> return .Whole
+            ForeignRead -> return .Whole
+            ForeignUnion -> return .Whole
+        }
+    }
+
+    // The `Any` an unboxing reads.
+    function unboxedOperand(borrow self) -> Optional<Int> {
+        match self {
+            FunctionReference -> return .None
+            IndirectCall -> return .None
+            MakeClosure -> return .None
+            GlobalRead -> return .None
+            TaskSpawn -> return .None
+            TaskReady -> return .None
+            TaskAwait -> return .None
+            TaskCancel -> return .None
+            TaskDetach -> return .None
+            Async -> return .None
+            RuntimeTrap -> return .None
+            StringText -> return .None
+            Sequence -> return .None
+            Try -> return .None
+            ChannelCreate -> return .None
+            ChannelReceiver -> return .None
+            ChannelSend -> return .None
+            ChannelClose -> return .None
+            ClassView -> return .None
+            ClassCall -> return .None
+            Integer -> return .None
+            FloatLiteral -> return .None
+            BoxAny -> return .None
+            TypeIs -> return .None
+            UnboxAny(operand, typeId, handler) -> return .Some(operand)
+            Boolean -> return .None
+            StringLiteral -> return .None
+            StringConcat -> return .None
+            TraceText -> return .None
+            HeapAllocateRaw -> return .None
+            HeapFreeRaw -> return .None
+            Print -> return .None
+            HeapRead -> return .None
+            HeapWrite -> return .None
+            Atomic -> return .None
+            HeapCopy -> return .None
+            HeapFill -> return .None
+            HeapOffset -> return .None
+            HeapLayout -> return .None
+            ArrayLiteral -> return .None
+            ArrayIndex -> return .None
+            ArrayAppend -> return .None
+            Transfer -> return .None
+            Read -> return .None
+            Member -> return .None
+            Call -> return .None
+            Construct -> return .None
+            Tagged -> return .None
+            Unary -> return .None
+            Arithmetic -> return .None
+            Wrapping -> return .None
+            Compare -> return .None
+            EnumCode -> return .None
+            EnumFromCode -> return .None
+            Order -> return .None
+            Hash -> return .None
+            Logical -> return .None
+            Select -> return .None
+            Choice -> return .None
+            Bitcast -> return .None
+            Convert -> return .None
+            ForeignImage -> return .None
+            ForeignElements -> return .None
+            ForeignCallback -> return .None
+            ForeignRead -> return .None
+            ForeignUnion -> return .None
+        }
+    }
+
+    // Whether the operation stops the program.
+    function isTrap(borrow self) -> Bool {
+        match self {
+            FunctionReference -> return false
+            IndirectCall -> return false
+            MakeClosure -> return false
+            GlobalRead -> return false
+            TaskSpawn -> return false
+            TaskReady -> return false
+            TaskAwait -> return false
+            TaskCancel -> return false
+            TaskDetach -> return false
+            Async -> return false
+            RuntimeTrap -> return true
+            StringText -> return false
+            Sequence -> return false
+            Try -> return false
+            ChannelCreate -> return false
+            ChannelReceiver -> return false
+            ChannelSend -> return false
+            ChannelClose -> return false
+            ClassView -> return false
+            ClassCall -> return false
+            Integer -> return false
+            FloatLiteral -> return false
+            BoxAny -> return false
+            TypeIs -> return false
+            UnboxAny -> return false
+            Boolean -> return false
+            StringLiteral -> return false
+            StringConcat -> return false
+            TraceText -> return false
+            HeapAllocateRaw -> return false
+            HeapFreeRaw -> return false
+            Print -> return false
+            HeapRead -> return false
+            HeapWrite -> return false
+            Atomic -> return false
+            HeapCopy -> return false
+            HeapFill -> return false
+            HeapOffset -> return false
+            HeapLayout -> return false
+            ArrayLiteral -> return false
+            ArrayIndex -> return false
+            ArrayAppend -> return false
+            Transfer -> return false
+            Read -> return false
+            Member -> return false
+            Call -> return false
+            Construct -> return false
+            Tagged -> return false
+            Unary -> return false
+            Arithmetic -> return false
+            Wrapping -> return false
+            Compare -> return false
+            EnumCode -> return false
+            EnumFromCode -> return false
+            Order -> return false
+            Hash -> return false
+            Logical -> return false
+            Select -> return false
+            Choice -> return false
+            Bitcast -> return false
+            Convert -> return false
+            ForeignImage -> return false
+            ForeignElements -> return false
+            ForeignCallback -> return false
+            ForeignRead -> return false
+            ForeignUnion -> return false
+        }
+    }
+
+    // Whether this is the literal `true`, as a `while true` is written.
+    function isTrue(borrow self) -> Bool {
+        match self {
+            FunctionReference -> return false
+            IndirectCall -> return false
+            MakeClosure -> return false
+            GlobalRead -> return false
+            TaskSpawn -> return false
+            TaskReady -> return false
+            TaskAwait -> return false
+            TaskCancel -> return false
+            TaskDetach -> return false
+            Async -> return false
+            RuntimeTrap -> return false
+            StringText -> return false
+            Sequence -> return false
+            Try -> return false
+            ChannelCreate -> return false
+            ChannelReceiver -> return false
+            ChannelSend -> return false
+            ChannelClose -> return false
+            ClassView -> return false
+            ClassCall -> return false
+            Integer -> return false
+            FloatLiteral -> return false
+            BoxAny -> return false
+            TypeIs -> return false
+            UnboxAny -> return false
+            Boolean(value) -> return value
+            StringLiteral -> return false
+            StringConcat -> return false
+            TraceText -> return false
+            HeapAllocateRaw -> return false
+            HeapFreeRaw -> return false
+            Print -> return false
+            HeapRead -> return false
+            HeapWrite -> return false
+            Atomic -> return false
+            HeapCopy -> return false
+            HeapFill -> return false
+            HeapOffset -> return false
+            HeapLayout -> return false
+            ArrayLiteral -> return false
+            ArrayIndex -> return false
+            ArrayAppend -> return false
+            Transfer -> return false
+            Read -> return false
+            Member -> return false
+            Call -> return false
+            Construct -> return false
+            Tagged -> return false
+            Unary -> return false
+            Arithmetic -> return false
+            Wrapping -> return false
+            Compare -> return false
+            EnumCode -> return false
+            EnumFromCode -> return false
+            Order -> return false
+            Hash -> return false
+            Logical -> return false
+            Select -> return false
+            Choice -> return false
+            Bitcast -> return false
+            Convert -> return false
+            ForeignImage -> return false
+            ForeignElements -> return false
+            ForeignCallback -> return false
+            ForeignRead -> return false
+            ForeignUnion -> return false
+        }
+    }
+
+    // The local a read names.
+    function readLocal(borrow self) -> Optional<Int> {
+        match self {
+            FunctionReference -> return .None
+            IndirectCall -> return .None
+            MakeClosure -> return .None
+            GlobalRead -> return .None
+            TaskSpawn -> return .None
+            TaskReady -> return .None
+            TaskAwait -> return .None
+            TaskCancel -> return .None
+            TaskDetach -> return .None
+            Async -> return .None
+            RuntimeTrap -> return .None
+            StringText -> return .None
+            Sequence -> return .None
+            Try -> return .None
+            ChannelCreate -> return .None
+            ChannelReceiver -> return .None
+            ChannelSend -> return .None
+            ChannelClose -> return .None
+            ClassView -> return .None
+            ClassCall -> return .None
+            Integer -> return .None
+            FloatLiteral -> return .None
+            BoxAny -> return .None
+            TypeIs -> return .None
+            UnboxAny -> return .None
+            Boolean -> return .None
+            StringLiteral -> return .None
+            StringConcat -> return .None
+            TraceText -> return .None
+            HeapAllocateRaw -> return .None
+            HeapFreeRaw -> return .None
+            Print -> return .None
+            HeapRead -> return .None
+            HeapWrite -> return .None
+            Atomic -> return .None
+            HeapCopy -> return .None
+            HeapFill -> return .None
+            HeapOffset -> return .None
+            HeapLayout -> return .None
+            ArrayLiteral -> return .None
+            ArrayIndex -> return .None
+            ArrayAppend -> return .None
+            Transfer -> return .None
+            Read(local) -> return .Some(local)
+            Member -> return .None
+            Call -> return .None
+            Construct -> return .None
+            Tagged -> return .None
+            Unary -> return .None
+            Arithmetic -> return .None
+            Wrapping -> return .None
+            Compare -> return .None
+            EnumCode -> return .None
+            EnumFromCode -> return .None
+            Order -> return .None
+            Hash -> return .None
+            Logical -> return .None
+            Select -> return .None
+            Choice -> return .None
+            Bitcast -> return .None
+            Convert -> return .None
+            ForeignImage -> return .None
+            ForeignElements -> return .None
+            ForeignCallback -> return .None
+            ForeignRead -> return .None
+            ForeignUnion -> return .None
+        }
+    }
+
+    // The global a read names.
+    function readGlobal(borrow self) -> Optional<Int> {
+        match self {
+            FunctionReference -> return .None
+            IndirectCall -> return .None
+            MakeClosure -> return .None
+            GlobalRead(global) -> return .Some(global)
+            TaskSpawn -> return .None
+            TaskReady -> return .None
+            TaskAwait -> return .None
+            TaskCancel -> return .None
+            TaskDetach -> return .None
+            Async -> return .None
+            RuntimeTrap -> return .None
+            StringText -> return .None
+            Sequence -> return .None
+            Try -> return .None
+            ChannelCreate -> return .None
+            ChannelReceiver -> return .None
+            ChannelSend -> return .None
+            ChannelClose -> return .None
+            ClassView -> return .None
+            ClassCall -> return .None
+            Integer -> return .None
+            FloatLiteral -> return .None
+            BoxAny -> return .None
+            TypeIs -> return .None
+            UnboxAny -> return .None
+            Boolean -> return .None
+            StringLiteral -> return .None
+            StringConcat -> return .None
+            TraceText -> return .None
+            HeapAllocateRaw -> return .None
+            HeapFreeRaw -> return .None
+            Print -> return .None
+            HeapRead -> return .None
+            HeapWrite -> return .None
+            Atomic -> return .None
+            HeapCopy -> return .None
+            HeapFill -> return .None
+            HeapOffset -> return .None
+            HeapLayout -> return .None
+            ArrayLiteral -> return .None
+            ArrayIndex -> return .None
+            ArrayAppend -> return .None
+            Transfer -> return .None
+            Read -> return .None
+            Member -> return .None
+            Call -> return .None
+            Construct -> return .None
+            Tagged -> return .None
+            Unary -> return .None
+            Arithmetic -> return .None
+            Wrapping -> return .None
+            Compare -> return .None
+            EnumCode -> return .None
+            EnumFromCode -> return .None
+            Order -> return .None
+            Hash -> return .None
+            Logical -> return .None
+            Select -> return .None
+            Choice -> return .None
+            Bitcast -> return .None
+            Convert -> return .None
+            ForeignImage -> return .None
+            ForeignElements -> return .None
+            ForeignCallback -> return .None
+            ForeignRead -> return .None
+            ForeignUnion -> return .None
+        }
+    }
+}
+
+// A place's last step: a field of a struct or an element of an array, or
+// `Whole` for a place that is no part of another value.
+enum PlacePart {
+    Field(PlaceStepOperands)
+    Element(PlaceStepOperands)
+    Whole
+}
+
+// The value a place step is taken from, and the field number or the index
+// expression that takes it.
+struct PlaceStepOperands {
+    let base: Int
+    let part: Int
+}
+
+extend Operation {
+    // The case an enum value is built as.
+    function taggedVariant(borrow self) -> Optional<Int> {
+        match self {
+            Integer -> return .None
+            FloatLiteral -> return .None
+            BoxAny -> return .None
+            TypeIs -> return .None
+            UnboxAny -> return .None
+            FunctionReference -> return .None
+            IndirectCall -> return .None
+            MakeClosure -> return .None
+            GlobalRead -> return .None
+            TaskSpawn -> return .None
+            TaskReady -> return .None
+            TaskAwait -> return .None
+            TaskCancel -> return .None
+            TaskDetach -> return .None
+            Async -> return .None
+            RuntimeTrap -> return .None
+            StringText -> return .None
+            Sequence -> return .None
+            Try -> return .None
+            ChannelCreate -> return .None
+            ChannelReceiver -> return .None
+            ChannelSend -> return .None
+            ChannelClose -> return .None
+            ClassView -> return .None
+            ClassCall -> return .None
+            Boolean -> return .None
+            StringLiteral -> return .None
+            StringConcat -> return .None
+            TraceText -> return .None
+            HeapAllocateRaw -> return .None
+            HeapFreeRaw -> return .None
+            Print -> return .None
+            HeapRead -> return .None
+            HeapWrite -> return .None
+            Atomic -> return .None
+            HeapCopy -> return .None
+            HeapFill -> return .None
+            HeapOffset -> return .None
+            HeapLayout -> return .None
+            ArrayLiteral -> return .None
+            ArrayIndex -> return .None
+            ArrayAppend -> return .None
+            Transfer -> return .None
+            Read -> return .None
+            Member -> return .None
+            Call -> return .None
+            Construct -> return .None
+            Tagged(variant, payload) -> return .Some(variant)
+            Unary -> return .None
+            Arithmetic -> return .None
+            Wrapping -> return .None
+            Compare -> return .None
+            EnumCode -> return .None
+            EnumFromCode -> return .None
+            Order -> return .None
+            Hash -> return .None
+            Logical -> return .None
+            Select -> return .None
+            Choice -> return .None
+            Bitcast -> return .None
+            Convert -> return .None
+            ForeignImage -> return .None
+            ForeignElements -> return .None
+            ForeignCallback -> return .None
+            ForeignRead -> return .None
+            ForeignUnion -> return .None
+        }
+    }
+}

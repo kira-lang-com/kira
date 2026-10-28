@@ -1,0 +1,191 @@
+// The lexer's editor facts (KLF-EDITOR sections 6.2 and 20.3): every token
+// and comment is classified, and only when the session serves an editor, so
+// a build pays one `editor_mode` call per file.
+
+let classComment = 0
+let classDocComment = 1
+let classString = 2
+let classNumber = 5
+let classBoolean = 6
+let classKeyword = 7
+let classOperator = 8
+let classPunctuation = 9
+let modifierControl = 16384
+
+extend TokenKind {
+    // The `TokenClass` code of the token, or -1 for names, which the
+    // editor spec already classifies by their shape.
+    function editorClass(borrow self) -> Int {
+        match self {
+            Identifier -> return -1
+            IntegerLiteral -> return classNumber
+            FloatLiteral -> return classNumber
+            StringLiteral -> return classString
+            Function -> return classKeyword
+            Let -> return classKeyword
+            Var -> return classKeyword
+            Return -> return classKeyword
+            If -> return classKeyword
+            Else -> return classKeyword
+            While -> return classKeyword
+            True -> return classBoolean
+            False -> return classBoolean
+            Import -> return classKeyword
+            As -> return classKeyword
+            Is -> return classKeyword
+            Struct -> return classKeyword
+            Enum -> return classKeyword
+            Class -> return classKeyword
+            Construct -> return classKeyword
+            Trait -> return classKeyword
+            Extends -> return classKeyword
+            Override -> return classKeyword
+            Match -> return classKeyword
+            Attempt -> return classKeyword
+            Try -> return classKeyword
+            For -> return classKeyword
+            In -> return classKeyword
+            Break -> return classKeyword
+            Continue -> return classKeyword
+            Type -> return classKeyword
+            Distinct -> return classKeyword
+            LeftParen -> return classPunctuation
+            RightParen -> return classPunctuation
+            LeftBrace -> return classPunctuation
+            RightBrace -> return classPunctuation
+            LeftBracket -> return classPunctuation
+            RightBracket -> return classPunctuation
+            Comma -> return classPunctuation
+            Colon -> return classPunctuation
+            Dot -> return classOperator
+            DotDot -> return classOperator
+            At -> return classOperator
+            Backslash -> return classOperator
+            Hash -> return classOperator
+            Question -> return classOperator
+            Arrow -> return classOperator
+            Equals -> return classOperator
+            Plus -> return classOperator
+            Minus -> return classOperator
+            Star -> return classOperator
+            Slash -> return classOperator
+            Percent -> return classOperator
+            EqualEqual -> return classOperator
+            BangEqual -> return classOperator
+            Less -> return classOperator
+            LessEqual -> return classOperator
+            Greater -> return classOperator
+            GreaterEqual -> return classOperator
+            AmpersandAmpersand -> return classOperator
+            PipePipe -> return classOperator
+            Ampersand -> return classOperator
+            Pipe -> return classOperator
+            Caret -> return classOperator
+            Tilde -> return classOperator
+            LessLess -> return classOperator
+            GreaterGreater -> return classOperator
+            Bang -> return classOperator
+            End -> return -1
+        }
+    }
+
+    function isControl(borrow self) -> Bool {
+        match self {
+            Identifier -> return false
+            IntegerLiteral -> return false
+            FloatLiteral -> return false
+            StringLiteral -> return false
+            Function -> return false
+            Let -> return false
+            Var -> return false
+            Return -> return true
+            If -> return true
+            Else -> return true
+            While -> return true
+            True -> return false
+            False -> return false
+            Import -> return false
+            As -> return false
+            Is -> return false
+            Struct -> return false
+            Enum -> return false
+            Class -> return false
+            Construct -> return false
+            Trait -> return false
+            Extends -> return false
+            Override -> return false
+            Match -> return true
+            Attempt -> return true
+            Try -> return true
+            For -> return true
+            In -> return true
+            Break -> return true
+            Continue -> return true
+            Type -> return false
+            Distinct -> return false
+            LeftParen -> return false
+            RightParen -> return false
+            LeftBrace -> return false
+            RightBrace -> return false
+            LeftBracket -> return false
+            RightBracket -> return false
+            Comma -> return false
+            Colon -> return false
+            Dot -> return false
+            DotDot -> return false
+            At -> return false
+            Backslash -> return false
+            Hash -> return false
+            Question -> return false
+            Arrow -> return false
+            Equals -> return false
+            Plus -> return false
+            Minus -> return false
+            Star -> return false
+            Slash -> return false
+            Percent -> return false
+            EqualEqual -> return false
+            BangEqual -> return false
+            Less -> return false
+            LessEqual -> return false
+            Greater -> return false
+            GreaterEqual -> return false
+            AmpersandAmpersand -> return false
+            PipePipe -> return false
+            Ampersand -> return false
+            Pipe -> return false
+            Caret -> return false
+            Tilde -> return false
+            LessLess -> return false
+            GreaterGreater -> return false
+            Bang -> return false
+            End -> return false
+        }
+    }
+}
+
+function recordTokens(tokens: [Token]) {
+    if editor_mode() == 0 { return }
+    for token in tokens {
+        let class = token.kind.editorClass()
+        if class >= 0 {
+            var modifiers = 0
+            if token.kind.isControl() { modifiers = modifierControl }
+            editor_classify(token.span.file, token.span.start, token.span.end, class, modifiers)
+        }
+    }
+}
+
+// `///` and `//!` start a documentation comment; every other comment is plain,
+// `////` included, as the lexer records it (`recordDoc`).
+function recordComment(source: String, file: Int, start: Int, end: Int) {
+    if editor_mode() == 0 { return }
+    var class = classComment
+    if end - start >= 3 {
+        // A line comment: its third byte says whether it documents.
+        let marker = utf8Byte(source, start + 2)
+        let rule = end - start > 3 && utf8Byte(source, start + 3) == asciiSlash
+        if marker == asciiBang || (marker == asciiSlash && !rule) { class = classDocComment }
+    }
+    editor_classify(file, start, end, class, 0)
+}

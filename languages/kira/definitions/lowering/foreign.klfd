@@ -1,0 +1,582 @@
+// `@FFI.Extern` and `@FFI.Address` functions in KIR (KLF section 26). Each C
+// symbol is one foreign declaration carrying its C prototype, so the backend
+// extends narrow integers and a C compiler passes C structs by value. A call
+// converts each argument by the seam it crosses: a scalar as itself, a
+// `CString`, pointer, callback or distinct as the word it holds, an array as
+// the address of its elements, an enum as its case's number, and a C struct
+// as the address of its image.
+
+// The C type codes `klf.kir.signature.c_parameter` reads.
+let cVoid = 0
+let cBool = 1
+let cSigned = 2
+let cUnsigned = 3
+let cFloat = 4
+let cPointer = 5
+let cValue = 6
+
+extend KirTypes {
+    // The KIR declaration of one C symbol; Kira names binding the same
+    // symbol share it.
+    // One declaration for each shape of call a reached variadic function is
+    // made with, named after its C symbol and the shape.
+    function declareVariadicCalls(borrow mut self, builder: KirModuleBuilder, program: CheckedProgram, reached: [Bool]) {
+        for index in 0..program.variadicShapes.count {
+            let shape = program.variadicShapes[index]
+            let checked = program.functions[shape.callee]
+            var declared: Optional<KirFunctionBuilder> = .None
+            match checked.foreign {
+                Some(foreign) -> {
+                    let bound = program.foreignFunctions[foreign]
+                    if reached[shape.callee] && !excludedForeign(program, bound) && !runtimeForeign(program, bound) {
+                        declared = .Some(declareForeign(builder, program, checked, bound, .Some(index)))
+                    }
+                }
+                None -> {}
+            }
+            variadicCalls.append(declared)
+        }
+    }
+
+    function declareForeign(borrow self, builder: KirModuleBuilder, program: CheckedProgram, checked: CheckedFunction, foreign: ForeignFunction, shape: Optional<Int>) -> KirFunctionBuilder {
+        let name = program.named(checked.name)
+        var result = unit
+        match foreign.result {
+            Word -> result = of(foreign.resultType)
+            Field -> result = of(fieldScalar(program, foreign.resultType))
+            Number -> result = integer32
+            Image -> {}
+            Elements -> {}
+            Nothing -> {}
+        }
+        if foreign.address { result = unit }
+        let signature = kir_signature_new(builder, name.start, name.end, result)
+        var symbol = foreign.symbol
+        match shape {
+            Some(index) -> symbol = joinText([symbol, "#", decimalText(stableHash(shapeText(program, program.variadicShapes[index].extras)))])
+            None -> symbol = joinText([symbol, "#", decimalText(fileHash(program, checked.name.file)), "_", decimalText(checked.name.start)])
+        }
+        for index in 0..utf8Count(symbol) { kir_signature_name_byte(signature, utf8Byte(symbol, index)) }
+        if foreign.address { return kir_signature_declare(signature) }
+        if foreign.result == .Image { kir_signature_parameter(signature, pointer) }
+        for index in 0..foreign.parameters.count {
+            let parameterType = foreign.parameterTypes[index]
+            match foreign.parameters[index] {
+                Word -> kir_signature_parameter(signature, of(parameterType))
+                Field -> kir_signature_parameter(signature, of(fieldScalar(program, parameterType)))
+                Elements -> kir_signature_parameter(signature, pointer)
+                Number -> kir_signature_parameter(signature, integer32)
+                Image -> kir_signature_parameter(signature, pointer)
+                Nothing -> {}
+            }
+            cParameter(signature, program, parameterType)
+        }
+        match shape {
+            Some(index) -> {
+                kir_signature_c_variadic(signature)
+                for extra in program.variadicShapes[index].extras {
+                    kir_signature_parameter(signature, cCarrierScalar(program, extra))
+                    cParameter(signature, program, extra)
+                }
+            }
+            None -> {}
+        }
+        cResult(signature, program, foreign.resultType)
+        for index in 0..utf8Count(foreign.syscall) { kir_signature_c_syscall_byte(signature, utf8Byte(foreign.syscall, index)) }
+        return kir_signature_declare(signature)
+    }
+
+    function cParameter(borrow self, signature: KirSignature, program: CheckedProgram, valueType: Type) {
+        let scalar = fieldScalar(program, valueType)
+        kir_signature_c_parameter(signature, cCode(program, scalar), cCarrier(program, scalar))
+    }
+
+    function cResult(borrow self, signature: KirSignature, program: CheckedProgram, valueType: Type) {
+        let scalar = fieldScalar(program, valueType)
+        kir_signature_c_result(signature, cCode(program, scalar), cCarrier(program, scalar))
+    }
+
+    // The type a C code takes its width or record from.
+    function cCarrier(borrow self, program: CheckedProgram, valueType: Type) -> KirType {
+        if valueType.kind == .Structure && !isArrayType(program, valueType) { return imageType(program, valueType) }
+        if valueType.kind == .Enumeration { return integer32 }
+        return of(valueType)
+    }
+
+    // Each native library the program names, linked into the binary.
+    function declareNativeLibraries(borrow self, builder: KirModuleBuilder, program: CheckedProgram) {
+        for library in program.nativeLibraries {
+            if utf8Count(library.artifact) > 0 { moduleAttribute(builder, library.artifact, 0) }
+            for source in library.sources {
+                var parts: [String] = [source.path]
+                for flag in source.flags {
+                    parts.append("\t")
+                    parts.append(flag)
+                }
+                moduleAttribute(builder, joinText(parts), 2)
+            }
+            for flag in library.linkerFlags { moduleAttribute(builder, flag, 1) }
+        }
+        for resource in program.resources { moduleAttribute(builder, resource, 3) }
+    }
+}
+
+function moduleAttribute(builder: KirModuleBuilder, text: String, kind: Int) {
+    for index in 0..utf8Count(text) { kir_module_attribute_byte(builder, utf8Byte(text, index)) }
+    kir_module_attribute(builder, kind)
+}
+
+function cCode(program: CheckedProgram, valueType: Type) -> Int {
+    match valueType.kind {
+        Integer -> return valueType.signed ? cSigned : cUnsigned
+        Decimal -> return cSigned
+        Floating -> return cFloat
+        Boolean -> return cBool
+        Pointer -> return cPointer
+        Enumeration -> return cSigned
+        Void -> return cVoid
+        Invalid -> return cVoid
+        Structure -> {
+            if isArrayType(program, valueType) { return cPointer }
+            return cValue
+        }
+    }
+}
+
+// The scalar a `CString`, an `@FFI.Pointer`, an `@FFI.Callback` or a
+// distinct holds, which is what crosses for it; any other type itself.
+function fieldScalar(program: CheckedProgram, valueType: Type) -> Type {
+    var crossing = valueType
+    while crossing.kind == .Structure && holdsSeamWord(program, crossing) {
+        crossing = program.structs[crossing.declaration].fields[0].valueType
+    }
+    return crossing
+}
+
+function holdsSeamWord(program: CheckedProgram, valueType: Type) -> Bool {
+    let structure = program.structs[valueType.declaration]
+    if isCStringType(program, valueType) || structure.genericBase == "Distinct" { return true }
+    match structure.shape {
+        Callback -> return true
+        CPointer -> return true
+        Plain -> return false
+        CLayout -> return false
+        CUnion -> return false
+        CArray -> return false
+    }
+}
+
+// The C function an owned `@FFI.Pointer` is freed with, or -1.
+function pointerFree(program: CheckedProgram, structure: Int) -> Int {
+    if structure >= program.pointerFrees.count { return 0 - 1 }
+    return program.pointerFrees[structure]
+}
+
+extend FunctionLowering {
+    // An owned pointer given back to C, unless it is null.
+    function freeOwnedPointer(borrow mut self, address: KirAddress, free: Int) {
+        let word = kir.load(kir.field(address, 0, types.pointer))
+        let held = kir.block()
+        let done = kir.block()
+        let bits = kir.convert(convertBitcast, word, types.integer64)
+        kir.branchIf(kir.compare(kirPredicate(.Equal, false), bits, kir.integer(types.integer64, 0)), done, held)
+        enter(held)
+        kir.argument(word)
+        kir.callVoid(functions[free])
+        flowInto(done)
+        enter(done)
+    }
+
+    function foreignOf(borrow self, target: Int) -> Optional<ForeignFunction> {
+        match program.functions[target].foreign {
+            Some(index) -> return .Some(program.foreignFunctions[index])
+            None -> return .None
+        }
+    }
+
+    // A call to a C function. A scalar result is returned; any other is
+    // written to `destination`.
+    function foreignCall(borrow mut self, target: Int, foreign: ForeignFunction, arguments: [Int], destination: Optional<KirAddress>, span: Span) -> KirValue {
+        if runtimeForeign(program, foreign) { return runtimeCall(foreign, arguments) }
+        let excluded = excludedForeign(program, foreign)
+        var callee = functions[target]
+        var fixed = arguments.count
+        if foreign.variadic && excluded {
+            fixed = foreign.parameters.count
+        } else if foreign.variadic {
+            fixed = foreign.parameters.count
+            var extras: [Type] = []
+            for index in fixed..arguments.count { extras.append(program.typeOf(arguments[index])) }
+            match types.variadicCalls[variadicShapeOf(program, target, extras)] {
+                Some(declared) -> callee = declared
+                None -> abort()
+            }
+        }
+        if foreign.address && excluded { return excludedCall(foreign, span) }
+        if foreign.address {
+            return kir.convert(convertBitcast, kir_value_function_reference(kir, callee), types.pointer)
+        }
+        var values: [KirValue] = []
+        var resultImage: Optional<KirAddress> = .None
+        if foreign.result == .Image {
+            let image = imageSlot(types.imageType(program, foreign.resultType))
+            resultImage = .Some(image)
+            values.append(kir.convert(convertBitcast, kir.pointer(image), types.pointer))
+        }
+        let outerStorage = callStorage.count
+        for index in 0..fixed {
+            let word = foreignArgument(arguments[index], foreign.parameters[index], foreign.parameterTypes[index], foreign.retained[index])
+            if !foreign.retained[index] && madeForCall(arguments[index]) { callStorage.append(word) }
+            values.append(word)
+        }
+        for index in fixed..arguments.count {
+            let extra = program.typeOf(arguments[index])
+            values.append(foreignArgument(arguments[index], variadicSeam(extra), extra, false))
+        }
+        if excluded {
+            endCallStorage(outerStorage, false)
+            return excludedCall(foreign, span)
+        }
+        for argument in values { kir.argument(argument) }
+        let result = foreignResult(callee, foreign, resultImage, destination, span)
+        endCallStorage(outerStorage, true)
+        return result
+    }
+
+    // Forgets the buffers made since `outerStorage`, giving each back first
+    // when `release` is set.
+    function endCallStorage(borrow mut self, outerStorage: Int, release: Bool) {
+        var outer: [KirValue] = []
+        for index in 0..callStorage.count {
+            if index < outerStorage {
+                outer.append(callStorage[index])
+            } else if release {
+                kir.argument(callStorage[index])
+                kir.callVoid(functions[program.arrayFunctions[3]])
+            }
+        }
+        callStorage = outer
+    }
+
+    // The call itself, once its arguments are in place.
+    function foreignResult(borrow mut self, callee: KirFunctionBuilder, foreign: ForeignFunction, resultImage: Optional<KirAddress>, destination: Optional<KirAddress>, span: Span) -> KirValue {
+        let unused = kir.integer(types.integer64, 0)
+        match foreign.result {
+            Word -> return kir.call(callee, types.of(foreign.resultType))
+            Field -> {
+                let word = kir.call(callee, types.of(fieldScalar(program, foreign.resultType)))
+                match destination {
+                    Some(place) -> storeSeamWord(word, foreign.resultType, place)
+                    None -> {}
+                }
+                return unused
+            }
+            Number -> {
+                let number = kir.call(callee, types.integer32)
+                match destination {
+                    Some(place) -> enumFromNumber(number, foreign.resultType, place, span)
+                    None -> {}
+                }
+                return unused
+            }
+            Image -> {
+                kir.callVoid(callee)
+                match resultImage {
+                    Some(image) -> {
+                        match destination {
+                            Some(place) -> readImage(image, foreign.resultType, place, span)
+                            None -> {}
+                        }
+                    }
+                    None -> {}
+                }
+                return unused
+            }
+            Elements -> return unused
+            Nothing -> {
+                kir.callVoid(callee)
+                return unused
+            }
+        }
+    }
+
+    // A call into a library the target leaves out traps, naming the call,
+    // once its arguments are evaluated. What follows runs in a block nothing
+    // reaches.
+    function excludedCall(borrow mut self, foreign: ForeignFunction, span: Span) -> KirValue {
+        let report = TrapReport {
+            code = checkTrap,
+            headline = "called a C function this target leaves out",
+            label = "this call",
+            note = "its native library is not available for the target the program was built for, so the call has no function to reach",
+            help = "guard the call with the target the library is available for, or give the library a build for this target"
+        }
+        trapReported(span, report, [])
+        open = false
+        enter(kir.block())
+        if foreign.result == .Word && !foreign.address { return kir.load(temporary(foreign.resultType)) }
+        if foreign.address { return kir.convert(convertBitcast, kir.integer(types.integer64, 0), types.pointer) }
+        return kir.integer(types.integer64, 0)
+    }
+
+    function foreignArgument(borrow mut self, argument: Int, seam: Seam, valueType: Type, retained: Bool) -> KirValue {
+        match seam {
+            Word -> return value(argument)
+            Field -> {
+                let word = seamWord(address(argument), valueType)
+                if retained && isCStringType(program, valueType) && !madeKept(argument) { return keptCString(word) }
+                return word
+            }
+            Elements -> return elementsPointer(argument, retained)
+            Number -> return kir.convert(convertTruncate, kir.tag(address(argument)), types.integer32)
+            Image -> {
+                let image = imageSlot(types.imageType(program, valueType))
+                writeImage(address(argument), valueType, image, retained)
+                return kir.convert(convertBitcast, kir.pointer(image), types.pointer)
+            }
+            Nothing -> return kir.integer(types.integer64, 0)
+        }
+    }
+
+    // Whether a string argument was copied into a buffer for this call alone.
+    function madeForCall(borrow self, argument: Int) -> Bool {
+        match program.expressions[argument].operation.invocation() {
+            Some(invocation) -> return invocation.target == program.foreignHelpers[3]
+            None -> return false
+        }
+    }
+
+    // Whether a string argument was already copied for C to keep.
+    function madeKept(borrow self, argument: Int) -> Bool {
+        match program.expressions[argument].operation.invocation() {
+            Some(invocation) -> return invocation.target == program.foreignHelpers[2]
+            None -> return false
+        }
+    }
+
+    // The word a `CString`, pointer, callback or distinct holds.
+    function seamWord(borrow mut self, source: KirAddress, valueType: Type) -> KirValue {
+        var place = source
+        var crossing = valueType
+        while crossing.kind == .Structure && holdsSeamWord(program, crossing) {
+            crossing = program.structs[crossing.declaration].fields[0].valueType
+            place = kir.field(place, 0, types.of(crossing))
+        }
+        return kir.load(place)
+    }
+
+    function storeSeamWord(borrow mut self, word: KirValue, valueType: Type, destination: KirAddress) {
+        var place = destination
+        var crossing = valueType
+        while crossing.kind == .Structure && holdsSeamWord(program, crossing) {
+            crossing = program.structs[crossing.declaration].fields[0].valueType
+            place = kir.field(place, 0, types.of(crossing))
+        }
+        kir.store(word, place)
+    }
+
+    // The address of an array's elements, null for an empty one. One C
+    // keeps gets a copy nothing collects.
+    function elementsPointer(borrow mut self, array: Int, retained: Bool) -> KirValue {
+        let arrayType = program.typeOf(array)
+        let header = address(array)
+        let count = kir.load(kir.field(header, 1, types.integer64))
+        let chosen = temporary(Type.pointer())
+        kir.store(kir_value_null(kir, types.pointer), chosen)
+        let present = kir.block()
+        let done = kir.block()
+        kir.branchIf(kir.compare(kirPredicate(.Equal, false), count, kir.integer(types.integer64, 0)), done, present)
+        enter(present)
+        var data = arrayData(header, arrayType)
+        if retained {
+            let element = program.structs[arrayType.declaration].typeArguments[0]
+            let bytes = kir.binary(kirOperator(.Multiply, true), false, true, count, kir.integer(types.integer64, types.byteSize(element)))
+            let kept = kir.allocateRaw(bytes, kir.integer(types.integer64, 8))
+            kir.copyRaw(data, kept, bytes)
+            data = kept
+        }
+        kir.store(data, chosen)
+        flowInto(done)
+        enter(done)
+        return kir.load(chosen)
+    }
+
+    // `@FFI.Pointer` storage filled with a value's image: collected storage
+    // for the call, or storage nothing collects for C to keep.
+    function foreignImage(borrow mut self, operand: Int, retained: Bool, valueType: Type) -> KirAddress {
+        let given = program.typeOf(operand)
+        let bytes = kir.integer(types.integer64, types.imageSize(program, given))
+        var block = kir.integer(types.integer64, 0)
+        if retained {
+            block = kir.allocateRaw(bytes, kir.integer(types.integer64, 8))
+        } else {
+            block = arrayRuntimePointer(0, [bytes])
+            callStorage.append(block)
+        }
+        writeImage(address(operand), given, kir.typedMemory(block, types.imageType(program, given)), retained)
+        let pointer = temporary(valueType)
+        kir.store(block, kir.field(pointer, 0, types.pointer))
+        markInitialized(pointer)
+        return pointer
+    }
+
+    // A member of the C struct a pointer points at, read through it; a null
+    // pointer traps.
+    function foreignRead(borrow mut self, base: Int, field: Int, valueType: Type, span: Span) -> KirAddress {
+        let baseType = program.typeOf(base)
+        var pointee = 0
+        match program.structs[baseType.declaration].shape {
+            CPointer(target) -> {
+                match target {
+                    Some(pointed) -> pointee = pointed
+                    None -> abort()
+                }
+            }
+            Plain -> abort()
+            CLayout -> abort()
+            CUnion -> abort()
+            CArray -> abort()
+            Callback -> abort()
+        }
+        let pointer = kir.load(kir.field(address(base), 0, types.pointer))
+        let null = kir.block()
+        let present = kir.block()
+        let word = kir.convert(convertBitcast, pointer, types.integer64)
+        kir.branchIf(kir.compare(kirPredicate(.Equal, false), word, kir.integer(types.integer64, 0)), null, present)
+        enter(null)
+        let report = TrapReport {
+            code = checkTrap,
+            headline = "read through a null C pointer",
+            label = "this pointer is null",
+            note = "the C function returned or stored no object here, so there is nothing to read",
+            help = "check the pointer against null before reading through it, as the C API's documentation says when it can be null"
+        }
+        trapReported(span, report, [])
+        open = false
+        enter(present)
+        let structType = Type.structure(pointee)
+        let image = kir.typedMemory(pointer, types.imageType(program, structType))
+        let destination = temporary(valueType)
+        readImageField(pointee, field, image, destination, span)
+        markInitialized(destination)
+        return destination
+    }
+
+    // The address of an adapter C calls, as an `@FFI.Callback` value.
+    function foreignCallbackValue(borrow mut self, entry: Int, closure: Optional<Int>, valueType: Type) -> KirAddress {
+        let callback = temporary(valueType)
+        match types.foreignEntries[entry] {
+            Some(adapter) -> {
+                let code = kir.convert(convertBitcast, kir_value_function_reference(kir, adapter), types.pointer)
+                kir.store(code, kir.field(callback, 0, types.pointer))
+            }
+            None -> abort()
+        }
+        if isContextCallbackType(program, valueType) {
+            var context = kir_value_null(kir, types.pointer)
+            match closure {
+                Some(value) -> context = takeContext(address(value))
+                None -> {}
+            }
+            kir.store(context, kir.field(callback, 1, types.pointer))
+        }
+        markInitialized(callback)
+        return callback
+    }
+
+    // A closure's context, handed over from a temporary and shared from a
+    // place.
+    function takeContext(borrow mut self, source: KirAddress) -> KirValue {
+        let context = kir.load(kir.field(source, 1, types.pointer))
+        if isTemporaryAddress(source) {
+            forgetTracked(source)
+            return context
+        }
+        let shared = temporary(Type.pointer())
+        kir.store(context, shared)
+        let bits = kir.convert(convertBitcast, context, types.integer64)
+        let retain = kir.block()
+        let done = kir.block()
+        kir.branchIf(kir.compare(kirPredicate(.NotEqual, false), bits, kir.integer(types.integer64, 0)), retain, done)
+        enter(retain)
+        kir.store(arrayRuntimePointer(2, [context]), shared)
+        flowInto(done)
+        enter(done)
+        return kir.load(shared)
+    }
+
+    // An `@FFI.Union` literal: zero, then the member it names.
+    function foreignUnion(borrow mut self, field: Int, member: Optional<Int>, valueType: Type) -> KirAddress {
+        let union = temporary(valueType)
+        zeroBytes(kir.convert(convertBitcast, kir.pointer(union), types.pointer), types.byteSize(valueType))
+        match member {
+            Some(value) -> {
+                let fieldType = program.structs[valueType.declaration].fields[field].valueType
+                write(value, kir.field(union, field, types.of(fieldType)))
+            }
+            None -> {}
+        }
+        markInitialized(union)
+        return union
+    }
+
+    // Storage for a C image, in the entry block like every other slot.
+    function imageSlot(borrow mut self, image: KirType) -> KirAddress {
+        kir.switchTo(entry)
+        let slot = kir.slot(image)
+        kir.switchTo(current)
+        return slot
+    }
+}
+
+// How a promoted variadic argument crosses: a scalar as itself, an enum as
+// its case number, and a `CString`, pointer, callback or distinct as its word.
+function variadicSeam(valueType: Type) -> Seam {
+    match valueType.kind {
+        Integer -> return .Word
+        Decimal -> return .Word
+        Floating -> return .Word
+        Boolean -> return .Word
+        Pointer -> return .Word
+        Invalid -> return .Word
+        Void -> return .Nothing
+        Enumeration -> return .Number
+        Structure -> return .Field
+    }
+}
+
+function excludedForeign(program: CheckedProgram, foreign: ForeignFunction) -> Bool {
+    return foreign.library >= 0 && program.nativeLibraries[foreign.library].excluded
+}
+
+// The content hash of `file`, which names a foreign declaration's symbol
+// alike in every unit and every build, as the session's id for the file
+// does not.
+function fileHash(program: CheckedProgram, file: Int) -> Int {
+    if file < 0 || file >= program.firstSources.count || program.firstSources[file] < 0 { return file }
+    return program.sources[program.firstSources[file]].hash
+}
+
+// The extra arguments of a variadic call as text, which names the call's
+// declaration alike in every unit that makes the same call.
+function shapeText(program: CheckedProgram, extras: [Type]) -> String {
+    var parts: [String] = []
+    for extra in extras {
+        match extra.kind {
+            Structure -> parts.append(program.structs[extra.declaration].name.text)
+            Enumeration -> parts.append(program.enums[extra.declaration].name.text)
+            Integer -> {
+                if extra.signed { parts.append("i") } else { parts.append("u") }
+                parts.append(decimalText(extra.bits))
+            }
+            Decimal -> parts.append("d")
+            Floating -> parts.append(joinText(["f", decimalText(extra.bits)]))
+            Boolean -> parts.append("b")
+            Pointer -> parts.append("p")
+            Void -> parts.append("v")
+            Invalid -> parts.append("x")
+        }
+        parts.append(",")
+    }
+    return joinText(parts)
+}

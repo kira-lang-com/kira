@@ -1,0 +1,227 @@
+// The lexer: KSL source text to a token stream ending in `End`.
+//
+// Whitespace and `//` comments are trivia; KSL has no block comment. A byte
+// the lexer cannot classify becomes one `Unknown` token, a multi-byte
+// character once rather than per byte, and the parser reports it.
+
+let asciiTab = 9
+let asciiNewline = 10
+let asciiFormFeed = 12
+let asciiReturn = 13
+let asciiSpace = 32
+let asciiBang = 33
+let asciiPercent = 37
+let asciiAmpersand = 38
+let asciiLeftParen = 40
+let asciiRightParen = 41
+let asciiStar = 42
+let asciiPlus = 43
+let asciiComma = 44
+let asciiMinus = 45
+let asciiDot = 46
+let asciiSlash = 47
+let asciiZero = 48
+let asciiNine = 57
+let asciiColon = 58
+let asciiLess = 60
+let asciiEquals = 61
+let asciiGreater = 62
+let asciiAt = 64
+let asciiUpperA = 65
+let asciiUpperE = 69
+let asciiUpperZ = 90
+let asciiLeftBracket = 91
+let asciiRightBracket = 93
+let asciiCaret = 94
+let asciiUnderscore = 95
+let asciiLowerA = 97
+let asciiLowerE = 101
+let asciiLowerZ = 122
+let asciiLeftBrace = 123
+let asciiPipe = 124
+let asciiRightBrace = 125
+
+let endOfInput = -1
+
+function isDigit(byte: Int) -> Bool {
+    return byte >= asciiZero && byte <= asciiNine
+}
+
+function isNameStart(byte: Int) -> Bool {
+    return byte == asciiUnderscore
+        || (byte >= asciiLowerA && byte <= asciiLowerZ)
+        || (byte >= asciiUpperA && byte <= asciiUpperZ)
+}
+
+function isNameContinue(byte: Int) -> Bool {
+    return isNameStart(byte) || isDigit(byte)
+}
+
+function isWhitespace(byte: Int) -> Bool {
+    return byte == asciiSpace || byte == asciiTab || byte == asciiNewline
+        || byte == asciiReturn || byte == asciiFormFeed
+}
+
+function lex(source: String, file: Int) -> [Token] {
+    var lexer = Lexer { source = source, file = file, position = 0 }
+    var tokens: [Token] = []
+    while true {
+        let token = lexer.next()
+        tokens.append(token)
+        if token.kind == .End { return tokens }
+    }
+    return tokens
+}
+
+struct Lexer {
+    let source: String
+    let file: Int
+    var position: Int
+
+    function byte(borrow self, ahead: Int) -> Int {
+        let at = position + ahead
+        if at >= utf8Count(source) { return endOfInput }
+        return utf8Byte(source, at)
+    }
+
+    function token(borrow self, kind: TokenKind, start: Int) -> Token {
+        return Token { kind = kind, span = Span { file = file, start = start, end = position } }
+    }
+
+    function next(borrow mut self) -> Token {
+        skipTrivia()
+        let start = position
+        let first = byte(0)
+        if first == endOfInput { return token(.End, start) }
+        if isNameStart(first) { return word() }
+        if isDigit(first) { return number() }
+        return symbol()
+    }
+
+    function skipTrivia(borrow mut self) {
+        while true {
+            let current = byte(0)
+            if isWhitespace(current) {
+                position += 1
+            } else if current == asciiSlash && byte(1) == asciiSlash {
+                while byte(0) != asciiNewline && byte(0) != endOfInput {
+                    position += 1
+                }
+            } else {
+                return
+            }
+        }
+    }
+
+    function word(borrow mut self) -> Token {
+        let start = position
+        while isNameContinue(byte(0)) {
+            position += 1
+        }
+        match keyword(utf8Slice(source, start, position)) {
+            Some(kind) -> return token(kind, start)
+            None -> return token(.Identifier, start)
+        }
+    }
+
+    // A `.` is a decimal point only when a digit follows it, and an exponent
+    // only when a digit follows its optional sign.
+    function number(borrow mut self) -> Token {
+        let start = position
+        var float = false
+        skipDigits()
+        if byte(0) == asciiDot && isDigit(byte(1)) {
+            float = true
+            position += 1
+            skipDigits()
+        }
+        if byte(0) == asciiLowerE || byte(0) == asciiUpperE {
+            var ahead = 1
+            if byte(1) == asciiPlus || byte(1) == asciiMinus { ahead = 2 }
+            if isDigit(byte(ahead)) {
+                float = true
+                position += ahead
+                skipDigits()
+            }
+        }
+        if float { return token(.FloatLiteral, start) }
+        return token(.IntegerLiteral, start)
+    }
+
+    function skipDigits(borrow mut self) {
+        while isDigit(byte(0)) {
+            position += 1
+        }
+    }
+
+    function symbol(borrow mut self) -> Token {
+        let start = position
+        let first = byte(0)
+        let second = byte(1)
+        match pairedSymbol(first, second) {
+            Some(kind) -> {
+                position += 2
+                return token(kind, start)
+            }
+            None -> {}
+        }
+        match singleSymbol(first) {
+            Some(kind) -> {
+                position += 1
+                return token(kind, start)
+            }
+            None -> {}
+        }
+        position += utf8Width(first)
+        return token(.Unknown, start)
+    }
+}
+
+function pairedSymbol(first: Int, second: Int) -> Optional<TokenKind> {
+    if first == asciiMinus && second == asciiGreater { return .Some(.Arrow) }
+    if first == asciiEquals && second == asciiEquals { return .Some(.EqualEqual) }
+    if first == asciiBang && second == asciiEquals { return .Some(.BangEqual) }
+    if first == asciiLess && second == asciiEquals { return .Some(.LessEqual) }
+    if first == asciiGreater && second == asciiEquals { return .Some(.GreaterEqual) }
+    if first == asciiAmpersand && second == asciiAmpersand { return .Some(.AmpersandAmpersand) }
+    if first == asciiPipe && second == asciiPipe { return .Some(.PipePipe) }
+    if first == asciiLess && second == asciiLess { return .Some(.LessLess) }
+    if first == asciiGreater && second == asciiGreater { return .Some(.GreaterGreater) }
+    let none: Optional<TokenKind> = .None
+    return none
+}
+
+function singleSymbol(byte: Int) -> Optional<TokenKind> {
+    if byte == asciiLeftParen { return .Some(.LeftParen) }
+    if byte == asciiRightParen { return .Some(.RightParen) }
+    if byte == asciiLeftBrace { return .Some(.LeftBrace) }
+    if byte == asciiRightBrace { return .Some(.RightBrace) }
+    if byte == asciiLeftBracket { return .Some(.LeftBracket) }
+    if byte == asciiRightBracket { return .Some(.RightBracket) }
+    if byte == asciiComma { return .Some(.Comma) }
+    if byte == asciiDot { return .Some(.Dot) }
+    if byte == asciiColon { return .Some(.Colon) }
+    if byte == asciiAt { return .Some(.At) }
+    if byte == asciiEquals { return .Some(.Equals) }
+    if byte == asciiPlus { return .Some(.Plus) }
+    if byte == asciiMinus { return .Some(.Minus) }
+    if byte == asciiStar { return .Some(.Star) }
+    if byte == asciiSlash { return .Some(.Slash) }
+    if byte == asciiPercent { return .Some(.Percent) }
+    if byte == asciiLess { return .Some(.Less) }
+    if byte == asciiGreater { return .Some(.Greater) }
+    if byte == asciiAmpersand { return .Some(.Ampersand) }
+    if byte == asciiPipe { return .Some(.Pipe) }
+    if byte == asciiCaret { return .Some(.Caret) }
+    if byte == asciiBang { return .Some(.Bang) }
+    let none: Optional<TokenKind> = .None
+    return none
+}
+
+// The bytes of the character a UTF-8 leading byte opens.
+function utf8Width(byte: Int) -> Int {
+    if byte < 128 { return 1 }
+    if byte >= 192 && byte < 224 { return 2 }
+    if byte >= 224 && byte < 240 { return 3 }
+    return 4
+}

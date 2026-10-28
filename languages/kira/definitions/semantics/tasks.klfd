@@ -1,0 +1,189 @@
+function isTaskType(program: CheckedProgram, valueType: Type) -> Bool {
+    if valueType.kind != .Structure { return false }
+    let base = program.structs[valueType.declaration].genericBase
+    match base {
+        "Task", "MainThreadTask" -> return true
+        else -> return false
+    }
+}
+
+function taskRuntimeFunctions(declarations: Declarations) -> [Int] {
+    for structure in declarations.structs {
+        if structure.genericBase != "Task" { continue }
+        var functions: [Int] = []
+        let names: [String] = ["createDeferredTask", "readyDeferredTask", "awaitDeferredTask", "cancelDeferredTask", "detachDeferredTask"]
+        for name in names {
+            match declarations.findFunction(.None, name) {
+                Some(target) -> functions.append(target)
+                None -> report(.UndefinedFunction, structure.name.span)
+            }
+        }
+        return functions
+    }
+    return []
+}
+
+extend Checker {
+    // `Task<element>`, or another handle template over `element`.
+    function handleTypeFor(borrow mut self, base: String, element: Type, span: Span) -> Type {
+        let arguments = [declarations.reference(element, span)]
+        return resolveType(TypeReference {
+            qualifier = .None, name = Identifier { text = base, span = span }, arguments = arguments, modes = [],
+            instanceName = referenceInstanceName(base, arguments, [])
+        })
+    }
+
+    function checkTask(borrow mut self, declared: TaskDeclaration) -> Int {
+        match declared.mainThread {
+            Some(operation) -> return checkMainThreadRequest(declared, operation)
+            None -> {}
+        }
+        if program.taskFunctions.count != 5 {
+            report(.UnknownType, declared.span)
+            return add(.Integer(0), Type.invalid(), declared.span)
+        }
+        if declared.body.count != 1 {
+            report(.OutsideSubset, declared.span)
+            return add(.Integer(0), Type.invalid(), declared.span)
+        }
+        match tree.statements[declared.body[0]].kind.evaluatedExpression() {
+            Some(value) -> {
+                match tree.expressions[value].kind.taskCall() {
+                    Some(invocation) -> {
+                        if invocation.receiver.isNone() { return deferredFreeCall(invocation, declared.span) }
+                    }
+                    None -> {}
+                }
+                return readyTask(value, declared.span)
+            }
+            None -> {
+                report(.OutsideSubset, declared.span)
+                return add(.Integer(0), Type.invalid(), declared.span)
+            }
+        }
+    }
+
+    // `Task { name(arguments) }`: the call runs when the task is awaited.
+    function deferredFreeCall(borrow mut self, invocation: TaskCallSyntax, span: Span) -> Int {
+        match overload(.None, invocation.name.text, invocation.arguments, span) {
+            Some(target) -> {
+                declarations.requireVisible(file(), declarations.signatures[target].name.span.file, invocation.name.span)
+                for parameter in declarations.signatures[target].parameters {
+                    if parameter.mode != .Owned {
+                        report(.TaskBorrowedTarget, span)
+                        return add(.Integer(0), Type.invalid(), span)
+                    }
+                }
+                let checked = call(target, .None, invocation.arguments, span)
+                match program.expressions[checked].operation.invocation() {
+                    Some(called) -> return deferredCall(called, false, "Task", span)
+                    None -> return checked
+                }
+            }
+            None -> {
+                report(.UndefinedFunction, invocation.name.span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+
+    // `Task { value }` for any other body: the value, already computed.
+    function readyTask(borrow mut self, value: Int, span: Span) -> Int {
+        let checked = expression(value, .None)
+        let element = typeOf(checked)
+        if element.isInvalid() { return checked }
+        let taskType = handleTypeFor("Task", element, span)
+        match declarations.typeNamed("Any") {
+            Some(anyType) -> return add(.TaskReady(coerce(checked, anyType, .BindingTypeMismatch)), taskType, span)
+            None -> {
+                report(.UnknownType, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+
+    // A deferred task whose work makes `called` with the values it captured,
+    // dispatched through the class's table when `dynamic`, under a handle of
+    // template `handle`.
+    function deferredCall(borrow mut self, called: Invocation, dynamic: Bool, handle: String, span: Span) -> Int {
+        if program.taskFunctions.count != 5 {
+            report(.UnknownType, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let callee = declarations.signatures[called.target]
+        let creator = declarations.signatures[program.taskFunctions[0]]
+        let workType = creator.parameters[0].valueType
+        let anyType = program.structs[workType.declaration].typeArguments[0]
+        var captures: [CaptureSpec] = []
+        var locals: [Local] = []
+        var values: [Int] = []
+        for index in 0..called.arguments.count {
+            let parameter = callee.parameters[index]
+            captures.append(CaptureSpec { name = parameter.name, valueType = parameter.valueType, cell = false })
+            locals.append(Local {
+                name = parameter.name.text, valueType = parameter.valueType, mutable = false,
+                byReference = false, moved = false, cell = false, captured = true, passingMode = .Borrowed
+            })
+            values.append(add(.Read(index), parameter.valueType, parameter.name.span))
+        }
+        var bodyCall = add(.Call(called.target, values), callee.result, span)
+        if dynamic { bodyCall = add(.ClassCall(called.target, values), callee.result, span) }
+        // An async function's task runs its future to the end.
+        if isAsyncSignature(callee) && callee.result.kind == .Structure {
+            bodyCall = blockOnCall(bodyCall, program.structs[callee.result.declaration].typeArguments[0], span)
+        }
+        var body: [Int] = []
+        var result = bodyCall
+        var element = typeOf(bodyCall)
+        if element.equals(Type.void()) {
+            body.append(program.addStatement(.Evaluate(bodyCall)))
+            result = add(.Integer(0), Type.int(), span)
+            element = Type.int()
+        }
+        result = coerce(result, anyType, .ReturnTypeMismatch)
+        body.append(program.addStatement(.Return(.Some(result))))
+        let work = declarations.signatures.count
+        let symbol = joinText(["__taskwork#", signature().symbol, "@", decimalText(span.start)])
+        let name = Identifier { text = symbol, span = signature().name.span }
+        let syntax = FunctionDeclaration {
+            name = name, annotations = [], receiver = .Free, parameters = [], result = .None, body = [], span = span,
+            typeParameters = [], scope = signature().declaration.scope
+        }
+        declarations.addSignature(Signature {
+            name = name, symbol = symbol, member = "", owner = .None, receiver = .Free, parameters = [], result = anyType, entry = false, declaration = syntax
+        })
+        program.functions.append(CheckedFunction {
+            symbol = symbol, name = name.span, result = anyType, parameterCount = captures.count,
+            locals = locals, body = body, entry = false, lambda = true, captures = captures, globalInitializer = false, service = false, foreign = .None, memberName = ""
+        })
+        return add(.TaskSpawn(work, called.arguments, program.wordsFor(workType)), handleTypeFor(handle, element, span), span)
+    }
+
+    function checkTaskAwait(borrow mut self, task: Int, span: Span) -> Int {
+        let element = program.structs[typeOf(task).declaration].typeArguments[0]
+        if isAnyType(program, element) {
+            let id = add(.Member(task, 0), Type.int(), span)
+            return add(.Call(program.taskFunctions[2], [id]), element, span)
+        }
+        return add(.TaskAwait(task, internAnyType(element)), element, span)
+    }
+
+    function checkTaskMethod(borrow mut self, task: Int, method: Identifier, arguments: [Int], span: Span) -> Int {
+        if program.structs[typeOf(task).declaration].genericBase == "MainThreadTask" {
+            report(.MainThreadHandleOpaque, method.span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        if arguments.count != 0 {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        match method.text {
+            "requestCancel" -> return add(.TaskCancel(task), Type.void(), span)
+            "detach" -> return add(.TaskDetach(task), Type.void(), span)
+            else -> {
+                report(.UndefinedFunction, method.span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+}

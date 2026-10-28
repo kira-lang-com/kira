@@ -1,0 +1,33 @@
+// What reaches an owned parameter without `move`: a scalar, a temporary, a
+// borrow, a capture, and a value written `move`.
+
+import Foundation
+
+enum Stage {
+    Frame
+    Draw
+}
+
+function stageIndex(stage: Stage) -> Int {
+    match stage {
+        Frame -> return 2
+        Draw -> return 3
+    }
+}
+
+function lent(stage: borrow Stage) -> Int { return stageIndex(Stage.Frame) }
+
+function doubled(value: Int) -> Int { return value * 2 }
+
+function applied(action: () -> Int) -> Int { return action() }
+
+@Main
+function main() -> Int {
+    let stage = Stage.Draw
+    let count = 5
+    let viaCapture: () -> Int = { in
+        return stageIndex(stage)
+    }
+    let total = doubled(count) + lent(stage) + stageIndex(Stage.Draw) + viaCapture()
+    return total + stageIndex(move stage)
+}

@@ -1,0 +1,66 @@
+import Foundation
+
+// Reading an ELF image: what it accepts, and how it refuses what it does not.
+
+@Test
+function theMachineOfAnExecutableIsRead() {
+    let machine = match elfMachine(sampleElf(2)) {
+        Ok(found) -> found
+        Error(failure) -> {
+            expect!((elfFailureText(failure)) == "")
+            return
+        }
+    }
+    expect!((machine) == (62))
+}
+
+// The first `count` bytes of `bytes`.
+function firstBytes(bytes: borrow [UN8], count: Number) -> [UN8] {
+    var head: [UN8] = []
+    for index in 0..count { head.append(bytes[index]) }
+    return head
+}
+
+@Test
+function aFileShorterThanItsHeaderIsMalformed() {
+    let text = match elfMachine(firstBytes(sampleElf(2), 16)) {
+        Ok(machine) -> "\(machine)"
+        Error(failure) -> elfFailureText(failure)
+    }
+    expect!((text) == "malformed ELF: the header is cut off")
+}
+
+@Test
+function aFileWithoutTheMagicIsMalformed() {
+    let text = match elfMachine(
+        "not a binary at all, longer than the ELF header is, which is sixty-four".utf8()
+    ) {
+        Ok(machine) -> "\(machine)"
+        Error(failure) -> elfFailureText(failure)
+    }
+    expect!((text) == "malformed ELF: the file does not start with the ELF magic")
+}
+
+// The reader takes 64-bit files only.
+@Test
+function aThirtyTwoBitFileIsUnsupported() {
+    var bytes = sampleElf(2)
+    bytes[4] = 1
+    let text = match elfMachine(bytes) {
+        Ok(machine) -> "\(machine)"
+        Error(failure) -> elfFailureText(failure)
+    }
+    expect!((text) == "unsupported ELF: only 64-bit files are read")
+}
+
+// The reader takes little-endian files only.
+@Test
+function aBigEndianFileIsUnsupported() {
+    var bytes = sampleElf(2)
+    bytes[5] = 2
+    let text = match elfMachine(bytes) {
+        Ok(machine) -> "\(machine)"
+        Error(failure) -> elfFailureText(failure)
+    }
+    expect!((text) == "unsupported ELF: only little-endian files are read")
+}

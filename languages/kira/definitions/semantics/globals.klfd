@@ -1,0 +1,299 @@
+struct GlobalSignature {
+    let name: Identifier
+    let mutable: Bool
+    var valueType: Type
+    let syntax: GlobalDeclaration
+}
+
+enum GlobalInitState {
+    Pending
+    Visiting
+    Done
+}
+
+// The function a package built apart initializes its globals with, which
+// its own unit defines and the program's initialization calls.
+function apartInitializerSymbol(module: String) -> String {
+    return joinText(["__globals#init#", module])
+}
+
+function declareGlobals(declarations: borrow mut Declarations, globals: [GlobalDeclaration], references: [TypeReference]) {
+    for global in globals {
+        let binding = global.binding
+        let bindingFile = binding.name.span.file
+        if declarations.globalInModule(binding.name.text, bindingFile).isSome() || declarations.overloadsOf(.None, binding.name.text).count > 0 && sameModuleSignatures(declarations, declarations.overloadsOf(.None, binding.name.text), bindingFile).count > 0 {
+            report(.DuplicateFunction, binding.name.span)
+        }
+        var valueType = Type.invalid()
+        match binding.annotation {
+            Some(annotation) -> valueType = declarations.resolve(references[annotation])
+            None -> {}
+        }
+        declarations.fileGlobal(binding.name.text)
+        declarations.globals.append(GlobalSignature {
+            name = binding.name, mutable = binding.mutable, valueType = valueType, syntax = global
+        })
+    }
+}
+
+extend Checker {
+    function checkGlobals(borrow mut self) {
+        if declarations.globals.count == 0 { return }
+        for global in declarations.globals {
+            program.globals.append(CheckedGlobal {
+                name = global.name, valueType = global.valueType, mutable = global.mutable, initializer = .None,
+                threadLocal = hasAttribute(global.syntax.annotations, .ThreadLocal)
+            })
+            globalStates.append(.Pending)
+        }
+        let first = declarations.globals[0]
+        let target = declarations.signatures.count
+        var symbol = "__globals#init"
+        if tree.dependencyUnit { symbol = apartInitializerSymbol(tree.modules[0].name) }
+        let name = Identifier { text = symbol, span = first.name.span }
+        let syntax = FunctionDeclaration {
+            name = name, annotations = [], receiver = .Free,
+            parameters = [], result = .None, body = [], span = first.syntax.span,
+            typeParameters = [], scope = GenericScope.none()
+        }
+        declarations.addSignature(Signature {
+            name = name, symbol = name.text, member = "", owner = .None, receiver = .Free,
+            parameters = [], result = Type.void(), entry = false, declaration = syntax
+        })
+        program.functions.append(CheckedFunction {
+            symbol = name.text, name = first.name.span, result = Type.void(), parameterCount = 0,
+            locals = [], body = [], entry = false, lambda = false, captures = [], globalInitializer = true, service = false, foreign = .None, memberName = ""
+        })
+        program.globalInitializer = .Some(target)
+        current = target
+        checkingInitializer = true
+        for index in 0..declarations.globals.count { checkGlobal(index) }
+        var body: [Int] = []
+        for index in program.globalInitOrder {
+            match program.globals[index].initializer {
+                Some(value) -> {
+                    let initialize = program.addStatement(.InitializeGlobal(index, value))
+                    if program.globals[index].threadLocal {
+                        program.globals[index].lazyInitializer = .Some(lazyGlobalInitializer(index, initialize, first.syntax.span))
+                    } else {
+                        body.append(initialize)
+                    }
+                }
+                None -> {}
+            }
+        }
+        program.functions[target] = CheckedFunction {
+            symbol = name.text, name = first.name.span, result = Type.void(), parameterCount = 0,
+            locals = locals, body = body, entry = false, lambda = false, captures = [], globalInitializer = true, service = false, foreign = .None, memberName = ""
+        }
+        checkingInitializer = false
+        sourceOverride = .None
+        current = 0
+    }
+
+    // The function a thread-local global's copy is made by, on its thread's
+    // first read. Its initializer was checked with the other globals', so
+    // the function keeps their locals, whichever of them it uses.
+    function lazyGlobalInitializer(borrow mut self, index: Int, initialize: Int, span: Span) -> Int {
+        let target = declarations.signatures.count
+        var module = ""
+        match declarations.moduleOf(program.globals[index].name.span.file) {
+            Some(found) -> module = declarations.modules[found].name
+            None -> {}
+        }
+        let symbol = joinText(["__globals#lazy#", program.globals[index].name.text, "#", module])
+        let name = Identifier { text = symbol, span = program.globals[index].name.span }
+        let syntax = FunctionDeclaration {
+            name = name, annotations = [], receiver = .Free,
+            parameters = [], result = .None, body = [], span = span,
+            typeParameters = [], scope = GenericScope.none()
+        }
+        declarations.addSignature(Signature {
+            name = name, symbol = symbol, member = "", owner = .None, receiver = .Free,
+            parameters = [], result = Type.void(), entry = false, declaration = syntax
+        })
+        program.functions.append(CheckedFunction {
+            symbol = symbol, name = name.span, result = Type.void(), parameterCount = 0,
+            locals = locals, body = [initialize], entry = false, lambda = false, captures = [], globalInitializer = true, service = false, foreign = .None, memberName = ""
+        })
+        return target
+    }
+
+    function checkGlobal(borrow mut self, index: Int) {
+        match globalStates[index] {
+            Done -> return
+            // Refused once the order is settled, with the cycles through calls.
+            Visiting -> return
+            Pending -> {}
+        }
+        globalStates[index] = .Visiting
+        let declared = declarations.globals[index]
+        match declarations.moduleOf(declared.name.span.file) {
+            Some(module) -> initializeImportedGlobals(module)
+            None -> {}
+        }
+        let saved = sourceOverride
+        sourceOverride = .Some(declared.name.span.file)
+        var valueType = declared.valueType
+        var value = 0
+        if valueType.isInvalid() {
+            value = expression(declared.syntax.binding.value, .None)
+            valueType = typeOf(value)
+        } else {
+            value = coerce(expression(declared.syntax.binding.value, .Some(valueType)), valueType, .BindingTypeMismatch)
+        }
+        declarations.globals[index].valueType = valueType
+        checkBindingPrefix(declared.syntax.binding.prefix, valueType)
+        if valueType.equals(Type.void()) { report(.BindingTypeMismatch, declared.name.span) }
+        program.globals[index].valueType = valueType
+        program.globals[index].initializer = .Some(value)
+        program.globalInitOrder.append(index)
+        globalStates[index] = .Done
+        sourceOverride = saved
+    }
+
+    // Once per module: the globals of the libraries its files import.
+    function initializeImportedGlobals(borrow mut self, module: Int) {
+        for done in importedGlobalModules {
+            if done == module { return }
+        }
+        importedGlobalModules.append(module)
+        var libraries: [Bool] = []
+        for index in 0..declarations.modules.count { libraries.append(false) }
+        for source in declarations.sources {
+            if source.module != module { continue }
+            for imported in source.imports {
+                match imported.module {
+                    Some(library) -> {
+                        if library >= 0 && library < libraries.count { libraries[library] = true }
+                    }
+                    None -> {}
+                }
+            }
+        }
+        for index in 0..declarations.globals.count {
+            match declarations.moduleOf(declarations.globals[index].name.span.file) {
+                Some(declaredModule) -> {
+                    if declaredModule >= 0 && declaredModule < libraries.count && libraries[declaredModule] { checkGlobal(index) }
+                }
+                None -> {}
+            }
+        }
+    }
+
+    function readGlobal(borrow mut self, index: Int, span: Span) -> Int {
+        if checkingInitializer { checkGlobal(index) }
+        let declared = declarations.globals[index]
+        declarations.requireVisible(file(), declared.name.span.file, span)
+        return add(.GlobalRead(index), declared.valueType, span)
+    }
+
+    function qualifiedGlobal(borrow mut self, base: Int, field: Identifier) -> Optional<Int> {
+        match tree.expressions[base].kind.name() {
+            Some(name) -> {
+                if lookup(name.text).isSome() || declarations.globalVisibleAt(name.text, name.span.file).isSome() || namesMember(name.text) { return .None }
+                match declarations.aliased(file(), name.text) {
+                    Some(module) -> {
+                        match declarations.globalNamed(field.text) {
+                            Some(global) -> {
+                                match declarations.moduleOf(declarations.globals[global].name.span.file) {
+                                    Some(origin) -> {
+                                        if origin == module { return .Some(readGlobal(global, field.span)) }
+                                    }
+                                    None -> {}
+                                }
+                            }
+                            None -> {}
+                        }
+                    }
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+        return .None
+    }
+
+    // `A.B.X`: the namespace member whose dotted path the access spells.
+    function namespaceMember(borrow mut self, base: Int, field: Identifier) -> Optional<Int> {
+        let path = dottedPath(base)
+        if utf8Count(path) == 0 { return .None }
+        let qualified = joinText([path, ".", field.text])
+        match declarations.globalNamed(qualified) {
+            Some(global) -> return .Some(readGlobal(global, field.span))
+            None -> return .None
+        }
+    }
+
+    // The path a chain of names spells, `A.B` for `A.B`, or "" when the
+    // chain holds anything else or starts with a local.
+    function dottedPath(borrow self, expression: Int) -> String {
+        var segments: [String] = []
+        var node = expression
+        while true {
+            match tree.expressions[node].kind.memberAccess() {
+                Some(access) -> {
+                    segments.append(access.field.text)
+                    node = access.base
+                }
+                None -> break
+            }
+        }
+        match tree.expressions[node].kind.name() {
+            Some(name) -> {
+                if lookup(name.text).isSome() { return "" }
+                // A namespace shares its spelling with a type a module of
+                // its own scopes; the path is the name as written.
+                segments.append(displayedTypeName(name.text))
+            }
+            None -> return ""
+        }
+        var path = segments[segments.count - 1]
+        for index in 1..segments.count {
+            path = joinText([path, ".", segments[segments.count - 1 - index]])
+        }
+        return path
+    }
+}
+
+// A `base.field` read.
+struct MemberAccess {
+    let base: Int
+    let field: Identifier
+}
+
+extend ExpressionKind {
+    function memberAccess(borrow self) -> Optional<MemberAccess> {
+        match self {
+            Member(base, field) -> return .Some(MemberAccess { base = base, field = field })
+            Name -> return .None
+            IntegerLiteral -> return .None
+            FloatLiteral -> return .None
+            BooleanLiteral -> return .None
+            StringLiteral -> return .None
+            ArrayLiteral -> return .None
+            Index -> return .None
+            Transfer -> return .None
+            Labelled -> return .None
+            TypeQuery -> return .None
+            Call -> return .None
+            GenericCall -> return .None
+            MethodCall -> return .None
+            IndirectCall -> return .None
+            Lambda -> return .None
+            KeyPath -> return .None
+            Task -> return .None
+            ExpandedMacro -> return .None
+            Quote -> return .None
+            MacroCall -> return .None
+            Try -> return .None
+            Variant -> return .None
+            StructLiteral -> return .None
+            Unary -> return .None
+            Binary -> return .None
+            Conditional -> return .None
+            MatchValue -> return .None
+            Content -> return .None
+        }
+    }
+}

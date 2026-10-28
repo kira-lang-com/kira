@@ -1,0 +1,178 @@
+// The `shader` block: options, resource groups and stages. The words that
+// open a resource, an access mode or a stage item are identifiers recognized
+// here by position.
+
+extend Parser {
+    function shader(borrow mut self) -> Result<ShaderDeclaration, Failure> {
+        let start = advance().span
+        let declared = try name()
+        try expect(.LeftBrace)
+        var options: [OptionDeclaration] = []
+        var groups: [GroupDeclaration] = []
+        var stages: [StageDeclaration] = []
+        while !at(.RightBrace) && !at(.End) {
+            if at(.Option) {
+                options.append(try option())
+            } else if at(.Group) {
+                groups.append(try group())
+            } else if atWord("vertex") {
+                stages.append(try stage(.Vertex))
+            } else if atWord("fragment") {
+                stages.append(try stage(.Fragment))
+            } else if atWord("compute") {
+                stages.append(try stage(.Compute))
+            } else {
+                return .Error(fail(.NotADeclaration, token().span))
+            }
+        }
+        try expect(.RightBrace)
+        return .Ok(ShaderDeclaration {
+            name = declared, options = options, groups = groups, stages = stages, span = since(start)
+        })
+    }
+
+    function option(borrow mut self) -> Result<OptionDeclaration, Failure> {
+        let start = advance().span
+        let declared = try name()
+        try expect(.Colon)
+        let reference = try typeReference()
+        try expect(.Equals)
+        let value = try expression()
+        return .Ok(OptionDeclaration { name = declared, typeReference = reference, value = value, span = since(start) })
+    }
+
+    function group(borrow mut self) -> Result<GroupDeclaration, Failure> {
+        let start = advance().span
+        let declared = try name()
+        try expect(.LeftBrace)
+        var resources: [ResourceDeclaration] = []
+        while !at(.RightBrace) && !at(.End) {
+            resources.append(try resource())
+        }
+        try expect(.RightBrace)
+        return .Ok(GroupDeclaration { name = declared, resources = resources, span = since(start) })
+    }
+
+    // `[@binding(n)] uniform|storage|texture|sampler [access] name: Type`.
+    // Storage always writes its access; a texture writes one only for a
+    // storage image.
+    function resource(borrow mut self) -> Result<ResourceDeclaration, Failure> {
+        let start = token().span
+        var binding = -1
+        while at(.At) {
+            let annotation = advance().span
+            let which = try name()
+            if which.text != "binding" { return .Error(fail(.BadAnnotation, annotation)) }
+            binding = try bindingIndex()
+        }
+        if !at(.Identifier) { return .Error(fail(.BadResource, start)) }
+        var kind: ResourceKind = .Uniform
+        match text(token().span) {
+            "uniform" -> kind = .Uniform
+            "storage" -> kind = .Storage
+            "texture" -> kind = .Texture
+            "sampler" -> kind = .Sampler
+            else -> return .Error(fail(.BadResource, start))
+        }
+        advance()
+        var access: Access = .Unwritten
+        if kind == .Storage || (kind == .Texture && atAccessWord()) {
+            access = try accessMode()
+        }
+        let declared = try name()
+        try expect(.Colon)
+        let reference = try typeReference()
+        return .Ok(ResourceDeclaration {
+            kind = kind, access = access, name = declared, binding = binding,
+            typeReference = reference, span = since(start)
+        })
+    }
+
+    function bindingIndex(borrow mut self) -> Result<Int, Failure> {
+        try expect(.LeftParen)
+        let slot = token()
+        if slot.kind != .IntegerLiteral { return .Error(fail(.BadAnnotation, slot.span)) }
+        match decimalValue(text(slot.span), 4294967295) {
+            Some(value) -> {
+                advance()
+                try expect(.RightParen)
+                return .Ok(value)
+            }
+            None -> return .Error(fail(.BadAnnotation, slot.span))
+        }
+    }
+
+    function atAccessWord(borrow self) -> Bool {
+        return atWord("read") || atWord("read_write") || atWord("write")
+    }
+
+    function accessMode(borrow mut self) -> Result<Access, Failure> {
+        let span = token().span
+        if !at(.Identifier) { return .Error(fail(.BadAccess, span)) }
+        var access: Access = .Read
+        match text(span) {
+            "read" -> access = .Read
+            "read_write" -> access = .ReadWrite
+            "write" -> access = .Write
+            else -> return .Error(fail(.BadAccess, span))
+        }
+        advance()
+        return .Ok(access)
+    }
+
+    function stage(borrow mut self, stage: StageKind) -> Result<StageDeclaration, Failure> {
+        let start = advance().span
+        try expect(.LeftBrace)
+        var input = noIdentifier(start)
+        var output = noIdentifier(start)
+        var threads: [Int] = []
+        var functions: [FunctionDeclaration] = []
+        while !at(.RightBrace) && !at(.End) {
+            if at(.Function) {
+                functions.append(try functionDeclaration())
+            } else if atWord("input") {
+                advance()
+                input = try name()
+            } else if atWord("output") {
+                advance()
+                output = try name()
+            } else if atWord("threads") {
+                threads = try threadExtents()
+            } else {
+                return .Error(fail(.BadStageItem, token().span))
+            }
+        }
+        try expect(.RightBrace)
+        return .Ok(StageDeclaration {
+            stage = stage, input = input, output = output, threads = threads,
+            functions = functions, span = since(start)
+        })
+    }
+
+    function threadExtents(borrow mut self) -> Result<[Int], Failure> {
+        let start = advance().span
+        try expect(.LeftParen)
+        var extents: [Int] = []
+        var more = !at(.RightParen) && !at(.End)
+        while more {
+            extents.append(try expression())
+            more = eat(.Comma) && !at(.RightParen) && !at(.End)
+        }
+        try expect(.RightParen)
+        if extents.count != 3 { return .Error(fail(.BadThreads, since(start))) }
+        return .Ok(extents)
+    }
+}
+
+// The value of a run of decimal digits, or none past `limit`.
+function decimalValue(digits: String, limit: Int) -> Optional<Int> {
+    var value = 0
+    for index in 0..utf8Count(digits) {
+        value = value * 10 + utf8Byte(digits, index) - asciiZero
+        if value > limit {
+            let none: Optional<Int> = .None
+            return none
+        }
+    }
+    return .Some(value)
+}

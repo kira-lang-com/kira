@@ -1,0 +1,157 @@
+extend FunctionLowering {
+    function boxAny(borrow mut self, operand: Int, typeId: Int, anyType: Type) -> KirAddress {
+        let storedType = program.anyTypeOf(typeId)
+        let sourceType = program.typeOf(operand)
+        let header = temporary(anyType)
+        let data = arrayRuntimePointer(0, [kir.integer(types.integer64, types.byteSize(storedType))])
+        let payload = kir.typedMemory(data, types.of(storedType))
+        if storedType.isAggregate() {
+            write(operand, payload)
+        } else {
+            var erased = value(operand)
+            if sourceType.isInteger() { erased = resize(erased, sourceType, storedType) }
+            if sourceType.kind == .Floating && sourceType.bits != storedType.bits {
+                erased = kir.convert(8, erased, types.of(storedType))
+            }
+            kir.store(erased, payload)
+        }
+        kir.store(data, kir.field(header, 0, types.pointer))
+        kir.store(kir.integer(types.integer64, typeId), kir.field(header, 1, types.integer64))
+        markInitialized(header)
+        return header
+    }
+
+    function copyAny(borrow mut self, from: KirAddress, to: KirAddress) {
+        let data = kir.load(kir.field(from, 0, types.pointer))
+        kir.store(arrayRuntimePointer(2, [data]), kir.field(to, 0, types.pointer))
+        kir.store(kir.load(kir.field(from, 1, types.integer64)), kir.field(to, 1, types.integer64))
+    }
+
+    function typeIs(borrow mut self, operand: Int, typeId: Int) -> KirValue {
+        let sourceType = program.typeOf(operand)
+        if isAnyType(program, sourceType) {
+            let header = address(operand)
+            let actual = kir.load(kir.field(header, 1, types.integer64))
+            return kir.compare(kirPredicate(.Equal, false), actual, kir.integer(types.integer64, typeId))
+        }
+        evaluate(operand)
+        let same = canonicalAnyType(sourceType).equals(program.anyTypeOf(typeId))
+        return kir.integer(types.boolean, same ? 1 : 0)
+    }
+
+    function unboxedAddress(borrow mut self, operand: Int, typeId: Int, handler: Optional<Int>, span: Span) -> KirAddress {
+        let storedType = program.anyTypeOf(typeId)
+        return kir.typedMemory(unboxedData(operand, typeId, handler, span), types.of(storedType))
+    }
+
+    // The storage an `Any` holding the type numbered `typeId` keeps its value
+    // in; the cast fails unless it holds that type.
+    function unboxedData(borrow mut self, operand: Int, typeId: Int, handler: Optional<Int>, span: Span) -> KirValue {
+        let header = address(operand)
+        let actual = kir.load(kir.field(header, 1, types.integer64))
+        let held = kir.compare(kirPredicate(.Equal, false), actual, kir.integer(types.integer64, typeId))
+        match handler {
+            Some(local) -> castMismatch(held, actual, local)
+            None -> trapUnlessHeld(held, span, castReport(program.anyTypeOf(typeId)), actual)
+        }
+        return kir.load(kir.field(header, 0, types.pointer))
+    }
+
+    // Unless `held`, writes `Mismatch` with the type the value held into the
+    // handler's local and enters the handler.
+    function castMismatch(borrow mut self, held: KirValue, actual: KirValue, local: Int) {
+        let success = kir.block()
+        let failure = kir.block()
+        kir.branchIf(held, success, failure)
+        enter(failure)
+        let errorType = checked.locals[local].valueType
+        releaseTracked(storage[local])
+        kir.store(actual, kir.field(newPayloadPlace(storage[local], errorType, 0), 0, types.integer64))
+        kir.inject(storage[local], 0)
+        markInitialized(storage[local])
+        var found = false
+        for lowered in handlers {
+            if lowered.local == local && !found {
+                kir.branch(lowered.block)
+                found = true
+            }
+        }
+        if !found { abort() }
+        enter(success)
+    }
+
+    function unboxValue(borrow mut self, operand: Int, typeId: Int, handler: Optional<Int>, target: Type, span: Span) -> KirValue {
+        let source = program.anyTypeOf(typeId)
+        let unboxed = kir.load(unboxedAddress(operand, typeId, handler, span))
+        if source.equals(target) { return unboxed }
+        if source.kind == .Floating && target.kind == .Floating {
+            return kir.convert(target.bits < source.bits ? 9 : 8, unboxed, types.of(target))
+        }
+        if !source.fitsIn(target) {
+            trapUnlessReported(inRange(unboxed, source, target), span, narrowingReport(source, target), [wideOperand(unboxed, source)])
+        }
+        return resize(unboxed, source, target)
+    }
+
+    // The report of an `as` whose `Any` holds another type than `expected`.
+    function castReport(borrow self, expected: Type) -> TrapReport {
+        let expectedName = spelledType(program, expected)
+        return TrapReport {
+            code = checkTrap,
+            headline = joinText(["cast failed: the `Any` does not hold a `", expectedName, "`"]),
+            label = joinText(["expects a `", expectedName, "`"]),
+            note = "`as` unwraps an `Any` only when it holds exactly the type it names; this one holds a `{text}`",
+            help = joinText(["test the value with `is ", expectedName, "` first, or handle the mismatch with `try ... as ", expectedName, " otherwise ...`"])
+        }
+    }
+
+    function destroyAnyBody(borrow mut self, header: KirAddress) {
+        let data = kir.load(kir.field(header, 0, types.pointer))
+        let typeId = kir.load(kir.field(header, 1, types.integer64))
+        kir.argument(data)
+        let unique = kir.call(functions[program.arrayFunctions[6]], types.boolean)
+        let dispatch = kir.block()
+        let release = kir.block()
+        kir.branchIf(unique, dispatch, release)
+        enter(dispatch)
+        for cases in types.anyDestroyCases {
+            let next = kir.block()
+            kir.argument(data)
+            kir.argument(typeId)
+            kir.branchIf(kir.call(cases, types.boolean), release, next)
+            enter(next)
+        }
+        flowInto(release)
+        enter(release)
+        arrayRuntimeVoid(3, [data])
+    }
+
+    function equalAnyBody(borrow mut self, left: KirAddress, right: KirAddress) -> KirValue {
+        let result = temporary(Type.boolean())
+        kir.store(kir.integer(types.boolean, 0), result)
+        let firstType = kir.load(kir.field(left, 1, types.integer64))
+        let secondType = kir.load(kir.field(right, 1, types.integer64))
+        let dispatch = kir.block()
+        let done = kir.block()
+        kir.branchIf(kir.compare(kirPredicate(.Equal, false), firstType, secondType), dispatch, done)
+        enter(dispatch)
+        let firstData = kir.load(kir.field(left, 0, types.pointer))
+        let secondData = kir.load(kir.field(right, 0, types.pointer))
+        for cases in types.anyEqualCases {
+            let known = kir.block()
+            let next = kir.block()
+            kir.argument(firstData)
+            kir.argument(secondData)
+            kir.argument(firstType)
+            let answer = kir.call(cases, types.integer64)
+            kir.branchIf(kir.compare(kirPredicate(.Equal, false), answer, kir.integer(types.integer64, 2)), next, known)
+            enter(known)
+            kir.store(kir.compare(kirPredicate(.Equal, false), answer, kir.integer(types.integer64, 1)), result)
+            flowInto(done)
+            enter(next)
+        }
+        flowInto(done)
+        enter(done)
+        return kir.load(result)
+    }
+}

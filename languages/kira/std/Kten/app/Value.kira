@@ -1,0 +1,200 @@
+import Foundation
+
+// Kten, the Kira Transport Encoding: Kira's own data format for files, IPC
+// and the network. One value model with two encodings: a text form that is a
+// Kira value literal, for files and reading on a terminal, and a compact
+// binary form for what crosses a socket. A value round-trips through either.
+//
+// Numbers are Kira's exact decimal `Number`, never a binary float, so what
+// one side writes the other reads back to the last digit.
+//
+// Reading is always safe: bytes and text come from another process, which
+// may be another version or something else entirely, so every decode and
+// every dynamic read answers a `Result`, never a trap.
+
+/// A Kten value: null, a boolean, a number, text, bytes, a list, an object or an enum case. Kten is one data model with two encodings, a text form and a binary form.
+public enum Kten {
+    /// No value, written `.None` in the text form.
+    Null
+    /// A `Bool`.
+    Bool(Bool)
+    /// An exact decimal `Number`.
+    Number(Number)
+    /// A `String`.
+    Text(String)
+    /// Raw bytes, written `0x` and lowercase hexadecimal in the text form.
+    Bytes([UN8])
+    /// A list of values, in order.
+    List([Kten])
+    /// An object: its fields, with the type name it was written with, when it has one.
+    Object(KtenObject)
+    /// An enum value: a case name and its payload.
+    Case(KtenCase)
+}
+
+/// An object's type name, when a type names it, and its fields in the order they were written. `Type { ... }` names the type a reader checks it against; a bare `{ ... }` is ad-hoc data with no declared type.
+public struct KtenObject {
+    /// The type name the object was written with, or none for a bare object.
+    let tag: String? = .None
+    /// The object's fields, in the order they were written.
+    let fields: [KtenField] = []
+}
+
+/// One named field of an object.
+public struct KtenField {
+    /// The field's name.
+    let name: String
+    /// The field's value.
+    let value: Kten
+}
+
+/// An enum value: a case name and its payload, which may be empty.
+public struct KtenCase {
+    /// The field's name.
+    let name: String
+    /// The values the case carries, in order.
+    let payload: [Kten] = []
+}
+
+/// What kind of value a `Kten` is, for a read that wanted another.
+public enum KtenShape {
+    /// No value, written `.None` in the text form.
+    Null
+    /// A `Bool`.
+    Bool
+    /// An exact decimal `Number`.
+    Number
+    /// A `String`.
+    Text
+    /// Raw bytes, written `0x` and lowercase hexadecimal in the text form.
+    Bytes
+    /// A list of values, in order.
+    List
+    /// An object: its fields, with the type name it was written with, when it has one.
+    Object
+    /// An enum value: a case name and its payload.
+    Case
+}
+
+/// A read that wanted one kind of value and found another.
+public struct KtenShapeMismatch {
+    /// The kind the read asked for.
+    let wanted: KtenShape
+    /// The kind the value actually is.
+    let found: KtenShape
+}
+
+/// Why a dynamic read found no value.
+public enum KtenReadFailure {
+    /// The object has no field of this name.
+    Absent(String)
+    /// The list has no element at this index.
+    OutOfRange(Number)
+    /// The value is of another kind than the read asked for.
+    WrongShape(KtenShapeMismatch)
+}
+
+/// A named field holding `value`.
+public function ktenField(name: borrow String, value: Kten) -> KtenField {
+    return KtenField { name: copy name, value: move value }
+}
+
+/// An object written as `tag { ... }`, with the given fields.
+public function ktenObject(tag: borrow String, fields: [KtenField]) -> Kten {
+    return .Object(KtenObject { tag: .Some(copy tag), fields: move fields })
+}
+
+/// A bare object with the given fields, which no type names.
+public function ktenBare(fields: [KtenField]) -> Kten {
+    return .Object(KtenObject { fields: move fields })
+}
+
+/// An enum value with the case name `name` and the given payload.
+public function ktenCase(name: borrow String, payload: [Kten]) -> Kten {
+    return .Case(KtenCase { name: copy name, payload: move payload })
+}
+
+extend Kten {
+    function shape(borrow self) -> KtenShape {
+        return match self {
+            Null -> .Null
+            Bool(_) -> .Bool
+            Number(_) -> .Number
+            Text(_) -> .Text
+            Bytes(_) -> .Bytes
+            List(_) -> .List
+            Object(_) -> .Object
+            Case(_) -> .Case
+        }
+    }
+
+    function mismatch(borrow self, wanted: KtenShape) -> KtenReadFailure {
+        return .WrongShape(KtenShapeMismatch { wanted: wanted, found: shape() })
+    }
+
+    // The field named `name`; the first one when a writer repeated it.
+    function field(borrow self, name: borrow String) -> Result<Kten, KtenReadFailure> {
+        let object = try object()
+        for field in object.fields {
+            if field.name == name { return .Ok(copy field.value) }
+        }
+        return .Error(.Absent(copy name))
+    }
+
+    function at(borrow self, index: Number) -> Result<Kten, KtenReadFailure> {
+        let items = try items()
+        if index < 0 || index >= items.count || index % 1 != 0 {
+            return .Error(.OutOfRange(index))
+        }
+        return .Ok(copy items[index])
+    }
+
+    function object(borrow self) -> Result<KtenObject, KtenReadFailure> {
+        return match self {
+            Object(object) -> .Ok(copy object)
+            Null, Bool, Number, Text, Bytes, List, Case -> .Error(mismatch(.Object))
+        }
+    }
+
+    function items(borrow self) -> Result<[Kten], KtenReadFailure> {
+        return match self {
+            List(items) -> .Ok(copy items)
+            Null, Bool, Number, Text, Bytes, Object, Case -> .Error(mismatch(.List))
+        }
+    }
+
+    function text(borrow self) -> Result<String, KtenReadFailure> {
+        return match self {
+            Text(text) -> .Ok(copy text)
+            Null, Bool, Number, Bytes, List, Object, Case -> .Error(mismatch(.Text))
+        }
+    }
+
+    function number(borrow self) -> Result<Number, KtenReadFailure> {
+        return match self {
+            Number(number) -> .Ok(number)
+            Null, Bool, Text, Bytes, List, Object, Case -> .Error(mismatch(.Number))
+        }
+    }
+
+    function boolean(borrow self) -> Result<Bool, KtenReadFailure> {
+        return match self {
+            Bool(flag) -> .Ok(flag)
+            Null, Number, Text, Bytes, List, Object, Case -> .Error(mismatch(.Bool))
+        }
+    }
+
+    function bytes(borrow self) -> Result<[UN8], KtenReadFailure> {
+        return match self {
+            Bytes(raw) -> .Ok(copy raw)
+            Null, Bool, Number, Text, List, Object, Case -> .Error(mismatch(.Bytes))
+        }
+    }
+
+    function variant(borrow self) -> Result<KtenCase, KtenReadFailure> {
+        return match self {
+            Case(variant) -> .Ok(copy variant)
+            Null, Bool, Number, Text, Bytes, List, Object -> .Error(mismatch(.Case))
+        }
+    }
+}

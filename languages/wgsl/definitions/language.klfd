@@ -1,0 +1,65 @@
+// WGSL as a shader language. The out is written; the in, which reads WGSL
+// into KSIR, is not yet, so a WGSL source is refused with a diagnostic.
+construct Kwgsl() extends ShaderLanguage<Tree, Program> {
+    let name: String = "wgsl"
+    let driver: String = "kwgsl"
+    let version: String = "26.10.4"
+    let extensions: [String] = ["wgsl"]
+    let layouts: LayoutDefaults = LayoutDefaults { uniform = .Std140, storage = .Std430, immediate = .Std430 }
+    let libraryRoot: String = ""
+    let capabilities: [ShaderCapability] = []
+    let diagnostics: [DiagnosticSpec] = [
+        DiagnosticSpec { code = 1, severity = .Error, title = "no WGSL reader",
+            explanation = "WGSL is a target of the shader tools, not yet a source they read" },
+        DiagnosticSpec { code = 230, severity = .Error, title = "target unsupported",
+            explanation = "a requested target cannot express this shader" },
+        DiagnosticSpec { code = 231, severity = .Error, title = "override missing",
+            explanation = "an override has no value: supply one with `--override`" },
+        DiagnosticSpec { code = 232, severity = .Error, title = "override unsupported",
+            explanation = "the target cannot specialize an override; bake it" },
+        DiagnosticSpec { code = 233, severity = .Error, title = "index not constant",
+            explanation = "the index must be known when the shader is compiled" },
+        DiagnosticSpec { code = 234, severity = .Error, title = "stage interface mismatch",
+            explanation = "a fragment input is not a vertex output of the same location, type and interpolation" },
+        DiagnosticSpec { code = 235, severity = .Error, title = "slot collision",
+            explanation = "two resources take the same slot" },
+        DiagnosticSpec { code = 236, severity = .Error, title = "constant not finite",
+            explanation = "a constant does not evaluate to a finite value" },
+        DiagnosticSpec { code = 237, severity = .Error, title = "capability unsupported",
+            explanation = "the shader uses a capability the target lacks" },
+        DiagnosticSpec { code = 5001, severity = .Warning, title = "non-uniform control flow",
+            explanation = "a barrier, derivative or implicit-level sample is reached under control flow that varies across invocations" }
+    ]
+    let keys: [DiagnosticKey] = [
+        DiagnosticKey { key = "shader.uniformity", code = 5001 },
+        DiagnosticKey { key = "shader.const-not-finite", code = 236 },
+        DiagnosticKey { key = "shader.const-index", code = 233 },
+        DiagnosticKey { key = "shader.interface-mismatch", code = 234 },
+        DiagnosticKey { key = "shader.override-missing", code = 231 },
+        DiagnosticKey { key = "shader.override-unsupported", code = 232 },
+        DiagnosticKey { key = "shader.target-unsupported", code = 230 },
+        DiagnosticKey { key = "shader.capability", code = 237 },
+        DiagnosticKey { key = "shader.slot-collision", code = 235 }
+    ]
+
+    function units(session: Session, inputs: [SourceFile]) -> [Unit] {
+        for input in inputs { diag_error_in(input, 1, 0, 0) }
+        return []
+    }
+
+    function parse(session: Session, unit: Unit, program: [SourceFile]) -> Tree {
+        return definition_tree(session, unit, 0)
+    }
+
+    function elaborate(session: Session, unit: Unit, tree: Tree) -> Program {
+        return definition_program(session, unit, 0)
+    }
+
+    function lower(session: Session, unit: Unit, program: Program) -> ShaderModule {
+        return shader_module_finish(shader_module_new(session, unit, program, "wgsl"))
+    }
+
+    function emit(unit: ShaderUnit) -> Bool {
+        return writeWgsl(unit)
+    }
+}

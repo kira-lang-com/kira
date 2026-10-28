@@ -1,0 +1,76 @@
+// The members of the families packages built apart declare, which the
+// program's own unit defines (`semantics/family-dispatch.klfd`).
+//
+// A member takes the family's trait object, whose box holds the value with
+// its declaration's descriptor. The number the descriptor carries
+// (`classTypeId`) picks the declaration, whose own method is called on the
+// value the box holds, or the family's default on the trait object, each
+// with the member's other arguments as they came.
+
+function lowerFamilyDispatches(program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder]) {
+    for dispatch in program.familyDispatches {
+        if program.builtElsewhere(dispatch.dispatcher) { continue }
+        var lowering = FunctionLowering.start(program, types, functions, dispatch.dispatcher)
+        lowering.lowerFamilyDispatch(dispatch)
+    }
+}
+
+extend FunctionLowering {
+    function lowerFamilyDispatch(borrow mut self, dispatch: FamilyDispatch) {
+        let body = kir.block()
+        enter(body)
+        var first = 0
+        if checked.result.isAggregate() { first = 1 }
+        let receiver = kir.parameter(first)
+        let object = kir.memory(receiver, types.of(checked.owner.unwrap()))
+        let held = kir.field(object, 0, types.pointer)
+        // A member changing its receiver changes a value no other holder
+        // sees.
+        if checked.locals[0].passingMode == .MutablyBorrowed {
+            kir.argument(kir.load(held))
+            kir.store(kir.call(types.boxUnique.unwrap(), types.pointer), held)
+        }
+        let box = kir.load(held)
+        let id = classProducerId(box)
+        for index in 0..dispatch.members.count {
+            let member = dispatch.members[index]
+            let target = dispatch.targets[index]
+            if target < 0 && dispatch.fallback < 0 { continue }
+            let selected = kir.block()
+            let next = kir.block()
+            kir.branchIf(kir.compare(kirPredicate(.Equal, false), id, kir.integer(types.integer64, classTypeId(program, member))), selected, next)
+            enter(selected)
+            if first == 1 { kir.argument(kir.parameter(0)) }
+            if target >= 0 {
+                let description = types.classDescription(member)
+                kir.argument(kir.pointer(kir.field(kir.typedMemory(box, description.boxType), 2, description.payloadType)))
+                forwardDispatched(first)
+                returnDispatched(functions[target])
+            } else {
+                kir.argument(receiver)
+                forwardDispatched(first)
+                returnDispatched(functions[dispatch.fallback])
+            }
+            enter(next)
+        }
+        kir.unreachable()
+        open = false
+        kir.switchTo(entry)
+        kir.branch(body)
+    }
+
+    // The member's arguments past its receiver, as the caller passed them.
+    function forwardDispatched(borrow self, first: Int) {
+        for index in 1..checked.parameterCount { kir.argument(kir.parameter(first + index)) }
+    }
+
+    function returnDispatched(borrow mut self, callee: KirFunctionBuilder) {
+        if checked.result.isAggregate() || checked.result.equals(Type.void()) {
+            kir.callVoid(callee)
+            kir.returnVoid()
+        } else {
+            kir.returnValue(kir.call(callee, types.of(checked.result)))
+        }
+        open = false
+    }
+}

@@ -1,0 +1,105 @@
+import Foundation
+
+// Reading gzip files (RFC 1952) on Foundation's DEFLATE decoder: every
+// member in turn, each one's CRC-32 and length checked.
+
+namespace GzipFormat {
+    let firstMagic: Number = 31
+    let secondMagic: Number = 139
+    let deflateMethod: Number = 8
+    // Header flags.
+    let headerCrc: Number = 2
+    let extra: Number = 4
+    let name: Number = 8
+    let comment: Number = 16
+    let reserved: Number = 224
+}
+
+/// The whole of the gzip file `bytes`, decompressed.
+///
+/// Every member of a multi-member gzip file is decompressed and joined in order.
+/// The CRC-32 and the length of each member are checked against its trailer.
+///
+/// # Errors
+/// - `.Malformed` when `bytes` is empty or not gzip, a header is cut off, a
+///   member's deflate stream is corrupt, its trailer is missing, or its CRC-32
+///   or length is wrong.
+/// - `.Unsupported` when a member uses a compression method other than deflate.
+///
+/// # Examples
+/// ```
+/// match decompressGzip(bytes) {
+///     Ok(plain) -> use(plain)
+///     Error(failure) -> report(failure)
+/// }
+/// ```
+public function decompressGzip(bytes: [UN8]) -> Result<[UN8], ArchiveFailure> {
+    // An empty input holds no member, which is not a gzip file.
+    if bytes.count == 0 { return .Error(.Malformed("not a gzip file")) }
+    let table = crcTable()
+    let input = bytes
+    var whole: [UN8] = []
+    var at: Number = 0
+    while at < bytes.count {
+        let start = match gzipHeaderEnd(bytes, at) {
+            Ok(end) -> end
+            Error(failure) -> return .Error(failure)
+        }
+        var inflater = Inflater()
+        inflater.input = copy input
+        inflater.pos = start
+        inflater.run()
+        if inflater.stopped {
+            return .Error(
+                .Malformed("a gzip member does not inflate: \(traceText(inflater.failure))")
+            )
+        }
+        // The bits held past the stream's last byte belong to the trailer.
+        let end: Number = inflater.pos - trunc(Number(inflater.bitCount) / 8)
+        if end + 8 > bytes.count { return .Error(.Malformed("a gzip member has no trailer")) }
+        var crc: Number = 4294967295
+        for byte in inflater.output { crc = table[(crc ^ Number(byte)) & 255] ^ (crc >> 8) }
+        if (crc ^ 4294967295) != littleWord(bytes, end) {
+            return .Error(.Malformed("a gzip member's CRC-32 is wrong"))
+        }
+        if (inflater.output.count & 4294967295) != littleWord(bytes, end + 4) {
+            return .Error(.Malformed("a gzip member's length is wrong"))
+        }
+        for byte in inflater.output { whole.append(UN8(byte)) }
+        at = end + 8
+    }
+    return .Ok(whole)
+}
+
+// Where the DEFLATE stream of the member at `at` starts.
+function gzipHeaderEnd(bytes: borrow [UN8], at: Number) -> Result<Number, ArchiveFailure> {
+    if at + 10 > bytes.count { return .Error(.Malformed("a gzip header is cut off")) }
+    let magic = Number(bytes[at]) == GzipFormat.firstMagic
+        && Number(bytes[at + 1]) == GzipFormat.secondMagic
+    if !magic { return .Error(.Malformed("not a gzip file")) }
+    if Number(bytes[at + 2]) != GzipFormat.deflateMethod {
+        return .Error(.Unsupported("the gzip method \(bytes[at + 2])"))
+    }
+    let flags = Number(bytes[at + 3])
+    if (flags & GzipFormat.reserved) != 0 {
+        return .Error(.Unsupported("gzip flags \(flags)"))
+    }
+    var end = at + 10
+    if (flags & GzipFormat.extra) != 0 {
+        if end + 2 > bytes.count { return .Error(.Malformed("a gzip header is cut off")) }
+        end += 2 + (Number(bytes[end]) | (Number(bytes[end + 1]) << 8))
+    }
+    for field in [GzipFormat.name, GzipFormat.comment] {
+        if (flags & field) == 0 { continue }
+        while end < bytes.count && bytes[end] != 0 { end += 1 }
+        end += 1
+    }
+    if (flags & GzipFormat.headerCrc) != 0 { end += 2 }
+    if end > bytes.count { return .Error(.Malformed("a gzip header is cut off")) }
+    return .Ok(end)
+}
+
+function littleWord(bytes: borrow [UN8], at: Number) -> Number {
+    return Number(bytes[at]) | (Number(bytes[at + 1]) << 8) | (Number(bytes[at + 2]) << 16)
+        | (Number(bytes[at + 3]) << 24)
+}

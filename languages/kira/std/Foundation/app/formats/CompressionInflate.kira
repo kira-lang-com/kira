@@ -1,0 +1,369 @@
+// DEFLATE, and the zlib stream that wraps it.
+//
+// RFC 1951 and RFC 1950. This is Foundation's rather than any one package's
+// because a compressed stream is not a graphics concept: a PNG's pixels arrive
+// through one, and so would a font, an archive, or a response body.
+//
+// What it does not do is verify the stream's Adler-32. A checksum answers
+// whether the bytes travelled intact, which is a different question from
+// whether they decode, and a decoder that refuses a stream it could read would
+// throw away data its caller can use. Structure *is* checked — a stored length
+// that overruns the input, a distance reaching behind the start of the output,
+// a block type that does not exist — because none of those can be decoded past.
+
+enum InflateFailure {
+    // The stream ended in the middle of something.
+    Truncated
+    // The bytes contradict the format.
+    Malformed
+}
+
+// The reader, and the output it has produced so far.
+//
+// One value rather than a pile of `borrow mut` parameters: the bit position and
+// the output are read and written by every step, and a back reference copies
+// from the output it is still appending to, so they cannot be separated.
+class Inflater {
+    var input: [UN8] = []
+    var pos: Number = 0
+    // Bits already read out of `input` and not yet consumed, least significant
+    // first — DEFLATE fills a byte from the bottom up.
+    var bitBuffer: Number = 0
+    var bitCount: Number = 0
+    var output: [UN8] = []
+    // `stopped` is the cheap test every step makes; `failure` says which of the
+    // two reasons stopped it. They are two fields rather than an optional
+    // because the test is on the hot path and the reason is read once.
+    var stopped: Bool = false
+    var failure: InflateFailure = .Truncated
+
+    function fail(reason: InflateFailure) {
+        self.stopped = true
+        self.failure = reason
+    }
+
+    // Bring the buffer up to at least `count` bits.
+    function fill(count: Number) -> Bool {
+        while self.bitCount < count {
+            if self.pos >= self.input.count {
+                self.fail(.Truncated)
+                return false
+            }
+            self.bitBuffer = self.bitBuffer | (Number(self.input[self.pos]) << self.bitCount)
+            self.pos = self.pos + 1
+            self.bitCount = self.bitCount + 8
+        }
+        return true
+    }
+
+    function takeBits(count: Number) -> Number {
+        if self.stopped {
+            return 0
+        }
+        if !self.fill(count) {
+            return 0
+        }
+        let value = self.bitBuffer & ((1 << count) - 1)
+        self.bitBuffer = self.bitBuffer >> count
+        self.bitCount = self.bitCount - count
+        return value
+    }
+
+    // One symbol, taking a bit at a time until the code reaches a length whose
+    // block it falls inside.
+    function decodeSymbol(table: borrow HuffmanCode) -> Number {
+        var code: Number = 0
+        var first: Number = 0
+        var index: Number = 0
+        for length in 1..table.counts.count + 1 {
+            code = code | self.takeBits(1)
+            if self.stopped {
+                return 0
+            }
+            let count = table.counts[length - 1]
+            if code - first < count {
+                let at = index + (code - first)
+                // A table whose counts promise more symbols than it listed. The
+                // walk cannot tell until it lands, and landing past the end has
+                // to be an answer rather than a trap.
+                if at >= table.symbols.count {
+                    self.fail(.Malformed)
+                    return 0
+                }
+                return table.symbols[at]
+            }
+            index = index + count
+            first = (first + count) << 1
+            code = code << 1
+        }
+        self.fail(.Malformed)
+        return 0
+    }
+
+    // A stored block: the remaining bits of the current byte are padding, then
+    // a length and its own complement, then the bytes themselves.
+    function copyStored() {
+        self.bitBuffer = 0
+        self.bitCount = 0
+        if self.pos + 4 > self.input.count {
+            self.fail(.Truncated)
+            return
+        }
+        let length = Number(self.input[self.pos]) | (Number(self.input[self.pos + 1]) << 8)
+        let complement = Number(self.input[self.pos + 2]) | (Number(self.input[self.pos + 3]) << 8)
+        self.pos = self.pos + 4
+        if (length ^ 65535) != complement {
+            self.fail(.Malformed)
+            return
+        }
+        if self.pos + length > self.input.count {
+            self.fail(.Truncated)
+            return
+        }
+        for taken in 0..length {
+            self.output.append(self.input[self.pos])
+            self.pos = self.pos + 1
+        }
+    }
+
+    // The literal/length and distance alphabets a dynamic block spells out for
+    // itself, read through the code-length alphabet that precedes them.
+    function readDynamicTables() -> [HuffmanCode] {
+        let literalCount = self.takeBits(5) + 257
+        let distanceCount = self.takeBits(5) + 1
+        let lengthCount = self.takeBits(4) + 4
+        if self.stopped {
+            return []
+        }
+        if literalCount > 286 || distanceCount > 30 {
+            self.fail(.Malformed)
+            return []
+        }
+
+        let order = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+        var codeLengths: [Number] = filled(19, 0)
+        for index in 0..lengthCount {
+            codeLengths[order[index]] = self.takeBits(3)
+        }
+        if self.stopped {
+            return []
+        }
+        let lengthTable = huffmanCodeFromLengths(codeLengths, 7)
+
+        var lengths: [Number] = filled(literalCount + distanceCount, 0)
+        var written: Number = 0
+        while written < lengths.count {
+            let symbol = self.decodeSymbol(lengthTable)
+            if self.stopped {
+                return []
+            }
+            if symbol < 16 {
+                lengths[written] = symbol
+                written = written + 1
+            } else {
+                var repeat: Number = 0
+                var value: Number = 0
+                match symbol {
+                    16 -> {
+                        if written == 0 {
+                            self.fail(.Malformed)
+                            return []
+                        }
+                        value = lengths[written - 1]
+                        repeat = 3 + self.takeBits(2)
+                    }
+                    17 -> repeat = 3 + self.takeBits(3)
+                    else -> repeat = 11 + self.takeBits(7)
+                }
+                if self.stopped {
+                    return []
+                }
+                if written + repeat > lengths.count {
+                    self.fail(.Malformed)
+                    return []
+                }
+                for step in 0..repeat {
+                    lengths[written] = value
+                    written = written + 1
+                }
+            }
+        }
+
+        var literalLengths: [Number] = []
+        var distanceLengths: [Number] = []
+        for index in 0..literalCount {
+            literalLengths.append(lengths[index])
+        }
+        for index in literalCount..lengths.count {
+            distanceLengths.append(lengths[index])
+        }
+        return [
+            huffmanCodeFromLengths(literalLengths, 15),
+            huffmanCodeFromLengths(distanceLengths, 15),
+        ]
+    }
+
+    // One compressed block, against the two tables it was given.
+    function inflateBlock(literals: borrow HuffmanCode, distances: borrow HuffmanCode) {
+        let lengthTable = deflateLengths()
+        let distanceTable = deflateDistances()
+        while !self.stopped {
+            let symbol = self.decodeSymbol(literals)
+            if self.stopped {
+                return
+            }
+            if symbol < 256 {
+                self.output.append(UN8(symbol))
+            } else if symbol == 256 {
+                return
+            } else {
+                let lengthIndex = symbol - 257
+                if lengthIndex >= lengthTable.count {
+                    self.fail(.Malformed)
+                    return
+                }
+                let (lengthBase, lengthExtra) = lengthTable[lengthIndex]
+                let length = lengthBase + self.takeBits(lengthExtra)
+                let distanceSymbol = self.decodeSymbol(distances)
+                if self.stopped {
+                    return
+                }
+                if distanceSymbol >= distanceTable.count {
+                    self.fail(.Malformed)
+                    return
+                }
+                let (distanceBase, distanceExtra) = distanceTable[distanceSymbol]
+                let distance = distanceBase + self.takeBits(distanceExtra)
+                if self.stopped {
+                    return
+                }
+                var from = self.output.count - distance
+                if from < 0 {
+                    self.fail(.Malformed)
+                    return
+                }
+                for copied in 0..length {
+                    self.output.append(self.output[from])
+                    from = from + 1
+                }
+            }
+        }
+    }
+
+    // Every block until the one that says it is the last.
+    function run() {
+        var last = false
+        while !last && !self.stopped {
+            last = self.takeBits(1) == 1
+            let kind = self.takeBits(2)
+            if self.stopped {
+                return
+            }
+            match kind {
+                0 -> self.copyStored()
+                1 -> self.inflateBlock(fixedLiteralCode(), fixedDistanceCode())
+                2 -> {
+                    let tables = self.readDynamicTables()
+                    if self.stopped {
+                        return
+                    }
+                    self.inflateBlock(tables[0], tables[1])
+                }
+                else -> {
+                    self.fail(.Malformed)
+                    return
+                }
+            }
+        }
+    }
+}
+
+// The lengths a literal/length symbol above 256 names, and how many extra bits
+// follow it (RFC 1951, section 3.2.5).
+function deflateLengths() -> [(Number, Number)] {
+    return [(3, 0), (4, 0), (5, 0), (6, 0), (7, 0), (8, 0), (9, 0), (10, 0), (11, 1), (13, 1), (
+        15,
+        1
+    ), (17, 1), (19, 2), (23, 2), (27, 2), (31, 2), (35, 3), (43, 3), (51, 3), (59, 3), (67, 4), (
+        83,
+        4
+    ), (99, 4), (115, 4), (131, 5), (163, 5), (195, 5), (227, 5), (258, 0)]
+}
+
+// The distances a distance symbol names, and how many extra bits follow it.
+function deflateDistances() -> [(Number, Number)] {
+    return [(1, 0), (2, 0), (3, 0), (4, 0), (5, 1), (7, 1), (9, 2), (13, 2), (17, 3), (25, 3), (
+        33,
+        4
+    ), (49, 4), (65, 5), (97, 5), (129, 6), (193, 6), (257, 7), (385, 7), (513, 8), (769, 8), (
+        1025,
+        9
+    ), (1537, 9), (2049, 10), (3073, 10), (4097, 11), (6145, 11), (8193, 12), (12289, 12), (
+        16385,
+        13
+    ), (24577, 13)]
+}
+
+// The tables a fixed block uses, which the format fixes rather than spelling
+// out: 288 literal/length codes of four different lengths, and 32 distance
+// codes of five bits each.
+function fixedLiteralCode() -> HuffmanCode {
+    var lengths: [Number] = []
+    for symbol in 0..288 {
+        if symbol < 144 {
+            lengths.append(8)
+        } else if symbol < 256 {
+            lengths.append(9)
+        } else if symbol < 280 {
+            lengths.append(7)
+        } else {
+            lengths.append(8)
+        }
+    }
+    return huffmanCodeFromLengths(lengths, 15)
+}
+
+function fixedDistanceCode() -> HuffmanCode {
+    return huffmanCodeFromLengths(filled(32, 5), 15)
+}
+
+// A raw DEFLATE stream, with no wrapper around it.
+function inflateRaw(data: [UN8]) -> Result<[UN8], InflateFailure> {
+    var inflater = Inflater()
+    inflater.input = move data
+    inflater.run()
+    if inflater.stopped {
+        return .Error(inflater.failure)
+    }
+    return .Ok(move inflater.output)
+}
+
+// A zlib stream: two header bytes, a DEFLATE stream, and a checksum this does
+// not read.
+function inflateZlib(data: [UN8]) -> Result<[UN8], InflateFailure> {
+    if data.count < 2 {
+        return .Error(.Truncated)
+    }
+    let method = Number(data[0])
+    let flags = Number(data[1])
+    if (method & 15) != 8 {
+        return .Error(.Malformed)
+    }
+    if ((method * 256) + flags) % 31 != 0 {
+        return .Error(.Malformed)
+    }
+    // A preset dictionary names bytes the stream does not carry, so a reader
+    // that does not have the dictionary cannot decode it however well formed it
+    // is. Nothing that writes a PNG or a font uses one.
+    if (flags & 32) != 0 {
+        return .Error(.Malformed)
+    }
+    var inflater = Inflater()
+    inflater.input = move data
+    inflater.pos = 2
+    inflater.run()
+    if inflater.stopped {
+        return .Error(inflater.failure)
+    }
+    return .Ok(move inflater.output)
+}

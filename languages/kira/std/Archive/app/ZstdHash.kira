@@ -1,0 +1,133 @@
+import Foundation
+
+// XXH64 with seed 0, whose low 4 bytes end a Zstandard frame as its content
+// checksum.
+//
+// The lanes and primes stay `U64`: the hash is 64-bit modular arithmetic
+// (`wrappingMul`, `wrappingAdd`, rotations), and Number and UNumber trap on
+// wrap instead of wrapping at 64 bits. Offsets and lengths are Numbers.
+
+namespace Xxh64 {
+    let prime1: U64 = 11400714785074694791
+    let prime2: U64 = 14029467366897019727
+    let prime3: U64 = 1609587929392839161
+    let prime4: U64 = 9650029242287828579
+    let prime5: U64 = 2870177450012600261
+}
+
+function xxh64(bytes: borrow [UN8]) -> U64 {
+    var hasher = xxh64Hasher()
+    hasher.add(bytes, 0, bytes.count)
+    return hasher.digest()
+}
+
+// XXH64 of bytes given a run at a time: four lanes take each 32-byte stripe,
+// and what is short of a stripe waits in `held`.
+struct Xxh64Hasher {
+    var lanes: [U64]
+    var held: [UN8] = []
+    var total: Number = 0
+
+    // Adds the bytes of `bytes` from `start` to `end`.
+    function add(borrow mut self, bytes: borrow [UN8], start: Number, end: Number) {
+        total += end - start
+        var at = start
+        if held.count > 0 {
+            while held.count < 32 && at < end {
+                held.append(bytes[at])
+                at += 1
+            }
+            if held.count < 32 { return }
+            let stripe = move held
+            held = []
+            addStripe(stripe, 0)
+        }
+        while at + 32 <= end {
+            addStripe(bytes, at)
+            at += 32
+        }
+        for index in at..end { held.append(bytes[index]) }
+    }
+
+    function addStripe(borrow mut self, bytes: borrow [UN8], at: Number) {
+        lanes[0] = xxhRound(lanes[0], laneAt(bytes, at))
+        lanes[1] = xxhRound(lanes[1], laneAt(bytes, at + 8))
+        lanes[2] = xxhRound(lanes[2], laneAt(bytes, at + 16))
+        lanes[3] = xxhRound(lanes[3], laneAt(bytes, at + 24))
+    }
+
+    // The hash of everything added.
+    function digest(borrow self) -> U64 {
+        var hash: U64 = 0
+        if total >= 32 {
+            hash = wrappingAdd(
+                wrappingAdd(rotateLeft(lanes[0], 1), rotateLeft(lanes[1], 7)),
+                wrappingAdd(rotateLeft(lanes[2], 12), rotateLeft(lanes[3], 18))
+            )
+            for lane in lanes { hash = xxhMerge(hash, lane) }
+        } else {
+            hash = Xxh64.prime5
+        }
+        hash = wrappingAdd(hash, U64(total))
+        let length = held.count
+        var at: Number = 0
+        while at + 8 <= length {
+            hash = hash ^ xxhRound(0, laneAt(held, at))
+            hash = wrappingAdd(wrappingMul(rotateLeft(hash, 27), Xxh64.prime1), Xxh64.prime4)
+            at += 8
+        }
+        if at + 4 <= length {
+            let word = U64(held[at]) | (U64(held[at + 1]) << 8) | (U64(held[at + 2]) << 16) | (
+                U64(held[at + 3]) << 24
+            )
+            hash = hash ^ wrappingMul(word, Xxh64.prime1)
+            hash = wrappingAdd(wrappingMul(rotateLeft(hash, 23), Xxh64.prime2), Xxh64.prime3)
+            at += 4
+        }
+        for index in at..length {
+            hash = hash ^ wrappingMul(U64(held[index]), Xxh64.prime5)
+            hash = wrappingMul(rotateLeft(hash, 11), Xxh64.prime1)
+        }
+        hash = hash ^ (hash >> 33)
+        hash = wrappingMul(hash, Xxh64.prime2)
+        hash = hash ^ (hash >> 29)
+        hash = wrappingMul(hash, Xxh64.prime3)
+        return hash ^ (hash >> 32)
+    }
+}
+
+function xxh64Hasher() -> Xxh64Hasher {
+    return Xxh64Hasher {
+        lanes: [
+            wrappingAdd(Xxh64.prime1, Xxh64.prime2),
+            Xxh64.prime2,
+            0,
+            wrappingSub(U64(0), Xxh64.prime1)
+        ]
+    }
+}
+
+function xxhRound(accumulator: U64, lane: U64) -> U64 {
+    let sum = wrappingAdd(accumulator, wrappingMul(lane, Xxh64.prime2))
+    return wrappingMul(rotateLeft(sum, 31), Xxh64.prime1)
+}
+
+function xxhMerge(accumulator: U64, value: U64) -> U64 {
+    let mixed = accumulator ^ xxhRound(0, value)
+    return wrappingAdd(wrappingMul(mixed, Xxh64.prime1), Xxh64.prime4)
+}
+
+function rotateLeft(value: U64, count: U64) -> U64 {
+    return (value << count) | (value >> (U64(64) - count))
+}
+
+// The 8 bytes at `at`, little-endian.
+function laneAt(bytes: borrow [UN8], at: Number) -> U64 {
+    let low = U64(bytes[at]) | (U64(bytes[at + 1]) << 8) | (U64(bytes[at + 2]) << 16) | (
+        U64(bytes[at + 3]) << 24
+    )
+    let high = U64(bytes[at + 4]) | (U64(bytes[at + 5]) << 8) | (U64(bytes[at + 6]) << 16) | (
+        U64(bytes[at + 7]) << 24
+    )
+    return low | (high << 32)
+}

@@ -1,0 +1,142 @@
+// Packages built as units of their own (KLF-RIDL sections 9.1 and 9.3).
+//
+// A program's build is one unit per package: the bundled Foundation, every
+// package its manifests reach by path, and the program itself, dependencies
+// first. Each unit checks and lowers the bodies of its own package, and only
+// declares what it calls of the others, whose units define it; the driver
+// merges the modules. An edit then re-runs the queries of the edited
+// package's unit, and every other unit is answered from the cache.
+//
+// A generic instance belongs to no package: the unit that names it builds it,
+// and two units building the same instance build the same function.
+
+// Whether this build splits the program into one unit per package. A format
+// run lays out one file, a framework is one binary of its own, a test build
+// runs the package's tests alone, and with an SDK a dependency may resolve
+// to the system's framework rather than its package.
+function splitsPackages(session: Session) -> Bool {
+    return !formatRun(session) && !frameworkBuild(session) && !testBuild(session) && utf8Count(sdkRoot(session)) == 0
+}
+
+// The packages a build of the package at `root` gives units of their own,
+// dependencies first: Foundation, then every package the manifests reach by
+// path, each once. A manifest that does not read is left to the load of the
+// package naming it to report.
+function separatePackages(session: Session, root: PackageRoot) -> [PackageRoot] {
+    var order: [PackageRoot] = []
+    var visiting: [String] = [normalizedPath(root.directory)]
+    let std = stdRoot(session)
+    if utf8Count(std) > 0 {
+        let directory = joinPath(std, "Foundation")
+        let manifest = readFile(session, joinPath(directory, "package.kira"))
+        if manifest >= 0 && manifest != root.manifest && !listsText(visiting, normalizedPath(directory)) {
+            let foundation = PackageRoot { directory = directory, manifest = manifest }
+            visiting.append(normalizedPath(directory))
+            appendDependencies(session, foundation, order, visiting)
+            order.append(foundation)
+        }
+    }
+    appendDependencies(session, root, order, visiting)
+    return order
+}
+
+function appendDependencies(session: Session, package: PackageRoot, order: borrow mut [PackageRoot], visiting: borrow mut [String]) {
+    match readManifest(fileText(session, package.manifest as SourceFile), package.manifest) {
+        Ok(manifest) -> {
+            let imported = packageImports(session, package.directory)
+            for dependency in manifest.dependencies {
+                if dependency.source != .Path { continue }
+                match imported {
+                    Some(names) -> { if !importsDependency(session, package.directory, names, dependency) { continue } }
+                    None -> {}
+                }
+                let named = joinPath(package.directory, dependency.path)
+                let manifestFile = readFile(session, joinPath(named, "package.kira"))
+                if manifestFile < 0 { continue }
+                let directory = bundledDirectory(session, named, manifestFile)
+                let normalized = normalizedPath(directory)
+                if listsPackage(order, normalized) || listsText(visiting, normalized) { continue }
+                let file = readFile(session, joinPath(directory, "package.kira"))
+                visiting.append(normalized)
+                let found = PackageRoot { directory = directory, manifest = file }
+                appendDependencies(session, found, order, visiting)
+                order.append(found)
+            }
+        }
+        Error(failure) -> {}
+    }
+}
+
+// Where a path dependency on the package at `directory` loads from: the
+// package the toolchain bundles when `directory` is it, spelled another way
+// (a relative path), or holds a copy of it with the same manifest (the
+// repository's std reached from a toolchain that ships its own), so one
+// program holds one Foundation, spelled one way; else `directory` itself.
+function bundledDirectory(session: Session, directory: String, file: Int) -> String {
+    let std = stdRoot(session)
+    if utf8Count(std) == 0 { return directory }
+    match readManifest(fileText(session, file as SourceFile), file) {
+        Ok(manifest) -> {
+            let bundled = joinPath(std, manifest.moduleRoot)
+            let shipped = readFile(session, joinPath(bundled, "package.kira"))
+            if shipped >= 0 && (shipped == file || fileText(session, shipped as SourceFile) == fileText(session, file as SourceFile)) {
+                return bundled
+            }
+        }
+        Error(failure) -> {}
+    }
+    return directory
+}
+
+// Whether the package at `root`, whose manifest is `manifest` and names the
+// module `name`, is one the toolchain bundles: under the bundled packages'
+// directory, or, reached by a path spelled another way, the same manifest
+// file as the bundled package of that name.
+function bundledPackage(session: Session, root: String, name: String, manifest: Int) -> Bool {
+    let std = stdRoot(session)
+    if utf8Count(std) == 0 { return false }
+    if directoryOf(normalizedPath(root)) == normalizedPath(std) { return true }
+    return readFile(session, joinPath(joinPath(std, name), "package.kira")) == manifest
+}
+
+function listsPackage(packages: [PackageRoot], normalized: String) -> Bool {
+    for package in packages {
+        if normalizedPath(package.directory) == normalized { return true }
+    }
+    return false
+}
+
+function listsText(texts: [String], wanted: String) -> Bool {
+    return textPosition(texts, wanted) >= 0
+}
+
+// Where `wanted` is among `texts`, or -1.
+function textPosition(texts: [String], wanted: String) -> Int {
+    for index in 0..texts.count {
+        if texts[index] == wanted { return index }
+    }
+    return -1
+}
+
+// The units of the programs whose entries are `entries`: one per package
+// they build apart, each once, then each entry's own.
+function programUnits(session: Session, entries: [SourceFile]) -> [Unit] {
+    var units: [Unit] = []
+    if splitsPackages(session) {
+        var built: [PackageRoot] = []
+        for entry in entries {
+            match findPackage(session, directoryOf(fileName(session, entry))) {
+                Some(package) -> {
+                    for dependency in separatePackages(session, package) {
+                        if listsPackage(built, normalizedPath(dependency.directory)) { continue }
+                        built.append(dependency)
+                        units.append(definition_unit(session, dependency.manifest as SourceFile))
+                    }
+                }
+                None -> {}
+            }
+        }
+    }
+    for entry in entries { units.append(definition_unit(session, entry)) }
+    return units
+}

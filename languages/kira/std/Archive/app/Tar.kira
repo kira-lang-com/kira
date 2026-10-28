@@ -1,0 +1,288 @@
+import Foundation
+
+// Reading tar archives (POSIX.1-2001 pax, ustar and GNU): 512-byte headers,
+// each entry's contents padded to a whole block, long names in GNU `L` and
+// `K` entries or pax `x` records. A pax `g` header names defaults no
+// reader needs here, and is passed over.
+
+namespace TarFormat {
+    let block: Number = 512
+    // Where each header field starts, and how long it is.
+    let nameAt: Number = 0
+    let nameSize: Number = 100
+    let modeAt: Number = 100
+    let numberSize: Number = 8
+    let sizeAt: Number = 124
+    let sizeSize: Number = 12
+    let checksumAt: Number = 148
+    let typeAt: Number = 156
+    let linkAt: Number = 157
+    let magicAt: Number = 257
+    let prefixAt: Number = 345
+    let prefixSize: Number = 155
+    let permissionBits: Number = 4095
+}
+
+// The entry types, as their type bytes.
+namespace TarType {
+    let oldFile: Number = 0
+    let file: Number = 48
+    let hardLink: Number = 49
+    let symbolicLink: Number = 50
+    let directory: Number = 53
+    let contiguous: Number = 55
+    let gnuLongLink: Number = 75
+    let gnuLongName: Number = 76
+    let paxGlobal: Number = 103
+    let paxEntry: Number = 120
+}
+
+// What the extension entries before an entry say of it.
+struct TarExtensions {
+    var path: String? = .None
+    var link: String? = .None
+    var size: Number? = .None
+}
+
+// Every entry of the tar archive `feed` holds, unpacked into `target`.
+function unpackTar(
+    feed: ByteFeed,
+    target: borrow mut UnpackTarget
+) -> Result<Void, ArchiveFailure> {
+    var input = move feed
+    let block = TarFormat.block
+    var extensions = TarExtensions {}
+    while true {
+        match input.want(block) {
+            Ok(whole) -> {
+                // An archive cut at a block boundary has lost only its end
+                // blocks, as GNU tar reads it.
+                if !whole {
+                    if input.buffer.count - input.at == 0 { return .Ok }
+                    return .Error(.Malformed("a tar header is cut off"))
+                }
+            }
+            Error(failure) -> return .Error(failure)
+        }
+        let header = match input.take(block, "a tar header") {
+            Ok(taken) -> taken
+            Error(failure) -> return .Error(failure)
+        }
+        var empty = true
+        for byte in header {
+            if byte != 0 {
+                empty = false
+                break
+            }
+        }
+        if empty { return .Ok }
+        match tarChecked(header) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        let type = Number(header[TarFormat.typeAt])
+        let size = match extensions.size {
+            Some(given) -> given
+            None -> match tarNumber(header, TarFormat.sizeAt, TarFormat.sizeSize) {
+                Some(read) -> read
+                None -> return .Error(.Malformed("a tar header's size does not read"))
+            }
+        }
+        let padding = (block - size % block) % block
+        let isExtension = type == TarType.gnuLongName || type == TarType.gnuLongLink
+            || type == TarType.paxEntry || type == TarType.paxGlobal
+        if isExtension {
+            let contents = match input.take(size, "a tar extension") {
+                Ok(taken) -> taken
+                Error(failure) -> return .Error(failure)
+            }
+            match tarExtension(type, contents, extensions) {
+                Ok -> {}
+                Error(failure) -> return .Error(failure)
+            }
+            match input.skip(padding, "a tar extension") {
+                Ok -> {}
+                Error(failure) -> return .Error(failure)
+            }
+            continue
+        }
+        let raw = match extensions.path {
+            Some(given) -> given
+            None -> tarName(header)
+        }
+        let link = match extensions.link {
+            Some(given) -> given
+            None -> tarField(header, TarFormat.linkAt, TarFormat.nameSize)
+        }
+        extensions = TarExtensions {}
+        let mode = tarNumber(header, TarFormat.modeAt, TarFormat.numberSize).or(420)
+            & TarFormat.permissionBits
+        let found = match unpackedPath(raw) {
+            Ok(cleaned) -> cleaned
+            Error(failure) -> return .Error(failure)
+        }
+        let regular = type == TarType.oldFile || type == TarType.file
+            || type == TarType.contiguous
+        var written = false
+        match found {
+            Some(path) -> {
+                if target.excludes(path) {
+                    match input.skip(size + padding, raw) {
+                        Ok -> {}
+                        Error(failure) -> return .Error(failure)
+                    }
+                    continue
+                }
+                written = regular
+                let placed = match type {
+                    0, 48, 55 -> target.file(path, mode, input, size)
+                    53 -> target.directory(path, mode)
+                    50 -> target.link(path, link)
+                    49 -> match unpackedPath(link) {
+                        Ok(cleaned) -> match cleaned {
+                            Some(from) -> target.hardLink(path, from, mode)
+                            None -> .Error(.Malformed("\(path) is a hard link to the root"))
+                        }
+                        Error(failure) -> .Error(failure)
+                    }
+                    else -> .Error(.Unsupported("the tar entry \(raw) of type \(type)"))
+                }
+                match placed {
+                    Ok -> {}
+                    Error(failure) -> return .Error(failure)
+                }
+            }
+            None -> {}
+        }
+        match input.skip(written ? padding : size + padding, raw) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+    }
+    return .Ok
+}
+
+// What a GNU long name or link, or a pax record list, says of the next
+// entry.
+function tarExtension(
+    type: Number,
+    contents: borrow [UN8],
+    extensions: borrow mut TarExtensions
+) -> Result<Void, ArchiveFailure> {
+    if type == TarType.paxGlobal { return .Ok }
+    if type == TarType.gnuLongName {
+        extensions.path = .Some(tarField(contents, 0, contents.count))
+        return .Ok
+    }
+    if type == TarType.gnuLongLink {
+        extensions.link = .Some(tarField(contents, 0, contents.count))
+        return .Ok
+    }
+    // Records of `<length> <key>=<value>\n`, the length counting it all.
+    var at: Number = 0
+    while at < contents.count {
+        var length: Number = 0
+        var cursor = at
+        while cursor < contents.count && contents[cursor] >= 48 && contents[cursor] <= 57 {
+            length = length * 10 + Number(contents[cursor]) - 48
+            cursor += 1
+        }
+        let end = at + length
+        let sound = cursor < contents.count && contents[cursor] == 32 && end <= contents.count
+            && end > cursor + 1 && contents[end - 1] == 10
+        if !sound { return .Error(.Malformed("a pax record does not read")) }
+        var equals = cursor + 1
+        while equals < end - 1 && contents[equals] != 61 { equals += 1 }
+        let key = textFromByteRun(contents, cursor + 1, equals).or("")
+        let value = match textFromByteRun(contents, equals + 1, end - 1) {
+            Some(text) -> text
+            None -> return .Error(.Malformed("the pax record \(key) is not UTF-8"))
+        }
+        match key {
+            "path" -> {
+                extensions.path = .Some(value)
+            }
+            "linkpath" -> {
+                extensions.link = .Some(value)
+            }
+            "size" -> match tarDecimal(value) {
+                Some(read) -> {
+                    extensions.size = .Some(read)
+                }
+                None -> return .Error(.Malformed("the pax size \(value) does not read"))
+            }
+            else -> {}
+        }
+        at = end
+    }
+    return .Ok
+}
+
+function tarDecimal(text: borrow String) -> Number? {
+    var value: Number = 0
+    if text.count == 0 { return .None }
+    for byte in text.utf8() {
+        if byte < 48 || byte > 57 { return .None }
+        value = value * 10 + Number(byte) - 48
+    }
+    return .Some(value)
+}
+
+// Whether the header's checksum, the sum of its bytes with the checksum
+// field read as spaces, is the one it records.
+function tarChecked(header: borrow [UN8]) -> Result<Void, ArchiveFailure> {
+    let at = TarFormat.checksumAt
+    var sum: Number = 0
+    for index in 0..header.count {
+        sum += index >= at && index < at + 8 ? 32 : Number(header[index])
+    }
+    return match tarNumber(header, at, 8) {
+        Some(recorded) -> recorded == sum
+        ? .Ok
+        : .Error(.Malformed("a tar header's checksum is wrong"))
+        None -> .Error(.Malformed("a tar header's checksum does not read"))
+    }
+}
+
+// The entry's name: the ustar prefix, when there is one, then the name.
+function tarName(header: borrow [UN8]) -> String {
+    let name = tarField(header, TarFormat.nameAt, TarFormat.nameSize)
+    // POSIX ustar's magic ends in a zero byte, GNU's in a space.
+    let magic = TarFormat.magicAt
+    let posix = textOfBytes(header, magic, 5) == "ustar" && header[magic + 5] == 0
+    if !posix { return name }
+    let prefix = tarField(header, TarFormat.prefixAt, TarFormat.prefixSize)
+    if prefix.count == 0 { return name }
+    return prefix + "/" + name
+}
+
+// The text of a field, up to its first zero byte.
+function tarField(bytes: borrow [UN8], at: Number, count: Number) -> String {
+    var end = at
+    while end < at + count && bytes[end] != 0 { end += 1 }
+    return textFromByteRun(bytes, at, end).or("")
+}
+
+// A number field: octal digits between spaces or zero bytes, or, with the
+// first byte's top bit set, the rest as a big-endian binary number.
+function tarNumber(bytes: borrow [UN8], at: Number, count: Number) -> Number? {
+    if (Number(bytes[at]) & 128) != 0 {
+        var value = Number(bytes[at]) & 127
+        for index in (at + 1)..(at + count) { value = (value << 8) | Number(bytes[index]) }
+        return .Some(value)
+    }
+    var value: Number = 0
+    var digits: Number = 0
+    for index in at..(at + count) {
+        let byte = Number(bytes[index])
+        if byte >= 48 && byte <= 55 {
+            value = value * 8 + byte - 48
+            digits += 1
+        } else if byte == 32 || byte == 0 {
+            if digits > 0 { break }
+        } else {
+            return .None
+        }
+    }
+    return .Some(value)
+}

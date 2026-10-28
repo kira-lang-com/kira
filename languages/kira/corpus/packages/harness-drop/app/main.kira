@@ -1,0 +1,48 @@
+import Foundation
+
+struct Counted: Drop {
+    let counter: RawPtr
+    function drop(borrow mut self) {
+        heapWriteInt(counter, heapReadInt(counter) + 1)
+    }
+}
+
+struct Retroactive { let counter: RawPtr }
+extend Retroactive: Drop {
+    function drop(borrow mut self) {
+        heapWriteInt(counter, heapReadInt(counter) + 1)
+    }
+}
+
+function scoped(counter: RawPtr) {
+    let first = Counted(counter: counter)
+    let second = Retroactive(counter: counter)
+}
+
+function consumed(value: move Counted) { }
+
+function nested(counter: RawPtr) {
+    if true { let held = Counted(counter: counter) }
+    for index in 0..3 { let held = Counted(counter: counter) }
+    for index in 0..3 {
+        let held = Counted(counter: counter)
+        if index == 0 { continue }
+        break
+    }
+    let owned = Counted(counter: counter)
+    consumed(move owned)
+    var elements: [Counted] = [Counted(counter: counter), Counted(counter: counter)]
+    for held in elements { let pointer = held.counter }
+    elements[0] = Counted(counter: counter)
+}
+
+@Main
+function main() -> Int {
+    let counter = heapAllocateRaw(8, 8)
+    heapWriteInt(counter, 0)
+    scoped(counter)
+    nested(counter)
+    let result = heapReadInt(counter)
+    heapFreeRaw(counter)
+    return result
+}

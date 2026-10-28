@@ -1,0 +1,305 @@
+// Expressions, by C++'s precedence: comma, assignment (right to left), `?:`,
+// then the binary ladder from `||` to `* / %` by precedence climbing,
+// prefix operators and casts, and postfix `[]`, `()`, `.`, `->`, `++` and
+// `--`. A type followed by `(` or `{` constructs; `(T)x`, `static_cast<T>`
+// and `as_type<T>` convert.
+
+let shiftPrecedence = 8
+
+function binaryOperator(kind: TokenKind) -> Optional<Operator> {
+    if kind == .Plus { return .Some(.Add) }
+    if kind == .Minus { return .Some(.Subtract) }
+    if kind == .Star { return .Some(.Multiply) }
+    if kind == .Slash { return .Some(.Divide) }
+    if kind == .Percent { return .Some(.Remainder) }
+    if kind == .EqualEqual { return .Some(.Equal) }
+    if kind == .BangEqual { return .Some(.NotEqual) }
+    if kind == .Less { return .Some(.Less) }
+    if kind == .LessEqual { return .Some(.LessEqual) }
+    if kind == .Greater { return .Some(.Greater) }
+    if kind == .GreaterEqual { return .Some(.GreaterEqual) }
+    if kind == .AmpersandAmpersand { return .Some(.LogicalAnd) }
+    if kind == .PipePipe { return .Some(.LogicalOr) }
+    if kind == .Ampersand { return .Some(.BitAnd) }
+    if kind == .Pipe { return .Some(.BitOr) }
+    if kind == .Caret { return .Some(.BitXor) }
+    if kind == .LessLess { return .Some(.ShiftLeft) }
+    if kind == .GreaterGreater { return .Some(.ShiftRight) }
+    let none: Optional<Operator> = .None
+    return none
+}
+
+function assignmentOperator(kind: TokenKind) -> Optional<Operator> {
+    if kind == .Equals { return .Some(.Plain) }
+    if kind == .PlusEquals { return .Some(.Add) }
+    if kind == .MinusEquals { return .Some(.Subtract) }
+    if kind == .StarEquals { return .Some(.Multiply) }
+    if kind == .SlashEquals { return .Some(.Divide) }
+    if kind == .PercentEquals { return .Some(.Remainder) }
+    if kind == .AmpersandEquals { return .Some(.BitAnd) }
+    if kind == .PipeEquals { return .Some(.BitOr) }
+    if kind == .CaretEquals { return .Some(.BitXor) }
+    if kind == .LessLessEquals { return .Some(.ShiftLeft) }
+    if kind == .GreaterGreaterEquals { return .Some(.ShiftRight) }
+    let none: Optional<Operator> = .None
+    return none
+}
+
+function binaryPrecedence(operator: Operator) -> Int {
+    if operator == .LogicalOr { return 1 }
+    if operator == .LogicalAnd { return 2 }
+    if operator == .BitOr { return 3 }
+    if operator == .BitXor { return 4 }
+    if operator == .BitAnd { return 5 }
+    if operator == .Equal || operator == .NotEqual { return 6 }
+    if operator == .Less || operator == .LessEqual || operator == .Greater || operator == .GreaterEqual { return 7 }
+    if operator == .ShiftLeft || operator == .ShiftRight { return 8 }
+    if operator == .Add || operator == .Subtract { return 9 }
+    return 10
+}
+
+extend Parser {
+    function addExpression(borrow mut self, expression: Expression) -> Int {
+        tree.expressions.append(expression)
+        return tree.expressions.count - 1
+    }
+
+    function node(borrow mut self, kind: ExpressionKind, operator: Operator, left: Int, right: Int, span: Span) -> Int {
+        return addExpression(Expression {
+            kind = kind, text = "", operator = operator, left = left, right = right, third = -1, arguments = [],
+            typeSyntax = -1, arrow = false, braced = false, span = span
+        })
+    }
+
+    function joined(borrow self, left: Int, right: Int) -> Span {
+        let first = tree.expressions[left].span
+        return Span { file = first.file, start = first.start, end = tree.expressions[right].span.end }
+    }
+
+    function expression(borrow mut self) -> Result<Int, Failure> {
+        return commaExpression()
+    }
+
+    function commaExpression(borrow mut self) -> Result<Int, Failure> {
+        var left = try assignment()
+        while eat(.Comma) {
+            let right = try assignment()
+            left = node(.Binary, .Comma, left, right, joined(left, right))
+        }
+        return .Ok(left)
+    }
+
+    function assignment(borrow mut self) -> Result<Int, Failure> {
+        let left = try conditional()
+        match assignmentOperator(token().kind) {
+            Some(operator) -> {
+                advance()
+                var right = -1
+                if operator == .Plain {
+                    right = try initializer()
+                } else {
+                    right = try assignment()
+                }
+                return .Ok(node(.Assign, operator, left, right, joined(left, right)))
+            }
+            None -> return .Ok(left)
+        }
+    }
+
+    function conditional(borrow mut self) -> Result<Int, Failure> {
+        let condition = try binary(1)
+        if !eat(.Question) { return .Ok(condition) }
+        let accept = try commaExpression()
+        try expect(.Colon)
+        let reject = try assignment()
+        return .Ok(addExpression(Expression {
+            kind = .Conditional, text = "", operator = .Plain, left = condition, right = accept, third = reject,
+            arguments = [], typeSyntax = -1, arrow = false, braced = false, span = joined(condition, reject)
+        }))
+    }
+
+    function binary(borrow mut self, floor: Int) -> Result<Int, Failure> {
+        var left = try unary()
+        while true {
+            match binaryOperator(token().kind) {
+                Some(operator) -> {
+                    let precedence = binaryPrecedence(operator)
+                    if precedence < floor { return .Ok(left) }
+                    advance()
+                    let right = try binary(precedence + 1)
+                    left = node(.Binary, operator, left, right, joined(left, right))
+                }
+                None -> return .Ok(left)
+            }
+        }
+        return .Ok(left)
+    }
+
+    function prefixOperator(borrow self) -> Optional<Operator> {
+        let kind = token().kind
+        if kind == .Minus { return .Some(.Negate) }
+        if kind == .Plus { return .Some(.Plus) }
+        if kind == .Bang { return .Some(.Not) }
+        if kind == .Tilde { return .Some(.BitNot) }
+        if kind == .Star { return .Some(.Dereference) }
+        if kind == .Ampersand { return .Some(.AddressOf) }
+        if kind == .PlusPlus { return .Some(.Increment) }
+        if kind == .MinusMinus { return .Some(.Decrement) }
+        let none: Optional<Operator> = .None
+        return none
+    }
+
+    function unary(borrow mut self) -> Result<Int, Failure> {
+        let start = token().span
+        match prefixOperator() {
+            Some(operator) -> {
+                advance()
+                let operand = try unary()
+                return .Ok(node(.Unary, operator, operand, -1, since(start)))
+            }
+            None -> {}
+        }
+        if atWord("sizeof") || atWord("alignof") { return .Error(fail(.UnsupportedConstruct, start)) }
+        // `(T)x`: a parenthesized type followed by an operand.
+        if at(.LeftParen) {
+            let saved = position
+            advance()
+            if atType() {
+                let written = try typeName()
+                if eat(.RightParen) && !at(.LeftParen) && !at(.LeftBrace) {
+                    let operand = try unary()
+                    return .Ok(convert(.Cast, written, operand, start))
+                }
+            }
+            position = saved
+        }
+        return postfix()
+    }
+
+    function convert(borrow mut self, kind: ExpressionKind, written: Int, operand: Int, start: Span) -> Int {
+        return addExpression(Expression {
+            kind = kind, text = "", operator = .Plain, left = operand, right = -1, third = -1, arguments = [],
+            typeSyntax = written, arrow = false, braced = false, span = since(start)
+        })
+    }
+
+    function postfix(borrow mut self) -> Result<Int, Failure> {
+        let start = token().span
+        var base = try primary()
+        while true {
+            if eat(.LeftBracket) {
+                let index = try expression()
+                try expect(.RightBracket)
+                base = node(.Index, .Plain, base, index, since(start))
+            } else if at(.LeftParen) {
+                let callee = tree.expressions[base]
+                if callee.kind == .Name && (callee.text == "printf" || callee.text == "os_log") {
+                    return .Error(fail(.Printf, since(start)))
+                }
+                advance()
+                let arguments = try callArguments()
+                base = addExpression(Expression {
+                    kind = .Call, text = "", operator = .Plain, left = base, right = -1, third = -1,
+                    arguments = arguments, typeSyntax = -1, arrow = false, braced = false, span = since(start)
+                })
+            } else if at(.Dot) || at(.Arrow) {
+                let arrow = advance().kind == .Arrow
+                let member = try expect(.Word)
+                base = addExpression(Expression {
+                    kind = .Member, text = member.text, operator = .Plain, left = base, right = -1, third = -1,
+                    arguments = [], typeSyntax = -1, arrow = arrow, braced = false, span = since(start)
+                })
+            } else if at(.PlusPlus) || at(.MinusMinus) {
+                var operator: Operator = .Increment
+                if advance().kind == .MinusMinus { operator = .Decrement }
+                base = node(.Postfix, operator, base, -1, since(start))
+            } else {
+                return .Ok(base)
+            }
+        }
+        return .Ok(base)
+    }
+
+    // Arguments after `(`, through `)`.
+    function callArguments(borrow mut self) -> Result<[Int], Failure> {
+        var arguments: [Int] = []
+        while !at(.RightParen) && !at(.End) {
+            arguments.append(try initializer())
+            if !eat(.Comma) { break }
+        }
+        try expect(.RightParen)
+        return .Ok(arguments)
+    }
+
+    function leaf(borrow mut self, kind: ExpressionKind, text: String, span: Span) -> Int {
+        return addExpression(Expression {
+            kind = kind, text = text, operator = .Plain, left = -1, right = -1, third = -1, arguments = [],
+            typeSyntax = -1, arrow = false, braced = false, span = span
+        })
+    }
+
+    function primary(borrow mut self) -> Result<Int, Failure> {
+        let current = token()
+        let start = current.span
+        if current.kind == .IntegerLiteral || current.kind == .FloatLiteral {
+            advance()
+            var kind: ExpressionKind = .IntegerLiteral
+            if current.kind == .FloatLiteral { kind = .FloatLiteral }
+            return .Ok(leaf(kind, current.text, start))
+        }
+        if current.kind == .StringLiteral || current.kind == .CharLiteral {
+            return .Error(fail(.UnsupportedConstruct, start))
+        }
+        if eat(.LeftParen) {
+            let inner = try expression()
+            try expect(.RightParen)
+            return .Ok(inner)
+        }
+        if at(.LeftBracket) { return .Error(fail(.Lambda, start)) }
+        if at(.LeftBrace) { return initializer() }
+        if !at(.Word) && !at(.ColonColon) { return .Error(unexpected()) }
+        let word = current.text
+        if word == "true" || word == "false" {
+            advance()
+            return .Ok(leaf(.BooleanLiteral, word, start))
+        }
+        if word == "static_cast" || word == "as_type" {
+            advance()
+            try expect(.Less)
+            let written = try typeName()
+            try closeAngle()
+            try expect(.LeftParen)
+            let operand = try expression()
+            try expect(.RightParen)
+            var kind: ExpressionKind = .Cast
+            if word == "as_type" { kind = .Bitcast }
+            return .Ok(convert(kind, written, operand, start))
+        }
+        let refused = word == "reinterpret_cast" || word == "const_cast" || word == "dynamic_cast"
+            || word == "this" || word == "new" || word == "delete" || word == "nullptr" || word == "throw"
+        if refused { return .Error(fail(.UnsupportedConstruct, start)) }
+        if atType() {
+            let written = try typeName()
+            if at(.LeftBrace) { return bracedConstruct(written, start) }
+            try expect(.LeftParen)
+            let arguments = try callArguments()
+            return .Ok(addExpression(Expression {
+                kind = .Construct, text = "", operator = .Plain, left = -1, right = -1, third = -1,
+                arguments = arguments, typeSyntax = written, arrow = false, braced = false, span = since(start)
+            }))
+        }
+        if isReserved(word) { return .Error(unexpected()) }
+        let path = try namePath()
+        return .Ok(leaf(.Name, path, since(start)))
+    }
+
+    // `T{...}`, the `{` at the cursor.
+    function bracedConstruct(borrow mut self, written: Int, start: Span) -> Result<Int, Failure> {
+        try expect(.LeftBrace)
+        let arguments = try initializerItems()
+        return .Ok(addExpression(Expression {
+            kind = .Construct, text = "", operator = .Plain, left = -1, right = -1, third = -1,
+            arguments = arguments, typeSyntax = written, arrow = false, braced = true, span = since(start)
+        }))
+    }
+}

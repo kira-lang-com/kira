@@ -1,0 +1,358 @@
+import Foundation
+
+// A Zstandard compressor (RFC 8878): one frame recording its content size
+// and checksum, cut into blocks of 128 KiB. Matches are found through hash
+// heads over a 2 MiB window and chains over the last 64 KiB, 1 MiB from
+// level 10, followed further at higher levels; literals are Huffman-coded
+// and sequences use the predefined distributions.
+
+namespace ZstdMatching {
+    let windowLog: Number = 21
+    let hashLog: Number = 16
+    let chainLog: Number = 16
+    let deepChainLog: Number = 20
+    // The shortest match the finder takes, which is what it hashes.
+    let shortest: Number = 4
+    // From this level on, the chains are deep and every position is tried.
+    let thorough: Number = 10
+    // From this many sequences on, a block describes distributions of its
+    // own rather than use the predefined ones.
+    let ownTables: Number = 64
+    // The levels a caller may ask for.
+    let fastest: Number = 1
+    let smallest: Number = 19
+}
+
+// The sequences of one block: before each match, how many literals; then
+// the match's length and its offset value: 1 for the last distance again,
+// after a literal, or the distance plus 3.
+struct ZstdSequences {
+    var literals: [UN8] = []
+    var literalLengths: [Number] = []
+    var matchLengths: [Number] = []
+    var offsets: [Number] = []
+}
+
+// What the encoder keeps across blocks: the tables and the code of each
+// short length.
+struct ZstdCoder {
+    let literalLengths: FseEncoder
+    let matchLengths: FseEncoder
+    let offsets: FseEncoder
+    let literalLengthBits: [Number]
+    let matchLengthBits: [Number]
+    let literalLengthBase: [Number]
+    let matchLengthBase: [Number]
+    let shortLiteralCodes: [Number]
+    let shortMatchCodes: [Number]
+
+    function literalLengthCode(borrow self, length: Number) -> Number {
+        if length > 63 { return highBit(length) + 19 }
+        return shortLiteralCodes[length]
+    }
+
+    // The code of a match `length` long.
+    function matchLengthCode(borrow self, length: Number) -> Number {
+        let above = length - ZstdFormat.minimumMatch
+        if above > 127 { return highBit(above) + 36 }
+        return shortMatchCodes[above]
+    }
+
+    // The sequences section of `sequences`.
+    function sequencesSection(borrow self, sequences: borrow ZstdSequences) -> [UN8] {
+        var section: [UN8] = []
+        let count = sequences.matchLengths.count
+        if count < 128 {
+            section.append(UN8(count))
+        } else if count < 32512 {
+            section.append(UN8((count >> 8) + 128))
+            section.append(UN8(count & 255))
+        } else {
+            section.append(255)
+            appendLittle(section, count - 32512, 2)
+        }
+        if count == 0 { return section }
+        var literalCounts = zeroCounts(ZstdFormat.literalLengthSymbols)
+        var matchCounts = zeroCounts(ZstdFormat.matchLengthSymbols)
+        var offsetCounts = zeroCounts(ZstdFormat.offsetSymbols)
+        for index in 0..count {
+            literalCounts[literalLengthCode(sequences.literalLengths[index])] += 1
+            matchCounts[matchLengthCode(sequences.matchLengths[index])] += 1
+            offsetCounts[highBit(sequences.offsets[index])] += 1
+        }
+        let literalTable = sequenceTable(
+            literalCounts,
+            count,
+            ZstdFormat.literalLengthLargestLog,
+            literalLengths
+        )
+        let offsetTable = sequenceTable(offsetCounts, count, ZstdFormat.offsetLargestLog, offsets)
+        let matchTable = sequenceTable(
+            matchCounts,
+            count,
+            ZstdFormat.matchLengthLargestLog,
+            matchLengths
+        )
+        section.append(
+            UN8((literalTable.mode << 6) | (offsetTable.mode << 4) | (matchTable.mode << 2))
+        )
+        section.appendAll(literalTable.description)
+        section.appendAll(offsetTable.description)
+        section.appendAll(matchTable.description)
+        var writer = LowBitWriter {}
+        let last = count - 1
+        var literalCode = literalLengthCode(sequences.literalLengths[last])
+        var matchCode = matchLengthCode(sequences.matchLengths[last])
+        var offsetCode = highBit(sequences.offsets[last])
+        var matchState = matchTable.encoder.start(matchCode)
+        var offsetState = offsetTable.encoder.start(offsetCode)
+        var literalState = literalTable.encoder.start(literalCode)
+        addExtras(sequences, last, literalCode, matchCode, offsetCode, writer)
+        for step in 0..last {
+            let index = last - 1 - step
+            literalCode = literalLengthCode(sequences.literalLengths[index])
+            matchCode = matchLengthCode(sequences.matchLengths[index])
+            offsetCode = highBit(sequences.offsets[index])
+            offsetState = offsetTable.encoder.encode(offsetState, offsetCode, writer)
+            matchState = matchTable.encoder.encode(matchState, matchCode, writer)
+            literalState = literalTable.encoder.encode(literalState, literalCode, writer)
+            addExtras(sequences, index, literalCode, matchCode, offsetCode, writer)
+        }
+        matchTable.encoder.flush(matchState, writer)
+        offsetTable.encoder.flush(offsetState, writer)
+        literalTable.encoder.flush(literalState, writer)
+        section.appendAll(writer.close())
+        return section
+    }
+
+    // The extra bits of sequence `index`: its literal length's, its match
+    // length's, then its offset's.
+    function addExtras(
+        borrow self,
+        sequences: borrow ZstdSequences,
+        index: Number,
+        literalCode: Number,
+        matchCode: Number,
+        offsetCode: Number,
+        writer: borrow mut LowBitWriter
+    ) {
+        writer.add(
+            sequences.literalLengths[index] - literalLengthBase[literalCode],
+            literalLengthBits[literalCode]
+        )
+        writer.add(
+            sequences.matchLengths[index] - matchLengthBase[matchCode],
+            matchLengthBits[matchCode]
+        )
+        writer.add(sequences.offsets[index] - (1 << offsetCode), offsetCode)
+    }
+}
+
+// `count` zeros.
+function zeroCounts(count: Number) -> [Number] {
+    var counts: [Number] = []
+    for symbol in 0..count { counts.append(0) }
+    return counts
+}
+
+// How one kind of code is written in a block: its mode (RFC 8878 section
+// 3.1.1.3.2.1), the description that follows the modes, and its encoder.
+struct SequenceTable {
+    let mode: Number
+    let description: [UN8]
+    let encoder: FseEncoder
+}
+
+// The table for codes counted `counts`, `total` in all: a distribution of
+// their own, at an accuracy up to `largestLog`, or `predefined` for a block
+// with few sequences.
+function sequenceTable(
+    counts: borrow [Number],
+    total: Number,
+    largestLog: Number,
+    predefined: borrow FseEncoder
+) -> SequenceTable {
+    let predefinedTable = SequenceTable { mode: 0, description: [], encoder: copy predefined }
+    if total < ZstdMatching.ownTables { return predefinedTable }
+    var top: Number = 0
+    for (symbol, count) in counts.enumerated() {
+        if count > 0 { top = symbol }
+    }
+    // The accuracy the reference encoder picks: what the count supports,
+    // but enough for every symbol.
+    let smallest = min(highBit(total - 1) + 1, highBit(max(top, 1)) + 2)
+    let log = max(ZstdFormat.smallestLog, min(largestLog, max(highBit(total - 1) - 2, smallest)))
+    let size: Number = 1 << log
+    // Each symbol's share of the table, at least one slot, the largest
+    // taking what rounding left.
+    var normalized: [Number] = []
+    var sum: Number = 0
+    var largest: Number = 0
+    for symbol in 0..(top + 1) {
+        let count = counts[symbol]
+        let share = count == 0 ? 0 : max(1, trunc((count * size + trunc(total / 2)) / total))
+        normalized.append(share)
+        sum += share
+        if share > normalized[largest] { largest = symbol }
+    }
+    normalized[largest] += size - sum
+    if normalized[largest] < 1 { return predefinedTable }
+    return SequenceTable {
+        mode: ZstdFormat.compressedMode,
+        description: distributionDescription(normalized, log),
+        encoder: fseEncoder(normalized, log)
+    }
+}
+
+function zstdCoder() -> ZstdCoder {
+    let literalBases = literalLengthBases()
+    let matchBases = matchLengthBases()
+    var matchAbove: [Number] = []
+    for base in matchBases { matchAbove.append(base - ZstdFormat.minimumMatch) }
+    return ZstdCoder {
+        literalLengths: fseEncoder(literalLengthDefaults(), ZstdFormat.literalLengthLog),
+        matchLengths: fseEncoder(matchLengthDefaults(), ZstdFormat.matchLengthLog),
+        offsets: fseEncoder(offsetDefaults(), ZstdFormat.offsetLog),
+        literalLengthBits: literalLengthExtraBits(),
+        matchLengthBits: matchLengthExtraBits(),
+        literalLengthBase: literalBases,
+        matchLengthBase: matchBases,
+        shortLiteralCodes: codesBelow(literalBases, 64),
+        shortMatchCodes: codesBelow(matchAbove, 128)
+    }
+}
+
+/// `bytes` as one Zstandard frame. `level`, from 1 to 19, is how hard it looks for matches.
+public function zstdCompress(bytes: borrow [UN8], level: Number) -> [UN8] {
+    var frame: [UN8] = []
+    appendLittle(frame, ZstdFormat.magic, 4)
+    // An 8-byte content size and a checksum, then the window: 2^(10 + e).
+    frame.append(196)
+    frame.append(UN8((ZstdMatching.windowLog - 10) << 3))
+    appendLittle(frame, bytes.count, 8)
+    let clamped = max(ZstdMatching.fastest, min(ZstdMatching.smallest, level))
+    let thorough = clamped >= ZstdMatching.thorough
+    var matcher = matchFinder(
+        ZstdMatching.shortest,
+        1 << trunc((clamped + 1) / 2),
+        thorough ? ZstdMatching.deepChainLog : ZstdMatching.chainLog,
+        ZstdMatching.hashLog,
+        1 << ZstdMatching.windowLog,
+        !thorough
+    )
+    let coder = zstdCoder()
+    if bytes.count == 0 {
+        appendLittle(frame, 1, 3)
+    }
+    // The last distance a decoder has read, which only a compressed block
+    // changes.
+    var repeated: Number = 1
+    var start: Number = 0
+    while start < bytes.count {
+        let end = min(start + ZstdFormat.blockSize, bytes.count)
+        let last = end == bytes.count ? 1 : 0
+        let size = end - start
+        let (block, after) = compressedBlock(bytes, start, end, matcher, coder, repeated)
+        if sameBytes(bytes, start, end) {
+            appendLittle(frame, (size << 3) | (ZstdFormat.rleBlock << 1) | last, 3)
+            frame.append(bytes[start])
+        } else if block.count < size {
+            appendLittle(frame, (block.count << 3) | (ZstdFormat.compressedBlock << 1) | last, 3)
+            frame.appendAll(block)
+            repeated = after
+        } else {
+            appendLittle(frame, (size << 3) | (ZstdFormat.rawBlock << 1) | last, 3)
+            frame.appendAll(byteRun(bytes, start, end))
+        }
+        start = end
+    }
+    appendLittle(frame, Number(xxh64(bytes) & U64(4294967295)), 4)
+    return frame
+}
+
+/// The file `from` compressed into the new file `to`, answering its length.
+public function zstdCompressFile(
+    from: borrow String,
+    to: borrow String,
+    level: Number
+) -> Result<UNumber, ArchiveFailure> {
+    let bytes = match readArchiveFile(from) {
+        Ok(read) -> read
+        Error(failure) -> return .Error(failure)
+    }
+    var sink = match createArchiveSink(to) {
+        Ok(created) -> created
+        Error(failure) -> return .Error(failure)
+    }
+    sink.append(zstdCompress(bytes, level))
+    return sink.finish()
+}
+
+// The contents of a compressed block holding `data` from `start` to `end`,
+// and the last distance once a decoder has read it, given `repeated` before.
+// After a literal, the bytes at the last distance are tried first: a match
+// there costs no table lookup and codes in a few bits.
+function compressedBlock(
+    data: borrow [UN8],
+    start: Number,
+    end: Number,
+    matcher: borrow mut MatchFinder,
+    coder: borrow ZstdCoder,
+    repeated: Number
+) -> ([UN8], Number) {
+    var sequences = ZstdSequences {}
+    let shortest = matcher.shortest
+    var distance = repeated
+    var anchor = start
+    var at = start
+    while at + shortest <= end {
+        var length = at > anchor && at >= distance ? matchingLength(
+            data,
+            at - distance,
+            at,
+            end
+        ) : 0
+        var offset: Number = 1
+        if length < shortest {
+            let (found, foundDistance) = matcher.find(data, at, end)
+            if found == 0 {
+                at += matcher.skips ? 1 + ((at - anchor) >> 8) : 1
+                continue
+            }
+            length = found
+            distance = foundDistance
+            offset = foundDistance + 3
+        } else {
+            matcher.insert(data, at)
+        }
+        for index in anchor..at { sequences.literals.append(data[index]) }
+        sequences.literalLengths.append(at - anchor)
+        sequences.matchLengths.append(length)
+        sequences.offsets.append(offset)
+        matcher.insertMatched(data, at, at + length)
+        at += length
+        anchor = at
+    }
+    for index in anchor..end { sequences.literals.append(data[index]) }
+    var block = literalsSection(sequences.literals)
+    block.appendAll(coder.sequencesSection(sequences))
+    return (block, distance)
+}
+
+// How many bytes from `at` up to `end` equal those from `earlier`.
+function matchingLength(data: borrow [UN8], earlier: Number, at: Number, end: Number) -> Number {
+    var length: Number = 0
+    for index in at..end {
+        if data[index] != data[earlier + length] { break }
+        length += 1
+    }
+    return length
+}
+
+// Whether every byte from `start` to `end` is the first.
+function sameBytes(data: borrow [UN8], start: Number, end: Number) -> Bool {
+    for index in start..end {
+        if data[index] != data[start] { return false }
+    }
+    return true
+}

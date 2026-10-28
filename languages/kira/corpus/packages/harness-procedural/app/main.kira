@@ -1,0 +1,32 @@
+import Foundation
+
+comptime macro Generate {
+    kind { function }
+    expand(input: Syntax) -> Syntax {
+        return quote { function generatedAnswer() -> Int { return 42 } }
+    }
+}
+
+comptime macro FortyTwo {
+    kind { function }
+    expand(input: Syntax) -> Syntax {
+        let platform = Build.platform()
+        if platform == "" { return quote { 0 } }
+        return quote { 42 }
+    }
+}
+
+comptime macro AssignTen {
+    kind { function }
+    expand(input: Syntax) -> Syntax { return quote { r = 10 } }
+}
+
+Generate!()
+
+@Main
+function main() -> Int {
+    let number = FortyTwo!()
+    var r = 0
+    AssignTen!()
+    return number + generatedAnswer() + r
+}

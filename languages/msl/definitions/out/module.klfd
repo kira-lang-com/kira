@@ -1,0 +1,191 @@
+// The module: structs, constants and overrides, then each function and
+// each entry point with its wrapper.
+
+extend TextOut {
+    function writeMslModule(borrow mut self) {
+        prepareNames(mslReserved(), false)
+        dialect.debug = flag("unit", -1, 0, "debug")
+        prepareSlots()
+        let functions = count("functions", -1)
+        for which in 0..functions {
+            if !isEntry(which) { dialect.hidden.append(reachedGlobals(which)) }
+        }
+        write("#include <metal_stdlib>\nusing namespace metal;\n\n")
+        writeStructs()
+        writeConstants()
+        for which in 0..functions {
+            if !isEntry(which) { writeFunction(which, functionNames[which], dialect.hidden[which]) }
+        }
+        for which in 0..functions {
+            if isEntry(which) { writeEntry(which) }
+        }
+    }
+
+    function writeStructs(borrow self) {
+        let types = count("types", -1)
+        for typeIndex in 0..types {
+            if typeKind(typeIndex) == "struct" { writeStruct(typeIndex) }
+        }
+    }
+
+    function writeStruct(borrow self, typeIndex: Int) {
+        let host = dialect.padded[typeIndex]
+        let members = count("members", typeIndex)
+        var slots: [Int] = []
+        if host {
+            slots = dialect.slots[typeIndex]
+        } else {
+            for member in 0..members {
+                slots.append(member)
+            }
+        }
+        var pieces: [String] = [joinText(["struct ", structName(typeIndex), " {\n"])]
+        var pad = 0
+        for slot in slots {
+            if slot < 0 {
+                pieces.append(joinText(["    char _pad", decimalText(pad), "[", decimalText((0 - slot) * 4), "];\n"]))
+                pad += 1
+            } else {
+                var memberType = typeName(field("members", typeIndex, slot, "type"))
+                if host && packedMember(typeIndex, slot) { memberType = joinText(["packed_", memberType]) }
+                pieces.append(joinText(["    ", memberType, " ", memberName(typeIndex, slot), ";\n"]))
+            }
+        }
+        pieces.append("};\n")
+        if host && dialect.debug {
+            // The Metal compiler then checks the layout the host binds
+            // against (section 19.3 rule 9).
+            let name = structName(typeIndex)
+            pieces.append(joinText(["static_assert(sizeof(", name, ") == ", decimalText(typeField(typeIndex, "size")),
+                ", \"", name, " size\");\n"]))
+            for member in 0..members {
+                let memberText = memberName(typeIndex, member)
+                pieces.append(joinText(["static_assert(__builtin_offsetof(", name, ", ", memberText, ") == ",
+                    decimalText(field("members", typeIndex, member, "offset")), ", \"", name, ".", memberText,
+                    " offset\");\n"]))
+            }
+        }
+        pieces.append("\n")
+        write(joinText(pieces))
+    }
+
+    // The value a constant, override or private global starts with, or a
+    // refusal at the record of `table` when it is not constant.
+    function constantValue(borrow self, table: String, index: Int) -> String {
+        let value = field(table, -1, index, "value")
+        if value < 0 {
+            refuseAt("an initializer that is not constant", table, -1, index)
+            return ""
+        }
+        return constText(value)
+    }
+
+    function writeConstants(borrow self) {
+        var any = false
+        let constants = count("constants", -1)
+        for constant in 0..constants {
+            let value = constantValue("constants", constant)
+            let constantType = typeName(field("constants", -1, constant, "type"))
+            write(joinText(["constant ", constantType, " ", constantNames[constant], " = ", value, ";\n"]))
+            any = true
+        }
+        let overrides = count("overrides", -1)
+        for item in 0..overrides {
+            let itemType = typeName(field("overrides", -1, item, "type"))
+            let name = overrideNames[item]
+            let id = field("overrides", -1, item, "id")
+            var initial = ""
+            let hasInitial = field("overrides", -1, item, "init") >= 0
+            if hasInitial { initial = constantValue("overrides", item) }
+            if id >= 0 && hasInitial {
+                write(joinText(["constant ", itemType, " ", name, "_constant [[function_constant(", decimalText(id),
+                    ")]];\nconstant ", itemType, " ", name, " = is_function_constant_defined(", name, "_constant) ? ",
+                    name, "_constant : ", initial, ";\n"]))
+            } else if id >= 0 {
+                write(joinText(["constant ", itemType, " ", name, " [[function_constant(", decimalText(id), ")]];\n"]))
+            } else {
+                refuseAt("a kept override without an id", "overrides", -1, item)
+            }
+            any = true
+        }
+        if any { write("\n") }
+    }
+
+    // Whether a global is a runtime-sized buffer, which comes with a count.
+    function counted(borrow self, global: Int) -> Bool {
+        return text("globals", -1, global, "space") == "storage" && runtimeSized(field("globals", -1, global, "type"))
+    }
+
+    // The arguments a call passes for the globals the callee uses.
+    function hiddenArguments(borrow self, globals: [Int]) -> [String] {
+        var arguments: [String] = []
+        for global in globals {
+            let name = globalNames[global]
+            arguments.append(name)
+            if counted(global) { arguments.append(joinText([name, "_count"])) }
+        }
+        return arguments
+    }
+
+    function hiddenParameters(borrow self, globals: [Int]) -> [String] {
+        var parameters: [String] = []
+        for global in globals {
+            let name = globalNames[global]
+            let written = parameter(global, name)
+            if failedText(written) {
+                refuseAt(failureText(written), "globals", -1, global)
+            } else {
+                parameters.append(written)
+            }
+            if counted(global) { parameters.append(joinText(["constant uint& ", name, "_count"])) }
+        }
+        return parameters
+    }
+
+    function writeFunction(borrow mut self, which: Int, name: String, hidden: [Int]) {
+        prepareBody(which)
+        var parameters: [String] = []
+        let arguments = count("arguments", which)
+        for argument in 0..arguments {
+            let argumentType = field("arguments", which, argument, "type")
+            if typeKind(argumentType) == "pointer" {
+                let space = typeText(argumentType, "space")
+                var word = "device"
+                if space == "private" || space == "function" {
+                    word = "thread"
+                } else if space == "workgroup" {
+                    word = "threadgroup"
+                } else if space == "uniform" {
+                    word = "constant"
+                }
+                parameters.append(joinText([word, " ", typeName(typeField(argumentType, "base")), "& ",
+                    argumentNames[argument]]))
+            } else {
+                parameters.append(joinText([typeName(argumentType), " ", argumentNames[argument]]))
+            }
+        }
+        for hiddenParameter in hiddenParameters(hidden) {
+            parameters.append(hiddenParameter)
+        }
+        var result = "void"
+        let resultIndex = field("functions", -1, which, "result")
+        if resultIndex >= 0 { result = typeName(resultIndex) }
+        write(joinText([result, " ", name, "(", joinWith(parameters, ", "), ") {\n"]))
+        let locals = count("locals", which)
+        for local in 0..locals {
+            let localType = field("locals", which, local, "type")
+            let init = field("locals", which, local, "init")
+            var value = ""
+            if init >= 0 && !flag("expressions", which, init, "emits") {
+                value = operand(init)
+            } else if init >= 0 {
+                refuseAt("a local initialized by a runtime expression", "locals", which, local)
+            } else {
+                value = joinText([typeName(localType), " {}"])
+            }
+            write(joinText(["    ", typeName(localType), " ", localNames[local], " = ", value, ";\n"]))
+        }
+        writeBlock(field("functions", -1, which, "body"), 1)
+        write("}\n\n")
+    }
+}

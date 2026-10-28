@@ -1,0 +1,538 @@
+import KnvmCore
+
+// The `knvm` binary: parse argv, dispatch, render what happened.
+//
+// All the logic lives in `KnvmCore` so it is reachable by the checks; this file
+// holds the streams and the exit codes.
+
+// The operation ran.
+let exitOk: Number = 0
+
+// The operation was understood and failed.
+let exitFailed: Number = 1
+
+// The invocation was not understood.
+let exitUsage: Number = 2
+
+@Main
+function main() -> Number {
+    let output = Output { color = colorIsWanted() }
+    if !migrateLegacyLayout() {
+        output.warn(
+            "could not move the toolchains installed before per-compiler trees under `kira/`"
+        )
+    }
+    let compilers = allCompilers()
+    match parseCommand(commandLineArguments(), compilers) {
+        Refused(failure) -> {
+            output.fail(usageFailureText(failure))
+            output.writeErrorText("\n" + usageText(output, compilers))
+            return exitUsage
+        }
+        Accepted(command) -> { return run(command, compilers, output) }
+    }
+    return exitUsage
+}
+
+// Runs a parsed command and answers the process exit status.
+function run(
+    command: borrow Command,
+    compilers: borrow [Compiler],
+    output: borrow Output
+) -> Number {
+    match command {
+        Help -> {
+            print(usageText(output, compilers))
+            return exitOk
+        }
+        Overview -> { return overview(compilers, output) }
+        Install(request) -> { return install(request, output) }
+        List(request) -> { return list(request, output) }
+        Use(request) -> { return use(request, output) }
+        Uninstall(request) -> { return uninstall(request, output) }
+        Pin(request) -> { return pin(request, output) }
+        Unpin(request) -> { return unpin(request, output) }
+        Binstall(request) -> { return binstall(request, output) }
+        Sinstall -> { return sinstall(output) }
+        Valgrind(request) -> { return valgrind(request, output) }
+        SdkList -> { return sdkList(output) }
+        Setup -> { return setup(output) }
+    }
+    return exitFailed
+}
+
+// `knvm setup`: everything from releases, installed or brought up to date.
+function setup(output: borrow Output) -> Number {
+    match userHomeDirectory() {
+        None -> {
+            output.fail("no home directory, so no shell startup file to configure")
+            return exitFailed
+        }
+        Some(shellHome) -> {
+            match setupFromReleases(shellHome, environmentValue("SHELL")) {
+                Failed(failure) -> {
+                    output.fail(setupFailureText(failure))
+                    return exitFailed
+                }
+                Ready(report) -> {
+                    for installed in report.installed {
+                        output.report(toolName + ": " + installed.compiler + " " + installed.version + " is selected")
+                    }
+                    output.report(
+                        toolName + ": installed " + joinTools(report.tools.tools) + " into " + report.tools.binDirectory
+                    )
+                    reportPathSetup(report.tools, output)
+                    return exitOk
+                }
+            }
+        }
+    }
+    return exitFailed
+}
+
+// `knvm sdk list`: every SDK found under the roots, one per line.
+function sdkList(output: borrow Output) -> Number {
+    let lines = sdkListingLines()
+    for index in 0..lines.count {
+        output.report(toolName + ": " + lines[index])
+    }
+    return exitOk
+}
+
+// Valgrind for a target, built once and kept.
+function valgrind(request: borrow ValgrindRequest, output: borrow Output) -> Number {
+    match installValgrind(request) {
+        Installed(tree) -> {
+            let verb = tree.already ? "is already" : "installed"
+            output.report(
+                toolName + ": Valgrind " + valgrindVersion + " for " + request.target + " " + verb + " at " + tree.root
+            )
+            return exitOk
+        }
+        Failed(failure) -> {
+            output.fail(valgrindFailureText(failure))
+            return exitFailed
+        }
+    }
+    return exitFailed
+}
+
+// The bare `knvm` screen: the usage text, with a first-run greeting when no
+// compiler has anything installed. Exit 0 either way — asking the front door
+// what is behind it is not an error.
+function overview(compilers: borrow [Compiler], output: borrow Output) -> Number {
+    var installedAny = false
+    for compiler in compilers {
+        match listToolchains(compiler) {
+            Listed(installed) -> { installedAny = installedAny || installed.count > 0 }
+            Failed(failure) -> {
+                output.fail(manageFailureText(compiler, failure))
+                return exitFailed
+            }
+            else -> { return exitFailed }
+        }
+    }
+    if !installedAny {
+        output.report(
+            output.bold("Welcome!") + " No toolchain is installed yet; " + firstStep(
+                compilers,
+                output
+            )
+        )
+        output.report("")
+    }
+    print(usageText(output, compilers))
+    return exitOk
+}
+
+// What a machine with nothing installed runs first: the default language's
+// provisioning command once one is registered, and the framework's `binstall`
+// before that, since `klf` is what builds every other language.
+function firstStep(compilers: borrow [Compiler], output: borrow Output) -> String {
+    match defaultCompiler(compilers) {
+        Some(compiler) -> { return output.cyan(provisionCommand(compiler)) + " provides one." }
+        None -> {
+            return output.cyan(provisionCommand(klfCompiler())) + " in a framework checkout, then "
+                + output.cyan(
+                    toolName + " binstall"
+                ) + " in a repository of languages, provide them."
+        }
+    }
+    return ""
+}
+
+// Fetches a release, lays it down, and selects it.
+function install(request: borrow InstallRequest, output: borrow Output) -> Number {
+    let compiler = request.compiler
+    match installToolchain(compiler, defaultSource(compiler), request.spec, request.channel) {
+        Failed(failure) -> {
+            output.fail(installFailureText(failure))
+            return exitFailed
+        }
+        Installed(installed) -> {
+            let state = installed.alreadyInstalled ? "already installed" : "installed"
+            output.report(
+                toolName + ": " + state + " " + compiler.name + " " + channelName(
+                    installed.channel
+                ) + " " + installed.version + " at " + installed.root
+            )
+            reportVerification(installed, output)
+            reportDispatch(compiler, output)
+            return exitOk
+        }
+    }
+    return exitFailed
+}
+
+// What a selection changed, in the name the user types.
+function reportDispatch(compiler: borrow Compiler, output: borrow Output) {
+    output.report(
+        toolName + ": selected it; `" + compiler.binary + "` now dispatches to this toolchain"
+    )
+}
+
+// Reports what an artifact's checksum proved, or that there was none.
+//
+// Said out loud rather than passed over: "verified" and "no checksum was
+// published" are different installs, and a user who cannot tell them apart has
+// no way to notice the day verification silently stops happening.
+function reportVerification(installed: borrow Installed, output: borrow Output) {
+    if installed.alreadyInstalled { return }
+    if installed.digest.isEmpty() {
+        output.warn("no checksum is published for this artifact; it was installed unverified")
+        return
+    }
+    output.report(toolName + ": verified sha256 " + installed.digest)
+}
+
+// `list`, of what is installed or of what is published.
+function list(request: borrow ListRequest, output: borrow Output) -> Number {
+    let compiler = request.compiler
+    if request.remote { return listRemote(compiler, output) }
+    match listToolchains(compiler) {
+        Listed(installed) -> {
+            printListing(compiler, installed, output)
+            return exitOk
+        }
+        Failed(failure) -> {
+            output.fail(manageFailureText(compiler, failure))
+            return exitFailed
+        }
+        else -> { return exitFailed }
+    }
+    return exitFailed
+}
+
+// Renders the installed toolchains, grouped by channel, `*` on the selected one.
+function printListing(
+    compiler: borrow Compiler,
+    installed: borrow [InstalledToolchain],
+    output: borrow Output
+) {
+    if installed.count == 0 {
+        output.report(
+            toolName + ": no " + compiler.name + " toolchains installed; run `" + provisionCommand(
+                compiler
+            ) + "`"
+        )
+        return
+    }
+    var channelShown = ""
+    for toolchain in installed {
+        let channel = channelName(toolchain.channel)
+        if channel != channelShown {
+            output.report(output.bold(channel + ":"))
+            channelShown = channel
+        }
+        if toolchain.isCurrent {
+            output.report("  " + output.green("* " + toolchain.version))
+        } else {
+            output.report("    " + toolchain.version)
+        }
+        if !toolchain.isComplete {
+            output.report("  " + output.yellow("(broken: no bin/" + compiler.binary + ")"))
+        }
+    }
+}
+
+// Renders what each channel publishes, newest first.
+function listRemote(compiler: borrow Compiler, output: borrow Output) -> Number {
+    let source = defaultSource(compiler)
+    var any = false
+    for channel in allChannels() {
+        match availableVersions(source, channel) {
+            Failed(failure) -> {
+                output.fail(sourceFailureText(failure))
+                return exitFailed
+            }
+            Found(versions) -> {
+                if versions.count == 0 { continue }
+                any = true
+                output.report(output.bold(channelName(channel) + ":"))
+                for version in versions {
+                    output.report("    " + version)
+                }
+            }
+        }
+    }
+    if !any { output.report(toolName + ": nothing of " + compiler.name + " is published yet") }
+    return exitOk
+}
+
+// `use`: select an installed toolchain.
+function use(request: borrow SelectionRequest, output: borrow Output) -> Number {
+    let compiler = request.compiler
+    match selectToolchain(compiler, request.channel, request.version) {
+        Selected(report) -> {
+            let named = compiler.name + " " + channelName(report.channel) + " " + report.version
+            if report.wasAlreadyCurrent {
+                output.report(toolName + ": " + named + " was already selected")
+                return exitOk
+            }
+            output.report(toolName + ": selected " + named + " at " + report.root)
+            return exitOk
+        }
+        Failed(failure) -> {
+            output.fail(manageFailureText(compiler, failure))
+            return exitFailed
+        }
+        else -> { return exitFailed }
+    }
+    return exitFailed
+}
+
+// `uninstall`: remove an installed toolchain.
+function uninstall(request: borrow SelectionRequest, output: borrow Output) -> Number {
+    let compiler = request.compiler
+    match uninstallToolchain(compiler, request.channel, request.version) {
+        Removed(report) -> {
+            output.report(
+                toolName + ": removed " + compiler.name + " " + channelName(
+                    report.channel
+                ) + " " + report.version + " from " + report.root
+            )
+            if report.wasCurrent {
+                output.warn(
+                    "that was the selected " + compiler.name + "; nothing is selected now. Run `" + toolName + " " + compiler.name + " use <version>` or `" + provisionCommand(
+                        compiler
+                    ) + "`"
+                )
+            }
+            return exitOk
+        }
+        Failed(failure) -> {
+            output.fail(manageFailureText(compiler, failure))
+            return exitFailed
+        }
+        else -> { return exitFailed }
+    }
+    return exitFailed
+}
+
+// `pin`: pin this directory tree to an installed toolchain.
+function pin(request: borrow SelectionRequest, output: borrow Output) -> Number {
+    let compiler = request.compiler
+    match workingDirectory() {
+        None -> { return failWithoutDirectory(output) }
+        Some(start) -> {
+            match pinToolchain(compiler, start, request.channel, request.version) {
+                Pinned(written) -> {
+                    output.report(
+                        toolName + ": pinned " + compiler.name + " " + channelName(
+                            written.channel
+                        ) + " " + written.version + " in " + written.path
+                    )
+                    output.report(
+                        toolName + ": `" + compiler.binary + "` under this directory now uses that toolchain"
+                    )
+                    return exitOk
+                }
+                NotInstalled(detail) -> {
+                    output.fail(detail)
+                    return exitFailed
+                }
+                Failed(detail) -> {
+                    output.fail("could not write the pin: " + detail)
+                    return exitFailed
+                }
+                else -> { return exitFailed }
+            }
+        }
+    }
+    return exitFailed
+}
+
+// `unpin`: remove this directory tree's pin.
+function unpin(request: borrow SelectionRequest, output: borrow Output) -> Number {
+    let compiler = request.compiler
+    match workingDirectory() {
+        None -> { return failWithoutDirectory(output) }
+        Some(start) -> {
+            match unpinTree(compiler, start) {
+                Unpinned(removed) -> {
+                    let file = pinFileName(compiler)
+                    if removed {
+                        output.report(
+                            toolName + ": removed " + file + "; `" + compiler.binary + "` here follows the selected toolchain again"
+                        )
+                    } else {
+                        output.report(toolName + ": no " + file + " here; nothing to remove")
+                    }
+                    return exitOk
+                }
+                Failed(detail) -> {
+                    output.fail("could not remove the pin: " + detail)
+                    return exitFailed
+                }
+                else -> { return exitFailed }
+            }
+        }
+    }
+    return exitFailed
+}
+
+// `binstall`: build this checkout and install it as the dev toolchain, of one
+// compiler when one is named and of every language the enclosing
+// `toolchain.klfd` lists when none is.
+function binstall(request: borrow BuildRequest, output: borrow Output) -> Number {
+    match workingDirectory() {
+        None -> { return failWithoutDirectory(output) }
+        Some(directory) -> {
+            match request.scope {
+                One(compiler) -> {
+                    return reportBinstall(
+                        compiler,
+                        binstallToolchain(compiler, directory),
+                        output
+                    )
+                }
+                Manifest -> { return binstallManifest(directory, output) }
+            }
+        }
+    }
+    return exitFailed
+}
+
+// Every language the manifest enclosing `directory` lists, in its order,
+// stopping at the first that fails.
+function binstallManifest(directory: borrow String, output: borrow Output) -> Number {
+    match enclosingManifest(directory) {
+        Missing -> {
+            output.fail(
+                "`" + directory + "` is not inside a repository of languages: no enclosing directory holds `" + manifestFileName + "`; name a compiler to build one checkout"
+            )
+            return exitFailed
+        }
+        Failed(detail) -> {
+            output.fail(detail)
+            return exitFailed
+        }
+        Found(manifest) -> {
+            for language in manifest.languages {
+                let status = reportBinstall(
+                    languageCompiler(language),
+                    binstallLanguage(manifest.root, language),
+                    output
+                )
+                if status != exitOk { return status }
+            }
+            return exitOk
+        }
+    }
+    return exitFailed
+}
+
+// What one binstall did, in the name the user types.
+function reportBinstall(
+    compiler: borrow Compiler,
+    outcome: borrow BinstallOutcome,
+    output: borrow Output
+) -> Number {
+    match outcome {
+        Failed(failure) -> {
+            output.fail(binstallFailureText(compiler, failure))
+            return exitFailed
+        }
+        Binstalled(installed) -> {
+            output.report(
+                toolName + ": built " + compiler.name + " " + channelName(
+                    installed.channel
+                ) + " " + installed.version + " at " + installed.root
+            )
+            reportDispatch(compiler, output)
+            reportLauncher(compiler, output)
+            return exitOk
+        }
+    }
+    return exitFailed
+}
+
+// Says when a compiler has no launcher on PATH yet: a language registered by
+// this run is dispatched by nothing until `sinstall` builds one for it.
+function reportLauncher(compiler: borrow Compiler, output: borrow Output) {
+    if fileExists(joinPath(joinPath(klfHome(), toolsDirectoryName), compiler.binary)) { return }
+    output.warn(
+        "no `" + compiler.binary + "` launcher is installed yet; run `" + toolName + " sinstall` in this checkout to put one on PATH"
+    )
+}
+
+// `sinstall`: build knvm and the launchers from this checkout and put them on
+// PATH.
+function sinstall(output: borrow Output) -> Number {
+    match workingDirectory() {
+        None -> { return failWithoutDirectory(output) }
+        Some(directory) -> {
+            match userHomeDirectory() {
+                None -> {
+                    output.fail("no home directory, so no shell startup file to configure")
+                    return exitFailed
+                }
+                Some(shellHome) -> {
+                    match selfInstall(directory, shellHome, environmentValue("SHELL")) {
+                        Failed(failure) -> {
+                            output.fail(sinstallFailureText(failure))
+                            return exitFailed
+                        }
+                        Installed(installed) -> {
+                            output.report(
+                                toolName + ": installed " + joinTools(
+                                    installed.tools
+                                ) + " into " + installed.binDirectory
+                            )
+                            reportPathSetup(installed, output)
+                            return exitOk
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return exitFailed
+}
+
+// `` `knvm`, `kira` and `klf` ``.
+function joinTools(tools: borrow [String]) -> String {
+    var text = ""
+    for index in 0..tools.count {
+        if index > 0 { text = text + (index == tools.count - 1 ? " and " : ", ") }
+        text = text + "`" + tools[index] + "`"
+    }
+    return text
+}
+
+function failWithoutDirectory(output: borrow Output) -> Number {
+    output.fail("could not read the working directory")
+    return exitFailed
+}
+
+// Says which PATH this run configured, in the terms that host uses.
+function reportPathSetup(installed: borrow SelfInstalled, output: borrow Output) {
+    if installed.updatedPath {
+        output.report(toolName + ": added a PATH line to " + installed.startupFile)
+    } else {
+        output.report(
+            toolName + ": " + installed.startupFile + " already sources " + installed.environmentScript
+        )
+    }
+    output.report(toolName + ": open a new terminal, or source that file, to pick the PATH up")
+}

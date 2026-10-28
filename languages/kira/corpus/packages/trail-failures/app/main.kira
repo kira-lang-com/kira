@@ -1,0 +1,85 @@
+// The failure paths the trail records keep what they did: `otherwise` falls
+// back, to a value or out of the function; `absorb` lets a failure go; a
+// `handle` arm and a `return .Error` still see and pass on the failure, for
+// Foundation's result and for an enum of the program's own.
+
+import Foundation
+
+enum InflateFailure {
+    Truncated
+    Malformed(Int)
+}
+
+enum CatalogError {
+    TruncatedHeader
+    Unreadable(String)
+}
+
+enum Outcome<Value, Failure> {
+    Ok(Value)
+    Error(Failure)
+}
+
+function inflate(size: Int) -> Result<Int, InflateFailure> {
+    if size < 10 { return .Error(.Truncated) }
+    if size > 100 { return .Error(.Malformed(size)) }
+    return .Ok(size * 2)
+}
+
+function catalog(size: Int) -> Result<Int, CatalogError> {
+    attempt {
+        let inflated = try inflate(size)
+        return .Ok(inflated)
+    } handle {
+        Truncated { return .Error(.TruncatedHeader) }
+        Malformed(byte) { return .Error(.Unreadable(stringFromInteger(byte))) }
+    }
+}
+
+function own(size: Int) -> Outcome<Int, InflateFailure> {
+    if size < 0 { return .Error(.Malformed(size)) }
+    return .Ok(size)
+}
+
+function loadOrZero(size: Int) -> Int {
+    let loaded = try catalog(size) otherwise 0
+    return loaded
+}
+
+function loadOrLeave(size: Int) -> Int {
+    let loaded = try catalog(size) otherwise return 0 - 1
+    return loaded + 1
+}
+
+function parsed(size: Int) -> Int {
+    match inflate(size) {
+        Ok(value) -> return value
+        Error(failure) -> {
+            absorb failure
+            return 0
+        }
+    }
+}
+
+function described(size: Int) -> String {
+    match catalog(size) {
+        Ok(value) -> return stringFromInteger(value)
+        Error(failure) -> return traceText(failure)
+    }
+}
+
+@Main
+function main() -> Int {
+    print(loadOrZero(50))
+    print(loadOrZero(3))
+    print(loadOrLeave(50))
+    print(loadOrLeave(500))
+    print(parsed(500))
+    print(described(3))
+    print(described(200))
+    match own(0 - 4) {
+        Ok(value) -> print(value)
+        Error(failure) -> print(traceText(failure))
+    }
+    return 0
+}

@@ -1,0 +1,38 @@
+// The MSL out (KLF-KSL section 19.3): one module holding every entry point.
+// Resources are entry point parameters; a function that uses globals takes
+// them as hidden reference parameters, through every function it calls; a
+// runtime-sized array's element count arrives in `<name>_count`.
+
+// What the MSL out keeps beside the shared text writer.
+struct Dialect {
+    // Per type: whether a host-shared struct was padded, and its slots.
+    var padded: [Bool]
+    var slots: [[Int]]
+    // Per function: the globals it uses, through every function it calls.
+    var hidden: [[Int]]
+    // Whether host-shared structs carry `static_assert`s of their layout.
+    var debug: Bool
+}
+
+function writeMsl(unit: ShaderUnit) -> Bool {
+    var out = textOut(unit, Dialect { padded = [], slots = [], hidden = [], debug = false })
+    out.writeMslModule()
+    return true
+}
+
+function mslReserved() -> [String] {
+    return [
+        "alignas", "alignof", "and", "and_eq", "asm", "auto", "bitand", "bitor", "bool", "break", "case", "catch",
+        "char", "class", "compl", "const", "constexpr", "const_cast", "continue", "decltype", "default", "delete",
+        "do", "double", "dynamic_cast", "else", "enum", "explicit", "export", "extern", "false", "float", "for",
+        "friend", "goto", "if", "inline", "int", "long", "mutable", "namespace", "new", "noexcept", "not", "not_eq",
+        "nullptr", "operator", "or", "or_eq", "private", "protected", "public", "register", "reinterpret_cast",
+        "return", "short", "signed", "sizeof", "static", "static_assert", "static_cast", "struct", "switch",
+        "template", "this", "thread_local", "throw", "true", "try", "typedef", "typeid", "typename", "union",
+        "unsigned", "using", "virtual", "void", "volatile", "wchar_t", "while", "xor", "xor_eq", "kernel", "vertex",
+        "fragment", "compute", "device", "constant", "thread", "threadgroup", "threadgroup_imageblock", "ray_data",
+        "object_data", "metal", "main", "uint", "half", "sampler", "texture", "array", "vec", "access", "assert",
+        "min", "max", "clamp", "abs", "dot", "cross", "length", "normalize", "sin", "cos", "pow", "sqrt", "mix",
+        "select", "fract", "floor", "ceil", "sign", "step", "fmod", "distance"
+    ]
+}

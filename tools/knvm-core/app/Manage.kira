@@ -1,0 +1,262 @@
+import Foundation
+
+// Operating on toolchains that are already installed: list, select, remove.
+//
+// # What these never touch
+//
+// The staging directory belongs to a concurrent install, and anything else under
+// the root that is not a channel directory is not this tool's business.
+// [`uninstallToolchain`] removes exactly `<channel>/<version>/`, and clears
+// `current.toml` only when it named the version being removed. A version that is
+// not a single path component is refused rather than joined, so no argument can
+// walk out of its channel directory.
+
+// One locally installed toolchain.
+public struct InstalledToolchain {
+    // Which compiler's tree this is in.
+    var compiler: String = ""
+    var channel: Channel = .Release
+    // Its version, which is its directory name.
+    var version: String = ""
+    var root: String = ""
+    // Whether `current.toml` names this one.
+    var isCurrent: Bool = false
+    // Whether `bin/<binary>` is present — a tree that lost it cannot be dispatched
+    // to, and is listed as broken rather than hidden.
+    var isComplete: Bool = false
+}
+
+// Why an operation on an installed toolchain could not be completed.
+public enum ManageFailure {
+    NotInstalled(String)
+    Incomplete(String)
+    InvalidVersion(String)
+    Selection(StateFailure)
+    UnreadableSelection(StateFailure)
+    Io(String)
+}
+
+// What listing, selecting or removing produced.
+public enum ManageOutcome {
+    Listed([InstalledToolchain])
+    Selected(SelectionReport)
+    Removed(SelectionReport)
+    Failed(ManageFailure)
+}
+
+// What a selection or a removal did.
+public struct SelectionReport {
+    // Which compiler's selection this was.
+    var compiler: String = ""
+    var channel: Channel = .Release
+    var version: String = ""
+    var root: String = ""
+    // Whether this was already the selected toolchain.
+    var wasAlreadyCurrent: Bool = false
+    // Whether the selection was removed because it named what was removed.
+    var wasCurrent: Bool = false
+}
+
+// Every locally installed toolchain, grouped by channel and newest first.
+//
+// A toolchains root that does not exist yet has nothing installed, which is not
+// an error: that is the state of a machine that has never run `knvm install`.
+public function listToolchains(compiler: borrow Compiler) -> ManageOutcome {
+    let state = readSelection(compiler)
+    match state {
+        Unusable(failure) -> { return .Failed(.Selection(failure)) }
+        NothingSelected -> { return .Listed(collectInstalled(compiler)) }
+        Selected(selection) -> { return .Listed(listUnderSelection(compiler, selection)) }
+    }
+}
+
+public function listUnderSelection(
+    compiler: borrow Compiler,
+    selection: borrow Selection
+) -> [InstalledToolchain] {
+    var installed = collectInstalled(compiler)
+    for index in 0..installed.count {
+        if namesSelection(selection.channel, installed[index].version, selection) {
+            installed[index].isCurrent = true
+        }
+    }
+    return installed
+}
+
+public function collectInstalled(compiler: borrow Compiler) -> [InstalledToolchain] {
+    var installed: [InstalledToolchain] = []
+    let channels = allChannels()
+    for channel in channels {
+        let directory = joinPath(compilerRoot(compiler), channelName(channel))
+        if !isDirectory(directory) { continue }
+        var versions: [String] = []
+        for name in entriesOf(directory) {
+            if name.startsWith(".") { continue }
+            if !isDirectory(joinPath(directory, name)) { continue }
+            versions.append(name)
+        }
+        for version in sortNewestFirst(versions) {
+            let root = toolchainRoot(compiler, channel, version)
+            installed.append(
+                InstalledToolchain {
+                    compiler: compiler.name,
+                    channel: channel,
+                    version: version,
+                    root: root,
+                    isCurrent: false,
+                    isComplete: fileExists(binaryPath(root, compiler))
+                }
+            )
+        }
+    }
+    return installed
+}
+
+// Selects an installed toolchain by rewriting `current.toml`.
+//
+// Refuses a version that is not installed, and one whose tree has lost the
+// binary the launcher runs: selecting either would leave the compiler's launcher
+// unable to dispatch, which is a failure to report now rather than later.
+public function selectToolchain(
+    compiler: borrow Compiler,
+    channel: borrow Channel,
+    version: borrow String
+) -> ManageOutcome {
+    let root = installedRoot(compiler, channel, version)
+    match root {
+        Failed(failure) -> { return .Failed(failure) }
+        Found(found) -> {
+            let primary = binaryPath(found, compiler)
+            if !fileExists(primary) {
+                return .Failed(
+                    .Incomplete(
+                        "`" + channelName(
+                            channel
+                        ) + "` `" + version + "` is installed but has no `" + compiler.binary + "` at " + primary + "; reinstall it"
+                    )
+                )
+            }
+            let state = readSelection(compiler)
+            var already = false
+            match state {
+                Selected(selection) -> { already = namesSelection(channel, version, selection) }
+                Unusable(failure) -> { return .Failed(.Selection(failure)) }
+                NothingSelected -> { already = false }
+            }
+            let report = SelectionReport {
+                compiler: compiler.name,
+                channel: channel,
+                version: version,
+                root: found,
+                wasAlreadyCurrent: already,
+                wasCurrent: already
+            }
+            let selection = Selection {
+                channel: channel,
+                version: version,
+                primary: compiler.binary
+            }
+            if !writeSelection(compiler, selection) {
+                return .Failed(.Io(currentToolchainPath(compiler)))
+            }
+            return .Selected(report)
+        }
+    }
+    return .Failed(.NotInstalled(version))
+}
+
+// Removes one installed toolchain.
+//
+// Removes exactly `<compiler>/<channel>/<version>/`. When the removed version was
+// the selected one, `current.toml` is deleted rather than repointed: guessing a
+// replacement would silently change which compiler a user runs.
+public function uninstallToolchain(
+    compiler: borrow Compiler,
+    channel: borrow Channel,
+    version: borrow String
+) -> ManageOutcome {
+    let root = installedRoot(compiler, channel, version)
+    match root {
+        Failed(failure) -> { return .Failed(failure) }
+        Found(found) -> {
+            let state = readSelection(compiler)
+            var wasCurrent = false
+            match state {
+                Selected(selection) -> { wasCurrent = namesSelection(channel, version, selection) }
+                Unusable(failure) -> { return .Failed(.Selection(failure)) }
+                NothingSelected -> { wasCurrent = false }
+            }
+            if !removeTree(found) { return .Failed(.Io(found)) }
+            if wasCurrent && !clearSelection(compiler) {
+                return .Failed(.Io(currentToolchainPath(compiler)))
+            }
+            let report = SelectionReport {
+                compiler: compiler.name,
+                channel: channel,
+                version: version,
+                root: found,
+                wasAlreadyCurrent: wasCurrent,
+                wasCurrent: wasCurrent
+            }
+            return .Removed(report)
+        }
+    }
+    return .Failed(.NotInstalled(version))
+}
+
+// The root of an installed toolchain, or a typed refusal.
+public function installedRoot(
+    compiler: borrow Compiler,
+    channel: borrow Channel,
+    version: borrow String
+) -> RootResult {
+    if !isSingleComponent(version) {
+        return .Failed(
+            .InvalidVersion(
+                "`" + version + "` is not a version name; a version is one path component"
+            )
+        )
+    }
+    let root = toolchainRoot(compiler, channel, version)
+    if !isDirectory(root) {
+        return .Failed(
+            .NotInstalled(
+                "`" + version + "` of " + compiler.name + " is not installed on the `" + channelName(
+                    channel
+                ) + "` channel (looked in `" + root + "`)"
+            )
+        )
+    }
+    return .Found(root)
+}
+
+public enum RootResult {
+    Found(String)
+    Failed(ManageFailure)
+}
+
+// Why an operation on an installed toolchain failed, in one line.
+public function manageFailureText(compiler: borrow Compiler, failure: borrow ManageFailure) -> String {
+    match failure {
+        NotInstalled(detail) -> { return detail }
+        Incomplete(detail) -> { return detail }
+        InvalidVersion(detail) -> { return detail }
+        Selection(problem) -> { return stateFailureText(compiler, problem) }
+        UnreadableSelection(problem) -> { return stateFailureText(compiler, problem) }
+        Io(path) -> { return "could not finish the operation on `" + path + "`" }
+    }
+    return ""
+}
+
+// Why a `current.toml` or a pin could not be read as one.
+public function stateFailureText(compiler: borrow Compiler, failure: borrow StateFailure) -> String {
+    match failure {
+        Malformed(path) -> {
+            return "`" + path + "` is not a readable selection; run `knvm " + compiler.name
+                + " use <version>` to rewrite it"
+        }
+        Unreadable(path) -> { return "cannot read `" + path + "`" }
+        UnknownChannel(name) -> { return "names an unknown channel `" + name + "`" }
+    }
+    return ""
+}

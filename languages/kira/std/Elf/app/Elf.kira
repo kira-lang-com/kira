@@ -1,0 +1,277 @@
+import Foundation
+
+// ELF, the object file format of Linux, as the System V ABI's generic
+// chapter lays it out: a header, program headers naming the segments a loader
+// maps, and section headers naming the parts a linker and a debugger read.
+// This library reads the 64-bit little-endian form, which x86_64 and aarch64
+// use (Build's DESIGN.md section 8).
+
+/// Why an ELF file could not be read or written.
+public enum ElfFailure {
+    /// The bytes contradict the format, or end inside something. Carries what was wrong.
+    Malformed(String)
+    /// The bytes use a part of the format this library does not handle. Carries what it was.
+    Unsupported(String)
+}
+
+/// A failure as one line of text.
+public function elfFailureText(failure: borrow ElfFailure) -> String {
+    return match failure {
+        Malformed(text) -> "malformed ELF: \(text)"
+        Unsupported(text) -> "unsupported ELF: \(text)"
+    }
+}
+
+namespace ElfFormat {
+    // The sizes of the header and of each program and section header.
+    let header: Number = 64
+    let programHeader: Number = 56
+    let sectionHeader: Number = 64
+    // `e_ident`: the class of 64-bit files and the little-endian encoding.
+    let wide: Number = 2
+    let little: Number = 1
+    // `e_type`.
+    let executable: Number = 2
+    let shared: Number = 3
+    // `p_type`: a loaded segment, thread-local storage, and the program
+    // headers' own segment.
+    let loaded: Number = 1
+    let threadLocal: Number = 7
+    let programHeaders: Number = 6
+    // `sh_type`.
+    let symbols: Number = 2
+    let strings: Number = 3
+    let relocationsWithAddends: Number = 4
+    let note: Number = 7
+    let noBits: Number = 8
+    let relocations: Number = 9
+    // `sh_flags`: occupies memory while the program runs, `sh_info` holds a
+    // section index, and is thread-local storage.
+    let allocated: Number = 2
+    let infoLink: Number = 64
+    let threadLocalFlag: Number = 1024
+    // `e_shstrndx` when the index is kept elsewhere.
+    let indexElsewhere: Number = 65535
+}
+
+// One section header.
+struct ElfSection {
+    let name: String
+    let kind: Number
+    // The low 32 bits of `sh_flags`, the ones the ABI defines.
+    let flags: Number
+    // Where it is in memory; -1 when it is 2^63 or more.
+    let address: Number
+    let offset: Number
+    let size: Number
+    let link: Number
+    let info: Number
+    let alignment: Number
+
+    // Whether it occupies memory while the program runs.
+    function allocated(borrow self) -> Bool {
+        return (flags & ElfFormat.allocated) != 0
+    }
+
+    // Whether its bytes are in the file.
+    function holdsBytes(borrow self) -> Bool {
+        return kind != ElfFormat.noBits && kind != 0
+    }
+}
+
+// One program header: its type, where its bytes are in the file, and where
+// they go in memory. An address of 2^63 or more is -1.
+struct ElfProgram {
+    let kind: Number
+    let offset: Number
+    let size: Number
+    let address: Number
+    let memorySize: Number
+    let alignment: Number
+}
+
+// What a file's headers say.
+struct ElfImage {
+    let kind: Number
+    let machine: Number
+    let programOffset: Number
+    let sectionOffset: Number
+    let programs: [ElfProgram]
+    let sections: [ElfSection]
+    // The index of the section holding the section names.
+    let names: Number
+}
+
+/// The machine an ELF file was built for, its `e_machine`: 62 is x86_64, 183 is aarch64.
+public function elfMachine(bytes: borrow [UN8]) -> Result<Number, ElfFailure> {
+    return match readElf(bytes) {
+        Ok(image) -> .Ok(image.machine)
+        Error(failure) -> .Error(failure)
+    }
+}
+
+function readElf(bytes: borrow [UN8]) -> Result<ElfImage, ElfFailure> {
+    if bytes.count < ElfFormat.header { return .Error(.Malformed("the header is cut off")) }
+    if bytes[0] != 127 || bytes[1] != 69 || bytes[2] != 76 || bytes[3] != 70 {
+        return .Error(.Malformed("the file does not start with the ELF magic"))
+    }
+    if Number(bytes[4]) != ElfFormat.wide {
+        return .Error(.Unsupported("only 64-bit files are read"))
+    }
+    if Number(bytes[5]) != ElfFormat.little {
+        return .Error(.Unsupported("only little-endian files are read"))
+    }
+    let programOffset = elfWord(bytes, 32, 8)
+    let sectionOffset = elfWord(bytes, 40, 8)
+    let programCount = elfWord(bytes, 56, 2)
+    let sectionCount = elfWord(bytes, 60, 2)
+    let names = elfWord(bytes, 62, 2)
+    if programCount > 0 && elfWord(bytes, 54, 2) != ElfFormat.programHeader {
+        return .Error(.Malformed("program headers are not 56 bytes"))
+    }
+    if sectionCount == 0 {
+        return .Error(
+            .Unsupported(
+                sectionOffset == 0 ? "the file has no section headers" : "the section count is kept elsewhere"
+            )
+        )
+    }
+    if elfWord(bytes, 58, 2) != ElfFormat.sectionHeader {
+        return .Error(.Malformed("section headers are not 64 bytes"))
+    }
+    if names == ElfFormat.indexElsewhere {
+        return .Error(.Unsupported("the index of the section names is kept elsewhere"))
+    }
+    if names >= sectionCount { return .Error(.Malformed("the section names are in no section")) }
+    if !elfInside(programOffset, programCount * ElfFormat.programHeader, bytes.count) {
+        return .Error(.Malformed("the program headers lie outside the file"))
+    }
+    if !elfInside(sectionOffset, sectionCount * ElfFormat.sectionHeader, bytes.count) {
+        return .Error(.Malformed("the section headers lie outside the file"))
+    }
+    var programs: [ElfProgram] = []
+    for index in 0..programCount {
+        let at = programOffset + index * ElfFormat.programHeader
+        let program = ElfProgram {
+            kind: elfWord(bytes, at, 4),
+            offset: elfWord(bytes, at + 8, 8),
+            size: elfWord(bytes, at + 32, 8),
+            address: elfWord(bytes, at + 16, 8),
+            memorySize: elfWord(bytes, at + 40, 8),
+            alignment: elfWord(bytes, at + 48, 8)
+        }
+        if !elfInside(program.offset, program.size, bytes.count) {
+            return .Error(.Malformed("segment \(index) lies outside the file"))
+        }
+        programs.append(program)
+    }
+    let namesAt = sectionOffset + names * ElfFormat.sectionHeader
+    let namesOffset = elfWord(bytes, namesAt + 24, 8)
+    let namesSize = elfWord(bytes, namesAt + 32, 8)
+    if !elfInside(namesOffset, namesSize, bytes.count) {
+        return .Error(.Malformed("the section names lie outside the file"))
+    }
+    var sections: [ElfSection] = []
+    for index in 0..sectionCount {
+        let at = sectionOffset + index * ElfFormat.sectionHeader
+        let name = match elfName(bytes, namesOffset, namesSize, elfWord(bytes, at, 4)) {
+            Some(read) -> read
+            None -> return .Error(.Malformed("section \(index) has no name"))
+        }
+        let section = ElfSection {
+            name: name,
+            kind: elfWord(bytes, at + 4, 4),
+            flags: elfWord(bytes, at + 8, 4),
+            address: elfWord(bytes, at + 16, 8),
+            offset: elfWord(bytes, at + 24, 8),
+            size: elfWord(bytes, at + 32, 8),
+            link: elfWord(bytes, at + 40, 4),
+            info: elfWord(bytes, at + 44, 4),
+            alignment: elfWord(bytes, at + 48, 8)
+        }
+        if section.alignment < 0 {
+            return .Error(.Malformed("section \(name) has no alignment"))
+        }
+        if section.holdsBytes() && !elfInside(section.offset, section.size, bytes.count) {
+            return .Error(.Malformed("section \(name) lies outside the file"))
+        }
+        if section.link >= sectionCount {
+            return .Error(.Malformed("section \(name) links a section there is not"))
+        }
+        sections.append(section)
+    }
+    return .Ok(
+        ElfImage {
+            kind: elfWord(bytes, 16, 2),
+            machine: elfWord(bytes, 18, 2),
+            programOffset: programOffset,
+            sectionOffset: sectionOffset,
+            programs: programs,
+            sections: sections,
+            names: names
+        }
+    )
+}
+
+// The little-endian number of `count` bytes at `at`; -1 for an 8-byte one
+// past what an offset or a size can be, which no range then fits.
+function elfWord(bytes: borrow [UN8], at: Number, count: Number) -> Number {
+    if count == 8 && Number(bytes[at + 7]) >= 128 { return -1 }
+    var value: Number = 0
+    for index in 0..count { value = value | (Number(bytes[at + index]) << (index * 8)) }
+    return value
+}
+
+// Writes `value` as the little-endian number of `count` bytes at `at`.
+function putElfWord(bytes: borrow mut [UN8], at: Number, value: Number, count: Number) {
+    for index in 0..count { bytes[at + index] = UN8((value >> (index * 8)) & 255) }
+}
+
+// Appends `value` as the little-endian number of `count` bytes.
+function appendElfWord(bytes: borrow mut [UN8], value: Number, count: Number) {
+    for index in 0..count { bytes.append(UN8((value >> (index * 8)) & 255)) }
+}
+
+// Whether `size` bytes from `offset` lie in a file of `total` bytes.
+function elfInside(offset: Number, size: Number, total: Number) -> Bool {
+    return offset >= 0 && size >= 0 && offset <= total && size <= total - offset
+}
+
+// The name at `at` in the string table of `size` bytes at `table`.
+function elfName(bytes: borrow [UN8], table: Number, size: Number, at: Number) -> String? {
+    if at >= size { return size == 0 && at == 0 ? .Some("") : .None }
+    var name: [UN8] = []
+    for index in (table + at)..(table + size) {
+        if bytes[index] == 0 { return textFromBytes(name) }
+        name.append(bytes[index])
+    }
+    return .None
+}
+
+// `count` rounded up to a multiple of `alignment`.
+function elfAligned(count: Number, alignment: Number) -> Number {
+    if alignment <= 1 { return count }
+    return trunc((count + alignment - 1) / alignment) * alignment
+}
+
+// Appends zero bytes to `bytes` up to a multiple of `alignment`.
+function padElf(bytes: borrow mut [UN8], alignment: Number) {
+    let start = bytes.count
+    for index in start..elfAligned(start, alignment) { bytes.append(0) }
+}
+
+// Copies the `size` bytes at `offset` of `from` to `at` in `bytes`.
+function copyElfRange(
+    bytes: borrow mut [UN8],
+    at: Number,
+    from: borrow [UN8],
+    offset: Number,
+    size: Number
+) {
+    for index in 0..size { bytes[at + index] = from[offset + index] }
+}
+
+// Appends the `size` bytes at `offset` of `from` to `bytes`.
+function appendElfRange(bytes: borrow mut [UN8], from: borrow [UN8], offset: Number, size: Number) {
+    for index in offset..(offset + size) { bytes.append(from[index]) }
+}

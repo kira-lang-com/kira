@@ -1,0 +1,220 @@
+struct CapturedUse {
+    let local: Int
+    let name: Identifier
+}
+
+function hasBoundName(names: [String], name: String) -> Bool {
+    for bound in names {
+        if bound == name { return true }
+    }
+    return false
+}
+
+extend Checker {
+    // A name the lambda reads from outside it: a local, or a member of the
+    // receiver named bare, which the lambda reaches through the receiver it
+    // captures.
+    function captureName(borrow self, name: Identifier, bound: [String], captures: borrow mut [CapturedUse]) {
+        if hasBoundName(bound, name.text) { return }
+        match lookup(name.text) {
+            Some(local) -> captureLocal(local, name, captures)
+            None -> {
+                if !namesMember(name.text) || hasBoundName(bound, "self") { return }
+                match bareReceiver() {
+                    Some(receiver) -> captureLocal(receiver, Identifier { text = "self", span = name.span }, captures)
+                    None -> {}
+                }
+            }
+        }
+    }
+
+    function captureLocal(borrow self, local: Int, name: Identifier, captures: borrow mut [CapturedUse]) {
+        for captured in captures {
+            if captured.local == local { return }
+        }
+        captures.append(CapturedUse { local = local, name = name })
+    }
+
+    function captureExpression(borrow self, index: Int, bound: [String], captures: borrow mut [CapturedUse]) {
+        match tree.expressions[index].kind {
+            Name(name) -> captureName(name, bound, captures)
+            Call(callee, arguments) -> {
+                captureName(callee, bound, captures)
+                for argument in arguments { captureExpression(argument, bound, captures) }
+            }
+            GenericCall(callee, types, arguments) -> {
+                for argument in arguments { captureExpression(argument, bound, captures) }
+            }
+            MethodCall(receiver, method, arguments) -> {
+                captureExpression(receiver, bound, captures)
+                for argument in arguments { captureExpression(argument, bound, captures) }
+            }
+            IndirectCall(target, arguments) -> {
+                captureExpression(target, bound, captures)
+                for argument in arguments { captureExpression(argument, bound, captures) }
+            }
+            Member(base, field) -> captureExpression(base, bound, captures)
+            Index(base, offset) -> {
+                captureExpression(base, bound, captures)
+                captureExpression(offset, bound, captures)
+            }
+            ArrayLiteral(elements) -> {
+                for element in elements { captureExpression(element, bound, captures) }
+            }
+            StructLiteral(name, types, fields) -> {
+                for field in fields { captureExpression(field.value, bound, captures) }
+            }
+            Variant(name, payload) -> {
+                match payload {
+                    Some(value) -> captureExpression(value, bound, captures)
+                    None -> {}
+                }
+            }
+            Unary(operator, operand) -> captureExpression(operand, bound, captures)
+            Transfer(mode, operand) -> captureExpression(operand, bound, captures)
+            TypeQuery(mode, operand, target) -> captureExpression(operand, bound, captures)
+            Labelled(label, value) -> captureExpression(value, bound, captures)
+            Binary(operator, left, right) -> {
+                captureExpression(left, bound, captures)
+                captureExpression(right, bound, captures)
+            }
+            Conditional(condition, whenTrue, whenFalse) -> {
+                captureExpression(condition, bound, captures)
+                captureExpression(whenTrue, bound, captures)
+                captureExpression(whenFalse, bound, captures)
+            }
+            MatchValue(subject, arms) -> {
+                captureExpression(subject, bound, captures)
+                captureArms(arms, bound, captures)
+            }
+            Lambda(declared) -> {
+                var nested = bound
+                for parameter in declared.parameters { nested.append(parameter.text) }
+                captureBlock(declared.body, nested, captures)
+            }
+            KeyPath -> {}
+            Task(declared) -> {
+                for value in declared.written { captureExpression(value, bound, captures) }
+                captureBlock(declared.body, bound, captures)
+            }
+            ExpandedMacro(body, value) -> {
+                captureBlock(body, bound, captures)
+                match value { Some(expression) -> captureExpression(expression, bound, captures) None -> {} }
+            }
+            Quote(parts) -> {
+                for part in parts {
+                    match part { Text -> {} Splice(value) -> captureExpression(value, bound, captures) }
+                }
+            }
+            MacroCall(name, arguments, input) -> { for argument in arguments { captureExpression(argument, bound, captures) } }
+            Try(operand) -> captureExpression(operand, bound, captures)
+            Content(content) -> {
+                match content.call { Some(call) -> captureExpression(call, bound, captures) None -> {} }
+                match content.items { Some(items) -> captureItems(items, bound, captures) None -> {} }
+                match content.closure { Some(closure) -> captureExpression(closure, bound, captures) None -> {} }
+                for fill in content.fills { captureExpression(fill, bound, captures) }
+            }
+            IntegerLiteral -> {}
+            FloatLiteral -> {}
+            BooleanLiteral -> {}
+            StringLiteral -> {}
+        }
+    }
+
+    function captureItems(borrow self, items: [Int], bound: [String], captures: borrow mut [CapturedUse]) {
+        for item in items {
+            match tree.contentItems[item] {
+                Child(value) -> captureExpression(value, bound, captures)
+                For(name, low, high, body) -> {
+                    captureExpression(low, bound, captures)
+                    match high { Some(value) -> captureExpression(value, bound, captures) None -> {} }
+                    var nested = bound
+                    nested.append(name.text)
+                    captureItems(body, nested, captures)
+                }
+                If(condition, whenTrue, whenFalse) -> {
+                    captureExpression(condition, bound, captures)
+                    captureItems(whenTrue, bound, captures)
+                    captureItems(whenFalse, bound, captures)
+                }
+            }
+        }
+    }
+
+    function captureArms(borrow self, arms: [MatchArm], bound: [String], captures: borrow mut [CapturedUse]) {
+        for arm in arms {
+            var nested = bound
+            match arm.binding {
+                Some(name) -> nested.append(name.text)
+                None -> {}
+            }
+            captureBlock(arm.body, nested, captures)
+        }
+    }
+
+    function captureBlock(borrow self, body: [Int], initial: [String], captures: borrow mut [CapturedUse]) {
+        var bound = initial
+        for index in body {
+            match tree.statements[index].kind {
+                Binding(binding) -> {
+                    captureExpression(binding.value, bound, captures)
+                    bound.append(binding.name.text)
+                }
+                Assignment(place, value) -> {
+                    captureExpression(place, bound, captures)
+                    captureExpression(value, bound, captures)
+                }
+                CompoundAssignment(operator, place, value) -> {
+                    captureExpression(place, bound, captures)
+                    captureExpression(value, bound, captures)
+                }
+                Evaluation(value) -> captureExpression(value, bound, captures)
+                If(condition, whenTrue, whenFalse) -> {
+                    captureExpression(condition, bound, captures)
+                    captureBlock(whenTrue, bound, captures)
+                    captureBlock(whenFalse, bound, captures)
+                }
+                While(condition, statements) -> {
+                    captureExpression(condition, bound, captures)
+                    captureBlock(statements, bound, captures)
+                }
+                For(name, low, high, statements) -> {
+                    captureExpression(low, bound, captures)
+                    captureExpression(high, bound, captures)
+                    var nested = bound
+                    nested.append(name.text)
+                    captureBlock(statements, nested, captures)
+                }
+                ForEach(name, source, statements) -> {
+                    captureExpression(source, bound, captures)
+                    var nested = bound
+                    nested.append(name.text)
+                    captureBlock(statements, nested, captures)
+                }
+                Match(subject, arms) -> {
+                    captureExpression(subject, bound, captures)
+                    captureArms(arms, bound, captures)
+                }
+                Attempt(statements, arms) -> {
+                    captureBlock(statements, bound, captures)
+                    for arm in arms {
+                        var nested = bound
+                        match arm.binding {
+                            Some(name) -> nested.append(name.text)
+                            None -> {}
+                        }
+                        captureBlock(arm.body, nested, captures)
+                    }
+                }
+                Return(value) -> {
+                    match value {
+                        Some(returned) -> captureExpression(returned, bound, captures)
+                        None -> {}
+                    }
+                }
+                Break -> {}
+                Continue -> {}
+            }
+        }
+    }
+}

@@ -1,0 +1,289 @@
+// Callback state: the intrinsics a program boxes a value for a host with.
+// Foundation's `NativeState.kira` keeps the registry; each intrinsic checks
+// what Kira requires of its operand and calls the registry function doing
+// its work. `nativeRecover<T>` reads the boxed `Any` as a `T` in place, and
+// a `var` bound to one is a view sharing the state's storage, so what it
+// writes is the state.
+
+function isNativeStateIntrinsic(name: String) -> Bool {
+    match name {
+        "nativeState", "nativeUserData", "nativeUserDataBorrow", "nativeRecover", "nativeUserDataRetain", "nativeUserDataRelease", "nativeStateFree" -> return true
+        else -> return false
+    }
+}
+
+function isNativeStateType(program: CheckedProgram, declarations: Declarations, valueType: Type) -> Bool {
+    if valueType.kind != .Structure { return false }
+    let declared = program.structs[valueType.declaration]
+    return declared.genericBase == "NativeState" && libraryDeclaration(declarations, declared.name.span.file)
+}
+
+function nativeStateErasure(program: CheckedProgram, declarations: Declarations, actual: Type, target: Type) -> Bool {
+    if !isNativeStateType(program, declarations, actual) || !isNativeStateType(program, declarations, target) { return false }
+    return isAnyType(program, program.structs[target.declaration].typeArguments[0])
+}
+
+extend Checker {
+    function checkNativeStateCall(borrow mut self, name: String, types: [TypeReference], arguments: [Int], span: Span) -> Int {
+        if name == "nativeRecover" { return nativeRecover(types, arguments, span) }
+        if types.count > 0 { report(.IntrinsicTypeArguments, span) }
+        if arguments.count != 1 {
+            report(.IntrinsicArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        match name {
+            "nativeState" -> return boxNativeState(arguments[0], span)
+            "nativeStateFree" -> return freeNativeState(arguments[0], span)
+            else -> {}
+        }
+        let operand = expression(arguments[0], .None)
+        let operandType = typeOf(operand)
+        if operandType.isInvalid() { return add(.Integer(0), Type.invalid(), span) }
+        if name == "nativeUserData" || name == "nativeUserDataBorrow" {
+            if !isNativeStateType(program, declarations, operandType) {
+                report(.NativeUserDataOperand, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+            let registry = name == "nativeUserDataBorrow" ? "nativeStateBorrow" : "nativeStateExport"
+            return nativeStateRegistryCall(registry, [add(.Member(operand, 0), Type.int(), span)], span)
+        }
+        if operandType.kind != .Pointer {
+            report(.NativeStateCountOperand, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        match name {
+            "nativeUserDataRetain" -> return nativeStateRegistryCall("nativeStateRetainToken", [operand], span)
+            else -> return nativeStateRegistryCall("nativeStateReleaseToken", [operand], span)
+        }
+    }
+
+    function boxNativeState(borrow mut self, argument: Int, span: Span) -> Int {
+        let value = expression(argument, .None)
+        let boxed = typeOf(value)
+        if boxed.isInvalid() { return add(.Integer(0), Type.invalid(), span) }
+        if !nativeStateEligible(boxed, []) {
+            report(.NativeStateIneligible, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        if runsUserDrop(boxed, []) {
+            report(.NativeStateUserDrop, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let handle = nativeStateHandleType(boxed, span)
+        if handle.isInvalid() { return add(.Integer(0), Type.invalid(), span) }
+        match declarations.findFunction(.None, "nativeStateBox") {
+            Some(target) -> {
+                let anyValue = coerce(value, declarations.signatures[target].parameters[0].valueType, .ArgumentTypeMismatch)
+                let slot = add(.Call(target, [anyValue]), Type.int(), span)
+                return add(.Construct([slot]), handle, span)
+            }
+            None -> {
+                report(.UndefinedName, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+
+    // `NativeState<T>`, minted for the type a handle boxes.
+    function nativeStateHandleType(borrow mut self, boxed: Type, span: Span) -> Type {
+        let argument = declarations.reference(boxed, span)
+        let name = Identifier { text = "NativeState", span = span }
+        return resolveType(TypeReference {
+            qualifier = .None, name = name, arguments = [argument], modes = [],
+            instanceName = genericInstanceName(name.text, [argument])
+        })
+    }
+
+    // Releasing through a handle consumes it: the reference it gives up is
+    // the handle's own, so the binding has nothing left to release.
+    function freeNativeState(borrow mut self, argument: Int, span: Span) -> Int {
+        report(.NativeStateFreeDeprecated, span)
+        let operand = checkTransfer(.Move, argument, .None, span)
+        let operandType = typeOf(operand)
+        if operandType.isInvalid() { return add(.Integer(0), Type.invalid(), span) }
+        if operandType.kind == .Pointer { return nativeStateRegistryCall("nativeStateReleaseToken", [operand], span) }
+        if !isNativeStateType(program, declarations, operandType) {
+            report(.NativeStateFreeOperand, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        match genericFunctionNamed("nativeStateFreeHandle") {
+            Some(template) -> {
+                let boxed = program.structs[operandType.declaration].typeArguments[0]
+                match mintFunction(template, [declarations.reference(boxed, span)], span) {
+                    Some(target) -> return callChecked(target, .None, [operand], span)
+                    None -> return add(.Integer(0), Type.invalid(), span)
+                }
+            }
+            None -> {
+                report(.UndefinedName, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+
+    function nativeRecover(borrow mut self, types: [TypeReference], arguments: [Int], span: Span) -> Int {
+        var target = Type.invalid()
+        if types.count == 1 { target = resolveType(types[0]) } else { report(.NativeRecoverTypeArguments, span) }
+        if arguments.count != 1 {
+            report(.IntrinsicArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        var token = expression(arguments[0], .None)
+        if isNativeStateType(program, declarations, typeOf(token)) {
+            token = nativeStateRegistryCall("nativeStateBorrow", [add(.Member(token, 0), Type.int(), span)], span)
+        }
+        let tokenType = typeOf(token)
+        if tokenType.isInvalid() { return add(.Integer(0), Type.invalid(), span) }
+        if tokenType.kind != .Pointer {
+            report(.NativeRecoverOperand, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        if target.isInvalid() { return add(.Integer(0), Type.invalid(), span) }
+        if !nativeStateEligible(target, []) {
+            report(.NativeStateIneligible, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        if runsUserDrop(target, []) {
+            report(.NativeStateUserDrop, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        match exportedHandle(token) {
+            Some(handle) -> {
+                if !program.structs[handle.declaration].typeArguments[0].equals(target) {
+                    report(.NativeRecoverMismatch, span)
+                    return add(.Integer(0), Type.invalid(), span)
+                }
+            }
+            None -> {}
+        }
+        match declarations.findFunction(.None, "nativeStateValue") {
+            Some(source) -> {
+                let boxed = add(.Call(source, [token]), declarations.signatures[source].result, span)
+                return add(.UnboxAny(boxed, internAnyType(target), .None), target, span)
+            }
+            None -> {
+                report(.UndefinedName, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+
+    // The handle a token written as `nativeUserData(handle)` was exported
+    // from, whose type says what the state boxes.
+    function exportedHandle(borrow self, token: Int) -> Optional<Type> {
+        match program.expressions[token].operation.invocation() {
+            Some(call) -> {
+                if declarations.signatures[call.target].name.text != "nativeStateExport" { return .None }
+                match program.expressions[call.arguments[0]].operation.memberBase() {
+                    Some(handle) -> return .Some(typeOf(handle))
+                    None -> return .None
+                }
+            }
+            None -> return .None
+        }
+    }
+
+    // Whether `value`, bound by a `var`, is a recovered view of callback state.
+    function recoveredState(borrow self, value: Int) -> Bool {
+        match program.expressions[value].operation.unboxedOperand() {
+            Some(operand) -> {
+                match program.expressions[operand].operation.invocation() {
+                    Some(call) -> return declarations.signatures[call.target].name.text == "nativeStateValue"
+                    None -> return false
+                }
+            }
+            None -> return false
+        }
+    }
+
+    function nativeStateRegistryCall(borrow mut self, name: String, arguments: [Int], span: Span) -> Int {
+        match declarations.findFunction(.None, name) {
+            Some(target) -> return add(.Call(target, arguments), declarations.signatures[target].result, span)
+            None -> {
+                report(.UndefinedName, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+
+    // A value the program owns outright: no `Any`, whose type a recovery
+    // could not check, no descriptor, task or handle, and nothing holding
+    // one.
+    function nativeStateEligible(borrow self, valueType: Type, visiting: [Type]) -> Bool {
+        for seen in visiting {
+            if seen.equals(valueType) { return true }
+        }
+        var inner: [Type] = []
+        for seen in visiting { inner.append(seen) }
+        inner.append(valueType)
+        match valueType.kind {
+            Structure -> {
+                if isStringType(program, valueType) { return true }
+                if isAnyType(program, valueType) || isNativeStateType(program, declarations, valueType) { return true }
+                if isTaskType(program, valueType) || isDescriptorType(declarations, valueType) { return false }
+                if isArrayType(program, valueType) {
+                    return nativeStateEligible(program.structs[valueType.declaration].typeArguments[0], inner)
+                }
+                for field in program.structs[valueType.declaration].fields {
+                    if !nativeStateEligible(field.valueType, inner) { return false }
+                }
+                return true
+            }
+            Enumeration -> {
+                for variant in program.enums[valueType.declaration].variants {
+                    match variant.payload {
+                        Some(payload) -> { if !nativeStateEligible(payload, inner) { return false } }
+                        None -> {}
+                    }
+                }
+                return true
+            }
+            Integer -> return true
+            Decimal -> return true
+            Floating -> return true
+            Boolean -> return true
+            Pointer -> return true
+            Void -> return false
+            Invalid -> return true
+        }
+    }
+
+    // Whether releasing a value of `valueType` enters a user `Drop` body.
+    function runsUserDrop(borrow self, valueType: Type, visiting: [Type]) -> Bool {
+        for seen in visiting {
+            if seen.equals(valueType) { return false }
+        }
+        var inner: [Type] = []
+        for seen in visiting { inner.append(seen) }
+        inner.append(valueType)
+        match valueType.kind {
+            Structure -> {
+                if isNativeStateType(program, declarations, valueType) { return false }
+                if program.dropFunctions[valueType.declaration] >= 0 { return true }
+                if isArrayType(program, valueType) {
+                    return runsUserDrop(program.structs[valueType.declaration].typeArguments[0], inner)
+                }
+                for field in program.structs[valueType.declaration].fields {
+                    if runsUserDrop(field.valueType, inner) { return true }
+                }
+                return false
+            }
+            Enumeration -> {
+                for variant in program.enums[valueType.declaration].variants {
+                    match variant.payload {
+                        Some(payload) -> { if runsUserDrop(payload, inner) { return true } }
+                        None -> {}
+                    }
+                }
+                return false
+            }
+            Integer -> return false
+            Decimal -> return false
+            Floating -> return false
+            Boolean -> return false
+            Pointer -> return false
+            Void -> return false
+            Invalid -> return false
+        }
+    }
+}

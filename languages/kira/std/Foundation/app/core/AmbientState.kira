@@ -1,0 +1,284 @@
+// Ambient state: native state a process keeps under a string key, so code
+// that runs again and again -- a widget rebuilt every frame -- finds the
+// state it made the first time without a path to whoever holds it.
+//
+// The store is the binary's own, kept in its runtime context. A token names
+// a state in the binary that boxed it (NativeState.kira), so state cannot be
+// handed to a store in another binary: each binary that keeps ambient state
+// keeps it here, in its own copy of Foundation.
+//
+// Keys live in scopes. A runner enters a scope of its own for its event loop,
+// so a key does not collide with the same key under another runner in the
+// same process, and drops the scope's slots when it ends. A slot owns one
+// reference to the state put in it, given up when the slot is replaced,
+// removed or reset.
+//
+// A key is one of two lifetimes, and its type says which. A persistent key
+// belongs to the process or the scope and is never swept. A view key belongs
+// to the build that last touched it: the build guard in StateLifetime.kira
+// ends the build, and every view key not touched in it goes. That is what
+// makes a widget's state live exactly while the widget is described, without
+// a key-name convention or a second presence table.
+
+distinct AmbientScope = Number
+
+// Which sweep owns a slot.
+enum AmbientLifetime {
+    Persistent
+    View
+}
+
+// A key a build owns. The nominal type is the guarantee: only a view key can
+// be put in the view sweep, and only the view sweep can take it out.
+struct ViewStateKey {
+    let name: String
+}
+
+// A key the process or its scope owns. The nominal type is the other half of
+// the guarantee: a state with no build cannot be put where the sweep looks.
+struct PersistentStateKey {
+    let name: String
+}
+
+struct AmbientKey {
+    let scope: AmbientScope
+    let name: String
+    let lifetime: AmbientLifetime
+}
+
+struct AmbientStore {
+    var slots: Map<AmbientKey, NativeState<Any>> = Map()
+    // The build each view slot was last touched in. Persistent keys are never
+    // entered here.
+    var touched: Map<AmbientKey, Number> = Map()
+    // The view keys this build touched while a container was recording them,
+    // in the order it touched them, so the keys it must touch again are the
+    // ones the view actually used -- declared `@State` and keyed control state
+    // alike.
+    var viewLog: [String] = []
+    var recordDepth: Number = 0
+    var build: Number = 0
+    var current: AmbientScope = AmbientScope(0)
+    // Scopes handed out so far; the next one is numbered after them.
+    var issued: Number = 0
+}
+
+function ambientKey(name: String, lifetime: AmbientLifetime) -> AmbientKey {
+    return AmbientKey {
+        scope: runtimeContext.ambient.current,
+        name: move name,
+        lifetime: lifetime
+    }
+}
+
+function ambientViewKey(key: borrow ViewStateKey) -> AmbientKey {
+    return ambientKey(copy key.name, .View)
+}
+
+// Adds a view key to the build's record only while a container is recording.
+// Nothing is gathered for the ordinary build, where no container keeps a view.
+function ambientStateLogView(name: String) {
+    if runtimeContext.ambient.recordDepth > 0 {
+        runtimeContext.ambient.viewLog.append(move name)
+    }
+}
+
+// A scope no runner has used yet.
+function ambientScopeCreate() -> AmbientScope {
+    runtimeContext.ambient.issued++
+    return AmbientScope(runtimeContext.ambient.issued)
+}
+
+function ambientScopeCurrent() -> AmbientScope {
+    return runtimeContext.ambient.current
+}
+
+function ambientScopeEnter(scope: AmbientScope) {
+    runtimeContext.ambient.current = scope
+}
+
+// --- persistent state ------------------------------------------------------
+// Process or scope state. It has no build, so no build takes it.
+
+function ambientStateHas(key: PersistentStateKey) -> Bool {
+    return runtimeContext.ambient.slots.contains(ambientKey(move key.name, .Persistent))
+}
+
+// The token of the state under `key`, borrowed from the slot, so it lives as
+// long as the slot does. A key with no slot is a caller that skipped
+// `ambientStateHas`, and traps.
+function ambientStateGet(key: PersistentStateKey) -> RawPtr {
+    let slot = ambientKey(move key.name, .Persistent)
+    match runtimeContext.ambient.slots.value(slot) {
+        Some(state) -> return nativeUserDataBorrow(state)
+        None -> {
+            log fault("no ambient state", slot.name)
+            runtimeTrap()
+            return RawPtr(0)
+        }
+    }
+}
+
+// Puts `state` under `key`, giving up the state the slot held before.
+function ambientStatePut(key: PersistentStateKey, state: NativeState<Any>) {
+    runtimeContext.ambient.slots.set(ambientKey(move key.name, .Persistent), move state)
+}
+
+// Answers whether `key` had a slot to remove.
+function ambientStateRemove(key: PersistentStateKey) -> Bool {
+    return runtimeContext.ambient.slots.remove(ambientKey(move key.name, .Persistent)).isSome()
+}
+
+// --- view state ------------------------------------------------------------
+// State a build owns. Creating or reading it touches it for this build; the
+// guard that ends the build drops every view slot the build did not touch.
+
+function ambientStateHasView(key: borrow ViewStateKey) -> Bool {
+    return runtimeContext.ambient.slots.contains(ambientViewKey(key))
+}
+
+function ambientStateGetView(key: borrow ViewStateKey) -> RawPtr {
+    let slot = ambientViewKey(key)
+    match runtimeContext.ambient.slots.value(slot) {
+        Some(state) -> {
+            runtimeContext.ambient.touched.set(copy slot, runtimeContext.ambient.build)
+            ambientStateLogView(copy key.name)
+            return nativeUserDataBorrow(state)
+        }
+        None -> {
+            log fault("no view state", key.name)
+            runtimeTrap()
+            return RawPtr(0)
+        }
+    }
+}
+
+function ambientStatePutView(key: ViewStateKey, state: NativeState<Any>) {
+    let name = move key.name
+    let slot = ambientKey(copy name, .View)
+    runtimeContext.ambient.slots.set(copy slot, move state)
+    runtimeContext.ambient.touched.set(move slot, runtimeContext.ambient.build)
+    ambientStateLogView(move name)
+}
+
+// Marks an existing view slot as seen by this build. A declared `@State`
+// whose value the build did not read still lives while its view is described:
+// the view's mark comes through here.
+function ambientStateTouchView(key: borrow ViewStateKey) {
+    let slot = ambientViewKey(key)
+    if runtimeContext.ambient.slots.contains(slot) {
+        runtimeContext.ambient.touched.set(move slot, runtimeContext.ambient.build)
+        ambientStateLogView(copy key.name)
+    }
+}
+
+function ambientStateRemoveView(key: ViewStateKey) -> Bool {
+    let slot = ambientKey(move key.name, .View)
+    runtimeContext.ambient.touched.remove(copy slot)
+    return runtimeContext.ambient.slots.remove(move slot).isSome()
+}
+
+// Starts a build. The next end drops every view slot this build did not touch.
+function ambientStateBuildBegin() {
+    runtimeContext.ambient.build++
+    runtimeContext.ambient.viewLog = []
+    runtimeContext.ambient.recordDepth = 0
+}
+
+// Ends a build: view slots not touched since it began go, and so does their
+// record in the touch table. The iteration is over a copy, so removal is safe.
+function ambientStateBuildEnd() {
+    let build = runtimeContext.ambient.build
+    for entry in runtimeContext.ambient.touched.entries() {
+        if entry.value == build { continue }
+        runtimeContext.ambient.touched.remove(entry.key)
+        if runtimeContext.ambient.slots.remove(entry.key).isSome() {
+            log trace("dropped the state of a view taken out of the interface", key: entry.key.name)
+        }
+    }
+    runtimeContext.ambient.viewLog = []
+    runtimeContext.ambient.recordDepth = 0
+}
+
+// How far the build's view log has run. A kept scope records this when it
+// starts and asks for the names after it when it ends.
+public function ambientStateViewLogCount() -> Number {
+    return runtimeContext.ambient.viewLog.count
+}
+
+// Recording is nested: a tab inside a tab keeps what the inner one used as
+// well as its own.
+function ambientStateRecordBegin() {
+    runtimeContext.ambient.recordDepth++
+}
+
+function ambientStateRecordEnd() {
+    if runtimeContext.ambient.recordDepth > 0 { runtimeContext.ambient.recordDepth-- }
+}
+
+// The view key names touched from `start` to now, each once, in the order the
+// build first touched them.
+function ambientStateViewKeysSince(start: Number) -> [String] {
+    var keys: [String] = []
+    var seen: Map<String, Bool> = Map()
+    let end = runtimeContext.ambient.viewLog.count
+    for index in start..end {
+        let name = runtimeContext.ambient.viewLog[index]
+        if seen.contains(name) { continue }
+        seen.set(copy name, true)
+        keys.append(copy name)
+    }
+    return keys
+}
+
+// --- scope teardown and counts ---------------------------------------------
+
+// Drops every slot of the current scope.
+function ambientStateReset() {
+    for key in runtimeContext.ambient.slots.keys() {
+        if key.scope == runtimeContext.ambient.current {
+            runtimeContext.ambient.slots.remove(key)
+            runtimeContext.ambient.touched.remove(key)
+        }
+    }
+    runtimeContext.ambient.viewLog = []
+    runtimeContext.ambient.recordDepth = 0
+}
+
+function ambientStateResetAll() {
+    runtimeContext.ambient.slots.removeAll()
+    runtimeContext.ambient.touched.removeAll()
+    runtimeContext.ambient.viewLog = []
+    runtimeContext.ambient.recordDepth = 0
+}
+
+// The slots of the current scope.
+function ambientStateCount() -> Number {
+    var count: Number = 0
+    for key in runtimeContext.ambient.slots.keys() {
+        if key.scope == runtimeContext.ambient.current { count++ }
+    }
+    return count
+}
+
+// The view slots of the current scope, for the test that a build leaves no
+// state behind.
+function ambientStateViewCount() -> Number {
+    var count: Number = 0
+    for key in runtimeContext.ambient.slots.keys() {
+        if key.scope == runtimeContext.ambient.current && key.lifetime == .View { count++ }
+    }
+    return count
+}
+
+function ambientStateCountAll() -> Number {
+    return runtimeContext.ambient.slots.count()
+}
+
+public function ambientStateTouchedCount() -> Number {
+    return runtimeContext.ambient.touched.count()
+}
+
+public function ambientStateScopeCount() -> Number {
+    return runtimeContext.ambient.issued
+}

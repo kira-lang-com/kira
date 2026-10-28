@@ -1,0 +1,475 @@
+// Checking statements.
+
+extend Checker {
+    function block(borrow mut self, statements: [Int]) -> [Int] {
+        openScope()
+        var checked: [Int] = []
+        for statement in statements {
+            checkStatementInto(statement, checked)
+        }
+        closeScope()
+        return checked
+    }
+
+    function checkStatement(borrow mut self, index: Int) -> Int {
+        let statement = tree.statements[index]
+        // A `try` may also be the whole value a statement directly in an
+        // `attempt` body returns, assigns or evaluates.
+        let savedTry = tryAllowed
+        var savedAwait = allowAwait(-1)
+        match statement.kind {
+            Return(value) -> {
+                match value {
+                    Some(returned) -> {
+                        tryAllowed = triesInAttempt(returned)
+                        savedAwait = allowAwait(returned)
+                    }
+                    None -> {}
+                }
+            }
+            Assignment(target, value) -> {
+                tryAllowed = triesInAttempt(value)
+                savedAwait = allowAwait(value)
+            }
+            Evaluation(value) -> {
+                tryAllowed = triesInAttempt(value)
+                savedAwait = allowAwait(value)
+            }
+            Binding(binding) -> savedAwait = allowAwait(binding.value)
+            CompoundAssignment -> {}
+            If -> {}
+            While -> {}
+            For -> {}
+            ForEach -> {}
+            Match -> {}
+            Attempt -> {}
+            Break -> {}
+            Continue -> {}
+        }
+        let checked = checkStatementKind(statement)
+        tryAllowed = savedTry
+        restoreAwait(savedAwait)
+        return checked
+    }
+
+    // Whether `value` is a `try` written directly in the innermost
+    // `attempt` body, where a failure has a handler to go to.
+    function triesInAttempt(borrow self, value: Int) -> Bool {
+        if resultTypes(program, signature().result).isSome() { return true }
+        if handlers.count == 0 { return false }
+        let handler = handlers[handlers.count - 1]
+        return scopes.count == handler.depth + 1 && tree.expressions[value].kind.triedOperand().isSome()
+    }
+
+    function checkStatementKind(borrow mut self, statement: Statement) -> Int {
+        match statement.kind {
+            Binding(binding) -> return program.addStatement(checkBinding(binding))
+            Assignment(target, value) -> return program.addStatement(checkAssignment(target, value))
+            CompoundAssignment(operator, target, value) -> {
+                if asyncBody.isSome() && isAwaitSyntax(value) { return awaitThenCompound(operator, target, value, statement.span) }
+                return program.addStatement(checkCompoundAssignment(operator, target, value, statement.span))
+            }
+            Evaluation(value) -> {
+                match tree.expressions[value].kind {
+                    ExpandedMacro(body, value) -> return program.addStatement(.Evaluate(checkExpandedMacro(body, value, .None, statement.span)))
+                    Quote -> {}
+                    MacroCall(name, arguments, input) -> return program.addStatement(.Evaluate(checkMacro(name, arguments, .None, statement.span, true)))
+                    IntegerLiteral -> {}
+                    FloatLiteral -> {}
+                    BooleanLiteral -> {}
+                    StringLiteral -> {}
+                    ArrayLiteral -> {}
+                    Index -> {}
+                    Transfer -> {}
+                    Labelled -> {}
+                    TypeQuery -> {}
+                    Name -> {}
+                    Member -> {}
+                    Call -> {}
+                    GenericCall -> {}
+                    MethodCall -> {}
+                    IndirectCall -> {}
+                    Lambda -> {}
+                    KeyPath -> {}
+                    Task -> {}
+                    Try -> {}
+                    Variant -> {}
+                    StructLiteral -> {}
+                    Unary -> {}
+                    Binary -> {}
+                    Conditional -> {}
+                    MatchValue -> {}
+                    Content -> {}
+                }
+                let checked = expression(value, .Some(Type.void()))
+                if resultTypes(program, typeOf(checked)).isSome() {
+                    report(.DiscardedFailure, statement.span)
+                }
+                return program.addStatement(.Evaluate(checked))
+            }
+            If(condition, whenTrue, whenFalse) -> {
+                let test = checkCondition(condition)
+                let before = movedNow()
+                let thenBody = block(whenTrue)
+                var paths: [[Bool]] = []
+                if !leaves(thenBody) { paths.append(movedNow()) }
+                restoreMoved(before)
+                let elseBody = block(whenFalse)
+                if !leaves(elseBody) { paths.append(movedNow()) }
+                joinMoved(paths, before)
+                return program.addStatement(.Branch(test, thenBody, elseBody))
+            }
+            While(condition, body) -> {
+                let test = checkCondition(condition)
+                return program.addStatement(.Loop(test, loopBody(body)))
+            }
+            For(name, low, high, body) -> return program.addStatement(checkFor(name, low, high, body))
+            ForEach(name, array, body) -> return program.addStatement(checkForEach(name, array, body, statement.span))
+            Match(subject, arms) -> return program.addStatement(checkMatch(subject, arms, statement.span))
+            Attempt(body, arms) -> return program.addStatement(checkAttempt(body, arms, statement.span))
+            Return(value) -> return program.addStatement(checkReturn(value, statement.span))
+            Break -> {
+                jumpMoved()
+                return program.addStatement(jump(.Break, statement.span))
+            }
+            Continue -> {
+                jumpMoved()
+                return program.addStatement(jump(.Continue, statement.span))
+            }
+        }
+    }
+
+    // `let` and `var`. An annotation is the type the value must have;
+    // without one the binding takes the value's type.
+    function checkBinding(borrow mut self, binding: BindingStatement) -> CheckedStatement {
+        let savedTry = tryAllowed
+        tryAllowed = false
+        if triesInAttempt(binding.value) { tryAllowed = true }
+        var value = 0
+        var valueType = Type.invalid()
+        match binding.annotation {
+            Some(annotation) -> {
+                valueType = resolveType(tree.typeReferences[annotation])
+                value = coerce(expression(binding.value, .Some(valueType)), valueType, .BindingTypeMismatch)
+            }
+            None -> {
+                value = expression(binding.value, .None)
+                valueType = typeOf(value)
+            }
+        }
+        if valueType.equals(Type.void()) { report(.BindingTypeMismatch, binding.name.span) }
+        // `let _ = mayFail()` says the value is not wanted, and a failure is
+        // the one thing in it that must never go unread. 3394 already refuses
+        // `Error(_)` in a `match`; this is the same gap in a binding.
+        if binding.name.text == "_" && resultTypes(program, valueType).isSome() {
+            report(.DiscardedFailure, binding.name.span)
+        }
+        checkBindingPrefix(binding.prefix, valueType)
+        let borrowed = bindsBorrow(binding.prefix, valueType)
+        let view = binding.mutable && recoveredState(value)
+        let alias = aliasesBorrow(value)
+        let local = declareLocal(binding.name.text, valueType, binding.mutable, view || alias)
+        if view { locals[local].cell = true }
+        if alias { locals[local].passingMode = .MutablyBorrowed }
+        if borrowed && !alias { locals[local].passingMode = .Borrowed }
+        tryAllowed = savedTry
+        return .Declare(local, value)
+    }
+
+    // Assigning a whole binding gives it a value again, so one that was
+    // moved from is available after; the value is checked while it is not.
+    // Binding what a `borrow mut` parameter names aliases the caller's value
+    // rather than copying it, so what the new binding writes the caller sees,
+    // until the binding is given a whole value of its own. A scalar has no
+    // part to write, so its alias would be a copy.
+    function aliasesBorrow(borrow self, value: Int) -> Bool {
+        match program.expressions[value].operation.readLocal() {
+            Some(local) -> return locals[local].passingMode == .MutablyBorrowed && locals[local].valueType.isAggregate()
+            None -> return false
+        }
+    }
+
+    function checkAssignment(borrow mut self, target: Int, value: Int) -> CheckedStatement {
+        var whole: Optional<Int> = .None
+        match tree.expressions[target].kind.name() {
+            Some(name) -> whole = lookup(name.text)
+            None -> {}
+        }
+        var place = 0
+        match whole {
+            Some(local) -> {
+                let moved = locals[local].moved
+                locals[local].moved = false
+                place = assignedPlace(target)
+                locals[local].moved = moved
+            }
+            None -> place = assignedPlace(target)
+        }
+        match computedWrite(place) {
+            Some(setter) -> return assignedThrough(setter, place, value)
+            None -> {}
+        }
+        var before: [Int] = []
+        var after: [Int] = []
+        let written = writableThrough(place, before, after)
+        checkCrossingArrayLength(written, program.expressions[written].span)
+        match immutability(written) {
+            Some(diagnostic) -> report(diagnostic, program.expressions[written].span)
+            None -> {}
+        }
+        let placeType = typeOf(written)
+        let stored = coerce(expression(value, .Some(placeType)), placeType, .AssignmentTypeMismatch)
+        match whole {
+            Some(local) -> locals[local].moved = false
+            None -> noteFieldRefill(target, written)
+        }
+        if before.count == 0 { return .Assign(written, stored) }
+        let span = program.expressions[place].span
+        before.append(program.addStatement(.Assign(written, stored)))
+        for statement in after { before.append(statement) }
+        return .Evaluate(add(.Sequence(before, add(.Integer(0), Type.int(), span)), Type.void(), span))
+    }
+
+    // A condition is `Bool`; Kira has no truthiness.
+    function checkCondition(borrow mut self, index: Int) -> Int {
+        let checked = expression(index, .Some(Type.boolean()))
+        let found = typeOf(checked)
+        if !found.isInvalid() && !found.equals(Type.boolean()) {
+            report(.ConditionNotBool, tree.expressions[index].span)
+        }
+        return checked
+    }
+
+    function checkForEach(borrow mut self, name: Identifier, array: Int, body: [Int], span: Span) -> CheckedStatement {
+        // `for x in []` never runs its body, so it binds nothing and needs no
+        // element type; the body is still checked for its own mistakes.
+        if tree.expressions[array].kind.isEmptyArray() {
+            openScope()
+            loopBody(body)
+            closeScope()
+            return .Branch(add(.Boolean(false), Type.boolean(), span), [], [])
+        }
+        var source = expression(array, .None)
+        var sourceType = typeOf(source)
+        // `for c in text` walks text one character at a time, as Foundation's
+        // `characters()` lists them.
+        if isStringType(program, sourceType) {
+            source = checkMethodOn(source, Identifier { text = "characters", span = span }, [], span)
+            sourceType = typeOf(source)
+        }
+        if sourceType.kind == .Structure && program.structs[sourceType.declaration].genericBase == "Iterator" {
+            return iterateLazily(name, source, body, span)
+        }
+        if !isArrayType(program, sourceType) {
+            if !sourceType.isInvalid() { report(.NotIterable, span) }
+            return .Evaluate(source)
+        }
+        openScope()
+        let elementType = program.structs[sourceType.declaration].typeArguments[0]
+        let element = declareLocal(name.text, elementType, false, false)
+        locals[element].passingMode = .Borrowed
+        let checked = loopBody(body)
+        closeScope()
+        return .Iterate(element, source, checked)
+    }
+
+    // `for x in iterator` calls its `next` until it answers `.None`:
+    //
+    //     let it = iterator
+    //     while true { match it.next() { Some(x) -> body  None -> break } }
+    function iterateLazily(borrow mut self, name: Identifier, source: Int, body: [Int], span: Span) -> CheckedStatement {
+        let sourceType = typeOf(source)
+        openScope()
+        let iterator = declareLocal(joinText(["__iterator_", decimalText(program.expressions.count)]), sourceType, true, false)
+        let saved = program.addStatement(.Declare(iterator, source))
+        let pulled = checkMethodOn(add(.Read(iterator), sourceType, span), Identifier { text = "next", span = span }, [], span)
+        let optionType = typeOf(pulled)
+        if optionType.kind != .Enumeration {
+            closeScope()
+            if !optionType.isInvalid() { report(.NotIterable, span) }
+            return .Evaluate(source)
+        }
+        let option = program.enums[optionType.declaration]
+        var arms: [CheckedArm] = []
+        for index in 0..option.variants.count {
+            match option.variants[index].payload {
+                Some(valueType) -> {
+                    openScope()
+                    let element = declareLocal(name.text, valueType, false, false)
+                    let checked = loopBody(body)
+                    closeScope()
+                    arms.append(CheckedArm { variant = index, binding = .Some(element), body = checked, literal = .None, value = .None, also = [], ranges = [], texts = [], decimals = [], decimalRanges = [] })
+                }
+                None -> {
+                    let stop = program.addStatement(.Break)
+                    arms.append(CheckedArm { variant = index, binding = .None, body = [stop], literal = .None, value = .None, also = [], ranges = [], texts = [], decimals = [], decimalRanges = [] })
+                }
+            }
+        }
+        let dispatch = program.addStatement(.Dispatch(pulled, arms))
+        let loop = program.addStatement(.Loop(add(.Boolean(true), Type.boolean(), span), [dispatch]))
+        closeScope()
+        return .Branch(add(.Boolean(true), Type.boolean(), span), [saved, loop], [])
+    }
+
+    function loopBody(borrow mut self, body: [Int]) -> [Int] {
+        loops += 1
+        loopMoves.append(movedNow())
+        let checked = block(body)
+        jumpMoved()
+        let exit = loopMoves[loopMoves.count - 1]
+        var outer: [[Bool]] = []
+        for index in 0..loopMoves.count - 1 { outer.append(loopMoves[index]) }
+        loopMoves = outer
+        restoreMoved(exit)
+        loops -= 1
+        return checked
+    }
+
+    // Both bounds are integers of one type, which the loop variable takes. A
+    // decimal bound is taken as a whole number the way `Int(n)` takes one,
+    // truncating toward zero, because a position in a loop is a position and
+    // not a quantity: `for index in 0..items.count` stays what it was.
+    function checkFor(borrow mut self, name: Identifier, low: Int, high: Int, body: [Int]) -> CheckedStatement {
+        // A bound expects nothing, so a literal bound is the `Number` it is
+        // written as and only an integer-typed bound makes the counter a word.
+        var start = expression(low, .None)
+        var end = expression(high, .None)
+        for bound in [start, end] {
+            let found = typeOf(bound)
+            if !found.isInvalid() && !found.isInteger() && found.kind != .Decimal {
+                report(.RangeBoundNotInteger, program.expressions[bound].span)
+            }
+        }
+        let numbered = typeOf(start).kind == .Decimal && typeOf(end).kind == .Decimal
+        var counterType = typeOf(start)
+        if typeOf(start).kind == .Decimal || typeOf(end).kind == .Decimal {
+            counterType = Type.int()
+        } else if counterType.isInt() && typeOf(end).isInteger() {
+            counterType = typeOf(end)
+        }
+        start = whole(start, counterType, .RangeBoundNotInteger)
+        end = whole(end, counterType, .RangeBoundNotInteger)
+        openScope()
+        if numbered {
+            // Both bounds are Numbers, so the counter the body sees is one;
+            // the loop itself still steps a word no source name reaches.
+            let counter = declareLocal("#counter", counterType, false, false)
+            let read = add(.Read(counter), counterType, name.span)
+            let visible = declareLocal(name.text, Type.number(), false, false)
+            var steps = [program.addStatement(.Declare(visible, numberCall(2, [read], Type.number(), name.span)))]
+            for statement in loopBody(body) { steps.append(statement) }
+            closeScope()
+            return .Count(counter, start, end, steps)
+        }
+        let counter = declareLocal(name.text, counterType, false, false)
+        let checked = loopBody(body)
+        closeScope()
+        return .Count(counter, start, end, checked)
+    }
+
+    function checkReturn(borrow mut self, value: Optional<Int>, span: Span) -> CheckedStatement {
+        let result = returnType()
+        match value {
+            Some(returned) -> {
+                if result.equals(Type.void()) {
+                    let checked = expression(returned, .Some(result))
+                    if !typeOf(checked).equals(Type.void()) && !typeOf(checked).isInvalid() { report(.VoidReturnsValue, span) }
+                    return .Return(.Some(checked))
+                }
+                // A result still to be inferred takes the value's type.
+                if result.isInvalid() { return .Return(.Some(expression(returned, .None))) }
+                let checked = coerce(expression(returned, .Some(result)), result, .ReturnTypeMismatch)
+                return .Return(.Some(checked))
+            }
+            None -> {
+                if !result.isInvalid() && !result.equals(Type.void()) { report(.ReturnValueMissing, span) }
+                return .Return(.None)
+            }
+        }
+    }
+
+    function jump(borrow self, statement: CheckedStatement, span: Span) -> CheckedStatement {
+        if loops == 0 { report(.JumpOutsideLoop, span) }
+        return statement
+    }
+
+    // Whether some statement guarantees that control cannot fall off the end
+    // of this sequence. A checked match covers every variant, so its arms are
+    // every way through it.
+    function alwaysReturns(borrow self, statements: [Int]) -> Bool {
+        for index in statements {
+            match program.statements[index] {
+                Return -> return true
+                Branch(condition, thenBody, elseBody) -> {
+                    if alwaysReturns(thenBody) && alwaysReturns(elseBody) { return true }
+                }
+                Dispatch(subject, arms) -> {
+                    if arms.count > 0 {
+                        var allReturn = true
+                        for arm in arms {
+                            if !alwaysReturns(arm.body) { allReturn = false }
+                        }
+                        if allReturn { return true }
+                    }
+                }
+                Attempt(body, error, subject, arms) -> {
+                    var allReturn = alwaysReturns(body)
+                    for arm in arms {
+                        if !alwaysReturns(arm.body) { allReturn = false }
+                    }
+                    if allReturn { return true }
+                }
+                Declare -> {}
+                InitializeGlobal -> {}
+                Assign -> {}
+                Evaluate(value) -> { if program.expressions[value].operation.isTrap() { return true } }
+                // `while true` that no `break` leaves only ends by returning.
+                Loop(condition, body) -> { if program.expressions[condition].operation.isTrue() && !breaksOut(body) { return true } }
+                Count -> {}
+                Iterate -> {}
+                Break -> {}
+                Continue -> {}
+            }
+        }
+        return false
+    }
+
+    // Whether a `break` in `statements` leaves the loop they are the body of:
+    // one inside a nested loop leaves that loop instead.
+    function breaksOut(borrow self, statements: [Int]) -> Bool {
+        for index in statements {
+            match program.statements[index] {
+                Break -> return true
+                Branch(condition, thenBody, elseBody) -> {
+                    if breaksOut(thenBody) || breaksOut(elseBody) { return true }
+                }
+                Dispatch(subject, arms) -> {
+                    for arm in arms { if breaksOut(arm.body) { return true } }
+                }
+                Attempt(body, error, subject, arms) -> {
+                    if breaksOut(body) { return true }
+                    for arm in arms { if breaksOut(arm.body) { return true } }
+                }
+                Declare -> {}
+                InitializeGlobal -> {}
+                Assign -> {}
+                Evaluate -> {}
+                Return -> {}
+                Continue -> {}
+                // A nested loop's own `break` leaves only it.
+                Loop -> {}
+                Count -> {}
+                Iterate -> {}
+            }
+        }
+        return false
+    }
+}
+
+function contains(values: [Int], wanted: Int) -> Bool {
+    for value in values {
+        if value == wanted { return true }
+    }
+    return false
+}

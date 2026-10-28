@@ -1,0 +1,214 @@
+// Written types to interned ones. Qualifiers, `*` and `&` stay with the
+// written type for the declaration that reads them; array extents wrap the
+// named type, the last extent innermost, as `float a[2][3]` is two arrays
+// of three.
+
+function imageDimension(name: String) -> Dimension {
+    if startsWith(name, "texture1d") { return .Line }
+    if startsWith(name, "texture3d") { return .Volume }
+    if startsWith(name, "texturecube") || startsWith(name, "depthcube") { return .Cube }
+    return .Plane
+}
+
+function accessNamed(word: String) -> Optional<Access> {
+    match word {
+        "access_sample" -> return .Some(.Sample)
+        "access_read" -> return .Some(.Read)
+        "access_write" -> return .Some(.Write)
+        "access_read_write" -> return .Some(.ReadWrite)
+        else -> {
+            let none: Optional<Access> = .None
+            return none
+        }
+    }
+}
+
+extend Checker {
+    function resolve(borrow mut self, index: Int) -> Int {
+        let written = tree.types[index]
+        var resolved = resolveName(written)
+        if resolved < 0 { return voidType() }
+        var at = written.extents.count - 1
+        while at >= 0 {
+            let extent = written.extents[at]
+            match fold(extent) {
+                Some(length) -> {
+                    if length <= 0 {
+                        report(.NotConstant, tree.expressions[extent].span)
+                        return voidType()
+                    }
+                    resolved = arrayType(resolved, length)
+                }
+                None -> {
+                    report(.NotConstant, tree.expressions[extent].span)
+                    return voidType()
+                }
+            }
+            at -= 1
+        }
+        return resolved
+    }
+
+    function refuseType(borrow mut self, diagnostic: Diagnostic, span: Span) -> Int {
+        report(diagnostic, span)
+        return -1
+    }
+
+    // The type a written name and its template arguments mean, or -1 after
+    // reporting.
+    function resolveName(borrow mut self, written: TypeSyntax) -> Int {
+        let name = written.name
+        let span = written.span
+        let alias = aliasNamed(name)
+        if alias >= 0 { return alias }
+        let structure = lastNamed(structNames, name)
+        if structure >= 0 { return structType(structure) }
+        match name {
+            "void" -> return voidType()
+            "sampler" -> return samplerType()
+            "atomic_int" -> return atomicType(.Int)
+            "atomic_uint" -> return atomicType(.UInt)
+            "atomic" -> return atomicOf(written)
+            "array" -> return arrayOf(written)
+            "vec" -> return vecOf(written, false)
+            "packed_vec" -> return vecOf(written, true)
+            "matrix" -> return matrixOf(written)
+            "imageblock" -> return refuseType(.TileFunction, span)
+            "visible_function_table" -> return refuseType(.FunctionTable, span)
+            "intersection_function_table" -> return refuseType(.FunctionTable, span)
+            "acceleration_structure" -> return refuseType(.FunctionTable, span)
+            else -> {}
+        }
+        if isImageWord(name) { return imageOf(written) }
+        if startsWith(name, "simdgroup_") { return refuseType(.SimdGroup, span) }
+        var base = name
+        if startsWith(base, "packed_") { base = utf8Slice(base, 7, utf8Count(base)) }
+        if startsWith(base, "simd_") { base = utf8Slice(base, 5, utf8Count(base)) }
+        match scalarNamed(base) {
+            Some(scalar) -> return scalarType(scalar)
+            None -> {}
+        }
+        if isScalarWord(base) { return refuseType(.UnsupportedType, span) }
+        let length = utf8Count(base)
+        if length >= 2 && isVectorSize(utf8Byte(base, length - 1)) {
+            let width = utf8Byte(base, length - 1) - asciiZero
+            match scalarNamed(utf8Slice(base, 0, length - 1)) {
+                Some(scalar) -> return vectorType(scalar, width)
+                None -> {}
+            }
+            if length >= 4 && utf8Byte(base, length - 2) == asciiLowerX {
+                let columns = utf8Byte(base, length - 3) - asciiZero
+                match scalarNamed(utf8Slice(base, 0, length - 3)) {
+                    Some(scalar) -> {
+                        if scalar.isFloat() { return matrixType(scalar, columns, width) }
+                    }
+                    None -> {}
+                }
+            }
+            if isBuiltinTypeWord(base) { return refuseType(.UnsupportedType, span) }
+        }
+        return refuseType(.UnknownType, span)
+    }
+
+    function typeArgument(borrow mut self, written: TypeSyntax, position: Int) -> Int {
+        if position >= written.typeArguments.count || written.typeArguments[position] < 0 {
+            report(.UnknownType, written.span)
+            return -1
+        }
+        return resolve(written.typeArguments[position])
+    }
+
+    function valueArgument(borrow mut self, written: TypeSyntax, position: Int) -> Int {
+        if position >= written.valueArguments.count || written.valueArguments[position] < 0 {
+            report(.NotConstant, written.span)
+            return -1
+        }
+        match fold(written.valueArguments[position]) {
+            Some(value) -> {
+                if value > 0 { return value }
+            }
+            None -> {}
+        }
+        report(.NotConstant, written.span)
+        return -1
+    }
+
+    function atomicOf(borrow mut self, written: TypeSyntax) -> Int {
+        let element = typeArgument(written, 0)
+        if element < 0 { return -1 }
+        let found = typeAt(element)
+        if found.shape != .ScalarShape || !found.scalar.isInteger() {
+            return refuseType(.UnsupportedType, written.span)
+        }
+        return atomicType(found.scalar)
+    }
+
+    function arrayOf(borrow mut self, written: TypeSyntax) -> Int {
+        let element = typeArgument(written, 0)
+        let length = valueArgument(written, 1)
+        if element < 0 || length < 0 { return -1 }
+        return arrayType(element, length)
+    }
+
+    function vecOf(borrow mut self, written: TypeSyntax, packed: Bool) -> Int {
+        let element = typeArgument(written, 0)
+        let width = valueArgument(written, 1)
+        if element < 0 || width < 0 { return -1 }
+        if !isScalar(element) || width < 2 || width > 4 { return refuseType(.UnsupportedType, written.span) }
+        return vectorType(typeAt(element).scalar, width)
+    }
+
+    function matrixOf(borrow mut self, written: TypeSyntax) -> Int {
+        let element = typeArgument(written, 0)
+        let columns = valueArgument(written, 1)
+        let rows = valueArgument(written, 2)
+        if element < 0 || columns < 0 || rows < 0 { return -1 }
+        let valid = isFloating(element) && isScalar(element) && columns >= 2 && columns <= 4 && rows >= 2 && rows <= 4
+        if !valid { return refuseType(.UnsupportedType, written.span) }
+        return matrixType(typeAt(element).scalar, columns, rows)
+    }
+
+    // `texture2d<float, access::write>` and its kin. A depth texture's
+    // texel is `float`; a multisampled texture is read, not sampled.
+    function imageOf(borrow mut self, written: TypeSyntax) -> Int {
+        let name = written.name
+        if name == "texture_buffer" { return refuseType(.UnsupportedType, written.span) }
+        let depth = startsWith(name, "depth")
+        let multisampled = endsWith(name, "_ms") || endsWith(name, "_ms_array")
+        var scalar: Scalar = .Float
+        if written.typeArguments.count > 0 {
+            let texel = typeArgument(written, 0)
+            if texel < 0 { return -1 }
+            if !isScalar(texel) || typeAt(texel).scalar == .Bool {
+                return refuseType(.UnsupportedType, written.span)
+            }
+            scalar = typeAt(texel).scalar
+        } else if !depth {
+            return refuseType(.UnknownType, written.span)
+        }
+        if depth && scalar != .Float { return refuseType(.UnsupportedType, written.span) }
+        var access: Access = .Sample
+        if multisampled { access = .Read }
+        if written.valueArguments.count > 1 {
+            let argument = tree.expressions[written.valueArguments[1]]
+            match accessNamed(argument.text) {
+                Some(found) -> access = found
+                None -> return refuseType(.UnsupportedType, written.span)
+            }
+        }
+        let writes = access == .Write || access == .ReadWrite
+        if writes && (depth || multisampled) { return refuseType(.UnsupportedType, written.span) }
+        let base = entry(.Image, scalar, 0, 0)
+        return imageType(TypeEntry {
+            shape = base.shape, scalar = scalar, width = 0, rows = 0, element = -1, length = 0, structure = -1,
+            dimension = imageDimension(name), arrayed = endsWith(name, "_array"), multisampled = multisampled,
+            depth = depth, access = access
+        })
+    }
+}
+
+function endsWith(text: String, end: String) -> Bool {
+    let length = utf8Count(end)
+    let total = utf8Count(text)
+    return total >= length && utf8Slice(text, total - length, total) == end
+}

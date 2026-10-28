@@ -1,0 +1,309 @@
+import Foundation
+
+// The binary form. Each value opens with its kind byte; integers are LEB128,
+// signed ones zigzagged first; text, names and byte runs carry their length
+// in front; lists, objects and cases carry their count.
+//
+// A `Number` has two spellings on the wire. A whole value in the 64-bit range
+// goes as an integer, the short form nearly every count and id takes;
+// anything else goes as its exact decimal text. Both read back as `Number`.
+
+@Open
+enum KtenKind: UN8 {
+    Null = 0
+    Bool = 1
+    Integer = 2
+    Decimal = 3
+    Text = 4
+    Bytes = 5
+    List = 6
+    Object = 7
+    Case = 8
+}
+
+namespace KtenVarint {
+    let payloadBits: Number = 7
+    let payloadMask: Number = 127
+    let continuation: Number = 128
+    // Ten groups of seven bits cover a 64-bit integer.
+    let groups: Number = 10
+}
+
+namespace KtenLimit {
+    // Nesting past this is refused, so hostile input cannot exhaust the stack.
+    let depth: Number = 256
+}
+
+namespace KtenIntegerRange {
+    let lowest: Number = -9223372036854775808
+    let highest: Number = 9223372036854775807
+}
+
+/// Why bytes are not a Kten value.
+public enum KtenDecodeFailure {
+    /// The bytes end inside a value.
+    Truncated
+    /// A length or count says more than the bytes that remain.
+    LengthPastEnd
+    /// A variable-length integer runs past 64 bits.
+    Overlong
+    /// A value's kind byte is not one Kten knows. Carries the byte.
+    UnknownKind(Number)
+    /// The values nest deeper than the reader allows, so a hostile input cannot exhaust the stack.
+    TooDeep
+    /// Text or a name that is not UTF-8.
+    NotText
+    /// A decimal that is not one: Kten's decimals have no exponent. Carries the text.
+    NotADecimal(String)
+}
+
+extend Kten {
+    // The binary form, for transport.
+    function encoded(borrow self) -> [UN8] {
+        var writer = KtenWriter {}
+        writer.value(self)
+        return move writer.bytes
+    }
+}
+
+struct KtenWriter {
+    var bytes: [UN8] = []
+
+    function kind(borrow mut self, kind: KtenKind) {
+        bytes.append(UN8(code(kind)))
+    }
+
+    function unsigned(borrow mut self, value: UNumber) {
+        var rest = value
+        while rest >= KtenVarint.continuation {
+            bytes.append(UN8((rest & KtenVarint.payloadMask) | KtenVarint.continuation))
+            rest = rest >> KtenVarint.payloadBits
+        }
+        bytes.append(UN8(rest))
+    }
+
+    // Zigzag: 0, -1, 1, -2 … become 0, 1, 2, 3 …, so a small negative stays
+    // short.
+    function signed(borrow mut self, value: Number) {
+        if value >= 0 {
+            unsigned(UNumber(value) * 2)
+        } else {
+            unsigned(UNumber(0 - (value + 1)) * 2 + 1)
+        }
+    }
+
+    function run(borrow mut self, raw: borrow [UN8]) {
+        unsigned(UNumber(raw.count))
+        bytes.appendAll(raw)
+    }
+
+    function string(borrow mut self, text: borrow String) {
+        run(text.utf8())
+    }
+
+    function number(borrow mut self, value: Number) {
+        if value >= KtenIntegerRange.lowest && value <= KtenIntegerRange.highest && value % 1 == 0 {
+            kind(.Integer)
+            signed(value)
+        } else {
+            kind(.Decimal)
+            string(String(value))
+        }
+    }
+
+    function value(borrow mut self, value: borrow Kten) {
+        match value {
+            Null -> kind(.Null)
+            Bool(flag) -> {
+                kind(.Bool)
+                bytes.append(flag ? 1 : 0)
+            }
+            Number(number) -> number(number)
+            Text(text) -> {
+                kind(.Text)
+                string(text)
+            }
+            Bytes(raw) -> {
+                kind(.Bytes)
+                run(raw)
+            }
+            List(items) -> {
+                kind(.List)
+                sequence(items)
+            }
+            Object(object) -> object(object)
+            Case(variant) -> {
+                kind(.Case)
+                string(variant.name)
+                sequence(variant.payload)
+            }
+        }
+    }
+
+    function sequence(borrow mut self, items: borrow [Kten]) {
+        unsigned(UNumber(items.count))
+        for item in items { value(item) }
+    }
+
+    // A bare object's tag is the empty name, which no type has.
+    function object(borrow mut self, object: borrow KtenObject) {
+        kind(.Object)
+        match object.tag {
+            Some(tag) -> string(tag)
+            None -> string("")
+        }
+        unsigned(UNumber(object.fields.count))
+        for field in object.fields {
+            string(field.name)
+            value(field.value)
+        }
+    }
+}
+
+/// The value the binary form `bytes` holds. Bytes after it are not read, so a value can open a longer frame.
+public function decodeKten(bytes: borrow [UN8]) -> Result<Kten, KtenDecodeFailure> {
+    var reader = KtenReader { bytes: copy bytes }
+    return reader.value()
+}
+
+struct KtenReader {
+    let bytes: [UN8]
+    var at: Number = 0
+    var depth: Number = 0
+
+    function byte(borrow mut self) -> Result<Number, KtenDecodeFailure> {
+        if at >= bytes.count { return .Error(.Truncated) }
+        let value = Number(bytes[at])
+        at += 1
+        return .Ok(value)
+    }
+
+    function unsigned(borrow mut self) -> Result<UNumber, KtenDecodeFailure> {
+        var result: UNumber = 0
+        for group in 0..KtenVarint.groups {
+            let next = try byte()
+            let payload = next & KtenVarint.payloadMask
+            // The tenth group's seven bits reach past bit 63 but one.
+            if group == KtenVarint.groups - 1 && payload > 1 { return .Error(.Overlong) }
+            result = result | (UNumber(payload) << (group * KtenVarint.payloadBits))
+            if (next & KtenVarint.continuation) == 0 { return .Ok(result) }
+        }
+        return .Error(.Overlong)
+    }
+
+    function signed(borrow mut self) -> Result<Number, KtenDecodeFailure> {
+        let raw = try unsigned()
+        let half = Number(raw >> 1)
+        if (raw & 1) == 0 { return .Ok(half) }
+        return .Ok(0 - half - 1)
+    }
+
+    // A length or count, refused when it says more than the bytes left: every
+    // element takes at least one byte, so a count past them cannot be honest.
+    function length(borrow mut self) -> Result<Number, KtenDecodeFailure> {
+        let count = try unsigned()
+        if count > UNumber(bytes.count - at) { return .Error(.LengthPastEnd) }
+        return .Ok(Number(count))
+    }
+
+    function run(borrow mut self) -> Result<[UN8], KtenDecodeFailure> {
+        let count = try length()
+        let raw = byteRun(bytes, at, at + count)
+        at += count
+        return .Ok(raw)
+    }
+
+    function string(borrow mut self) -> Result<String, KtenDecodeFailure> {
+        let raw = try run()
+        return match textFromBytes(raw) {
+            Some(text) -> .Ok(text)
+            None -> .Error(.NotText)
+        }
+    }
+
+    function value(borrow mut self) -> Result<Kten, KtenDecodeFailure> {
+        if depth >= KtenLimit.depth { return .Error(.TooDeep) }
+        depth += 1
+        let read = valueBody()
+        depth -= 1
+        return read
+    }
+
+    function valueBody(borrow mut self) -> Result<Kten, KtenDecodeFailure> {
+        let kind = try byte()
+        return match fromCode<KtenKind>(UN8(kind)) {
+            Null -> .Ok(.Null)
+            Bool -> boolean()
+            Integer -> number()
+            Decimal -> decimal()
+            Text -> text()
+            Bytes -> bytes()
+            List -> list()
+            Object -> object()
+            Case -> variant()
+            else -> .Error(.UnknownKind(kind))
+        }
+    }
+
+    function boolean(borrow mut self) -> Result<Kten, KtenDecodeFailure> {
+        let flag = try byte()
+        return .Ok(.Bool(flag != 0))
+    }
+
+    function number(borrow mut self) -> Result<Kten, KtenDecodeFailure> {
+        let value = try signed()
+        return .Ok(.Number(value))
+    }
+
+    function decimal(borrow mut self) -> Result<Kten, KtenDecodeFailure> {
+        let text = try string()
+        return match parseNumber(text) {
+            Some(value) -> .Ok(.Number(value))
+            None -> .Error(.NotADecimal(text))
+        }
+    }
+
+    function text(borrow mut self) -> Result<Kten, KtenDecodeFailure> {
+        let text = try string()
+        return .Ok(.Text(text))
+    }
+
+    function bytes(borrow mut self) -> Result<Kten, KtenDecodeFailure> {
+        let raw = try run()
+        return .Ok(.Bytes(raw))
+    }
+
+    function sequence(borrow mut self) -> Result<[Kten], KtenDecodeFailure> {
+        let count = try length()
+        var items: [Kten] = []
+        for _ in 0..count {
+            let item = try value()
+            items.append(item)
+        }
+        return .Ok(items)
+    }
+
+    function list(borrow mut self) -> Result<Kten, KtenDecodeFailure> {
+        let items = try sequence()
+        return .Ok(.List(items))
+    }
+
+    function object(borrow mut self) -> Result<Kten, KtenDecodeFailure> {
+        let tag = try string()
+        let count = try length()
+        var fields: [KtenField] = []
+        for _ in 0..count {
+            let name = try string()
+            let value = try value()
+            fields.append(KtenField { name: name, value: value })
+        }
+        let named: String? = tag.count == 0 ? .None : .Some(tag)
+        return .Ok(.Object(KtenObject { tag: named, fields: fields }))
+    }
+
+    function variant(borrow mut self) -> Result<Kten, KtenDecodeFailure> {
+        let name = try string()
+        let payload = try sequence()
+        return .Ok(.Case(KtenCase { name: name, payload: payload }))
+    }
+}

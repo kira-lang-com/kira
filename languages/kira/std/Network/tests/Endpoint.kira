@@ -1,0 +1,205 @@
+import Foundation
+
+// Two endpoints talking through memory: a client and a server that makes
+// every client prove its address with a Retry.
+
+namespace TestPeers {
+    let client: String = "192.0.2.1:50000"
+    let server: String = "192.0.2.2:443"
+    let unknownVersion: Number = 0x1a2a3a4a
+}
+
+function testServerSettings() -> Result<QuicServerSettings, String> {
+    let key = try loadSigningKey(QuicTestPki.leafKey) otherwise return .Error("key")
+    let identity = TlsServerIdentity {
+        certificates: [QuicTestPki.leaf],
+        key: key,
+        scheme: .EcdsaSecp256r1Sha256
+    }
+    return .Ok(QuicServerSettings { identity: identity, protocols: ["h3"] })
+}
+
+function testClientSettings() -> QuicClientSettings {
+    return QuicClientSettings {
+        serverName: "localhost",
+        protocols: ["h3"],
+        seconds: QuicTestPki.seconds,
+        anchors: NetworkTesting.anchors()
+    }
+}
+
+struct EndpointPair {
+    var client: QuicEndpoint
+    var server: QuicEndpoint
+    var now: QuicInstant
+    // Datagrams that went each way, Retry and resets included.
+    var toServer: Number = 0
+    var toClient: Number = 0
+
+    function exchange(borrow mut self) {
+        for _ in 0..TestClock.rounds {
+            let up = forward(client, server, TestPeers.client, now)
+            let down = forward(server, client, TestPeers.server, now)
+            toServer += up
+            toClient += down
+            now = now.plus(TestClock.step)
+            if up == 0 && down == 0 { return }
+        }
+    }
+}
+
+// Every datagram `from` has goes to `to`, as coming from `source`.
+function forward(
+    from: borrow mut QuicEndpoint,
+    to: borrow mut QuicEndpoint,
+    source: borrow String,
+    now: QuicInstant
+) -> Number {
+    var count = 0
+    while true {
+        let next = from.transmit(now)
+        let datagram = match next {
+            Some(value) -> value
+            None -> return count
+        }
+        count += 1
+        to.receive(Datagram { peer: copy source, bytes: datagram.bytes }, now)
+    }
+    return count
+}
+
+function endpointEvents(endpoint: borrow mut QuicEndpoint, handle: QuicConnectionHandle) -> String {
+    let position = match endpoint.index(handle) {
+        Some(value) -> value
+        None -> return "gone"
+    }
+    var notes: [String] = []
+    while true {
+        let next = endpoint.connections[position].connection.event()
+        let event = match next {
+            Some(value) -> value
+            None -> return joined(notes, ", ")
+        }
+        notes.append(describe(event))
+    }
+    return joined(notes, ", ")
+}
+
+function endpointPair() -> Result<EndpointPair, String> {
+    let serverSettings = try testServerSettings()
+    let server = try quicEndpoint(
+        QuicEndpointSettings { server: .Some(serverSettings), validateAddresses: true }
+    )
+    otherwise return .Error("server endpoint")
+    let client = try quicEndpoint(QuicEndpointSettings {}) otherwise return .Error(
+        "client endpoint"
+    )
+    return .Ok(EndpointPair { client: client, server: server, now: QuicInstant(0) })
+}
+
+function endpointStream(
+    pair: borrow mut EndpointPair,
+    client: QuicConnectionHandle,
+    server: QuicConnectionHandle
+) -> String {
+    let clientAt = match pair.client.index(client) {
+        Some(value) -> value
+        None -> return "no client"
+    }
+    let id = match pair.client.connections[clientAt].connection.openStream(.Bidirectional) {
+        Ok(value) -> value
+        Error(problem) -> return traceText(problem)
+    }
+    absorb pair.client.connections[clientAt].connection.write(id, "ping".utf8(), true)
+    pair.exchange()
+    let serverAt = match pair.server.index(server) {
+        Some(value) -> value
+        None -> return "no server"
+    }
+    return readAll(pair.server.connections[serverAt].connection, id)
+}
+
+@Test
+function endpointsValidateWithRetryAndReset() {
+    let expected: String = "true | connected Some(\"h3\") / connected Some(\"h3\") | ping true | Ok 2 closed 0 stateless reset true"
+    var pair = match endpointPair() {
+        Ok(value) -> value
+        Error(text) -> {
+            expect!((text) == expected)
+            return
+        }
+    }
+    let client = match pair.client.connect(testClientSettings(), TestPeers.server, pair.now) {
+        Ok(value) -> value
+        Error(failure) -> {
+            expect!((traceText(failure)) == expected)
+            return
+        }
+    }
+    pair.exchange()
+    let server = match pair.server.accept() {
+        Some(value) -> value
+        None -> {
+            expect!(("nothing accepted") == expected)
+            return
+        }
+    }
+    let retried = traceText(pair.server.connections[0].connection.addressValidated)
+    let opened = "\(endpointEvents(pair.client, client)) / \(endpointEvents(pair.server, server))"
+    let stream = endpointStream(pair, client, server)
+    // The server loses every connection but keeps its secret: the
+    // client's next packet is answered with a stateless reset.
+    pair.server.connections = []
+    let clientAt = match pair.client.index(client) {
+        Some(value) -> value
+        None -> {
+            expect!(("no client") == expected)
+            return
+        }
+    }
+    let sentDatagram = pair.client.connections[clientAt].connection.sendDatagram([1, 2, 3])
+    let before = pair.toServer + pair.toClient
+    pair.exchange()
+    // One datagram out, one reset back, and then silence.
+    let after = pair.toServer + pair.toClient - before
+    let reset = endpointEvents(pair.client, client)
+    expect!((retried) == ("true"))
+    expect!((opened) == ("connected Some(\"h3\") / connected Some(\"h3\")"))
+    expect!((stream) == ("ping true"))
+    expect!((traceText(sentDatagram)) == ("Ok"))
+    expect!("\(after)" == "2")
+    expect!((reset) == ("closed 0 stateless reset true"))
+}
+
+
+@Test
+function unknownVersionsAreNegotiated() {
+    let expected: String = "192.0.2.1:50000 0 0 0 0 2 5 6 4 1 2 3 4 0 0 0 1"
+    var pair = match endpointPair() {
+        Ok(value) -> value
+        Error(text) -> {
+            expect!((text) == expected)
+            return
+        }
+    }
+    var writer = WireWriter {}
+    writer.writeByte(Quic.longHeader | Quic.fixedBit)
+    writer.writeInteger(TestPeers.unknownVersion, QuicPacketLimit.versionBytes)
+    writer.writeVector([1, 2, 3, 4], Tls.shortVector)
+    writer.writeVector([5, 6], Tls.shortVector)
+    while writer.count() < Quic.minimumDatagram { writer.writeByte(0) }
+    pair.server.receive(Datagram { peer: TestPeers.client, bytes: writer.bytes }, pair.now)
+    let answer = match pair.server.transmit(pair.now) {
+        Some(value) -> value
+        None -> {
+            expect!(("no answer") == expected)
+            return
+        }
+    }
+    let packet = answer.bytes
+    var listed: [String] = []
+    for byte in byteRun(packet, 1, packet.count) { listed.append(String(byte)) }
+    expect!("\(answer.peer)" == "192.0.2.1:50000")
+    expect!((joined(listed, " ")) == ("0 0 0 0 2 5 6 4 1 2 3 4 0 0 0 1"))
+}
+

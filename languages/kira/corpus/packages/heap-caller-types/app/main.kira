@@ -1,0 +1,17 @@
+import Heap
+
+// A struct Heap's own files cannot see. `viewElement` calls `viewLoad` inside
+// Heap, and that inner call must still resolve this package's type.
+@FFI.Struct { layout: c }
+struct Pair {
+    var low: U32
+    var high: U32
+}
+
+@Main
+function main() -> Int {
+    let block = zeroedBlock(16, 8)
+    setViewElement<Pair>(block.view(), 1, Pair { low: 40, high: 2 })
+    let pair = viewElement<Pair>(block.view(), 1)
+    return Int(pair.low) + Int(pair.high)
+}

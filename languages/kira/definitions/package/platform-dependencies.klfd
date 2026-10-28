@@ -1,0 +1,49 @@
+// A manifest makes dependencies available. Only imports from files active on
+// this target make them build units; an excluded file cannot pull in its OS.
+
+function sourcesImportDependency(session: Session, root: String, tree: borrow SyntaxTree, first: Int, last: Int, dependency: Dependency) -> Bool {
+    var imported: [String] = []
+    for index in first..last {
+        for item in tree.sources[index].imports { imported.append(item.name.text) }
+    }
+    return importsDependency(session, root, imported, dependency)
+}
+
+function importsDependency(session: Session, root: String, imported: [String], dependency: Dependency) -> Bool {
+    if listsText(imported, dependency.name.text) { return true }
+    // The manifest's entry name and the package's exported moduleRoot can
+    // differ. Inspecting an available manifest must not turn an unavailable,
+    // excluded dependency into an error or a build unit.
+    let fetched = dependencyOverride(session, dependency.name.text)
+    if dependency.source != .Path && utf8Count(fetched) == 0 { return false }
+    let named = utf8Count(fetched) > 0 ? fetched : joinPath(root, dependency.path)
+    let file = readFile(session, joinPath(named, "package.kira"))
+    if file < 0 { return false }
+    match readManifest(fileText(session, file as SourceFile), file) {
+        Ok(manifest) -> return listsText(imported, manifest.moduleRoot)
+        Error(_) -> return false
+    }
+}
+
+function packageImports(session: Session, directory: String) -> Optional<[String]> {
+    var files: [Int] = []
+    let count = readDirectory(session, joinPath(directory, "app"), "kira")
+    for index in 0..count { files.append(source_directory_file(session, index)) }
+    var tree = SyntaxTree.empty()
+    tree.buildTarget = targetTriple(session)
+    var imported: [String] = []
+    for file in files {
+        match parseFile(move tree, fileText(session, file as SourceFile), file, 0) {
+            Ok(parsed) -> tree = parsed
+            // Discovery must not hide the sources whose ordinary parse will
+            // report the failure. Keep the graph conservative in that case.
+            Error(_) -> return .None
+        }
+    }
+    for source in tree.sources {
+        for item in source.imports {
+            if !listsText(imported, item.name.text) { imported.append(item.name.text) }
+        }
+    }
+    return .Some(imported)
+}

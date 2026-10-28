@@ -1,0 +1,333 @@
+// Semantic analysis: the syntax tree to a checked program.
+//
+// Imported files are declared first, then their bodies checked, then the
+// compiled file: so the compiled file can name what they declare, and an
+// imported file's own mistakes are reported too. Everything an imported
+// file declares is named `Alias_name`; the compiled file reaches it as
+// `Alias.name`, which is the same name once its dot is a `_`. A mistake is
+// reported where it is found and the expression takes `Void`, which every
+// later check accepts silently, so every independent mistake is reported
+// once.
+
+function check(tree: SyntaxTree) -> CheckedProgram {
+    var checker = Checker {
+        tree = tree, program = CheckedProgram.empty(), file = 0, prefix = "",
+        signatures = [], constants = [], resourceNames = [], optionNames = [], functionSites = [],
+        current = -1, locals = [], visible = [], scopes = [], calls = [], derivatives = [], result = voidType()
+    }
+    for index in 1..tree.files.count {
+        checker.switchTo(index)
+        checker.declare()
+    }
+    for index in 1..tree.files.count {
+        checker.switchTo(index)
+        checker.checkItems()
+    }
+    checker.switchTo(0)
+    checker.declare()
+    checker.reportUnresolvedImports()
+    checker.checkItems()
+    checker.reportRecursion()
+    checker.reportStageDerivatives()
+    return checker.program
+}
+
+struct Signature {
+    let name: String
+    let parameters: [ShaderType]
+    let result: ShaderType
+    let checkedFunction: Int
+}
+
+struct NamedConstant {
+    let name: String
+    let constantType: ShaderType
+    let value: ConstValue
+}
+
+struct NamedIndex {
+    let name: String
+    let index: Int
+}
+
+// Where a top-level function was declared, and the function it became.
+struct FunctionSite {
+    let file: Int
+    let declaration: Int
+    let checkedFunction: Int
+}
+
+struct Checker {
+    var tree: SyntaxTree
+    var program: CheckedProgram
+    var file: Int
+    var prefix: String
+    // Later entries shadow earlier ones of the same name, as the oracle's
+    // tables overwrite.
+    var signatures: [Signature]
+    var constants: [NamedConstant]
+    var resourceNames: [NamedIndex]
+    var optionNames: [NamedIndex]
+    var functionSites: [FunctionSite]
+    // The function being checked, its locals, the locals in scope (innermost
+    // last), where each open scope starts, the functions it calls and where
+    // it takes a derivative.
+    var current: Int
+    var locals: [LocalVariable]
+    var visible: [Int]
+    var scopes: [Int]
+    var calls: [Int]
+    var derivatives: [Span]
+    var result: ShaderType
+
+    function switchTo(borrow mut self, index: Int) {
+        file = index
+        prefix = tree.files[index].alias
+    }
+
+    function qualified(borrow self, name: String) -> String {
+        if utf8Count(prefix) == 0 { return name }
+        return joinText([prefix, "_", name])
+    }
+
+    function declare(borrow mut self) {
+        let source = tree.files[file]
+        for item in source.items {
+            match item.kind {
+                ImportItem -> {}
+                TypeItem -> declareStruct(source.types[item.index])
+                ConstItem -> declareConstant(source.constants[item.index])
+                EnumItem -> declareEnum(source.enums[item.index])
+                FunctionItem -> declareFunction(source.functions[item.index], item.index)
+                ShaderItem -> {}
+            }
+        }
+    }
+
+    function checkItems(borrow mut self) {
+        let source = tree.files[file]
+        for item in source.items {
+            match item.kind {
+                ImportItem -> {}
+                TypeItem -> {}
+                ConstItem -> {}
+                EnumItem -> {}
+                FunctionItem -> checkFunction(source.functions[item.index], siteFunction(item.index))
+                ShaderItem -> checkShader(source.shaders[item.index])
+            }
+        }
+    }
+
+    // A function that reaches itself through its calls, reported once per
+    // cycle at the function where the search closes it.
+    function reportRecursion(borrow mut self) {
+        var state: [Int] = []
+        for index in 0..program.functions.count {
+            state.append(0)
+        }
+        for index in 0..program.functions.count {
+            visitCalls(index, state)
+        }
+    }
+
+    // `state` is 0 for unvisited, 1 while on the search path, 2 when done.
+    function visitCalls(borrow mut self, caller: Int, state: borrow mut [Int]) {
+        if state[caller] != 0 { return }
+        state[caller] = 1
+        for callee in program.functions[caller].calls {
+            if state[callee] == 1 { report(.Recursion, program.functions[caller].span) }
+            visitCalls(callee, state)
+        }
+        state[caller] = 2
+    }
+
+    // A derivative compares neighbouring fragments of a quad, so a vertex or
+    // compute entry cannot reach one (KLF-KSL SV21). Each site is reported
+    // once, however many entries reach it.
+    function reportStageDerivatives(borrow mut self) {
+        var reached: [Bool] = []
+        for index in 0..program.functions.count {
+            reached.append(false)
+        }
+        for stage in program.stages {
+            if stage.stage != .Fragment && stage.entry >= 0 { reach(stage.entry, reached) }
+        }
+        for index in 0..program.functions.count {
+            if !reached[index] { continue }
+            for site in program.functions[index].derivatives {
+                report(.StageDerivative, site)
+            }
+        }
+    }
+
+    function reach(borrow self, caller: Int, reached: borrow mut [Bool]) {
+        if reached[caller] { return }
+        reached[caller] = true
+        for callee in program.functions[caller].calls {
+            reach(callee, reached)
+        }
+    }
+
+    // An import whose alias names no loaded file could not be resolved.
+    function reportUnresolvedImports(borrow mut self) {
+        for declared in tree.files[0].imports {
+            var found = false
+            for index in 1..tree.files.count {
+                if tree.files[index].alias == declared.alias { found = true }
+            }
+            if !found { report(.UnresolvedImport, declared.span) }
+        }
+    }
+
+    function structNamed(borrow self, name: String) -> Int {
+        for index in 0..program.structs.count {
+            if program.structs[index].name == name { return index }
+        }
+        return -1
+    }
+
+    function signatureNamed(borrow self, name: String) -> Int {
+        var found = -1
+        for index in 0..signatures.count {
+            if signatures[index].name == name { found = index }
+        }
+        return found
+    }
+
+    function constantNamed(borrow self, name: String) -> Int {
+        for index in 0..constants.count {
+            if constants[index].name == name { return index }
+        }
+        return -1
+    }
+
+    function lastNamed(borrow self, names: [NamedIndex], name: String) -> Int {
+        var found = -1
+        for named in names {
+            if named.name == name { found = named.index }
+        }
+        return found
+    }
+
+    function siteFunction(borrow self, declaration: Int) -> Int {
+        for site in functionSites {
+            if site.file == file && site.declaration == declaration { return site.checkedFunction }
+        }
+        return -1
+    }
+
+    function declareStruct(borrow mut self, declared: TypeDeclaration) {
+        let name = qualified(declared.name.text)
+        if structNamed(name) >= 0 {
+            report(.Duplicate, declared.span)
+            return
+        }
+        var fields: [CheckedField] = []
+        for field in declared.fields {
+            fields.append(checkField(field))
+        }
+        program.structs.append(CheckedStruct { name = name, fields = fields, span = declared.span })
+    }
+
+    function checkField(borrow mut self, field: FieldDeclaration) -> CheckedField {
+        let fieldType = resolve(field.typeReference)
+        var builtin = field.builtin.text
+        if utf8Count(builtin) > 0 && builtinValue(builtin).isNone() {
+            report(.BadBuiltin, field.span)
+            builtin = ""
+        }
+        var interpolation = field.interpolation.text
+        if utf8Count(interpolation) > 0 && !isInterpolation(interpolation) {
+            report(.BadBuiltin, field.span)
+            interpolation = ""
+        }
+        return CheckedField {
+            name = field.name.text, fieldType = fieldType, builtin = builtin,
+            interpolation = interpolation, span = field.span
+        }
+    }
+
+    function declareConstant(borrow mut self, declared: ConstDeclaration) {
+        let name = qualified(declared.name.text)
+        let constantType = resolve(declared.typeReference)
+        match constant(declared.value, constantType) {
+            Some(value) -> bindConstant(name, constantType, value, declared.span)
+            None -> report(.BadConstant, declared.span)
+        }
+    }
+
+    // An enum is a namespace of `Int` constants, `Enum_Variant`.
+    function declareEnum(borrow mut self, declared: EnumDeclaration) {
+        let intType = scalarType(.Int)
+        for variant in declared.variants {
+            let name = qualified(joinText([declared.name.text, "_", variant.name.text]))
+            match constant(variant.value, intType) {
+                Some(value) -> bindConstant(name, intType, value, variant.span)
+                None -> report(.BadConstant, variant.span)
+            }
+        }
+    }
+
+    function bindConstant(borrow mut self, name: String, constantType: ShaderType, value: ConstValue, span: Span) {
+        if constantNamed(name) >= 0 {
+            report(.Duplicate, span)
+            return
+        }
+        constants.append(NamedConstant { name = name, constantType = constantType, value = value })
+    }
+
+    function declareFunction(borrow mut self, declared: FunctionDeclaration, declaration: Int) {
+        let name = qualified(declared.name.text)
+        let checkedFunction = newFunction(name, declared)
+        functionSites.append(FunctionSite { file = file, declaration = declaration, checkedFunction = checkedFunction })
+        if signatureNamed(name) >= 0 { report(.Duplicate, declared.span) }
+        signatures.append(signature(name, declared, checkedFunction))
+    }
+
+    function newFunction(borrow mut self, name: String, declared: FunctionDeclaration) -> Int {
+        program.functions.append(CheckedFunction {
+            name = name, locals = [], parameters = declared.parameters.count, result = voidType(),
+            body = [], calls = [], derivatives = [], checked = false, span = declared.span
+        })
+        return program.functions.count - 1
+    }
+
+    function signature(borrow mut self, name: String, declared: FunctionDeclaration, checkedFunction: Int) -> Signature {
+        var parameters: [ShaderType] = []
+        for parameter in declared.parameters {
+            parameters.append(resolve(parameter.typeReference))
+        }
+        var result = voidType()
+        if declared.result >= 0 { result = resolve(declared.result) }
+        return Signature { name = name, parameters = parameters, result = result, checkedFunction = checkedFunction }
+    }
+
+    // A written type: a built-in, a struct by its written path joined with
+    // `_`, or a struct of this file by its qualified name.
+    function resolve(borrow mut self, reference: Int) -> ShaderType {
+        let written = tree.typeReferences[reference]
+        if written.element >= 0 {
+            let element = resolve(written.element)
+            if element.array {
+                report(.UnknownType, written.span)
+                return voidType()
+            }
+            return element.arrayOf()
+        }
+        var joined = ""
+        for segment in written.path {
+            if utf8Count(joined) > 0 { joined = joinText([joined, "_"]) }
+            joined = joinText([joined, segment.text])
+        }
+        match builtinType(joined) {
+            Some(found) -> return found
+            None -> {}
+        }
+        let direct = structNamed(joined)
+        if direct >= 0 { return structType(direct) }
+        let local = structNamed(qualified(joined))
+        if local >= 0 { return structType(local) }
+        report(.UnknownType, written.span)
+        return voidType()
+    }
+}

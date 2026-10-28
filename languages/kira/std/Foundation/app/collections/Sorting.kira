@@ -1,0 +1,95 @@
+// Sorting by comparators, as Foundation sorts: a `SortComparator` says how two
+// values stand, `KeyPathComparator` compares them by the members a key path
+// reads, and `sorted(using:)` orders an array by a list of comparators, the
+// first deciding unless two values stand the same by it.
+//
+//     var order = [KeyPathComparator(\Person.familyName), KeyPathComparator(\Person.givenName)]
+//     people.sort(using: order)
+
+// The order a comparator sorts in, as Foundation's `SortOrder` is.
+enum SortOrder {
+    Forward
+    Reverse
+}
+
+// How two values stand, as Foundation's `ComparisonResult` is.
+enum ComparisonResult {
+    OrderedAscending
+    OrderedSame
+    OrderedDescending
+}
+
+// How two values of `Compared` stand, read in the comparator's `order`, as
+// Foundation's `SortComparator` is. Its `compare(_:_:)` is `comparison` here:
+// `compare` is Kira's structural order, a builtin no method may take the name
+// of.
+trait SortComparator {
+    associatedtype Compared
+    var order: SortOrder { get set }
+    function comparison(borrow self, lhs: borrow Compared, rhs: borrow Compared) -> ComparisonResult
+}
+
+// A comparator by the members a key path reads, as Foundation's
+// `KeyPathComparator` is. Two comparators are equal when they read the same
+// members in the same order, which is how a table finds the column a sort
+// order names.
+//
+//     KeyPathComparator(\Person.givenName)
+//     KeyPathComparator(\Person.age, order: .Reverse)
+struct KeyPathComparator<Compared>: SortComparator {
+    // The members it compares by.
+    let keyPath: PartialKeyPath<Compared>
+    var order: SortOrder
+    // How a value compares with another forward: the key path the
+    // comparator was made with, applied to the first and answering for the
+    // second.
+    let ordering: KeyPath<Compared, (borrow Compared) -> ComparisonResult>
+
+    function init<Value>(keyPath: KeyPath<Compared, Value>, order: SortOrder = .Forward) -> KeyPathComparator<Compared> {
+        return KeyPathComparator<Compared> {
+            keyPath: keyPath.partial(),
+            order: order,
+            ordering: KeyPath<Compared, (borrow Compared) -> ComparisonResult> {
+                path: keyPath.path,
+                read: { lhs in
+                    let left = keyPath(lhs)
+                    return { rhs in
+                        match compare(left, keyPath(rhs)) {
+                            Less -> return .OrderedAscending
+                            Equal -> return .OrderedSame
+                            Greater -> return .OrderedDescending
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    function comparison(borrow self, lhs: borrow Compared, rhs: borrow Compared) -> ComparisonResult {
+        let against = self.ordering(lhs)
+        let forward = against(rhs)
+        if order == .Forward { return forward }
+        return forward.reversed()
+    }
+}
+
+extend ComparisonResult {
+    // The result the other way round.
+    function reversed(borrow self) -> ComparisonResult {
+        match self {
+            OrderedAscending -> return .OrderedDescending
+            OrderedSame -> return .OrderedSame
+            OrderedDescending -> return .OrderedAscending
+        }
+    }
+}
+
+extend SortOrder {
+    // The other order, as a table's column flips its sort when clicked again.
+    function reversed(borrow self) -> SortOrder {
+        match self {
+            Forward -> return .Reverse
+            Reverse -> return .Forward
+        }
+    }
+}

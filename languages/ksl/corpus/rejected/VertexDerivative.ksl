@@ -1,0 +1,29 @@
+// A helper taking a derivative, called from a vertex entry: a vertex has no
+// neighbouring fragments to compare, so the call is refused there.
+
+type VertexIn {
+    @builtin(vertex_index)
+    let vid: UInt
+}
+
+type VertexOut {
+    @builtin(position)
+    let clip_position: Float4
+}
+
+function edge(distance: Float) -> Float {
+    return fwidth(distance)
+}
+
+shader VertexDerivative {
+    vertex {
+        input VertexIn
+        output VertexOut
+
+        function entry(input: VertexIn) -> VertexOut {
+            let out: VertexOut
+            out.clip_position = Float4(edge(1.0), 0.0, 0.0, 1.0)
+            return out
+        }
+    }
+}

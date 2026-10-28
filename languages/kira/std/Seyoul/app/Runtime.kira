@@ -1,0 +1,163 @@
+import Foundation
+import Heap
+
+// Seyoul: async I/O, timers and tasks in pure Kira.
+//
+//     async function greet(address: String) -> Result<Void, NetFailure> {
+//         let connected = connect(address).await
+//         match connected {
+//             Ok(connection) -> {
+//                 let sent = connection.writeAll("hello".utf8()).await
+//                 let closed = connection.close()
+//                 return sent
+//             }
+//             Error(failure) -> return .Error(failure)
+//         }
+//     }
+//
+//     @Main
+//     function main() {
+//         let greeted = run(greet("127.0.0.1:7000"))
+//     }
+//
+// `run` drives one future, and every task it `spawn`s, until that future
+// finishes. Tasks are Foundation `Executor` slots: a wake writes the task's
+// index into a ring, and the runtime polls what the ring holds. Once nothing
+// is queued the runtime turns the reactor: it fires the timers that are due,
+// and otherwise blocks on the poller until a socket is ready or the next
+// timer is due, then queues the tasks those wake.
+//
+// Every thread has a runtime of its own (`@ThreadLocal`), so a task, its
+// sockets and its timers stay on the thread that started them and nothing
+// the runtime touches per poll is shared: threads exchange values through a
+// `Conduit`, whose wake crosses to the receiver's runtime through its inbox.
+
+class Runtime: Drop {
+    let executor: Executor = Executor()
+    let reactor: Reactor = Reactor()
+    let timers: TimerHeap = TimerHeap()
+    // The thread this runtime belongs to.
+    let thread: U64 = currentThread().raw
+    // Wakes other threads left for this runtime's tasks, under `inboxLock`.
+    let inboxLock: RawPtr = newSpinLock()
+    var inbox: [Waker] = []
+    // Tasks waiting on a `Conduit`: while there are some, a turn may block
+    // until another thread sends.
+    var expecting: Number = 0
+
+    // Calls `waker`, of a task here that `expecting` counts, from any
+    // thread.
+    function wakeExpected(waker: Waker) {
+        if currentThread().raw == self.thread {
+            self.expecting -= 1
+            waker.wakeUp()
+            return
+        }
+        lockSpin(self.inboxLock)
+        self.inbox.append(waker)
+        unlockSpin(self.inboxLock)
+        self.reactor.interrupt()
+    }
+
+    // Wakes what other threads left in the inbox; answers whether there was
+    // any.
+    function drainInbox() -> Bool {
+        lockSpin(self.inboxLock)
+        let arrived = move self.inbox
+        self.inbox = []
+        unlockSpin(self.inboxLock)
+        for waker in arrived {
+            self.expecting -= 1
+            waker.wakeUp()
+        }
+        return arrived.count > 0
+    }
+
+    // Fires due timers and waits on the poller. False when nothing could
+    // ever wake a task: no timer is armed, no task waits on a socket and
+    // none expects another thread.
+    function turn() -> Bool {
+        if self.drainInbox() { return true }
+        let instant = now().nanoseconds
+        let fired = self.timers.fire(instant)
+        if !fired && self.timers.live == 0 && self.reactor.waiting == 0 && self.expecting <= 0 {
+            return false
+        }
+        var timeout: Number = -1
+        if fired {
+            timeout = 0
+        } else {
+            match self.timers.next() {
+                Some(deadline) -> {
+                    if deadline > instant { timeout = Number(deadline - instant) } else {
+                        timeout = 0
+                    }
+                }
+                None -> {}
+            }
+        }
+        match self.reactor.wait(timeout) {
+            Ok -> {}
+            Error(failure) -> return false
+        }
+        let drained = self.drainInbox()
+        return true
+    }
+
+    function drop(borrow mut self) {
+        Heap.freeRaw(self.inboxLock)
+    }
+}
+
+// The calling thread's runtime, made on its first use.
+@ThreadLocal
+let seyoul = Runtime()
+
+// Runs `future`, and the tasks it spawns, until it finishes; answers its
+// output. Traps when the future waits for something nothing will bring:
+// no timer is armed, no task waits on a socket, none expects a thread.
+function run<Output>(future: Async<Output>) -> Output {
+    let handle = seyoul.executor.spawn(move future)
+    while !handle.isFinished() {
+        seyoul.executor.run()
+        if handle.isFinished() { break }
+        if !seyoul.turn() { runtimeTrap() }
+    }
+    return handle.join()
+}
+
+// `run`, going on until every task spawned has finished too.
+function runAll<Output>(future: Async<Output>) -> Output {
+    let handle = seyoul.executor.spawn(move future)
+    while !handle.isFinished() || seyoul.executor.pending() > 0 {
+        seyoul.executor.run()
+        if handle.isFinished() && seyoul.executor.pending() == 0 { break }
+        if !seyoul.turn() { runtimeTrap() }
+    }
+    return handle.join()
+}
+
+// Starts `future` as a task beside the caller. Await the handle for its
+// output, or `abort()` it.
+function spawn<Output>(future: Async<Output>) -> JoinHandle<Output> {
+    return seyoul.executor.spawn(move future)
+}
+
+// A word other threads take turns at: 0 free, 1 held. Held only for a few
+// loads and stores, so a waiter spins, offering the processor between
+// tries.
+function newSpinLock() -> RawPtr {
+    let lock = Heap.allocateRaw(8, 8)
+    atomicStore<U64>(lock, U64(0), .Relaxed)
+    return lock
+}
+
+function lockSpin(lock: RawPtr) {
+    while atomicExchange<U64>(lock, U64(1), .Acquire) != U64(0) {
+        while atomicLoad<U64>(lock, .Relaxed) != U64(0) { yieldThread() }
+    }
+}
+
+function unlockSpin(lock: RawPtr) {
+    atomicStore<U64>(lock, U64(0), .Release)
+}

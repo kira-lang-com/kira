@@ -1,0 +1,114 @@
+import Foundation
+
+// The math functions on `Number` compute in decimal and round once to eighteen
+// fractional digits, so each answer is the exact decimal printed here.
+
+@Test
+function numberSquareRootIsDecimal() {
+    let got = String(sqrt(Number(2))) + " " + String(sqrt(Number("0.0001")))
+    expect!(got == "1.414213562373095049 0.01")
+}
+
+@Test
+function numberTrigonometryIsDecimal() {
+    let got = String(sin(Number(1))) + " " + String(cos(Number(1))) + " " + String(
+            tan(Number("0.7853981633974483"))
+        )
+    expect!(got == "0.841470984807896507 0.540302305868139717 0.999999999999999981")
+}
+
+@Test
+function numberLargeAnglesReduceExactly() {
+    let got = String(sin(Number(1000000)))
+    expect!(got == "-0.349993502171292952")
+}
+
+@Test
+function numberInverseTrigonometryIsDecimal() {
+    let got = String(atan(Number(1))) + " " + String(asin(Number(1))) + " " + String(
+            acos(Number(1))
+        ) + " " + String(atan2(Number(1), Number(-1)))
+    expect!(got == "0.78539816339744831 1.570796326794896619 0 2.356194490192344929")
+}
+
+@Test
+function numberExponentialsAreDecimal() {
+    let got = String(exp(Number(1))) + " " + String(log(Number(2))) + " " + String(
+            log10(Number(1000))
+        ) + " " + String(log2(Number(8))) + " " + String(exp2(Number(10)))
+    expect!(got == "2.718281828459045235 0.693147180559945309 3 3 1024")
+}
+
+@Test
+function numberPowersAreExactForIntegerExponents() {
+    let got = String(pow(Number("1.1"), Number(2))) + " " + String(
+            pow(Number(2), Number(-2))
+        ) + " " + String(pow(Number(4), Number("0.5")))
+    expect!(got == "1.21 0.25 2")
+}
+
+@Test
+function numberRoundingIsExact() {
+    let got = String(floor(Number("-1.5"))) + " " + String(ceil(Number("-1.5"))) + " " + String(
+            round(Number("2.5"))
+        ) + " " + String(trunc(Number("-2.7"))) + " " + String(abs(Number("-0.5")))
+    expect!(got == "-2 -1 3 -2 0.5")
+}
+
+@Test
+function numberBinaryFunctionsAreExact() {
+    let got = String(min(Number("0.1"), Number("0.2"))) + " " + String(
+            max(Number("0.1"), Number("0.2"))
+        ) + " " + String(hypot(Number(3), Number(4))) + " " + String(
+            copysign(Number("1.5"), Number(-2))
+        ) + " " + String(fmod(Number("-5.5"), Number(2)))
+    expect!(got == "0.1 0.2 5 -1.5 -1.5")
+}
+
+@Test
+function numberHyperbolicAndRoots() {
+    let got = String(sinh(Number(0))) + " " + String(cosh(Number(0))) + " " + String(
+            tanh(Number(30))
+        ) + " " + String(cbrt(Number(-8)))
+    expect!(got == "0 1 1 -2")
+}
+
+@Test
+function numberClampAndLerp() {
+    let got = String(clamp(Number("1.5"), Number(0), Number(1))) + " " + String(
+            lerp(Number(0), Number(10), Number("0.25"))
+        )
+    expect!(got == "1 2.5")
+}
+
+@Test
+function numberMantissaIsAFullWord() {
+    let largest: Number = 9223372036854775807
+    let tiny: Number = 0.000000000000000001
+    let got = String(largest) + " " + String(tiny * Number(1000000000000000000)) + " " + String(
+        Number("-9223372036854775808")
+    )
+    expect!(got == "9223372036854775807 1 -9223372036854775808")
+}
+
+// `parseNumber` reads the text `Number(text)` reads, and answers `.None`
+// where `Number(text)` would trap.
+@Test
+function parseNumberReadsOrDeclines() {
+    let read = parseNumber("-12.5")
+    let declined = parseNumber("12x")
+    let empty = parseNumber("")
+    let got = traceText(read) + " " + traceText(declined) + " " + traceText(empty)
+    expect!(got == "Some(-12.5) None None")
+}
+
+// A mantissa past `Int` keeps its sign in the 65th bit, not in the first word's.
+@Test
+function numberAbsoluteValueOfAnExtendedMantissa() {
+    let past = Number("99.08256880733944954")
+    let below = 0 - past
+    let got = String(abs(past)) + " " + String(abs(below)) + " " + String(
+        copysign(Number(2), past)
+    ) + " " + String(copysign(Number(2), below))
+    expect!(got == "99.08256880733944954 99.08256880733944954 2 -2")
+}

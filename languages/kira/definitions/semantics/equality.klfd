@@ -1,0 +1,66 @@
+// Structural equality. `==` and `!=` compare two structs field by field, two
+// arrays by length and then element by element, and two enums by variant and
+// then payload, down to the scalars, strings and pointer words at the leaves.
+// No declaration opts a type in: it compares once every leaf does. A leaf with
+// no equality of its own, such as a task, native state, a closure, a type
+// descriptor or C storage, refuses the comparison rather than letting it
+// compare by identity.
+
+// The leaf that keeps values of `valueType` from comparing, or nothing when
+// every leaf compares. `visiting` holds the aggregates being walked, so a
+// recursive type is walked once.
+function equalityLeaf(program: CheckedProgram, declarations: Declarations, valueType: Type, visiting: [Int]) -> Optional<Type> {
+    match valueType.kind {
+        Integer -> return .None
+        Decimal -> return .None
+        Floating -> return .None
+        Boolean -> return .None
+        Pointer -> return .None
+        Void -> return .None
+        Invalid -> return .None
+        Enumeration -> {
+            let key = program.structs.count + valueType.declaration
+            if contains(visiting, key) { return .None }
+            var walked = visiting
+            walked.append(key)
+            for variant in program.enums[valueType.declaration].variants {
+                match variant.payload {
+                    Some(payload) -> {
+                        let leaf = equalityLeaf(program, declarations, payload, walked)
+                        if leaf.isSome() { return leaf }
+                    }
+                    None -> {}
+                }
+            }
+            return .None
+        }
+        Structure -> return structEqualityLeaf(program, declarations, valueType, visiting)
+    }
+}
+
+function structEqualityLeaf(program: CheckedProgram, declarations: Declarations, valueType: Type, visiting: [Int]) -> Optional<Type> {
+    if contains(visiting, valueType.declaration) { return .None }
+    if isStringType(program, valueType) || isAnyType(program, valueType) || isClassType(program, valueType) || isDistinctType(program, valueType) {
+        return .None
+    }
+    let declared = program.structs[valueType.declaration]
+    if isTaskType(program, valueType) || isClosureType(program, valueType) || isWitnessedType(program, valueType) || isDescriptorType(declarations, valueType) || declared.genericBase == "NativeState" {
+        return .Some(valueType)
+    }
+    match declared.shape {
+        Plain -> {}
+        CPointer -> return .None
+        Callback -> return .Some(valueType)
+        CLayout -> return .Some(valueType)
+        CUnion -> return .Some(valueType)
+        CArray -> return .Some(valueType)
+    }
+    var walked = visiting
+    walked.append(valueType.declaration)
+    if isArrayType(program, valueType) { return equalityLeaf(program, declarations, declared.typeArguments[0], walked) }
+    for index in 0..comparedFields(program, valueType) {
+        let leaf = equalityLeaf(program, declarations, declared.fields[index].valueType, walked)
+        if leaf.isSome() { return leaf }
+    }
+    return .None
+}

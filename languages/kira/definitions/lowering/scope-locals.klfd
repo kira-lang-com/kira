@@ -1,0 +1,56 @@
+extend CheckedStatement {
+    function declaredLocal(borrow self) -> Optional<Int> {
+        match self {
+            Declare(local, value) -> return .Some(local)
+            InitializeGlobal -> return .None
+            Assign -> return .None
+            Evaluate -> return .None
+            Branch -> return .None
+            Loop -> return .None
+            Count -> return .None
+            Iterate -> return .None
+            Dispatch -> return .None
+            Attempt -> return .None
+            Return -> return .None
+            Break -> return .None
+            Continue -> return .None
+        }
+    }
+}
+
+struct LifetimeScope {
+    var locals: [Int]
+    let firstTemporary: Int
+}
+
+extend FunctionLowering {
+    function cleanupLifetimeScope(borrow mut self, scope: LifetimeScope) {
+        for offset in 0..scope.locals.count {
+            let local = scope.locals[scope.locals.count - offset - 1]
+            if !checked.locals[local].cell { releaseTracked(storage[local]) }
+        }
+        for offset in 0..(lifetimes.count - scope.firstTemporary) {
+            destroyTracked(lifetimes[lifetimes.count - offset - 1])
+        }
+    }
+
+    // Drops the scope at `scope` and every scope inside it.
+    function popLifetimeScope(borrow mut self, scope: Int) {
+        var outer: [LifetimeScope] = []
+        for index in 0..scope { outer.append(lifetimeScopes[index]) }
+        lifetimeScopes = outer
+    }
+
+    function cleanupLoopScopes(borrow mut self) {
+        let first = loopScopeDepths[loopScopeDepths.count - 1]
+        for offset in 0..(lifetimeScopes.count - first) {
+            cleanupLifetimeScope(lifetimeScopes[lifetimeScopes.count - offset - 1])
+        }
+    }
+
+    function popLoopScope(borrow mut self) {
+        var outer: [Int] = []
+        for index in 0..(loopScopeDepths.count - 1) { outer.append(loopScopeDepths[index]) }
+        loopScopeDepths = outer
+    }
+}

@@ -1,0 +1,200 @@
+// The entry interface: `in` and `out` variables at their locations, `gl_*`
+// built-ins, and the `main` that gathers the entry's arguments, calls it,
+// and scatters its result.
+
+function locationName(direction: String, location: Int) -> String {
+    return joinText(["_ksir_", direction, "_loc", decimalText(location)])
+}
+
+function builtinInput(builtin: String) -> String {
+    match builtin {
+        "position" -> return "gl_FragCoord"
+        "vertex_index" -> return "uint(gl_VertexID)"
+        "instance_index" -> return "uint(gl_InstanceID)"
+        "front_facing" -> return "gl_FrontFacing"
+        "sample_index" -> return "uint(gl_SampleID)"
+        "sample_mask" -> return "uint(gl_SampleMaskIn[0])"
+        "global_invocation_id" -> return "gl_GlobalInvocationID"
+        "local_invocation_id" -> return "gl_LocalInvocationID"
+        "local_invocation_index" -> return "gl_LocalInvocationIndex"
+        "workgroup_id" -> return "gl_WorkGroupID"
+        "num_workgroups" -> return "gl_NumWorkGroups"
+        else -> return typeFailure(joinText(["the ", builtin, " built-in as an input"]))
+    }
+}
+
+function builtinOutput(builtin: String, value: String) -> String {
+    match builtin {
+        "position" -> return joinText(["gl_Position = ", value, ";"])
+        "frag_depth" -> return joinText(["gl_FragDepth = ", value, ";"])
+        "sample_mask" -> return joinText(["gl_SampleMask[0] = int(", value, ");"])
+        else -> return typeFailure(joinText(["the ", builtin, " built-in as an output"]))
+    }
+}
+
+extend TextOut {
+    function interpolationQualifier(borrow self, leaf: Leaf, integer: Bool) -> String {
+        var pieces: [String] = []
+        let mode = leafText(leaf, "interpolation")
+        if mode == "flat" || (utf8Count(mode) == 0 && integer) {
+            pieces.append("flat ")
+        } else if mode == "linear" {
+            pieces.append("noperspective ")
+        }
+        let sampling = leafText(leaf, "sampling")
+        if sampling == "centroid" {
+            pieces.append("centroid ")
+        } else if sampling == "sample" {
+            pieces.append("sample ")
+        }
+        return joinText(pieces)
+    }
+
+    function entryHeader(borrow self) -> String {
+        var pieces: [String] = []
+        let functions = count("functions", -1)
+        for which in 0..functions {
+            let stage = text("functions", -1, which, "stage")
+            if isEntry(which) && stage == "compute" {
+                var values: [String] = []
+                for axis in 0..3 {
+                    var size = 1
+                    if fieldCount("functions", -1, which, "workgroup") == 3 {
+                        size = fieldItem("functions", -1, which, "workgroup", axis)
+                    }
+                    if size < 0 {
+                        refuseAt("a workgroup size from a kept override", "functions", -1, which)
+                        size = 1
+                    }
+                    values.append(decimalText(size))
+                }
+                pieces.append(joinText(["layout(local_size_x = ", values[0], ", local_size_y = ", values[1],
+                    ", local_size_z = ", values[2], ") in;\n\n"]))
+            } else if isEntry(which) && stage == "fragment" {
+                var position = false
+                for leaf in inputLeaves(which) {
+                    if leafBuiltin(leaf) == "position" { position = true }
+                }
+                if position { pieces.append("layout(origin_upper_left) in vec4 gl_FragCoord;\n\n") }
+                if textCount("functions", -1, which, "early_depth_test") > 0 {
+                    pieces.append("layout(early_fragment_tests) in;\n\n")
+                }
+            }
+        }
+        return joinText(pieces)
+    }
+
+    function interfaceDeclarations(borrow self) -> String {
+        var pieces: [String] = []
+        let functions = count("functions", -1)
+        for which in 0..functions {
+            if isEntry(which) {
+                let stage = text("functions", -1, which, "stage")
+                for leaf in inputLeaves(which) {
+                    if utf8Count(leafBuiltin(leaf)) == 0 {
+                        var qualifier = ""
+                        if stage == "fragment" {
+                            qualifier = interpolationQualifier(leaf, integerScalar(typeText(leaf.typeIndex, "scalar")))
+                        }
+                        let declared = declare(leaf.typeIndex, locationName("in", leafLocation(leaf)))
+                        pieces.append(joinText(["layout(location = ", decimalText(leafLocation(leaf)), ") ", qualifier,
+                            "in ", declared, ";\n"]))
+                    }
+                }
+                for leaf in resultLeaves(which) {
+                    if utf8Count(leafBuiltin(leaf)) == 0 {
+                        var qualifier = ""
+                        if stage == "vertex" {
+                            qualifier = interpolationQualifier(leaf, integerScalar(typeText(leaf.typeIndex, "scalar")))
+                        }
+                        var index = ""
+                        let source = leafField(leaf, "blend_src")
+                        if source >= 0 { index = joinText([", index = ", decimalText(source)]) }
+                        let declared = declare(leaf.typeIndex, locationName("out", leafLocation(leaf)))
+                        pieces.append(joinText(["layout(location = ", decimalText(leafLocation(leaf)), index, ") ",
+                            qualifier, "out ", declared, ";\n"]))
+                    }
+                }
+            }
+        }
+        if pieces.count > 0 { pieces.append("\n") }
+        return joinText(pieces)
+    }
+
+    function inputValue(borrow self, leaf: Leaf) -> String {
+        let builtin = leafBuiltin(leaf)
+        if utf8Count(builtin) == 0 { return locationName("in", leafLocation(leaf)) }
+        let value = builtinInput(builtin)
+        if failedText(value) {
+            refuse(failureText(value))
+            return ""
+        }
+        return value
+    }
+
+    function writeMain(borrow self, which: Int) {
+        var pieces: [String] = ["void main() {\n"]
+        var arguments: [String] = []
+        let argumentCount = count("arguments", which)
+        for argument in 0..argumentCount {
+            let argumentType = field("arguments", which, argument, "type")
+            let leaves = argumentLeaves(which, argument)
+            var value = ""
+            var kept = true
+            if bound("arguments", which, argument, "") {
+                if leaves.count > 0 { value = inputValue(leaves[0]) }
+            } else if typeKind(argumentType) != "struct" {
+                kept = false
+            } else {
+                var parts: [String] = []
+                let members = count("members", argumentType)
+                for member in 0..members {
+                    var found = -1
+                    for at in 0..leaves.count {
+                        if found < 0 && leaves[at].member == member { found = at }
+                    }
+                    if found >= 0 {
+                        parts.append(inputValue(leaves[found]))
+                    } else {
+                        var zero = zeroText(field("members", argumentType, member, "type"))
+                        if failedText(zero) { zero = "" }
+                        parts.append(zero)
+                    }
+                }
+                value = structValue(argumentType, parts)
+            }
+            if kept {
+                let name = joinText(["_ksir_arg", decimalText(argument)])
+                let declared = declare(argumentType, name)
+                pieces.append(joinText(["    ", declared, " = ", value, ";\n"]))
+                arguments.append(name)
+            }
+        }
+        let call = joinText([entryNames[entryIndex(which)], "(", joinWith(arguments, ", "), ")"])
+        let resultIndex = field("functions", -1, which, "result")
+        if resultIndex < 0 {
+            pieces.append(joinText(["    ", call, ";\n"]))
+        } else {
+            let declared = declare(resultIndex, "_ksir_result")
+            pieces.append(joinText(["    ", declared, " = ", call, ";\n"]))
+            for leaf in resultLeaves(which) {
+                var value = "_ksir_result"
+                if leaf.member >= 0 { value = joinText(["_ksir_result.", memberName(resultIndex, leaf.member)]) }
+                let builtin = leafBuiltin(leaf)
+                var written = ""
+                if utf8Count(builtin) > 0 {
+                    written = builtinOutput(builtin, value)
+                } else {
+                    written = joinText([locationName("out", leafLocation(leaf)), " = ", value, ";"])
+                }
+                if failedText(written) {
+                    refuseAt(failureText(written), "functions", -1, which)
+                } else {
+                    pieces.append(joinText(["    ", written, "\n"]))
+                }
+            }
+        }
+        pieces.append("}\n\n")
+        write(joinText(pieces))
+    }
+}

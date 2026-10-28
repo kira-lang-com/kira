@@ -1,0 +1,31 @@
+import Foundation
+
+var invocations: Int = 0
+var argumentsEvaluated: Int = 0
+
+function argument(value: Int) -> Int {
+    argumentsEvaluated = argumentsEvaluated + 1
+    return value
+}
+
+async function sum(left: Int, right: Int) -> Int {
+    invocations = invocations + 1
+    return left + right
+}
+
+async function noResult(value: Int) {
+    invocations = invocations + 1
+}
+
+@Main
+function main() -> Int {
+    let joined = Task { sum(argument(19), argument(23)) }
+    let cancelled = Task { sum(1, 1) }
+    cancelled.requestCancel()
+    if invocations != 0 || argumentsEvaluated != 2 { return 0 }
+    let result = joined.await
+    let detached = Task { noResult(5) }
+    detached.detach()
+    let ready = Task { 41 }
+    return result + ready.await + invocations + argumentsEvaluated
+}

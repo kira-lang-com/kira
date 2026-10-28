@@ -1,0 +1,376 @@
+// Streams on a connection: opening, reading and writing them, the frames
+// that change them, and the flow control credit both ways.
+
+// Why a stream operation is refused.
+enum QuicStreamProblem {
+    // The peer allows no more streams of this kind yet.
+    Blocked
+    UnknownStream
+    // This side cannot send on it, or already finished or reset it.
+    NotWritable
+    NotReadable
+    ConnectionClosed
+}
+
+// What `read` gave: the bytes in order, and whether the stream's end came.
+struct QuicStreamRead {
+    let data: [UN8]
+    let finished: Bool
+}
+
+extend QuicConnection {
+    function streamIndex(borrow self, id: QuicStreamNumber) -> Number? {
+        for (index, stream) in streams.enumerated() {
+            if stream.id == id { return .Some(Number(index)) }
+        }
+        return .None
+    }
+
+    function initialSendLimit(borrow self, id: QuicStreamNumber) -> Number {
+        let parameters = match peerParameters {
+            Some(value) -> value
+            None -> return 0
+        }
+        if id.kind() == .Unidirectional { return parameters.initialMaxStreamDataUni }
+        // The peer's "local" limit is for streams it opened.
+        return id.openedBy() == role ? parameters.initialMaxStreamDataBidiRemote : parameters.initialMaxStreamDataBidiLocal
+    }
+
+    function newStream(borrow self, id: QuicStreamNumber) -> QuicStream {
+        let window = Number(limits.streamData)
+        var stream = QuicStream { id: id, receiveLimit: window, receiveWindow: window }
+        stream.sending.limit = initialSendLimit(id)
+        return stream
+    }
+
+    function openStream(
+        borrow mut self,
+        kind: QuicStreamKind
+    ) -> Result<QuicStreamNumber, QuicStreamProblem> {
+        if state != .Connected { return .Error(.ConnectionClosed) }
+        var counts = kind == .Bidirectional ? copy bidirectional : copy unidirectional
+        if counts.opened >= counts.peerAllows { return .Error(.Blocked) }
+        let id = quicStreamId(counts.opened, kind, role)
+        counts.opened += 1
+        storeCounts(kind, move counts)
+        streams.append(newStream(id))
+        return .Ok(id)
+    }
+
+    function storeCounts(borrow mut self, kind: QuicStreamKind, counts: QuicStreamCounts) {
+        match kind {
+            Bidirectional -> bidirectional = counts
+            Unidirectional -> unidirectional = counts
+        }
+    }
+
+    // The stream a peer's frame names, opened along with every lower one of
+    // its kind (RFC 9000 section 3.2).
+    function peerStream(
+        borrow mut self,
+        id: QuicStreamNumber
+    ) -> Result<Number?, QuicTransportError> {
+        match streamIndex(id) {
+            Some(index) -> return .Ok(.Some(index))
+            None -> {}
+        }
+        let kind = id.kind()
+        var counts = kind == .Bidirectional ? copy bidirectional : copy unidirectional
+        if id.openedBy() == role {
+            // A stream of ours that is gone, or one never opened.
+            if id.index() >= counts.opened { return .Error(.StreamStateError) }
+            return .Ok(.None)
+        }
+        if id.index() < counts.accepted { return .Ok(.None) }
+        if id.index() >= counts.allowed { return .Error(.StreamLimitError) }
+        while counts.accepted <= id.index() {
+            let opened = quicStreamId(counts.accepted, kind, id.openedBy())
+            streams.append(newStream(opened))
+            events.append(.StreamOpened(opened))
+            counts.accepted += 1
+        }
+        storeCounts(kind, move counts)
+        return .Ok(streamIndex(id))
+    }
+
+    function takeStream(
+        borrow mut self,
+        frame: borrow QuicStreamFrame
+    ) -> Result<Void, QuicTransportError> {
+        let found = try peerStream(frame.id)
+        let index = match found {
+            Some(value) -> value
+            None -> return .Ok
+        }
+        var stream = copy streams[index]
+        if !stream.receives(role) { return .Error(.StreamStateError) }
+        let before = stream.incoming.highest()
+        try stream.take(frame)
+        // A reset already counted the stream up to its final size.
+        if stream.peerReset.isNone() {
+            received += max(stream.incoming.highest() - before, 0)
+        }
+        if received > receiveLimit { return .Error(.FlowControlError) }
+        streams[index] = stream
+        events.append(.StreamReadable(frame.id))
+        return .Ok
+    }
+
+    function takeReset(
+        borrow mut self,
+        reset: borrow QuicResetStreamFrame
+    ) -> Result<Void, QuicTransportError> {
+        let found = try peerStream(reset.id)
+        let index = match found {
+            Some(value) -> value
+            None -> return .Ok
+        }
+        var stream = copy streams[index]
+        if !stream.receives(role) { return .Error(.StreamStateError) }
+        if reset.finalSize < stream.incoming.highest() { return .Error(.FinalSizeError) }
+        match stream.incoming.finalSize {
+            Some(size) -> if size != reset.finalSize { return .Error(.FinalSizeError) }
+            None -> {}
+        }
+        match stream.peerReset {
+            // A later reset may lower the reliable size, never raise it, and
+            // must keep the error and final size (draft section 5.2).
+            Some(earlier) -> {
+                if earlier.finalSize != reset.finalSize { return .Error(.FinalSizeError) }
+                if earlier.error != reset.error { return .Error(.StreamStateError) }
+                if reset.reliableSize < earlier.reliableSize {
+                    stream.peerReset = .Some(copy reset)
+                }
+            }
+            None -> {
+                if reset.finalSize > stream.receiveLimit { return .Error(.FlowControlError) }
+                received += reset.finalSize - stream.incoming.highest()
+                if received > receiveLimit { return .Error(.FlowControlError) }
+                stream.peerReset = .Some(copy reset)
+            }
+        }
+        streams[index] = stream
+        announceReset(index)
+        return .Ok
+    }
+
+    // Reports the peer's reset on stream `index` once the bytes it still
+    // delivers were read.
+    function announceReset(borrow mut self, index: Number) {
+        let reset = match streams[index].peerReset {
+            Some(value) -> value
+            None -> return
+        }
+        if streams[index].resetAnnounced || streams[index].incoming.delivered < reset.reliableSize {
+            return
+        }
+        streams[index].resetAnnounced = true
+        events.append(.StreamReset(QuicStreamFailure { id: reset.id, error: reset.error }))
+    }
+
+    function takeStop(
+        borrow mut self,
+        stop: borrow QuicStopSendingFrame
+    ) -> Result<Void, QuicTransportError> {
+        let found = try peerStream(stop.id)
+        let index = match found {
+            Some(value) -> value
+            None -> return .Ok
+        }
+        var stream = copy streams[index]
+        if !stream.sends(role) { return .Error(.StreamStateError) }
+        stream.peerStopped = .Some(stop.error)
+        streams[index] = stream
+        events.append(.StreamStopped(QuicStreamFailure { id: stop.id, error: stop.error }))
+        // A stopped stream is reset with the error the peer gave (RFC 9000
+        // section 3.5).
+        match resetStream(stop.id, stop.error) {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+        return .Ok
+    }
+
+    function takeCredit(
+        borrow mut self,
+        credit: borrow QuicStreamCredit
+    ) -> Result<Void, QuicTransportError> {
+        let found = try peerStream(credit.id)
+        let index = match found {
+            Some(value) -> value
+            None -> return .Ok
+        }
+        var stream = copy streams[index]
+        if !stream.sends(role) { return .Error(.StreamStateError) }
+        stream.sending.limit = max(stream.sending.limit, credit.maximum)
+        streams[index] = stream
+        return .Ok
+    }
+
+    function takeStreamCount(borrow mut self, count: borrow QuicStreamCount) {
+        match count.kind {
+            Bidirectional -> bidirectional.peerAllows = max(bidirectional.peerAllows, count.maximum)
+            Unidirectional -> unidirectional.peerAllows = max(
+                unidirectional.peerAllows,
+                count.maximum
+            )
+        }
+    }
+
+    // Queues `data` on stream `id`, and its end when `finish` is set.
+    function write(
+        borrow mut self,
+        id: QuicStreamNumber,
+        data: borrow [UN8],
+        finish: Bool
+    ) -> Result<Void, QuicStreamProblem> {
+        if state != .Connected { return .Error(.ConnectionClosed) }
+        let index = match streamIndex(id) {
+            Some(value) -> value
+            None -> return .Error(.UnknownStream)
+        }
+        var stream = copy streams[index]
+        if !stream.sends(role) || stream.sending.finQueued || stream.sending.resetError.isSome() {
+            return .Error(.NotWritable)
+        }
+        if data.count > 0 {
+            stream.sending.queued.append(
+                QuicPiece { offset: stream.sending.offset, data: copy data }
+            )
+            stream.sending.offset += data.count
+        }
+        stream.sending.finQueued = finish
+        streams[index] = stream
+        return .Ok
+    }
+
+    // What arrived in order on stream `id`, crediting the peer for it.
+    function read(
+        borrow mut self,
+        id: QuicStreamNumber
+    ) -> Result<QuicStreamRead, QuicStreamProblem> {
+        let index = match streamIndex(id) {
+            Some(value) -> value
+            None -> return .Error(.UnknownStream)
+        }
+        var stream = copy streams[index]
+        if !stream.receives(role) { return .Error(.NotReadable) }
+        let data = stream.incoming.read()
+        consumed += data.count
+        match stream.creditUpdate() {
+            Some(maximum) -> control.append(
+                .MaxStreamData(QuicStreamCredit { id: id, maximum: maximum })
+            )
+            None -> {}
+        }
+        let finished = stream.incoming.isFinished()
+        if finished { stream.announcedEnd = true }
+        streams[index] = stream
+        announceReset(index)
+        creditConnection()
+        return .Ok(QuicStreamRead { data: data, finished: finished })
+    }
+
+    function creditConnection(borrow mut self) {
+        let window = Number(limits.connectionData)
+        if receiveLimit - consumed > trunc(window / 2) { return }
+        receiveLimit = consumed + window
+        control.append(.MaxData(receiveLimit))
+    }
+
+    function resetStream(
+        borrow mut self,
+        id: QuicStreamNumber,
+        error: Number
+    ) -> Result<Void, QuicStreamProblem> {
+        return resetStreamAt(id, error, 0)
+    }
+
+    // Resets stream `id` and still delivers its first `reliable` bytes,
+    // sending them and resending them until acknowledged
+    // (draft-ietf-quic-reliable-stream-reset section 5). Above zero it
+    // needs a peer that announced reset_stream_at; without one it is
+    // refused as `NotWritable`.
+    function resetStreamAt(
+        borrow mut self,
+        id: QuicStreamNumber,
+        error: Number,
+        reliable: Number
+    ) -> Result<Void, QuicStreamProblem> {
+        let index = match streamIndex(id) {
+            Some(value) -> value
+            None -> return .Error(.UnknownStream)
+        }
+        let understood = match peerParameters {
+            Some(parameters) -> parameters.resetStreamAt
+            None -> false
+        }
+        var stream = copy streams[index]
+        if !stream.sends(role) || stream.sending.resetError.isSome() { return .Error(.NotWritable) }
+        if reliable > 0 && !understood { return .Error(.NotWritable) }
+        let kept = min(reliable, stream.sending.offset)
+        stream.sending.resetError = .Some(error)
+        stream.sending.reliableSize = kept
+        stream.sending.queued = quicPiecesBelow(stream.sending.queued, kept)
+        // Bytes never sent do not count: the final size stays within the
+        // credit the peer gave, unless reliable bytes still go.
+        let finalSize = max(stream.sending.sentHighest, kept)
+        streams[index] = stream
+        control.append(
+            .ResetStream(
+                QuicResetStreamFrame {
+                    id: id,
+                    error: error,
+                    finalSize: finalSize,
+                    reliableSize: kept
+                }
+            )
+        )
+        return .Ok
+    }
+
+    function stopSending(
+        borrow mut self,
+        id: QuicStreamNumber,
+        error: Number
+    ) -> Result<Void, QuicStreamProblem> {
+        let index = match streamIndex(id) {
+            Some(value) -> value
+            None -> return .Error(.UnknownStream)
+        }
+        if !streams[index].receives(role) { return .Error(.NotReadable) }
+        control.append(.StopSending(QuicStopSendingFrame { id: id, error: error }))
+        return .Ok
+    }
+
+    // An unreliable datagram (RFC 9221), if the peer takes them and it fits.
+    function sendDatagram(borrow mut self, data: borrow [UN8]) -> Result<Void, QuicStreamProblem> {
+        let room = match peerParameters {
+            Some(parameters) -> parameters.maxDatagramFrameSize
+            None -> 0
+        }
+        if state != .Connected || data.count + 1 + wireVarintSize(data.count) > room {
+            return .Error(.NotWritable)
+        }
+        datagramsOut.append(copy data)
+        return .Ok
+    }
+
+    // Streams both sides are done with leave the table; the peer's are
+    // replaced by new credit for its kind (RFC 9000 section 4.6).
+    function retireStreams(borrow mut self) {
+        var kept: [QuicStream] = []
+        for stream in streams {
+            if !stream.isClosed(role) {
+                kept.append(stream)
+            } else if stream.id.openedBy() != role {
+                let kind = stream.id.kind()
+                var counts = kind == .Bidirectional ? copy bidirectional : copy unidirectional
+                counts.allowed += 1
+                control.append(.MaxStreams(QuicStreamCount { kind: kind, maximum: counts.allowed }))
+                storeCounts(kind, move counts)
+            }
+        }
+        streams = kept
+    }
+}

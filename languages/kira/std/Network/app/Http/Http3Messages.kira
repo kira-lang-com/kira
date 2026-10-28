@@ -1,0 +1,188 @@
+import Foundation
+
+// Message heads to and from field lines: pseudo-header fields become the
+// typed members, and a head that breaks RFC 9114 sections 4.2 and 4.3 is
+// malformed.
+
+namespace Pseudo {
+    let method: String = ":method"
+    let scheme: String = ":scheme"
+    let authority: String = ":authority"
+    let path: String = ":path"
+    let status: String = ":status"
+    let protocolName: String = ":protocol"
+    // Fields that only mean something to one HTTP/1.1 connection (RFC 9114
+    // section 4.2).
+    let connectionFields: [String] = ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"]
+}
+
+function requestLines(head: borrow RequestHead) -> Result<[Field], Http3Error> {
+    let token = match methodToken(head.method) {
+        Some(value) -> value
+        None -> return .Error(.MessageError)
+    }
+    var lines = [Field { name: Pseudo.method, value: token }]
+    lines.append(Field { name: Pseudo.scheme, value: copy head.target.scheme })
+    lines.append(Field { name: Pseudo.authority, value: copy head.target.authority })
+    // A plain CONNECT names only the authority; an extended one names its
+    // protocol and a path as well (RFC 9220 section 3).
+    match head.protocolName {
+        Some(name) -> {
+            if head.method != .Connect { return .Error(.MessageError) }
+            lines.append(Field { name: Pseudo.protocolName, value: copy name })
+            lines.append(Field { name: Pseudo.path, value: copy head.target.path })
+        }
+        None -> if head.method != .Connect {
+            lines.append(Field { name: Pseudo.path, value: copy head.target.path })
+        }
+    }
+    try appendRegular(lines, head.fields)
+    return .Ok(lines)
+}
+
+function responseLines(head: borrow ResponseHead) -> Result<[Field], Http3Error> {
+    var lines = [Field { name: Pseudo.status, value: String(code(head.status)) }]
+    try appendRegular(lines, head.fields)
+    return .Ok(lines)
+}
+
+function appendRegular(
+    lines: borrow mut [Field],
+    fields: borrow Fields
+) -> Result<Void, Http3Error> {
+    for field in fields.entries {
+        try checkRegular(field)
+        lines.append(copy field)
+    }
+    return .Ok
+}
+
+function checkRegular(field: borrow Field) -> Result<Void, Http3Error> {
+    if field.name.count == 0 || field.name.startsWith(":") { return .Error(.MessageError) }
+    if field.name != field.name.lowercased() { return .Error(.MessageError) }
+    if Pseudo.connectionFields.contains(field.name) { return .Error(.MessageError) }
+    if field.name == "te" && field.value != "trailers" { return .Error(.MessageError) }
+    if field.value.contains("\r") || field.value.contains("\n") || field.value.contains("\0") {
+        return .Error(.MessageError)
+    }
+    return .Ok
+}
+
+// Field lines split into pseudo-header fields, which come first, and the
+// rest.
+struct SplitLines {
+    var pseudo: [Field] = []
+    var regular: Fields = Fields {}
+}
+
+function splitLines(lines: borrow [Field]) -> Result<SplitLines, Http3Error> {
+    var split = SplitLines {}
+    for line in lines {
+        if line.name.startsWith(":") {
+            if split.regular.entries.count > 0 { return .Error(.MessageError) }
+            for seen in split.pseudo {
+                if seen.name == line.name { return .Error(.MessageError) }
+            }
+            split.pseudo.append(copy line)
+        } else {
+            try checkRegular(line)
+            split.regular.entries.append(copy line)
+        }
+    }
+    return .Ok(split)
+}
+
+function pseudoValue(split: borrow SplitLines, name: borrow String) -> String? {
+    for field in split.pseudo {
+        if field.name == name { return .Some(copy field.value) }
+    }
+    return .None
+}
+
+function onlyPseudo(split: borrow SplitLines, allowed: borrow [String]) -> Bool {
+    for field in split.pseudo {
+        if !allowed.contains(field.name) { return false }
+    }
+    return true
+}
+
+function parseRequestHead(lines: borrow [Field]) -> Result<RequestHead, Http3Error> {
+    let split = try splitLines(lines)
+    let allowed = [Pseudo.method, Pseudo.scheme, Pseudo.authority, Pseudo.path, Pseudo.protocolName]
+    if !onlyPseudo(split, allowed) { return .Error(.MessageError) }
+    let token = match pseudoValue(split, Pseudo.method) {
+        Some(value) -> value
+        None -> return .Error(.MessageError)
+    }
+    let method = match methodFrom(token) {
+        Some(value) -> value
+        None -> return .Error(.MessageError)
+    }
+    let authority = match pseudoValue(split, Pseudo.authority) {
+        Some(value) -> value
+        None -> match split.regular.first("host") {
+            Some(host) -> host
+            None -> ""
+        }
+    }
+    let scheme = pseudoValue(split, Pseudo.scheme)
+    let path = pseudoValue(split, Pseudo.path)
+    // A plain CONNECT names only the authority; every other request names
+    // a scheme and a nonempty path (RFC 9114 section 4.3.1).
+    let protocolName = pseudoValue(split, Pseudo.protocolName)
+    // :protocol belongs to CONNECT alone (RFC 9220 section 3).
+    if protocolName.isSome() && method != .Connect { return .Error(.MessageError) }
+    let plainConnect = method == .Connect && protocolName.isNone()
+    if plainConnect {
+        if scheme.isSome() || path.isSome() || authority.count == 0 { return .Error(.MessageError) }
+    }
+    let target = Target {
+        scheme: match scheme {
+            Some(value) -> value
+            None -> ""
+        },
+        authority: authority,
+        path: match path {
+            Some(value) -> value
+            None -> ""
+        }
+    }
+    if !plainConnect && (target.scheme.count == 0 || target.path.count == 0) {
+        return .Error(.MessageError)
+    }
+    return .Ok(
+        RequestHead {
+            method: method,
+            target: target,
+            fields: split.regular,
+            protocolName: protocolName
+        }
+    )
+}
+
+function parseResponseHead(lines: borrow [Field]) -> Result<ResponseHead, Http3Error> {
+    let split = try splitLines(lines)
+    if !onlyPseudo(split, [Pseudo.status]) { return .Error(.MessageError) }
+    let text = match pseudoValue(split, Pseudo.status) {
+        Some(value) -> value
+        None -> return .Error(.MessageError)
+    }
+    // Exactly three digits (RFC 9110 section 15).
+    let bytes = text.utf8()
+    if bytes.count != StatusRange.digits { return .Error(.MessageError) }
+    var number: Number = 0
+    for byte in bytes {
+        let digit = Number(byte) - StatusRange.zero
+        if digit < 0 || digit >= StatusRange.radix { return .Error(.MessageError) }
+        number = number * StatusRange.radix + digit
+    }
+    if number < StatusRange.lowest || number > StatusRange.highest { return .Error(.MessageError) }
+    return .Ok(ResponseHead { status: fromCode<Status>(number), fields: split.regular })
+}
+
+// Trailers carry no pseudo-header fields (RFC 9114 section 4.3).
+function parseTrailers(lines: borrow [Field]) -> Result<Fields, Http3Error> {
+    let split = try splitLines(lines)
+    if split.pseudo.count > 0 { return .Error(.MessageError) }
+    return .Ok(split.regular)
+}

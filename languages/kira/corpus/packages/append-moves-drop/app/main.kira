@@ -1,0 +1,22 @@
+import Foundation
+import Heap
+
+// An element whose type drops moves into the array that appends it: the
+// block is freed once, when the array goes, not also after the append.
+struct Piece {
+    let address: U64
+    let bytes: ByteBlock
+}
+
+@Main
+function main() -> Int {
+    var pieces: [Piece] = []
+    let bytes = zeroedBlock(count: 4096, alignment: 16)
+    heapStore<U64>(bytes.pointer(), 0, U64(42))
+    pieces.append(Piece { address: U64(1), bytes: move bytes })
+    var blocks: [ByteBlock] = []
+    blocks.append(zeroedBlock(count: 64, alignment: 16))
+    var filler: [String] = []
+    for index in 0..64 { filler.append("line \(index)") }
+    return Number(heapLoad<U64>(pieces[0].bytes.pointer(), 0)) + blocks.count - 1
+}

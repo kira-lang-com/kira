@@ -1,0 +1,202 @@
+// The floating-point functions every target has: the kernel's `klf.math`
+// services answer them, numbered as the services number them.
+
+// The operations, as the `klf.math` services number them.
+enum MathOperation: Int {
+    Sqrt = 0
+    Sin = 1
+    Cos = 2
+    Tan = 3
+    Floor = 4
+    Ceil = 5
+    Abs = 6
+    Exp = 7
+    Log = 8
+    Log2 = 9
+    Log10 = 10
+    Exp2 = 11
+    Round = 12
+    Trunc = 13
+    Asin = 14
+    Acos = 15
+    Atan = 16
+    Sinh = 17
+    Cosh = 18
+    Tanh = 19
+    Pow = 20
+    Atan2 = 21
+    Min = 22
+    Max = 23
+    Hypot = 24
+    Copysign = 25
+    Fmod = 26
+    Cbrt = 27
+}
+
+@Service("klfsvc_math_unary")
+function kernelMathUnary(operation: Int, value: U64) -> U64
+
+@Service("klfsvc_math_binary")
+function kernelMathBinary(operation: Int, left: U64, right: U64) -> U64
+
+function mathUnary(operation: MathOperation, value: Float) -> Float {
+    return bitsToFloat(kernelMathUnary(code(operation), floatToBits(value)))
+}
+
+function mathBinary(operation: MathOperation, left: Float, right: Float) -> Float {
+    return bitsToFloat(kernelMathBinary(code(operation), floatToBits(left), floatToBits(right)))
+}
+
+function sqrt(value: Float) -> Float { return mathUnary(.Sqrt, value) }
+function sin(value: Float) -> Float { return mathUnary(.Sin, value) }
+function cos(value: Float) -> Float { return mathUnary(.Cos, value) }
+function tan(value: Float) -> Float { return mathUnary(.Tan, value) }
+function floor(value: Float) -> Float { return mathUnary(.Floor, value) }
+function ceil(value: Float) -> Float { return mathUnary(.Ceil, value) }
+function abs(value: Float) -> Float { return mathUnary(.Abs, value) }
+function exp(value: Float) -> Float { return mathUnary(.Exp, value) }
+function log(value: Float) -> Float { return mathUnary(.Log, value) }
+function log2(value: Float) -> Float { return mathUnary(.Log2, value) }
+function log10(value: Float) -> Float { return mathUnary(.Log10, value) }
+function exp2(value: Float) -> Float { return mathUnary(.Exp2, value) }
+function round(value: Float) -> Float { return mathUnary(.Round, value) }
+function trunc(value: Float) -> Float { return mathUnary(.Trunc, value) }
+function asin(value: Float) -> Float { return mathUnary(.Asin, value) }
+function acos(value: Float) -> Float { return mathUnary(.Acos, value) }
+function atan(value: Float) -> Float { return mathUnary(.Atan, value) }
+function sinh(value: Float) -> Float { return mathUnary(.Sinh, value) }
+function cosh(value: Float) -> Float { return mathUnary(.Cosh, value) }
+function tanh(value: Float) -> Float { return mathUnary(.Tanh, value) }
+function pow(base: Float, exponent: Float) -> Float { return mathBinary(.Pow, base, exponent) }
+function atan2(y: Float, x: Float) -> Float { return mathBinary(.Atan2, y, x) }
+// A NaN operand loses to a number.
+function min(left: Float, right: Float) -> Float { return mathBinary(.Min, left, right) }
+function max(left: Float, right: Float) -> Float { return mathBinary(.Max, left, right) }
+function hypot(x: Float, y: Float) -> Float { return mathBinary(.Hypot, x, y) }
+function copysign(magnitude: Float, sign: Float) -> Float {
+    return mathBinary(.Copysign, magnitude, sign)
+}
+// The remainder keeps the dividend's sign.
+function fmod(dividend: Float, divisor: Float) -> Float {
+    return mathBinary(.Fmod, dividend, divisor)
+}
+
+function cbrt(value: Float) -> Float { return mathUnary(.Cbrt, value) }
+
+function clamp(value: Float, lower: Float, upper: Float) -> Float {
+    return min(max(value, lower), upper)
+}
+
+function lerp(a: Float, b: Float, t: Float) -> Float { return a + (b - a) * t }
+
+// The same functions on `Number`, computed in decimal by the `klfsvc_number`
+// service, whose math operations are `NumberOperation.Math` plus `klf.math`'s
+// numbers. An
+// answer is rounded once to eighteen fractional digits; `floor`, `fmod` and
+// the like are exact.
+function numberMath(operation: MathOperation, value: Number) -> Number {
+    let words = numberWords(value)
+    let operationCode = code(NumberOperation.Math) + code(operation)
+    return numberAnswerOf(
+        kernelNumber(operationCode, words.mantissa, words.scale, 0, 0),
+        operationCode,
+        words,
+        NumberWords(0, 0)
+    )
+}
+
+// Which whole number a fraction goes to.
+enum Rounding {
+    Floor
+    Ceil
+    // Halfway cases go away from zero.
+    Round
+    Trunc
+}
+
+// `value` rounded to a whole number in word arithmetic: a whole number is
+// itself, and a fraction is its mantissa's quotient by ten to its scale, moved
+// one by the remainder's sign. Only an extended mantissa leaves a word.
+function numberRounded(rounding: Rounding, value: Number) -> Number {
+    let words = numberWords(value)
+    if words.scale == 0 { return value }
+    if words.scale > NumberWord.scale { return numberMath(mathOf(rounding), value) }
+    var divisor: Int = 1
+    for _ in 0..words.scale { divisor = divisor * 10 }
+    let quotient = words.mantissa / divisor
+    let remainder = words.mantissa % divisor
+    let step = match rounding {
+        Floor -> remainder < 0 ? -1 : 0
+        Ceil -> remainder > 0 ? 1 : 0
+        Round -> magnitude(remainder) * 2 >= divisor ? (remainder < 0 ? -1 : 1) : 0
+        Trunc -> 0
+    }
+    return numberFromWords(NumberWords(quotient + step, 0))
+}
+
+function mathOf(rounding: Rounding) -> MathOperation {
+    return match rounding {
+        Floor -> .Floor
+        Ceil -> .Ceil
+        Round -> .Round
+        Trunc -> .Trunc
+    }
+}
+
+function numberMath(operation: MathOperation, left: Number, right: Number) -> Number {
+    return numberService(code(NumberOperation.Math) + code(operation), left, right)
+}
+
+function sqrt(value: Number) -> Number { return numberMath(.Sqrt, value) }
+function sin(value: Number) -> Number { return numberMath(.Sin, value) }
+function cos(value: Number) -> Number { return numberMath(.Cos, value) }
+function tan(value: Number) -> Number { return numberMath(.Tan, value) }
+function floor(value: Number) -> Number { return numberRounded(.Floor, value) }
+function ceil(value: Number) -> Number { return numberRounded(.Ceil, value) }
+function abs(value: Number) -> Number {
+    if numberNegative(value) { return numberNegate(value) }
+    return value
+}
+function exp(value: Number) -> Number { return numberMath(.Exp, value) }
+function log(value: Number) -> Number { return numberMath(.Log, value) }
+function log2(value: Number) -> Number { return numberMath(.Log2, value) }
+function log10(value: Number) -> Number { return numberMath(.Log10, value) }
+function exp2(value: Number) -> Number { return numberMath(.Exp2, value) }
+function round(value: Number) -> Number { return numberRounded(.Round, value) }
+function trunc(value: Number) -> Number { return numberRounded(.Trunc, value) }
+function asin(value: Number) -> Number { return numberMath(.Asin, value) }
+function acos(value: Number) -> Number { return numberMath(.Acos, value) }
+function atan(value: Number) -> Number { return numberMath(.Atan, value) }
+function sinh(value: Number) -> Number { return numberMath(.Sinh, value) }
+function cosh(value: Number) -> Number { return numberMath(.Cosh, value) }
+function tanh(value: Number) -> Number { return numberMath(.Tanh, value) }
+function pow(base: Number, exponent: Number) -> Number { return numberMath(.Pow, base, exponent) }
+function atan2(y: Number, x: Number) -> Number { return numberMath(.Atan2, y, x) }
+function min(left: Number, right: Number) -> Number {
+    if numberOrder(right, left) < 0 { return right }
+    return left
+}
+function max(left: Number, right: Number) -> Number {
+    if numberOrder(right, left) > 0 { return right }
+    return left
+}
+function hypot(x: Number, y: Number) -> Number { return numberMath(.Hypot, x, y) }
+function copysign(magnitude: Number, sign: Number) -> Number {
+    let positive = abs(magnitude)
+    if numberNegative(sign) { return numberNegate(positive) }
+    return positive
+}
+// The remainder keeps the dividend's sign.
+function fmod(dividend: Number, divisor: Number) -> Number {
+    return numberMath(.Fmod, dividend, divisor)
+}
+function cbrt(value: Number) -> Number { return numberMath(.Cbrt, value) }
+
+function clamp(value: Number, lower: Number, upper: Number) -> Number {
+    return min(max(value, lower), upper)
+}
+
+function lerp(a: Number, b: Number, t: Number) -> Number { return a + (b - a) * t }
+
+// IEEE-754's positive infinity: every exponent bit set, no fraction.
+let infinity: Float = bitsToFloat(U64(0x7ff0000000000000))

@@ -1,0 +1,527 @@
+import Foundation
+
+// ColxAggregateTests.kira
+// Aggregate pipeline test suite. All new names use colxa / ColxA prefix.
+// Reuses colxSum, colxBuildRange, colxBuildSquares, colxBuildFib, ColxPt,
+// ColxGrid, ColxBox from ColxCollectionTests.kira (same package namespace).
+// ~72 tests (including ~10 trap tests).
+
+// ---------------------------------------------------------------------------
+// New struct types
+// ---------------------------------------------------------------------------
+
+struct ColxAStat {
+    var count: Int
+    var sum: Int
+    var minVal: Int
+    var maxVal: Int
+}
+
+struct ColxARow {
+    var vals: [Int]
+
+    function rowSum() -> Int {
+        var t = 0
+        for i in 0..self.vals.count {
+            t = t + self.vals[i]
+        }
+        return t
+    }
+
+    function rowCount() -> Int {
+        return self.vals.count
+    }
+}
+
+// ---------------------------------------------------------------------------
+// New helper functions
+// ---------------------------------------------------------------------------
+
+// Accumulate one value into a running stat.
+function colxaAccumStat(stat: borrow mut ColxAStat, val: Int) {
+    if stat.count == 0 {
+        stat.minVal = val
+        stat.maxVal = val
+    } else {
+        if val < stat.minVal {
+            stat.minVal = val
+        }
+        if val > stat.maxVal {
+            stat.maxVal = val
+        }
+    }
+    stat.count = stat.count + 1
+    stat.sum = stat.sum + val
+}
+
+// Build a stat from an array.
+function colxaStatFrom(xs: borrow [Int]) -> ColxAStat {
+    var count = 0
+    var sum = 0
+    var minVal = 0
+    var maxVal = 0
+    for i in 0..xs.count {
+        let v = xs[i]
+        if count == 0 {
+            minVal = v
+            maxVal = v
+        } else {
+            if v < minVal {
+                minVal = v
+            }
+            if v > maxVal {
+                maxVal = v
+            }
+        }
+        count = count + 1
+        sum = sum + v
+    }
+    return ColxAStat { count: count, sum: sum, minVal: minVal, maxVal: maxVal }
+}
+
+// Return a sorted copy using bubble sort.
+function colxaSorted(xs: borrow [Int]) -> [Int] {
+    var out: [Int] = []
+    for i in 0..xs.count {
+        out.append(xs[i])
+    }
+    var n = out.count
+    for p in 0..n {
+        for q in 0..(n - 1 - p) {
+            if out[q] > out[q + 1] {
+                let tmp = out[q]
+                out[q] = out[q + 1]
+                out[q + 1] = tmp
+            }
+        }
+    }
+    return out
+}
+
+// Filter: keep elements strictly greater than thresh.
+function colxaFilterGt(xs: borrow [Int], thresh: Int) -> [Int] {
+    var out: [Int] = []
+    for i in 0..xs.count {
+        if xs[i] > thresh {
+            out.append(xs[i])
+        }
+    }
+    return out
+}
+
+// Filter: keep elements strictly less than thresh.
+function colxaFilterLt(xs: borrow [Int], thresh: Int) -> [Int] {
+    var out: [Int] = []
+    for i in 0..xs.count {
+        if xs[i] < thresh {
+            out.append(xs[i])
+        }
+    }
+    return out
+}
+
+// Dot product of two equal-length arrays.
+function colxaDot(xs: borrow [Int], ys: borrow [Int]) -> Int {
+    var s = 0
+    for i in 0..xs.count {
+        s = s + xs[i] * ys[i]
+    }
+    return s
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 1 – Running statistics with ColxAStat
+// ---------------------------------------------------------------------------
+@Test
+function colxAStatSumRange10() {
+    let xs = colxBuildRange(10)
+    let st = colxaStatFrom(xs)
+    // [0..9] sum=45
+    expect!(st.sum == 45)
+}
+
+@Test
+function colxAStatCountRange10() {
+    let xs = colxBuildRange(10)
+    let st = colxaStatFrom(xs)
+    expect!(st.count == 10)
+}
+
+@Test
+function colxAStatMinRange10() {
+    let xs = colxBuildRange(10)
+    let st = colxaStatFrom(xs)
+    expect!(st.minVal == 0)
+}
+
+@Test
+function colxAStatMaxRange10() {
+    let xs = colxBuildRange(10)
+    let st = colxaStatFrom(xs)
+    expect!(st.maxVal == 9)
+}
+
+@Test
+function colxAStatSumPlusCountPlusMax() {
+    let xs = colxBuildRange(10)
+    let st = colxaStatFrom(xs)
+    // 45+10+9=64
+    expect!(st.sum + st.count + st.maxVal == 64)
+}
+
+@Test
+function colxAStatFromLiteral() {
+    var xs: [Int] = []
+    xs.append(3)
+    xs.append(1)
+    xs.append(4)
+    xs.append(1)
+    xs.append(5)
+    xs.append(9)
+    xs.append(2)
+    xs.append(6)
+    xs.append(5)
+    xs.append(3)
+    let st = colxaStatFrom(xs)
+    // [3,1,4,1,5,9,2,6,5,3] sum=39, min=1, max=9 -> 8
+    expect!(st.maxVal - st.minVal == 8)
+}
+
+@Test
+function colxAStatSumLiteral() {
+    var xs: [Int] = []
+    xs.append(3)
+    xs.append(1)
+    xs.append(4)
+    xs.append(1)
+    xs.append(5)
+    xs.append(9)
+    xs.append(2)
+    xs.append(6)
+    xs.append(5)
+    xs.append(3)
+    let st = colxaStatFrom(xs)
+    // 3+1+4+1+5+9+2+6+5+3 = 39
+    expect!(st.sum == 39)
+}
+
+@Test
+function colxAStatSingle() {
+    var xs: [Int] = []
+    xs.append(42)
+    let st = colxaStatFrom(xs)
+    // sum=42, count=1, min=42, max=42 -> 127
+    expect!(st.sum + st.count + st.minVal + st.maxVal == 127)
+}
+
+@Test
+function colxAStatRange20Sum() {
+    let xs = colxBuildRange(20)
+    let st = colxaStatFrom(xs)
+    // sum=190, count=20 -> 170
+    expect!(st.sum - st.count == 170)
+}
+
+@Test
+function colxAStatEvenOnly() {
+    var xs: [Int] = []
+    xs.append(2)
+    xs.append(4)
+    xs.append(6)
+    xs.append(8)
+    xs.append(10)
+    let st = colxaStatFrom(xs)
+    // sum=30, count=5, max=10, min=2 -> 30+5+10-2=43
+    expect!(st.sum + st.count + st.maxVal - st.minVal == 43)
+}
+
+@Test
+function colxAStatAccumLoop() {
+    var stat = ColxAStat { count: 0, sum: 0, minVal: 0, maxVal: 0 }
+    for i in 0..5 {
+        colxaAccumStat(stat, i * 2 + 1)
+    }
+    // values: 1,3,5,7,9 -> sum=25
+    expect!(stat.sum == 25)
+}
+
+@Test
+function colxAStatAccumMin() {
+    var stat = ColxAStat { count: 0, sum: 0, minVal: 0, maxVal: 0 }
+    colxaAccumStat(stat, 10)
+    colxaAccumStat(stat, 3)
+    colxaAccumStat(stat, 7)
+    colxaAccumStat(stat, 1)
+    colxaAccumStat(stat, 5)
+    expect!(stat.minVal == 1)
+}
+
+@Test
+function colxAStatAccumMax() {
+    var stat = ColxAStat { count: 0, sum: 0, minVal: 0, maxVal: 0 }
+    colxaAccumStat(stat, 10)
+    colxaAccumStat(stat, 3)
+    colxaAccumStat(stat, 7)
+    colxaAccumStat(stat, 1)
+    colxaAccumStat(stat, 5)
+    expect!(stat.maxVal == 10)
+}
+
+@Test
+function colxAStatFromSquares() {
+    let xs = colxBuildSquares(6)
+    let st = colxaStatFrom(xs)
+    // [0,1,4,9,16,25] -> max=25
+    expect!(st.maxVal == 25)
+}
+
+@Test
+function colxAStatChurn50() {
+    var grandSum = 0
+    for r in 0..50 {
+        let xs = colxBuildRange(r + 1)
+        let st = colxaStatFrom(xs)
+        grandSum = grandSum + st.sum
+    }
+    // sum(r*(r+1)/2 for r=0..49) = (sum r^2 + sum r)/2 = (40425 + 1225)/2 = 20825
+    expect!(grandSum == 20825)
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 2 – ColxARow
+// ---------------------------------------------------------------------------
+
+@Test
+function colxARowSum5() {
+    var vals: [Int] = []
+    vals.append(1)
+    vals.append(2)
+    vals.append(3)
+    vals.append(4)
+    vals.append(5)
+    let row = ColxARow { vals: move vals }
+    expect!(row.rowSum() == 15)
+}
+
+@Test
+function colxARowCount5() {
+    var vals: [Int] = []
+    vals.append(1)
+    vals.append(2)
+    vals.append(3)
+    vals.append(4)
+    vals.append(5)
+    let row = ColxARow { vals: move vals }
+    expect!(row.rowCount() == 5)
+}
+
+@Test
+function colxARowSumRange10() {
+    let vals = colxBuildRange(10)
+    let row = ColxARow { vals: move vals }
+    expect!(row.rowSum() == 45)
+}
+
+@Test
+function colxARowCountRange10() {
+    let vals = colxBuildRange(10)
+    let row = ColxARow { vals: move vals }
+    expect!(row.rowCount() == 10)
+}
+
+@Test
+function colxARowEmpty() {
+    let vals: [Int] = []
+    let row = ColxARow { vals: move vals }
+    expect!(row.rowSum() + row.rowCount() == 0)
+}
+
+@Test
+function colxARowMatrixTotalSum() {
+    // 5 rows of 4 cells: row r has cells r*4, r*4+1, r*4+2, r*4+3
+    var total = 0
+    for r in 0..5 {
+        var vals: [Int] = []
+        for c in 0..4 {
+            vals.append(r * 4 + c)
+        }
+        let row = ColxARow { vals: move vals }
+        total = total + row.rowSum()
+    }
+    // r=0:6, r=1:22, r=2:38, r=3:54, r=4:70 -> 190
+    expect!(total == 190)
+}
+
+@Test
+function colxARowMatrixRowCounts() {
+    var totalCells = 0
+    for r in 0..5 {
+        var vals: [Int] = []
+        for c in 0..(r + 1) {
+            vals.append(c)
+        }
+        let row = ColxARow { vals: move vals }
+        totalCells = totalCells + row.rowCount()
+    }
+    // row counts: 1+2+3+4+5=15
+    expect!(totalCells == 15)
+}
+
+@Test
+function colxARowSquaresSum() {
+    let vals = colxBuildSquares(5)
+    let row = ColxARow { vals: move vals }
+    // [0,1,4,9,16] -> 30
+    expect!(row.rowSum() == 30)
+}
+
+@Test
+function colxARowFibSum() {
+    let vals = colxBuildFib(8)
+    let row = ColxARow { vals: move vals }
+    // [0,1,1,2,3,5,8,13] -> 33
+    expect!(row.rowSum() == 33)
+}
+
+@Test
+function colxARowChurn30() {
+    var total = 0
+    for r in 0..30 {
+        let vals = colxBuildSquares(6)
+        let row = ColxARow { vals: move vals }
+        total = total + row.rowSum()
+    }
+    // squares(6)=[0,1,4,9,16,25] sum=55; 55*30=1650
+    expect!(total == 1650)
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 3 – Sorted arrays
+// ---------------------------------------------------------------------------
+
+@Test
+function colxASortedFirst() {
+    var xs: [Int] = []
+    xs.append(5)
+    xs.append(3)
+    xs.append(8)
+    xs.append(1)
+    xs.append(9)
+    xs.append(2)
+    xs.append(7)
+    xs.append(4)
+    xs.append(6)
+    let s = colxaSorted(xs)
+    expect!(s[0] == 1)
+}
+
+@Test
+function colxASortedLast() {
+    var xs: [Int] = []
+    xs.append(5)
+    xs.append(3)
+    xs.append(8)
+    xs.append(1)
+    xs.append(9)
+    xs.append(2)
+    xs.append(7)
+    xs.append(4)
+    xs.append(6)
+    let s = colxaSorted(xs)
+    expect!(s[8] == 9)
+}
+
+@Test
+function colxASortedSum() {
+    var xs: [Int] = []
+    xs.append(5)
+    xs.append(3)
+    xs.append(8)
+    xs.append(1)
+    xs.append(9)
+    xs.append(2)
+    xs.append(7)
+    xs.append(4)
+    xs.append(6)
+    let s = colxaSorted(xs)
+    // [1..9] sum=45
+    expect!(colxSum(s) == 45)
+}
+
+@Test
+function colxASortedDuplicates() {
+    var xs: [Int] = []
+    xs.append(7)
+    xs.append(7)
+    xs.append(3)
+    xs.append(7)
+    xs.append(3)
+    xs.append(1)
+    let s = colxaSorted(xs)
+    // sorted=[1,3,3,7,7,7] -> s[0]=1, s[5]=7 -> 8
+    expect!(s[0] + s[5] == 8)
+}
+
+@Test
+function colxASortedDuplicatesSum() {
+    var xs: [Int] = []
+    xs.append(7)
+    xs.append(7)
+    xs.append(3)
+    xs.append(7)
+    xs.append(3)
+    xs.append(1)
+    let s = colxaSorted(xs)
+    // 1+3+3+7+7+7=28
+    expect!(colxSum(s) == 28)
+}
+
+@Test
+function colxASortedTwo() {
+    var xs: [Int] = []
+    xs.append(100)
+    xs.append(1)
+    let s = colxaSorted(xs)
+    // sorted=[1,100] -> 1*1000+100=1100
+    expect!(s[0] * 1000 + s[1] == 1100)
+}
+
+@Test
+function colxASortedSingle() {
+    var xs: [Int] = []
+    xs.append(42)
+    let s = colxaSorted(xs)
+    expect!(s[0] == 42)
+}
+
+@Test
+function colxASortedAlreadySorted() {
+    let xs = colxBuildRange(8)
+    let s = colxaSorted(xs)
+    // [0,1,2,3,4,5,6,7] -> s[0]=0, s[7]=7 -> 7
+    expect!(s[0] + s[7] == 7)
+}
+
+@Test
+function colxASortedReverseInput() {
+    // Build [9,8,7,6,5,4,3,2,1,0]
+    var xs: [Int] = []
+    var i = 9
+    while i >= 0 {
+        xs.append(i)
+        i = i - 1
+    }
+    let s = colxaSorted(xs)
+    // sorted=[0..9], s[0]=0, s[9]=9 -> 9
+    expect!(s[0] + s[9] == 9)
+}
+
+@Test
+function colxASortedCount() {
+    var xs: [Int] = []
+    xs.append(3)
+    xs.append(1)
+    xs.append(4)
+    let s = colxaSorted(xs)
+    expect!(s.count == 3)
+}

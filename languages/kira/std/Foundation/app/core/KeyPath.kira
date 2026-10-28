@@ -1,0 +1,29 @@
+// A key path, `\Root.member` or `\.member`: the members a value of `Root` is
+// read through to reach a `Value`, as Swift's `KeyPath` is. Two key paths are
+// equal when they read the same members, which is how a sort comparator built
+// from one tells which column it sorts.
+//
+// Applying a key path reads its members from the root it is given:
+//
+//     let name = \Row.name
+//     name(row)
+//
+// Where a function is expected, a key path literal is the function reading
+// the value, as Swift's are (SE-0249): `rows.map(\.name)`.
+struct KeyPath<Root, Value> {
+    // The members it reads, in order: `name.count` for `\Row.name.count`.
+    let path: String
+    let read: (borrow Root) -> Value
+
+    // The same key path with its value type set aside.
+    function partial(borrow self) -> PartialKeyPath<Root> {
+        return PartialKeyPath<Root> { path: path }
+    }
+}
+
+// A key path whose value type is set aside, as Swift's `PartialKeyPath` is:
+// what a comparator keeps to name the members it compares by, whatever they
+// hold.
+struct PartialKeyPath<Root> {
+    let path: String
+}

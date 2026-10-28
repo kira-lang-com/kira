@@ -1,0 +1,261 @@
+// Kira types as KIR types.
+//
+// An integer is a KIR integer of its written width, and `Bool` is an `i1`. A
+// struct is a record laid out by the RIDL rule and an enum a RIDL enum, each
+// named by its declaration in the source, with its suffix when it has one: an
+// instance's, or a type another module's same-named one shadows. Every record and enum is declared
+// before any field or payload names one, so declaration order does not matter.
+
+struct KirTypes {
+    let module: KirModuleBuilder
+    let unit: KirType
+    let boolean: KirType
+    let pointer: KirType
+    let integer8: KirType
+    let integer16: KirType
+    let integer32: KirType
+    let integer64: KirType
+    let float32: KirType
+    let float64: KirType
+    var structs: [KirType]
+    var enums: [KirType]
+    var structSizes: [Int]
+    var enumSizes: [Int]
+    // Per enum and case, the size and alignment of a recursive case's heap
+    // cell, zero for a case kept in place.
+    var cellSizes: [[Int]]
+    var cellAlignments: [[Int]]
+    var arrayOpsGlobals: [KirGlobal]
+    var destructors: [KirFunctionBuilder]
+    var equalities: [KirFunctionBuilder]
+    // Per struct and enum, the function writing its values' trace text.
+    var tracers: [KirFunctionBuilder]
+    var orderings: [KirFunctionBuilder]
+    var hashers: [KirFunctionBuilder]
+    // Per enum, the function that copies a value of one with a recursive
+    // case, which an inline copy would expand without end.
+    var copiers: [Optional<KirFunctionBuilder>]
+    // The functions destroying and comparing the values an `Any` holds,
+    // this unit's first (`any-cases.klfd`).
+    var anyDestroyCases: [KirFunctionBuilder]
+    var anyEqualCases: [KirFunctionBuilder]
+    var closureThunks: [Optional<KirFunctionBuilder>]
+    var capturePayloadTypes: [Optional<KirType>]
+    var captureBoxTypes: [Optional<KirType>]
+    var captureBoxSizes: [Int]
+    var capturePayloadSizes: [Int]
+    var capturePayloadAlignments: [Int]
+    var captureDescriptors: [Optional<KirGlobal>]
+    var captureDrops: [Optional<KirFunctionBuilder>]
+    // The frame of each async function's resume function, lowered first.
+    var asyncFrames: [AsyncFrameLayout] = []
+    var captureCopies: [Optional<KirFunctionBuilder>]
+    var descriptorTypes: [KirType]
+    var globals: [KirGlobal]
+    var globalFlags: [KirGlobal]
+    // Destroys the initialized globals when the entry returns.
+    var globalTeardown: Optional<KirFunctionBuilder>
+    // Hands the kernel the program's `@AtExit` functions as the entry starts.
+    var exitRegistration: Optional<KirFunctionBuilder>
+    var opaqueClasses: [Bool]
+    // The structs that are classes, in declaration order.
+    var classIndices: [Int]
+    // Per function, the position among `classDispatchers` of the dispatcher
+    // a call through its class falls back on, or -1
+    // (`lowering/class-dispatch.klfd`).
+    var classDispatcherSlots: [Int] = []
+    var classDispatchers: [KirFunctionBuilder] = []
+    var classDescriptions: [Optional<PayloadDescription>]
+    // `klfsvc_io_write`, the platform output service, when the program prints.
+    var output: Optional<KirFunctionBuilder>
+    // `klfsvc_trap_operands`, which records the values a failed check names
+    // (`trap-reports.klfd`).
+    var trapOperands: Optional<KirFunctionBuilder> = .None
+    // `klfsvc_trap_text`, which records the text a failed check names.
+    var trapText: Optional<KirFunctionBuilder> = .None
+    // Per struct, the C image record it crosses the C seam as, and its size.
+    var images: [Optional<KirType>]
+    var imageSizes: [Int]
+    var imageAlignments: [Int]
+    // Per C image, the record field each member is, -1 for a bit-field, and
+    // each bit-field's offset in bits.
+    var imageFields: [[Int]]
+    var bitOffsets: [[Int]]
+    // Per `program.foreignCallbacks` entry, the adapter C calls.
+    var foreignEntries: [Optional<KirFunctionBuilder>]
+    var variadicCalls: [Optional<KirFunctionBuilder>]
+    // Per struct, whether its values are boxed as trait objects; per
+    // function, the witness table accessor a boxing function calls; and the
+    // function a witness call makes a box its own with (`witnesses.klfd`).
+    var witnessMembers: [Bool] = []
+    var witnessAccessors: [Optional<KirFunctionBuilder>] = []
+    var boxUnique: Optional<KirFunctionBuilder> = .None
+
+    function declare(builder: KirModuleBuilder, program: CheckedProgram) -> KirTypes {
+        var types = KirTypes {
+            module = builder,
+            unit = kir_type_unit(),
+            boolean = kir_type_integer(1),
+            pointer = kir_type_pointer(),
+            integer8 = kir_type_integer(8),
+            integer16 = kir_type_integer(16),
+            integer32 = kir_type_integer(32),
+            integer64 = kir_type_integer(64),
+            float32 = kir_type_float(32),
+            float64 = kir_type_float(64),
+            structs = [],
+            enums = [],
+            structSizes = [],
+            enumSizes = [],
+            cellSizes = [], cellAlignments = [],
+            arrayOpsGlobals = [],
+            destructors = [],
+            equalities = [],
+            tracers = [],
+            orderings = [],
+            hashers = [],
+            copiers = [],
+            anyDestroyCases = [],
+            anyEqualCases = [],
+            closureThunks = [],
+            capturePayloadTypes = [], captureBoxTypes = [], captureBoxSizes = [],
+            capturePayloadSizes = [], capturePayloadAlignments = [], captureDescriptors = [],
+            captureDrops = [], captureCopies = [], descriptorTypes = [], globals = [], globalFlags = [], globalTeardown = .None, exitRegistration = .None,
+            opaqueClasses = [], classIndices = [], classDescriptions = [], output = .None, images = [], imageSizes = [], imageAlignments = [], imageFields = [], bitOffsets = [], foreignEntries = [], variadicCalls = []
+        }
+        for structType in program.structs {
+            if structType.genericBase == "Class" { types.classIndices.append(types.opaqueClasses.count) }
+            types.opaqueClasses.append(structType.genericBase == "Class")
+            let name = program.named(structType.baseNameSpan)
+            if structType.specialized || structType.typeSuffix != 0 {
+                types.structs.append(builder.declareRecordSpecialization(name.start, name.end, ridlLayout, structType.typeSuffix))
+            } else {
+                types.structs.append(builder.declareRecord(name.start, name.end, ridlLayout))
+            }
+        }
+        for enumType in program.enums {
+            let name = program.named(enumType.baseNameSpan)
+            if enumType.existential && enumType.variants.count == 0 && !enumType.specialized {
+                // A trait no type of this unit conforms to, whose conformers
+                // another unit built apart may hold: with no case no value
+                // of it exists here, and a name of this unit's own keeps it
+                // from contradicting that unit's when the units merge.
+                types.enums.append(builder.declareEnumSpecialization(name.start, name.end, generatedSuffix(builder, "conformer-less trait", program.moduleName)))
+                continue
+            }
+            if enumType.specialized || enumType.typeSuffix != 0 {
+                types.enums.append(builder.declareEnumSpecialization(name.start, name.end, enumType.typeSuffix))
+            } else {
+                types.enums.append(builder.declareEnum(name.start, name.end))
+            }
+            if enumType.open { kir_type_enum_open(types.enums[types.enums.count - 1]) }
+        }
+        for index in 0..program.structs.count {
+            for field in program.structs[index].fields {
+                let name = program.named(field.name.span)
+                builder.addRecordField(types.structs[index], name.start, name.end, types.of(field.valueType))
+            }
+            if isUnionShape(program.structs[index].shape) { kir_type_record_union(types.structs[index]) }
+        }
+        for index in 0..program.enums.count {
+            let enumType = program.enums[index]
+            for number in 0..enumType.variants.count {
+                let variant = enumType.variants[number]
+                var payload = types.payload(variant)
+                if isRecursiveCase(program, index, number) { payload = types.pointer }
+                if enumType.existential {
+                    // A case per conforming type is spelled `[Int]` or
+                    // `Box<Int>`, so it takes its number for a name.
+                    let name = program.named(enumType.baseNameSpan)
+                    builder.addNumberedEnumCase(types.enums[index], name.start, name.end, number, payload)
+                } else {
+                    let name = program.named(variant.name.span)
+                    builder.addEnumCase(types.enums[index], name.start, name.end, payload)
+                }
+            }
+        }
+        for index in 0..program.enums.count {
+            var sizes: [Int] = []
+            var alignments: [Int] = []
+            for number in 0..program.enums[index].variants.count {
+                if isRecursiveCase(program, index, number) {
+                    let cell = types.payload(program.enums[index].variants[number])
+                    sizes.append(kir_type_size(builder, cell))
+                    alignments.append(kir_type_align(builder, cell))
+                } else {
+                    sizes.append(0)
+                    alignments.append(0)
+                }
+            }
+            types.cellSizes.append(sizes)
+            types.cellAlignments.append(alignments)
+        }
+        for record in types.structs {
+            types.structSizes.append(kir_type_size(builder, record))
+        }
+        for enumeration in types.enums {
+            types.enumSizes.append(kir_type_size(builder, enumeration))
+        }
+        return types
+    }
+
+    function of(borrow self, valueType: Type) -> KirType {
+        match valueType.kind {
+            Integer -> return integer(valueType.bits)
+            Decimal -> return integer(valueType.bits)
+            Floating -> {
+                if valueType.bits == 32 { return float32 }
+                return float64
+            }
+            Boolean -> return boolean
+            Pointer -> return pointer
+            Void -> return unit
+            Structure -> {
+                if opaqueClasses[valueType.declaration] { return pointer }
+                return structs[valueType.declaration]
+            }
+            Enumeration -> return enums[valueType.declaration]
+            Invalid -> return unit
+        }
+    }
+
+    function integer(borrow self, bits: Int) -> KirType {
+        if bits == 8 { return integer8 }
+        if bits == 16 { return integer16 }
+        if bits == 32 { return integer32 }
+        return integer64
+    }
+
+    function byteSize(borrow self, valueType: Type) -> Int {
+        match valueType.kind {
+            Integer -> return valueType.bits / 8
+            Decimal -> return valueType.bits / 8
+            Floating -> return valueType.bits / 8
+            Boolean -> return 1
+            Pointer -> return 8
+            Void -> return 0
+            Structure -> {
+                if opaqueClasses[valueType.declaration] { return 8 }
+                return structSizes[valueType.declaration]
+            }
+            Enumeration -> return enumSizes[valueType.declaration]
+            Invalid -> return 0
+        }
+    }
+
+    // What a variant carries; `unit` declares a variant that carries nothing.
+    function payload(borrow self, variant: Variant) -> KirType {
+        match variant.payload {
+            Some(payloadType) -> return of(payloadType)
+            None -> return unit
+        }
+    }
+
+    // A value passed by address: an aggregate, or anything `borrow mut`.
+    function address(borrow self, valueType: Type) -> KirType {
+        return kir_type_address(of(valueType))
+    }
+}
+
+// Layout rule 0 is RIDL's (section 27.3: a Kira struct is a RIDL nominal).
+let ridlLayout = 0

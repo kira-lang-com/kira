@@ -1,0 +1,29 @@
+// Fields are evaluated only when their event records, and a site at a quieter
+// level than anything prints or records costs one call.
+struct Tally {
+    var evaluated: Int = 0
+
+    function counted(borrow mut self, value: Int) -> Int {
+        self.evaluated = self.evaluated + 1
+        return value
+    }
+
+    function price(borrow mut self, count: Int) -> Int {
+        let unit = 12
+        log debug("pricing", count, unit)
+        log trace("never recorded", seen: self.counted(count))
+        return count * unit
+    }
+}
+
+@Main
+function main() -> Int {
+    let name = "hull"
+    var tally = Tally { evaluated: 0 }
+    log("starting", name)
+    var total = 0
+    for count in 1..4 { total = total + tally.price(count) }
+    log info("done", total, ratio: 0.5, open: false, first: tally.counted(1))
+    print(tally.evaluated)
+    return total
+}

@@ -1,0 +1,24 @@
+extend Parser {
+    function attemptStatement(borrow mut self) -> Result<Int, Failure> {
+        let start = try expect(.Attempt)
+        let body = try block()
+        if !atWord("handle") { return .Error(failure(.Expected)) }
+        advance()
+        try expect(.LeftBrace)
+        var arms: [MatchArm] = []
+        while !at(.RightBrace) {
+            let variant = try identifier(.ExpectedArmVariant)
+            var binding: Optional<Identifier> = .None
+            if eat(.LeftParen) {
+                binding = .Some(macroName(try identifier(.ExpectedPayloadBinding)))
+                try expect(.RightParen)
+            }
+            handling += 1
+            let handler = try block()
+            handling -= 1
+            arms.append(MatchArm { variant = variant, binding = binding, pattern = .Variant, alternatives = [], body = handledBody(variant, handler) })
+        }
+        try expect(.RightBrace)
+        return .Ok(tree.addStatement(.Attempt(body, arms), spanFrom(start.span)))
+    }
+}

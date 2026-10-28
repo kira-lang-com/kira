@@ -1,0 +1,193 @@
+import Foundation
+
+// TdxTypeDescriptorTests.kira — `value.type` and what a runtime type
+// descriptor answers: name, kind, package, generic arguments, and the traits
+// the type keeps. Equality is exact nominal identity, so two same-shaped
+// declarations answer unequal.
+// PREFIX: tdx / Tdx  (all top-level names use this prefix).
+
+struct TdxPoint {
+    let x: Int
+    let y: Int
+}
+
+struct TdxOther {
+    let x: Int
+    let y: Int
+}
+
+enum TdxCrate<Held> {
+    Full(Held)
+    Empty
+}
+
+trait TdxGreets {
+    function greet(borrow self) -> String
+}
+
+extend TdxPoint: TdxGreets {
+    function greet(borrow self) -> String { return "hi" }
+}
+
+function tdxErase(value: TdxPoint) -> Any {
+    return value
+}
+
+function tdxATypeEqualsItselfAnswer() -> Number {
+    let p = TdxPoint(x: 1, y: 2)
+    if p.type == p.type { return 1 }
+    return 0
+}
+
+@Test
+function tdxATypeEqualsItself() {
+    expect!(tdxATypeEqualsItselfAnswer() == 1)
+}
+@Test
+function tdxTwoShapesAreTwoTypes() {
+    let p = TdxPoint(x: 1, y: 2)
+    let o = TdxOther(x: 1, y: 2)
+    var score = 0
+    if p.type != o.type { score = score + 1 }
+    if p.type == o.type { score = score + 10 }
+    let got = score
+    expect!(got == 1)
+}
+
+function tdxAnErasedValueKeepsItsTypeAnswer() -> Number {
+    let p = TdxPoint(x: 3, y: 4)
+    let erased = tdxErase(TdxPoint(x: 5, y: 6))
+    if erased.type == p.type { return 1 }
+    return 0
+}
+
+@Test
+function tdxAnErasedValueKeepsItsType() {
+    expect!(tdxAnErasedValueKeepsItsTypeAnswer() == 1)
+}
+@Test
+function tdxADescriptorNamesItsType() {
+    let p = TdxPoint(x: 1, y: 2)
+    let got = p.type.name.count
+    expect!(got == 8)
+}
+
+@Test
+function tdxADescriptorReportsItsKind() {
+    let p = TdxPoint(x: 1, y: 2)
+    let n: Int = 7
+    let words = ["a"]
+    var score: Int = 0
+    if p.type.kind == "struct" { score = score + 1 }
+    if n.type.kind == "int" { score = score + 10 }
+    if words.type.kind == "array" { score = score + 100 }
+    let got = score
+    expect!(got == 111)
+}
+
+@Test
+function tdxAProgramsOwnTypeHasNoPackage() {
+    let p = TdxPoint(x: 1, y: 2)
+    let got = p.type.package.count
+    expect!(got == 0)
+}
+
+@Test
+function tdxAnInstantiationCarriesItsArguments() {
+    let held: TdxCrate<Int> = .Full(3)
+    var score = held.type.arguments.count
+    if held.type.arguments[0].name == "Int" { score = score + 10 }
+    if held.type.name == "TdxCrate" { score = score + 100 }
+    let got = score
+    expect!(got == 111)
+}
+
+@Test
+function tdxAnArrayCarriesItsElementType() {
+    let words = ["a", "b"]
+    var score = words.type.arguments.count
+    if words.type.arguments[0].name == "String" { score = score + 10 }
+    let got = score
+    expect!(got == 11)
+}
+
+function tdxTwoInstantiationsAreTwoTypesAnswer() -> Number {
+    let ints: TdxCrate<Int> = .Full(1)
+    let words: TdxCrate<String> = .Full("a")
+    if ints.type != words.type { return 1 }
+    return 0
+}
+
+@Test
+function tdxTwoInstantiationsAreTwoTypes() {
+    expect!(tdxTwoInstantiationsAreTwoTypesAnswer() == 1)
+}
+@Test
+function tdxADescriptorListsWhatTheTypeKeeps() {
+    let p = TdxPoint(x: 1, y: 2)
+    var score = p.type.conformances.count
+    if p.type.conformances[0] == "TdxGreets" { score = score + 10 }
+    let got = score
+    expect!(got == 11)
+}
+
+function tdxEverySpellingOfAnIntIsOneTypeAnswer() -> Number {
+    let plain: Int = 3
+    let narrow: U8 = 3
+    if plain.type == narrow.type { return 1 }
+    return 0
+}
+
+@Test
+function tdxEverySpellingOfAnIntIsOneType() {
+    expect!(tdxEverySpellingOfAnIntIsOneTypeAnswer() == 1)
+}
+function tdxATriedCastAnswersWithItsPayloadAnswer() -> Number {
+    let boxed: Any = TdxPoint(x: 4, y: 5)
+    attempt {
+        let p = try boxed as TdxPoint
+    return p.x + p.y
+    } handle {
+        Mismatch(actual) { return 0 }
+    }
+}
+
+@Test
+function tdxATriedCastAnswersWithItsPayload() {
+    expect!(tdxATriedCastAnswersWithItsPayloadAnswer() == 9)
+}
+function tdxATriedCastHandsTheHandlerWhatItHeldAnswer() -> Number {
+    let boxed: Any = "text"
+    attempt {
+        let p = try boxed as TdxPoint
+        return p.x
+    } handle {
+        Mismatch(actual) {
+            if actual.name == "String" { return 1 }
+    return 0
+        }
+    }
+}
+
+@Test
+function tdxATriedCastHandsTheHandlerWhatItHeld() {
+    expect!(tdxATriedCastHandsTheHandlerWhatItHeldAnswer() == 1)
+}
+function tdxATriedCastOfAnEnumIsOrdinaryAnswer() -> Number {
+    let held: TdxCrate<Int> = .Full(6)
+    let boxed: Any = held
+    attempt {
+        let recovered = try boxed as TdxCrate<Int>
+        match recovered {
+            Full(value) -> { return value }
+            Empty -> { return 0 }
+        }
+    } handle {
+        Mismatch(actual) { return 0 }
+    }
+}
+
+@Test
+function tdxATriedCastOfAnEnumIsOrdinary() {
+    expect!(tdxATriedCastOfAnEnumIsOrdinaryAnswer() == 6)
+}

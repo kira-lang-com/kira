@@ -1,0 +1,317 @@
+// The KIR builder, as methods on the kernel's handles.
+//
+// This is the one file that names a `klf.kir.*` service. Lowering speaks in
+// `kir.load(address)` and `kir.branch(block)`; a change to the service
+// surface stays here.
+
+let convertTruncate = 0
+let convertZeroExtend = 1
+let convertSignExtend = 2
+let convertBitcast = 3
+
+extend KirFunctionBuilder {
+    function parameter(borrow self, index: Int) -> KirValue {
+        return kir_function_parameter(self, index)
+    }
+
+    function integer(borrow self, valueType: KirType, value: Int) -> KirValue {
+        return kir_value_integer(self, valueType, value)
+    }
+
+    function slot(borrow self, valueType: KirType) -> KirAddress {
+        return kir_value_stack_alloc(self, valueType)
+    }
+
+    function load(borrow self, address: KirAddress) -> KirValue {
+        return kir_value_load(self, address)
+    }
+
+    function store(borrow self, value: KirValue, address: KirAddress) {
+        kir_value_store(self, value, address)
+    }
+
+    function field(borrow self, base: KirAddress, index: Int, fieldType: KirType) -> KirAddress {
+        return kir_value_field_address(self, base, index, fieldType)
+    }
+
+    function element(borrow self, base: KirAddress, index: KirValue, elementType: KirType) -> KirAddress {
+        return kir_value_element_address(self, base, index, elementType)
+    }
+
+    // The storage a value that holds an address points at, and back.
+    function memory(borrow self, pointer: KirValue, valueType: KirType) -> KirAddress {
+        return kir_address_from_value(self, pointer, valueType)
+    }
+
+    function pointer(borrow self, address: KirAddress) -> KirValue {
+        return kir_value_from_address(self, address)
+    }
+
+    function binary(borrow self, operator: Int, traps: Bool, signed: Bool, left: KirValue, right: KirValue) -> KirValue {
+        return kir_value_binary(self, operator, flag(traps), flag(signed), left, right)
+    }
+
+    function compare(borrow self, predicate: Int, left: KirValue, right: KirValue) -> KirValue {
+        return kir_value_compare(self, predicate, left, right)
+    }
+
+    function convert(borrow self, kind: Int, value: KirValue, target: KirType) -> KirValue {
+        return kir_value_convert(self, kind, value, target)
+    }
+
+    // Arguments are pushed one at a time; the call or branch that follows
+    // takes them all.
+    function argument(borrow self, value: KirValue) {
+        kir_value_argument(self, value)
+    }
+
+    function elseArgument(borrow self, value: KirValue) {
+        kir_block_else_argument(self, value)
+    }
+
+    function call(borrow self, callee: KirFunctionBuilder, result: KirType) -> KirValue {
+        return kir_value_call(self, callee, result)
+    }
+
+    function callVoid(borrow self, callee: KirFunctionBuilder) {
+        kir_value_call_void(self, callee)
+    }
+
+    function block(borrow self) -> KirBlockBuilder {
+        return kir_block_define(self)
+    }
+
+    function entryBlock(borrow self) -> KirBlockBuilder {
+        return kir_block_entry(self)
+    }
+
+    // Declares the next parameter of the block made after it.
+    function blockParameter(borrow self, valueType: KirType) {
+        kir_block_parameter(self, valueType)
+    }
+
+    function blockValue(borrow self, block: KirBlockBuilder, index: Int) -> KirValue {
+        return kir_block_value(self, block, index)
+    }
+
+    function switchTo(borrow self, block: KirBlockBuilder) {
+        kir_block_switch(self, block)
+    }
+
+    function branch(borrow self, target: KirBlockBuilder) {
+        kir_block_branch(self, target)
+    }
+
+    function branchIf(borrow self, condition: KirValue, whenTrue: KirBlockBuilder, whenFalse: KirBlockBuilder) {
+        kir_block_conditional_branch(self, condition, whenTrue, whenFalse)
+    }
+
+    function returnValue(borrow self, value: KirValue) {
+        kir_function_result(self, value)
+    }
+
+    function returnVoid(borrow self) {
+        kir_function_result_void(self)
+    }
+
+    // Places the instructions that follow at the source `span` names, for
+    // the line table a debugger and a backtrace read (section 16.3).
+    function at(borrow self, span: Span) {
+        kir_function_at(self, span.start, span.end)
+    }
+
+    // Ends the block in a trap whose report is `report` (`trap-reports.klfd`),
+    // placed at the source at `span`.
+    function trapReported(borrow self, span: Span, report: String) {
+        for index in 0..utf8Count(report) { kir_block_trap_text_byte(self, utf8Byte(report, index)) }
+        kir_block_trap(self, span.start, span.end)
+    }
+
+    function unreachable(borrow self) {
+        kir_block_unreachable(self)
+    }
+
+    function allocateRaw(borrow self, byteCount: KirValue, alignment: KirValue) -> KirValue {
+        return kir_value_heap_alloc_raw(self, byteCount, alignment)
+    }
+
+    function freeRaw(borrow self, pointer: KirValue) {
+        kir_value_heap_free_raw(self, pointer)
+    }
+
+    function copyBytes(borrow self, from: KirAddress, to: KirAddress, byteCount: KirValue, pointer: KirType) {
+        copyRaw(convert(convertBitcast, pointer(from), pointer), convert(convertBitcast, pointer(to), pointer), byteCount)
+    }
+
+    function copyRaw(borrow self, from: KirValue, to: KirValue, byteCount: KirValue) {
+        kir_value_mem_copy(self, to, from, byteCount)
+    }
+
+    // The bytes copied as though through a buffer, so the ranges may overlap.
+    function moveRaw(borrow self, from: KirValue, to: KirValue, byteCount: KirValue) {
+        kir_value_mem_move(self, to, from, byteCount)
+    }
+
+    function setBytes(borrow self, start: KirValue, byte: KirValue, byteCount: KirValue) {
+        kir_value_mem_set(self, start, byte, byteCount)
+    }
+
+    function typedMemory(borrow self, pointer: KirValue, element: KirType) -> KirAddress {
+        let typed = convert(convertBitcast, pointer, kir_type_address(element))
+        return memory(typed, element)
+    }
+
+    function offsetBytes(borrow self, pointer: KirValue, offset: KirValue) -> KirValue {
+        let byte = kir_type_integer(8)
+        let buffer = typedMemory(pointer, kir_type_array(0, byte))
+        let location = kir_value_element_address(self, buffer, offset, byte)
+        return convert(convertBitcast, self.pointer(location), kir_type_pointer())
+    }
+
+    function inject(borrow self, address: KirAddress, variant: Int) {
+        kir_value_enum_inject(self, address, variant)
+    }
+
+    function payload(borrow self, address: KirAddress, variant: Int, payloadType: KirType) -> KirAddress {
+        return kir_value_enum_payload_address(self, address, variant, payloadType)
+    }
+
+    function tag(borrow self, address: KirAddress) -> KirValue {
+        return kir_value_enum_tag(self, address)
+    }
+
+    // One target of the `switchEnum` that follows.
+    function switchCase(borrow self, variant: Int, target: KirBlockBuilder) {
+        kir_switch_case(self, variant, target)
+    }
+
+    function switchEnum(borrow self, address: KirAddress) {
+        kir_switch_enum(self, address)
+    }
+}
+
+extend KirModuleBuilder {
+    function declareRecord(borrow self, nameStart: Int, nameEnd: Int, layout: Int) -> KirType {
+        return kir_type_record(self, nameStart, nameEnd, layout)
+    }
+
+    function declareRecordSpecialization(borrow self, nameStart: Int, nameEnd: Int, layout: Int, suffix: Int) -> KirType {
+        return kir_type_record_named(self, nameStart, nameEnd, layout, suffix)
+    }
+
+    function addRecordField(borrow self, record: KirType, nameStart: Int, nameEnd: Int, fieldType: KirType) {
+        kir_type_record_field(record, nameStart, nameEnd, fieldType)
+    }
+
+    function declareEnum(borrow self, nameStart: Int, nameEnd: Int) -> KirType {
+        return kir_type_enum(self, nameStart, nameEnd)
+    }
+
+    function declareEnumSpecialization(borrow self, nameStart: Int, nameEnd: Int, suffix: Int) -> KirType {
+        return kir_type_enum_named(self, nameStart, nameEnd, suffix)
+    }
+
+    function addEnumCase(borrow self, enumeration: KirType, nameStart: Int, nameEnd: Int, payload: KirType) {
+        kir_type_enum_case(enumeration, nameStart, nameEnd, payload)
+    }
+
+    function addNumberedEnumCase(borrow self, enumeration: KirType, nameStart: Int, nameEnd: Int, number: Int, payload: KirType) {
+        kir_type_enum_case_numbered(enumeration, nameStart, nameEnd, number, payload)
+    }
+}
+
+function flag(value: Bool) -> Int {
+    return value ? 1 : 0
+}
+
+// The KIR operator for an arithmetic operator at a signedness.
+function kirOperator(operator: ArithmeticOperator, signed: Bool) -> Int {
+    match operator {
+        Add -> return 0
+        Subtract -> return 1
+        Multiply -> return 2
+        Divide -> return signed ? 3 : 4
+        Remainder -> return signed ? 5 : 6
+        BitAnd -> return 7
+        BitOr -> return 8
+        BitXor -> return 9
+        ShiftLeft -> return 10
+        ShiftRight -> return signed ? 12 : 11
+    }
+}
+
+// The KIR predicate for a comparison at a signedness.
+function kirPredicate(comparison: Comparison, signed: Bool) -> Int {
+    match comparison {
+        Equal -> return 0
+        NotEqual -> return 1
+        Less -> return signed ? 2 : 6
+        LessEqual -> return signed ? 3 : 7
+        Greater -> return signed ? 4 : 8
+        GreaterEqual -> return signed ? 5 : 9
+    }
+}
+
+// The suffix a generated type, function or global is named with: a hash of
+// its role and of what it is generated for, so every unit and every build
+// that generates it names it alike, and none takes the name another unit
+// generates for something else. The module records what the suffix stands
+// for, `destroy of Array<Selection>`, which the debug information and a
+// backtrace show in place of the number (section 16.3).
+function generatedSuffix(builder: KirModuleBuilder, role: String, key: String) -> Int {
+    let suffix = instanceSuffix(joinText([role, ":", key]))
+    moduleAttribute(builder, joinText([decimalText(suffix), "\t", role, " of ", shownKey(key)]), debugNameAttribute)
+    return suffix
+}
+
+// The `klf.debug.name` module attribute.
+let debugNameAttribute = 17
+
+// A generated item's key as its source would name it: a type without the
+// kind `typeIdentity` leads with.
+function shownKey(key: String) -> String {
+    for lead in ["struct ", "enum "] {
+        if startsWithText(key, lead) { return utf8Slice(key, utf8Count(lead), utf8Count(key)) }
+    }
+    return key
+}
+
+// A type as every unit spells it.
+function typeKey(program: CheckedProgram, valueType: Type) -> String {
+    return typeIdentity(program.structs, program.enums, valueType)
+}
+
+// The name of the module that declares what `span` names.
+function spanModule(program: CheckedProgram, span: Span) -> String {
+    if span.file < 0 || span.file >= program.firstSources.count || program.firstSources[span.file] < 0 { return "" }
+    return program.moduleNames[program.sources[program.firstSources[span.file]].module]
+}
+
+// The atomics of KLF section 12.14: `pointer` is a raw pointer value and
+// each ordering C11's memory_order number.
+extend KirFunctionBuilder {
+    function atomicLoad(borrow self, valueType: KirType, pointer: KirValue, order: Int) -> KirValue {
+        return kir_value_atomic_load(self, valueType, pointer, order)
+    }
+
+    function atomicStore(borrow self, value: KirValue, pointer: KirValue, order: Int) {
+        kir_value_atomic_store(self, value, pointer, order)
+    }
+
+    function atomicModify(borrow self, operator: Int, pointer: KirValue, value: KirValue, order: Int) -> KirValue {
+        return kir_value_atomic_rmw(self, operator, pointer, value, order)
+    }
+
+    // The value read; `exchanged` asks whether it was the one expected.
+    function compareExchange(borrow self, weak: Bool, pointer: KirValue, expected: KirValue, replacement: KirValue, success: Int, failure: Int) -> KirValue {
+        return kir_value_compare_exchange(self, weak ? 1 : 0, pointer, expected, replacement, success, failure)
+    }
+
+    function exchanged(borrow self, read: KirValue) -> KirValue {
+        return kir_value_compare_exchange_succeeded(self, read)
+    }
+
+    function fence(borrow self, order: Int) {
+        kir_value_fence(self, order)
+    }
+}

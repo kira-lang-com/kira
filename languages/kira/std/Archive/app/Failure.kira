@@ -1,0 +1,27 @@
+import Foundation
+
+// Archive formats and compressors, written and read in Kira (Build's
+// DESIGN.md section 8). Every writer is reproducible: entries in the order
+// they are given, owner and group 0, and timestamps 0.
+
+/// Why the archive library could not do what it was asked.
+public enum ArchiveFailure {
+    /// The bytes contradict the format, or end inside something. Carries what was wrong.
+    Malformed(String)
+    /// The bytes use a part of the format this library does not read. Carries what was used.
+    Unsupported(String)
+    /// A file could not be read or written. Carries the path and the reason.
+    Files(String)
+    /// A patch does not fit the files it patches. Carries what does not fit.
+    Conflict(String)
+}
+
+/// The failure as one line of text, for a log or a message.
+public function archiveFailureText(failure: borrow ArchiveFailure) -> String {
+    return match failure {
+        Malformed(text) -> "malformed: \(text)"
+        Unsupported(text) -> "unsupported: \(text)"
+        Files(text) -> text
+        Conflict(text) -> text
+    }
+}

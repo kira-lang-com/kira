@@ -1,0 +1,80 @@
+// Library calls, image operations and atomics. Metal's `round` rounds
+// halves away from zero, which KSIR's `round` does not, so it is built
+// from `sign`, `abs` and `floor`.
+
+function isRelational(name: String) -> Bool {
+    return name == "all" || name == "any" || name == "is_nan" || name == "is_inf"
+}
+
+extend Lowering {
+    function libraryValue(borrow mut self, checked: CheckedExpression) -> Int {
+        let arguments = values(checked.arguments)
+        if checked.name == "derivative" {
+            return shader_expr_derivative(module, builder, checked.detail, "none", arguments[0])
+        }
+        if isRelational(checked.name) {
+            return shader_expr_relational(module, builder, checked.name, arguments[0])
+        }
+        if checked.name == "round_away" { return roundAway(checked, arguments[0]) }
+        pushAll(arguments)
+        return shader_expr_math(module, builder, checked.name)
+    }
+
+    // `sign(x) * floor(abs(x) + 0.5)`.
+    function roundAway(borrow mut self, checked: CheckedExpression, operand: Int) -> Int {
+        let found = program.types[checked.expressionType]
+        shader_push(module, operand)
+        let magnitude = shader_expr_math(module, builder, "abs")
+        var half = shader_expr_literal(module, builder, found.scalar.ksir(), "0.5")
+        if found.shape == .Vector { half = shader_expr_splat(module, builder, found.width, half) }
+        shader_push(module, shader_expr_binary(module, builder, "add", magnitude, half))
+        let floored = shader_expr_math(module, builder, "floor")
+        shader_push(module, operand)
+        let sign = shader_expr_math(module, builder, "sign")
+        return shader_expr_binary(module, builder, "multiply", sign, floored)
+    }
+
+    function optionalValue(borrow mut self, expression: Int) -> Int {
+        if expression < 0 { return -1 }
+        return value(expression)
+    }
+
+    function imageValue(borrow mut self, checked: CheckedExpression) -> Int {
+        var operands: [Int] = []
+        for argument in checked.arguments {
+            operands.append(optionalValue(argument))
+        }
+        match checked.name {
+            "sample" -> {
+                if checked.components.count == 1 { operands[8] = checked.components[0] }
+                pushAll(operands)
+                return shader_expr_image_sample(module, builder, checked.detail)
+            }
+            "read" -> {
+                pushAll(operands)
+                return shader_expr_image_load(module, builder)
+            }
+            "write" -> {
+                pushAll(operands)
+                shader_stmt_image_store(module, builder)
+                return -1
+            }
+            else -> return shader_expr_image_query(module, builder, operands[0], checked.name, operands[1])
+        }
+    }
+
+    function atomicValue(borrow mut self, checked: CheckedExpression) -> Int {
+        let pointer = place(checked.left)
+        let operand = value(checked.right)
+        if checked.name == "compare_exchange" {
+            let expected = place(checked.third)
+            let compare = load(expected)
+            let result = shader_stmt_atomic(module, builder, pointer, checked.name, operand, compare, 1)
+            shader_stmt_store(module, builder, expected, shader_expr_access_index(module, builder, result, 0))
+            return shader_expr_access_index(module, builder, result, 1)
+        }
+        var want = 1
+        if program.types[checked.expressionType].shape == .Void { want = 0 }
+        return shader_stmt_atomic(module, builder, pointer, checked.name, operand, -1, want)
+    }
+}

@@ -1,0 +1,309 @@
+import Foundation
+
+// The client side of the driver (DESIGN.md section 8.2): a request waits for
+// its origin's name, then its connection, then goes out on a stream of its
+// own. Requests with one route share one connection.
+
+extend Network {
+    // Starts `request`; its response arrives as events with the ID.
+    function send(borrow mut self, request: Request) -> Result<RequestId, HttpFailure> {
+        let route = try routeFor(request.target, options.transport)
+        let id = takeRequestId()
+        var message = move request
+        if message.fields.first("user-agent").isNone() && options.userAgent.count > 0 {
+            message.fields.add("user-agent", options.userAgent)
+        }
+        requests.append(ClientRequest { id: id, route: route, pending: .Some(move message) })
+        routeRequest(id)
+        return .Ok(id)
+    }
+
+    // Sends `request` and waits for its whole response until `until`.
+    // Events for other requests are kept for the next `wait` or `poll`.
+    function fetch(
+        borrow mut self,
+        request: Request,
+        until: QuicInstant
+    ) -> Result<Response, HttpFailure> {
+        let id = try send(move request)
+        var kept: [NetworkEvent] = []
+        var status: Status? = .None
+        var fields = Fields {}
+        var body: [UN8] = []
+        while now().raw < until.raw {
+            for event in wait(.Some(until)) {
+                match event {
+                    ResponseHead(head) -> {
+                        if head.request == id {
+                            status = .Some(head.status)
+                            fields = copy head.fields
+                        } else {
+                            kept.append(copy event)
+                        }
+                    }
+                    ResponseBody(chunk) -> {
+                        if chunk.request == id {
+                            body.appendAll(chunk.bytes)
+                        } else {
+                            kept.append(copy event)
+                        }
+                    }
+                    ResponseEnded(end) -> {
+                        if end.request != id {
+                            kept.append(copy event)
+                            continue
+                        }
+                        keep(kept)
+                        match end.failure {
+                            Some(failure) -> return .Error(copy failure)
+                            None -> {}
+                        }
+                        return match status {
+                            Some(value) -> .Ok(
+                                Response { status: value, fields: fields, body: .Bytes(body) }
+                            )
+                            None -> .Error(.Closed)
+                        }
+                    }
+                    Incoming(_) -> kept.append(copy event)
+                    SessionOpened(_) -> kept.append(copy event)
+                    StreamOpened(_) -> kept.append(copy event)
+                    StreamData(_) -> kept.append(copy event)
+                    StreamEnded(_) -> kept.append(copy event)
+                    Datagram(_) -> kept.append(copy event)
+                    SessionDraining(_) -> kept.append(copy event)
+                    SessionClosed(_) -> kept.append(copy event)
+                }
+            }
+        }
+        let phase = phaseOf(id)
+        cancel(id)
+        keep(kept)
+        return .Error(.TimedOut(phase))
+    }
+
+    // Events taken out of turn go back ahead of anything newer.
+    function keep(borrow mut self, kept: borrow [NetworkEvent]) {
+        var all = copy kept
+        all.appendAll(events)
+        events = all
+    }
+
+    // Abandons a request; its stream, if it had one, is reset.
+    function cancel(borrow mut self, id: RequestId) {
+        let index = match requestIndex(id) {
+            Some(value) -> value
+            None -> return
+        }
+        let request = copy requests[index]
+        dropRequest(index)
+        let key = match request.session {
+            Some(value) -> value
+            None -> return
+        }
+        // HTTP/1.1 cannot abandon one response and keep the connection.
+        match linkIndex(key) {
+            Some(link) -> return closeLink(link, .Closed)
+            None -> {}
+        }
+        let session = match sessionIndex(key) {
+            Some(value) -> value
+            None -> return
+        }
+        let connection = match connectionIndex(session) {
+            Some(value) -> value
+            None -> return
+        }
+        let stream = match request.stream {
+            Some(value) -> value
+            None -> return
+        }
+        let slot = sessions[session].slot
+        let error = code(Http3Error.RequestCancelled)
+        absorb slots[slot].endpoint.connections[connection].connection.resetStream(stream, error)
+        absorb slots[slot].endpoint.connections[connection].connection.stopSending(stream, error)
+    }
+
+    function phaseOf(borrow self, id: RequestId) -> Phase {
+        let index = match requestIndex(id) {
+            Some(value) -> value
+            None -> return .Response
+        }
+        let key = match requests[index].session {
+            Some(value) -> value
+            None -> {
+                for lookup in lookups {
+                    if lookup.route.key == requests[index].route.key { return .Resolve }
+                }
+                return .Connect
+            }
+        }
+        match linkIndex(key) {
+            Some(link) -> {
+                if !links[link].writable { return .Connect }
+                return linkOpen(link) ? .Response : .Handshake
+            }
+            None -> {}
+        }
+        return match sessionIndex(key) {
+            Some(session) -> sessions[session].connected ? .Response : .Handshake
+            None -> .Connect
+        }
+    }
+
+    function requestIndex(borrow self, id: RequestId) -> Number? {
+        for (index, request) in requests.enumerated() {
+            if request.id == id { return .Some(index) }
+        }
+        return .None
+    }
+
+    function dropRequest(borrow mut self, index: Number) {
+        var kept: [ClientRequest] = []
+        for (position, request) in requests.enumerated() {
+            if position != index { kept.append(copy request) }
+        }
+        requests = kept
+    }
+
+    // Ends request `id` with an event, and forgets it.
+    function endRequestId(borrow mut self, id: RequestId, failure: HttpFailure?) {
+        match requestIndex(id) {
+            Some(index) -> endRequest(index, Fields {}, move failure)
+            None -> {}
+        }
+    }
+
+    // Ends request `index` with an event, and forgets it.
+    function endRequest(borrow mut self, index: Number, trailers: Fields, failure: HttpFailure?) {
+        match failure {
+            Some(value) -> log warn(category: NetworkLog.Request, "request ended with a failure", request: requests[index].id.raw, failure: value)
+            None -> {}
+        }
+        // A session's CONNECT that never got its answer ends the session.
+        let id = SessionId(requests[index].id.raw)
+        match webIndex(id) {
+            Some(web) -> {
+                dropRequest(index)
+                let ending = match failure {
+                    Some(value) -> value
+                    None -> HttpFailure.Closed
+                }
+                return closeWebSession(web, SessionClose { session: id, failure: .Some(ending) })
+            }
+            None -> {}
+        }
+        events.append(
+            .ResponseEnded(
+                RequestEnd { request: requests[index].id, trailers: trailers, failure: failure }
+            )
+        )
+        dropRequest(index)
+    }
+
+    // Sends the requests waiting on session `session`, now connected.
+    function startRequests(borrow mut self, session: Number) {
+        let key = sessions[session].id
+        let connection = match connectionIndex(session) {
+            Some(value) -> value
+            None -> return
+        }
+        let slot = sessions[session].slot
+        var waiting: [RequestId] = []
+        for request in requests {
+            if request.session == .Some(key) && request.pending.isSome() {
+                waiting.append(request.id)
+            }
+        }
+        for id in waiting {
+            let index = match requestIndex(id) {
+                Some(value) -> value
+                None -> continue
+            }
+            let request = match requests[index].pending {
+                Some(value) -> value
+                None -> continue
+            }
+            let head = RequestHead {
+                method: request.method,
+                target: copy request.target,
+                fields: copy request.fields,
+                protocolName: copy request.protocolName
+            }
+            let bytes: [UN8] = match request.body {
+                Empty -> []
+                Bytes(value) -> copy value
+            }
+            let transport = request.protocolName.isSome()
+            // A session's CONNECT waits for the server's SETTINGS
+            // (draft-ietf-webtrans-http3 section 3.1).
+            if transport && sessions[session].http.peerSettings.isNone() { continue }
+            let opened = transport ? sessions[session].http.openTransport(
+                slots[slot].endpoint.connections[connection].connection,
+                head
+            ) : sessions[session].http.sendRequest(
+                slots[slot].endpoint.connections[connection].connection,
+                head,
+                bytes.count == 0
+            )
+            let stream = match opened {
+                Ok(value) -> value
+                Error(problem) -> {
+                    // The peer's stream limit; the request waits for the
+                    // peer to raise it.
+                    if streamBlocked(problem) { return }
+                    endRequest(index, Fields {}, .Some(http3Failure(problem)))
+                    continue
+                }
+            }
+            requests[index].pending = .None
+            requests[index].stream = .Some(stream)
+            if transport {
+                match webIndex(SessionId(id.raw)) {
+                    Some(web) -> {
+                        webSessions[web].session = .Some(key)
+                        webSessions[web].stream = .Some(stream)
+                    }
+                    None -> {}
+                }
+            }
+            if bytes.count > 0 {
+                absorb sessions[session].http.sendData(
+                    slots[slot].endpoint.connections[connection].connection,
+                    stream,
+                    bytes,
+                    true
+                )
+            }
+        }
+    }
+
+    function sessionIndex(borrow self, key: Number) -> Number? {
+        for (index, session) in sessions.enumerated() {
+            if session.id == key { return .Some(index) }
+        }
+        return .None
+    }
+
+    // Where session `session`'s connection sits in its endpoint.
+    function connectionIndex(borrow self, session: Number) -> Number? {
+        return match slots[sessions[session].slot].endpoint.index(sessions[session].handle) {
+            Some(value) -> .Some(value)
+            None -> .None
+        }
+    }
+}
+
+function streamBlocked(problem: borrow Http3Problem) -> Bool {
+    return match problem {
+        Stream(reason) -> match reason {
+            Blocked -> true
+            UnknownStream -> false
+            NotWritable -> false
+            NotReadable -> false
+            ConnectionClosed -> false
+        }
+        Invalid(_) -> false
+        WrongRole -> false
+    }
+}

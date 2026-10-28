@@ -1,0 +1,191 @@
+import Foundation
+
+// Paths as the build spells them: `/`-separated text.
+
+// `relative` read from `directory`. An absolute `relative` stands alone.
+function joinPath(directory: borrow String, relative: borrow String) -> String {
+    if relative.startsWith("/") || directory.count == 0 { return copy relative }
+    if relative.count == 0 { return copy directory }
+    if directory.endsWith("/") { return directory + relative }
+    return directory + "/" + relative
+}
+
+// The directory holding `path`, or `.` for a bare name.
+function parentPath(path: borrow String) -> String {
+    match path.lastIndexOf("/") {
+        Some(slash) -> return slash == 0 ? "/" : path.substring(0, slash)
+        None -> return "."
+    }
+}
+
+// The last name of `path`.
+function lastName(path: borrow String) -> String {
+    match path.lastIndexOf("/") {
+        Some(slash) -> return path.substring(slash + 1, path.count)
+        None -> return copy path
+    }
+}
+
+// Makes `path` a directory, with every directory above it that is missing.
+function makePathTree(path: borrow String) -> Result<Void, BuildFailure> {
+    if isDirectory(path) { return .Ok }
+    let parent = parentPath(path)
+    if parent != path && parent != "." {
+        match makePathTree(parent) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+    }
+    match makeDirectory(path) {
+        Ok -> return .Ok
+        Error(failure) -> {
+            absorb failure
+            if isDirectory(path) { return .Ok }
+            return .Error(.Files("cannot make the directory \(path)"))
+        }
+    }
+}
+
+// Removes `path` and everything under it, when it exists.
+function clearPath(path: borrow String) -> Result<Void, BuildFailure> {
+    match linkStatus(path) {
+        Ok -> {}
+        Error(failure) -> {
+            if !missing(failure) { absorb failure }
+            return .Ok
+        }
+    }
+    match removePath(path) {
+        Ok -> return .Ok
+        Error(failure) -> {
+            absorb failure
+            return .Error(.Files("cannot remove \(path)"))
+        }
+    }
+}
+
+// The project's root: the nearest directory at or above the working directory
+// holding `build/package.kira`, or the working directory when none does.
+function projectRoot() -> String {
+    let start = match currentDirectory() {
+        Ok(directory) -> directory
+        Error(failure) -> {
+            absorb failure
+            "."
+        }
+    }
+    var directory = copy start
+    while true {
+        if fileExists(joinPath(directory, "build/package.kira")) { return directory }
+        let parent = parentPath(directory)
+        if parent == directory || parent == "." { return start }
+        directory = parent
+    }
+    return start
+}
+
+// `text` as one name of a path: every byte but letters, digits, `.`, `-` and
+// `_` becomes `_`.
+function pathSafe(text: borrow String) -> String {
+    var safe = ""
+    for index in 0..text.count {
+        let byte = UN8(text.byteAt(index))
+        let digit = byte >= UN8(48) && byte <= UN8(57)
+        let letter = (byte >= UN8(65) && byte <= UN8(90)) || (byte >= UN8(97) && byte <= UN8(122))
+        let mark = byte == UN8(45) || byte == UN8(46) || byte == UN8(95)
+        safe += digit || letter || mark ? text.substring(index, index + 1) : "_"
+    }
+    return safe
+}
+
+// `path` without `.` or `..` names: each `..` takes the name before it away.
+function plainPath(path: borrow String) -> String {
+    var names: [String] = []
+    for name in path.split("/") {
+        match name {
+            "", "." -> {}
+            ".." -> {
+                if names.count > 0 { names = names.prefix(names.count - 1) }
+            }
+            else -> names.append(copy name)
+        }
+    }
+    let joinedNames = joined(names, "/")
+    return path.startsWith("/") ? "/" + joinedNames : joinedNames
+}
+
+// Whether `path` is `prefix` or lies under it.
+function pathUnder(path: borrow String, prefix: borrow String) -> Bool {
+    return path == prefix || path.startsWith(prefix + "/")
+}
+
+// Whether `path` names a place inside an action's working directory that is
+// not one the library fills: relative, without `..`, and outside `inputs/`,
+// `outputs/` and `scratch/`.
+function placeablePath(path: borrow String) -> Bool {
+    if path.count == 0 || path.startsWith("/") { return false }
+    let names = path.split("/")
+    for name in names {
+        if name.count == 0 || name == "." || name == ".." { return false }
+    }
+    let first = names[0]
+    return first != "inputs" && first != "outputs" && first != "scratch"
+}
+
+// Holds the lock of the project's state at `state`, waiting while another
+// run holds it. The handle stays open, so the lock lasts until the process
+// ends, however it ends.
+function lockState(state: borrow String) -> Result<FileHandle, BuildFailure> {
+    match makePathTree(state) {
+        Ok -> {}
+        Error(failure) -> return .Error(failure)
+    }
+    let path = joinPath(state, StateNames.lock)
+    let file = match openFileHandle(path, .ReadWrite) {
+        Ok(opened) -> opened
+        Error(failure) -> return .Error(.Files("cannot open \(path): \(traceText(failure))"))
+    }
+    match file.lock(false) {
+        Ok(held) -> {
+            if held { return .Ok(file) }
+        }
+        Error(failure) -> return .Error(.Files("cannot lock \(path): \(traceText(failure))"))
+    }
+    printError("kira build: waiting for the other build in \(parentPath(state))")
+    return match file.lock(true) {
+        Ok(held) -> .Ok(file)
+        Error(failure) -> .Error(.Files("cannot lock \(path): \(traceText(failure))"))
+    }
+}
+
+// Removes everything in the project's state but its lock, which this run
+// holds.
+function clearState(state: borrow String) -> Result<Void, BuildFailure> {
+    let names = match listDirectory(state) {
+        Ok(listing) -> listing.entries
+        Error(failure) -> return .Error(.Files("cannot list \(state): \(traceText(failure))"))
+    }
+    for name in names {
+        if name == StateNames.lock { continue }
+        match clearPath(joinPath(state, name)) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+    }
+    return .Ok
+}
+
+namespace StateNames {
+    // The file whose lock one run holds at a time.
+    let lock: String = "lock"
+}
+
+// Whether `failure` says only that nothing is at its path: what a caller
+// that expects that answers for itself, with nothing to let go.
+function missing(failure: borrow FileFailure) -> Bool {
+    return match failure {
+        Missing(path) -> true
+        NotFile, NotDirectory, ReadFailed, InvalidText, WriteFailed, CreateFailed, RenameFailed,
+            RemoveFailed, InvalidRange -> false
+    }
+}

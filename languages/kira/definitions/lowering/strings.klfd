@@ -1,0 +1,71 @@
+extend FunctionLowering {
+    function initializeBufferHeader(borrow mut self, header: KirAddress, data: KirValue, count: KirValue) {
+        kir.store(data, kir.field(header, 0, types.pointer))
+        kir.store(count, kir.field(header, 1, types.integer64))
+        kir.store(count, kir.field(header, 2, types.integer64))
+        let ops = kir_value_global_address(kir, types.arrayOpsGlobals[0])
+        kir.store(kir.convert(convertBitcast, kir.pointer(ops), types.pointer), kir.field(header, 3, types.pointer))
+    }
+
+    function stringLiteral(borrow mut self, valueType: Type, span: Span) -> KirAddress {
+        let source = program.named(span)
+        let bytes = kir_value_const_string(kir, source.start, source.end)
+        let length = kir_value_const_string_length(kir, bytes)
+        return stringBytes(valueType, bytes, length)
+    }
+
+    function stringText(borrow mut self, valueType: Type, text: String) -> KirAddress {
+        for index in 0..utf8Count(text) { kir_value_text_byte(kir, utf8Byte(text, index)) }
+        let bytes = kir_value_text(kir)
+        return stringBytes(valueType, bytes, kir_value_const_string_length(kir, bytes))
+    }
+
+    function stringBytes(borrow mut self, valueType: Type, bytes: KirValue, length: KirValue) -> KirAddress {
+        let header = temporary(valueType)
+        let data = arrayRuntimePointer(0, [length])
+        initializeBufferHeader(header, data, length)
+        kir.copyRaw(bytes, data, length)
+        markInitialized(header)
+        return header
+    }
+
+    // The string's bytes and a newline, through the platform's output service.
+    function printString(borrow mut self, header: KirAddress) {
+        writeOutput(kir.load(kir.field(header, 0, types.pointer)), kir.load(kir.field(header, 1, types.integer64)))
+        kir_value_text_byte(kir, 10)
+        writeOutput(kir_value_text(kir), kir.integer(types.integer64, 1))
+    }
+
+    function writeOutput(borrow mut self, data: KirValue, count: KirValue) {
+        match types.output {
+            Some(service) -> {
+                kir.argument(data)
+                kir.argument(count)
+                kir.call(service, types.integer64)
+            }
+            None -> abort()
+        }
+    }
+
+    function stringConcat(borrow mut self, left: Int, right: Int, valueType: Type) -> KirAddress {
+        let first = address(left)
+        let second = address(right)
+        let destination = temporary(valueType)
+        kir.argument(kir.pointer(destination))
+        kir.argument(kir.pointer(first))
+        kir.argument(kir.pointer(second))
+        kir.callVoid(functions[program.stringFunctions[0]])
+        markInitialized(destination)
+        return destination
+    }
+
+    function compareStrings(borrow mut self, comparison: Comparison, left: Int, right: Int) -> KirValue {
+        let first = address(left)
+        let second = address(right)
+        kir.argument(kir.pointer(first))
+        kir.argument(kir.pointer(second))
+        let same = kir.call(functions[program.stringFunctions[1]], types.boolean)
+        if comparison == .Equal { return same }
+        return kir.compare(kirPredicate(.Equal, false), same, kir.integer(types.boolean, 0))
+    }
+}

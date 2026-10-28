@@ -1,0 +1,259 @@
+// Functions by owner and name, and types by name. Each signature is filed in
+// the bucket its owner and name hash to, so a lookup reads one bucket rather
+// than every declaration, and the methods many types share a name for
+// spread out. A type is filed by its name, a struct as twice its index and an
+// enum as one more than that. A global is filed by its name too, as minus
+// one less its index. A type is filed again by the span of its name, the same
+// way, for the lookups that name one declaration rather than a name.
+//
+// The buckets are shared by every copy of the declarations, so a bucket may
+// hold an index another copy filed. A lookup therefore checks each candidate
+// against its own declarations, and answers as a scan in declaration order
+// would.
+
+let functionBuckets = 4096
+
+function emptyNameIndex() -> [[Int]] {
+    var buckets: [[Int]] = []
+    for bucket in 0..functionBuckets {
+        let empty: [Int] = []
+        buckets.append(empty)
+    }
+    return buckets
+}
+
+function spanBucket(span: Span) -> Int {
+    return ((span.file * 31 + span.start) * 31 + span.end) % 65521 % functionBuckets
+}
+
+function functionBucket(owner: Optional<Type>, name: String) -> Int {
+    var hash = 0
+    match owner {
+        Some(ownerType) -> hash = (ownerType.declaration * 64 + ownerType.bits + 1) % 65521
+        None -> {}
+    }
+    return (hash * 31 + nameHash(name)) % 65521 % functionBuckets
+}
+
+extend Declarations {
+    function addSignature(borrow mut self, signature: Signature) {
+        functionIndex[functionBucket(signature.owner, signature.name.text)].append(signatures.count)
+        signatures.append(signature)
+    }
+
+    function fileStruct(borrow mut self, name: Identifier) {
+        typeIndex[functionBucket(.None, name.text)].append(structs.count * 2)
+        spanIndex[spanBucket(name.span)].append(structs.count * 2)
+    }
+
+    function fileEnum(borrow mut self, name: Identifier) {
+        typeIndex[functionBucket(.None, name.text)].append(enums.count * 2 + 1)
+        spanIndex[spanBucket(name.span)].append(enums.count * 2 + 1)
+    }
+
+    // Every struct whose name is written at `span`, in declaration order.
+    function structsAt(borrow self, span: Span) -> [Int] {
+        var found: [Int] = []
+        for entry in spanIndex[spanBucket(span)] {
+            let index = entry / 2
+            if entry % 2 == 0 && index < structs.count && structs[index].name.span.same(span) { found = withIndex(found, index) }
+        }
+        return found
+    }
+
+    // Every enum whose name is written at `span`, in declaration order.
+    function enumsAt(borrow self, span: Span) -> [Int] {
+        var found: [Int] = []
+        for entry in spanIndex[spanBucket(span)] {
+            let index = entry / 2
+            if entry % 2 == 1 && index < enums.count && enums[index].name.span.same(span) { found = withIndex(found, index) }
+        }
+        return found
+    }
+
+    function fileGlobal(borrow mut self, name: String) {
+        typeIndex[functionBucket(.None, name)].append(-1 - globals.count)
+    }
+
+    // The first global called `name`.
+    function globalNamed(borrow self, name: String) -> Optional<Int> {
+        var found = -1
+        for entry in typeIndex[functionBucket(.None, name)] {
+            if entry >= 0 { continue }
+            let index = -1 - entry
+            if index < globals.count && globals[index].name.text == name && (found < 0 || index < found) { found = index }
+        }
+        if found < 0 { return .None }
+        return .Some(found)
+    }
+
+    // The first global called `name` that code in `file` may name: one its module
+    // lets `file` see, as a free function is.
+    function globalVisibleAt(borrow self, name: String, file: Int) -> Optional<Int> {
+        var found = -1
+        for entry in typeIndex[functionBucket(.None, name)] {
+            if entry >= 0 { continue }
+            let index = -1 - entry
+            if index >= globals.count || globals[index].name.text != name { continue }
+            if !visibleIn(file, globals[index].name.span.file) { continue }
+            if found < 0 || index < found { found = index }
+        }
+        if found < 0 { return .None }
+        return .Some(found)
+    }
+
+    // The first global called `name` declared in the module of `file`.
+    function globalInModule(borrow self, name: String, file: Int) -> Optional<Int> {
+        var found = -1
+        for entry in typeIndex[functionBucket(.None, name)] {
+            if entry >= 0 { continue }
+            let index = -1 - entry
+            if index >= globals.count || globals[index].name.text != name { continue }
+            if !sameModule(globals[index].name.span.file, file) { continue }
+            if found < 0 || index < found { found = index }
+        }
+        if found < 0 { return .None }
+        return .Some(found)
+    }
+
+    // The struct called `name` or, when there is none, the enum.
+    function indexedType(borrow self, name: String) -> Optional<Type> {
+        var structure = -1
+        var enumeration = -1
+        for entry in typeIndex[functionBucket(.None, name)] {
+            if entry < 0 { continue }
+            let index = entry / 2
+            if entry % 2 == 0 {
+                if index < structs.count && structs[index].name.text == name && (structure < 0 || index < structure) { structure = index }
+            } else {
+                if index < enums.count && enums[index].name.text == name && (enumeration < 0 || index < enumeration) { enumeration = index }
+            }
+        }
+        if structure >= 0 { return .Some(Type.structure(structure)) }
+        if enumeration >= 0 { return .Some(Type.enumeration(enumeration)) }
+        return .None
+    }
+
+    // The struct or enum `name` declares, where `indexedType` answers the
+    // first of that name: a package's own `Rect` beside Foundation's.
+    function typeDeclaredAt(borrow self, name: Identifier) -> Optional<Type> {
+        for index in structsAt(name.span) { return .Some(Type.structure(index)) }
+        for index in enumsAt(name.span) { return .Some(Type.enumeration(index)) }
+        return typeNamed(name.text)
+    }
+
+    function overloadsOf(borrow self, owner: Optional<Type>, name: String) -> [Int] {
+        var found: [Int] = []
+        for index in functionIndex[functionBucket(owner, name)] {
+            if declaresFunction(index, owner, name) { found = withIndex(found, index) }
+        }
+        return found
+    }
+
+    function findFunction(borrow self, owner: Optional<Type>, name: String) -> Optional<Int> {
+        let overloads = overloadsOf(owner, name)
+        if overloads.count == 0 { return .None }
+        return .Some(overloads[0])
+    }
+
+    function declaresFunction(borrow self, index: Int, owner: Optional<Type>, name: String) -> Bool {
+        if index >= signatures.count { return false }
+        return signatures[index].name.text == name && sameOwner(signatures[index].owner, owner)
+    }
+}
+
+// `indices` with `index` in its place in ascending order, once.
+function withIndex(indices: [Int], index: Int) -> [Int] {
+    var merged: [Int] = []
+    var placed = false
+    for existing in indices {
+        if existing == index { return indices }
+        if !placed && index < existing {
+            merged.append(index)
+            placed = true
+        }
+        merged.append(existing)
+    }
+    if !placed { merged.append(index) }
+    return merged
+}
+
+extend Declarations {
+    // The struct or enum called `name` that code in `file` may name: one of the file's own
+    // module first, then an exported one of a module its imports let it see, as a free
+    // function is. Types are not global names, so two packages' private types of one name
+    // are two types, and only the exported one is visible across packages.
+    function typeNamedAt(borrow self, name: String, file: Int) -> Optional<Type> {
+        match builtinType(name) {
+            Some(builtin) -> return .Some(builtin)
+            None -> {}
+        }
+        var found: Optional<Type> = .None
+        var foundRank = 9
+        for entry in typeIndex[functionBucket(.None, name)] {
+            if entry < 0 { continue }
+            let index = entry / 2
+            var candidate: Type = Type.invalid()
+            var declared = Span { file = -1, start = 0, end = 0 }
+            if entry % 2 == 0 {
+                if index >= structs.count || structs[index].name.text != name { continue }
+                declared = structs[index].name.span
+                candidate = Type.structure(index)
+            } else {
+                if index >= enums.count || enums[index].name.text != name { continue }
+                declared = enums[index].name.span
+                candidate = Type.enumeration(index)
+            }
+            let rank = typeAccessRank(declared, file)
+            if rank < foundRank {
+                found = .Some(candidate)
+                foundRank = rank
+            }
+        }
+        if found.isSome() { return found }
+        return indexedType(name)
+    }
+
+    // 0 for a type declared in the file's own module, 1 for an exported type
+    // of a module the file imports, 2 for one of Foundation, which every file
+    // sees without importing it, and 9 for one it cannot name. A name the file
+    // imported outright is the one it means over Foundation's.
+    function typeAccessRank(borrow self, declared: Span, file: Int) -> Int {
+        if sameModule(declared.file, file) { return 0 }
+        if !isExportedSpan(declared) { return 9 }
+        if !visibleIn(file, declared.file) { return 9 }
+        return inFoundation(declared.file) ? 2 : 1
+    }
+
+    // The type `name` that `module` declares, for `Alias.Name`: the alias
+    // picks the module, so a same-named type elsewhere is not a candidate.
+    function typeNamedIn(borrow self, name: String, module: Int) -> Optional<Type> {
+        for entry in typeIndex[functionBucket(.None, name)] {
+            if entry < 0 { continue }
+            let index = entry / 2
+            if entry % 2 == 0 {
+                if index >= structs.count || structs[index].name.text != name { continue }
+                if declaredInModule(structs[index].name.span.file, module) { return .Some(Type.structure(index)) }
+            } else {
+                if index >= enums.count || enums[index].name.text != name { continue }
+                if declaredInModule(enums[index].name.span.file, module) { return .Some(Type.enumeration(index)) }
+            }
+        }
+        return .None
+    }
+
+    function declaredInModule(borrow self, file: Int, module: Int) -> Bool {
+        match moduleOf(file) {
+            Some(found) -> return found == module
+            None -> return false
+        }
+    }
+
+    // Whether the declaration at `name` is exported (`public`).
+    function isExportedSpan(borrow self, name: Span) -> Bool {
+        for exported in exports {
+            if exported.span.file == name.file && exported.span.start == name.start && exported.span.end == name.end { return true }
+        }
+        return false
+    }
+}

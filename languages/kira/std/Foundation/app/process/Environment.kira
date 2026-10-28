@@ -1,0 +1,30 @@
+import Heap
+
+@Service("klfsvc_process_environment")
+function kernelEnvironment(name: RawPtr, nameCount: Int, destination: RawPtr, capacity: Int) -> Int
+
+function environmentIsSet(name: borrow String) -> Bool {
+    return kernelEnvironment(name.data, name.count, RawPtr(0), 0) >= 0
+}
+
+function environmentValue(name: borrow String) -> String {
+    let empty: String = ""
+    let count = kernelEnvironment(name.data, name.count, RawPtr(0), 0)
+    if count <= 0 { return empty }
+    let data = makeArrayData(count)
+    let copied = kernelEnvironment(name.data, name.count, data, count)
+    if copied < 0 || copied > count {
+        releaseArrayData(data)
+        return empty
+    }
+    return String { data = data, count = copied, capacity = count, ops = empty.ops }
+}
+
+// The number the variable spells, or `fallback` when it is unset or spells
+// none.
+function environmentNumber(name: borrow String, fallback: Number) -> Number {
+    match environmentValue(name).toNumber() {
+        Some(value) -> return value
+        None -> return fallback
+    }
+}

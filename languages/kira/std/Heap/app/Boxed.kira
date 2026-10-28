@@ -1,0 +1,30 @@
+// One value of `Value` held in a heap block of its own, laid out as C lays
+// it out, and freed when its holder lets the box go. The value is of a type
+// with a C shape: a number, a Bool, a pointer, a payload-free enum, or an
+// `@FFI.Struct`. Its address can be handed to C and stays put for as long
+// as the box lives.
+struct Boxed<Value>: Drop {
+    let address: RawPtr
+
+    function pointer(borrow self) -> RawPtr {
+        return self.address
+    }
+
+    function drop(borrow mut self) {
+        heapFreeRaw(self.address)
+    }
+}
+
+function boxed<T>(value: T) -> Boxed<T> {
+    let address = heapAllocateRaw(sizeOf<T>(), alignOf<T>())
+    heapStore<T>(address, value)
+    return Boxed<T> { address = address }
+}
+
+function boxedValue<T>(box: borrow Boxed<T>) -> T {
+    return heapLoad<T>(box.address)
+}
+
+function setBoxedValue<T>(box: borrow Boxed<T>, value: T) {
+    heapStore<T>(box.address, value)
+}

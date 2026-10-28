@@ -1,0 +1,50 @@
+import Foundation
+
+// fs-verity digests: the empty file, a short file, a long file read from
+// bytes, and the same long file read from disk, which must agree.
+
+@Test
+function verityDigestOfTheEmptyFile() {
+    let empty: [UN8] = []
+    let outcome = match verityDigestOfBytes(empty) {
+        Ok(sum) -> hexText(sum)
+        Error(failure) -> archiveFailureText(failure)
+    }
+    expect!((outcome) == "3d248ca542a24fc62d1c43b916eae5016878e2533c88238480b26128a1f1af95")
+}
+
+@Test
+function verityDigestOfAShortFile() {
+    let outcome = match verityDigestOfBytes("hello\n".utf8()) {
+        Ok(sum) -> hexText(sum)
+        Error(failure) -> archiveFailureText(failure)
+    }
+    expect!((outcome) == "9c76eecc7b76fcb46199cb27b90cf59a660e10575bb0412128905129d5b1c2aa")
+}
+
+// Several blocks: the digest of the bytes and the digest of the same bytes
+// read from a file are the same, and both differ from a one-byte change.
+@Test
+function verityDigestOfALongFileMatchesItsBytes() {
+    var long: [UN8] = []
+    for index in 0..600000 { long.append(UN8((index * 13) % 251)) }
+    let path = scratchPath("verity-long.bin")
+    absorb removePath(path)
+    absorb writeFileBytes(path, long)
+    let fromBytes = match verityDigestOfBytes(long) {
+        Ok(sum) -> hexText(sum)
+        Error(failure) -> archiveFailureText(failure)
+    }
+    let fromFile = match verityDigestOfFile(path) {
+        Ok(sum) -> hexText(sum)
+        Error(failure) -> archiveFailureText(failure)
+    }
+    expect!((fromBytes) == "ba650c574e87d08c96adeb441af39d48bed96c4ef693c34b9dcb75755954fc1b")
+    expect!((fromFile) == (fromBytes))
+    long[300000] = long[300000] ^ 1
+    let changed = match verityDigestOfBytes(long) {
+        Ok(sum) -> hexText(sum)
+        Error(failure) -> archiveFailureText(failure)
+    }
+    expect!((changed == fromBytes) == (false))
+}

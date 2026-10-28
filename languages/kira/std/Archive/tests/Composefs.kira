@@ -1,0 +1,70 @@
+import Foundation
+
+// The composefs image: the tree written with directories, files, a hard size
+// spanning chunks, a link and a directory with many entries; the image is
+// padded to 4 KiB, and its superblock carries the EROFS magic.
+
+@Test
+function composefsWriterLaysOutTheTree() {
+    let path = scratchPath("composefs-tree.cfs")
+    absorb removePath(path)
+    var writer = match createComposefsWriter(path) {
+        Ok(created) -> created
+        Error(failure) -> {
+            expect!((archiveFailureText(failure)) == "")
+            return
+        }
+    }
+    let hello = match verityDigestOfBytes("hello\n".utf8()) {
+        Ok(sum) -> sum
+        Error(failure) -> {
+            expect!((archiveFailureText(failure)) == "")
+            return
+        }
+    }
+    var added = [
+        writer.addDirectory("", 493),
+        writer.addDirectory("etc", 493),
+        writer.addFile("etc/motd", 420, 6, hello),
+        writer.addFile("etc/empty", 384, 0, hello),
+        writer.addDirectory("usr", 493),
+        writer.addDirectory("usr/bin", 493),
+        writer.addFile("usr/bin/tool", 493, 6000000000, hello),
+        writer.addLink("usr/lib", "bin"),
+        writer.addDirectory("usr/many", 493)
+    ]
+    for index in 0..400 {
+        added.append(
+            writer.addFile("usr/many/entry-with-a-longer-name-\(index)", 420, 6, hello)
+        )
+    }
+    for result in added {
+        match result {
+            Ok -> {}
+            Error(failure) -> {
+                expect!((archiveFailureText(failure)) == "")
+                return
+            }
+        }
+    }
+    let length = match writer.finish() {
+        Ok(size) -> size
+        Error(failure) -> {
+            expect!((archiveFailureText(failure)) == "")
+            return
+        }
+    }
+    let bytes = match readArchiveFile(path) {
+        Ok(read) -> read
+        Error(failure) -> {
+            expect!((archiveFailureText(failure)) == "")
+            return
+        }
+    }
+    expect!((length % 4096) == (0))
+    expect!((length) == (bytes.count))
+    // The superblock's magic, little-endian: 0xE0F5E1E2.
+    let magic = Number(bytes[1024]) + Number(bytes[1025]) * 256 + Number(bytes[1026]) * 65536
+        + Number(bytes[1027]) * 16777216
+    expect!((magic) == (3774210530))
+}

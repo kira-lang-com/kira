@@ -1,0 +1,167 @@
+// How a `match` reaches its arms, and what an arm's binding holds.
+
+extend FunctionLowering {
+    function testOpenArms(borrow mut self, tag: KirValue, enumType: EnumType, arms: [CheckedArm], blocks: [KirBlockBuilder]) {
+        var otherwise = -1
+        for index in 0..arms.count {
+            if arms[index].variant < 0 { otherwise = index continue }
+            branchToArm(kir.compare(kirPredicate(.Equal, false), tag, kir.integer(types.integer64, enumType.tag(arms[index].variant))), blocks[index])
+            for variant in arms[index].also {
+                branchToArm(kir.compare(kirPredicate(.Equal, false), tag, kir.integer(types.integer64, enumType.tag(variant))), blocks[index])
+            }
+        }
+        finishTests(otherwise, blocks)
+    }
+    // Each variant an arm names goes to that arm's block, and every other
+    // one to the `else` arm's.
+    function switchArms(borrow mut self, subjectType: Type, arms: [CheckedArm], blocks: [KirBlockBuilder]) {
+        var named: [Int] = []
+        var otherwise = -1
+        for index in 0..arms.count {
+            if arms[index].variant < 0 {
+                otherwise = index
+                continue
+            }
+            kir.switchCase(arms[index].variant, blocks[index])
+            named.append(arms[index].variant)
+            for variant in arms[index].also {
+                kir.switchCase(variant, blocks[index])
+                named.append(variant)
+            }
+        }
+        if otherwise < 0 { return }
+        for variant in 0..program.enums[subjectType.declaration].variants.count {
+            if !contains(named, variant) { kir.switchCase(variant, blocks[otherwise]) }
+        }
+    }
+
+    // The subject's value against each arm's literals and ranges in turn,
+    // falling to the `else` arm, which a subject no pattern matched always
+    // has.
+    function testArms(borrow mut self, tested: KirValue, subjectType: Type, arms: [CheckedArm], blocks: [KirBlockBuilder]) {
+        let valueType = types.of(subjectType)
+        var otherwise = -1
+        for index in 0..arms.count {
+            let arm = arms[index]
+            if isOtherwise(arm) {
+                otherwise = index
+                continue
+            }
+            var literals: [Int] = []
+            match arm.literal {
+                Some(literal) -> literals.append(literal)
+                None -> {}
+            }
+            for literal in arm.also { literals.append(literal) }
+            for literal in literals {
+                let same = kir.compare(kirPredicate(.Equal, false), tested, kir.integer(valueType, literal))
+                branchToArm(same, blocks[index])
+            }
+            for pair in 0..(arm.ranges.count / 2) {
+                let low = kir.compare(kirPredicate(.GreaterEqual, subjectType.signed), tested, kir.integer(valueType, arm.ranges[pair * 2]))
+                let high = kir.compare(kirPredicate(.Less, subjectType.signed), tested, kir.integer(valueType, arm.ranges[pair * 2 + 1]))
+                branchToArm(kir.binary(kirOperator(.BitAnd, false), false, false, low, high), blocks[index])
+            }
+        }
+        finishTests(otherwise, blocks)
+    }
+
+    // A `String` subject against each arm's literals, compared by content.
+    function testTextArms(borrow mut self, subject: KirAddress, subjectType: Type, arms: [CheckedArm], blocks: [KirBlockBuilder]) {
+        var otherwise = -1
+        for index in 0..arms.count {
+            if isOtherwise(arms[index]) {
+                otherwise = index
+                continue
+            }
+            for text in arms[index].texts {
+                branchToArm(equalNominalBody(subject, address(text), subjectType), blocks[index])
+            }
+        }
+        finishTests(otherwise, blocks)
+    }
+
+    // A `Number` subject against each arm's literals and ranges in turn. A
+    // number is ordered by value and not by its two words, so every test asks
+    // `numberOrder` and asks it for -1, 0 or 1, exactly as `a < b` does.
+    function testNumberArms(borrow mut self, tested: KirAddress, arms: [CheckedArm], blocks: [KirBlockBuilder]) {
+        var otherwise = -1
+        for index in 0..arms.count {
+            let arm = arms[index]
+            if isOtherwise(arm) {
+                otherwise = index
+                continue
+            }
+            for literal in arm.decimals {
+                branchToArm(numberBeside(tested, address(literal), .Equal), blocks[index])
+            }
+            for pair in 0..(arm.decimalRanges.count / 2) {
+                let low = address(arm.decimalRanges[pair * 2])
+                let high = address(arm.decimalRanges[pair * 2 + 1])
+                let above = numberBeside(tested, low, .GreaterEqual)
+                let below = numberBeside(tested, high, .Less)
+                branchToArm(kir.binary(kirOperator(.BitAnd, false), false, true, above, below), blocks[index])
+            }
+        }
+        finishTests(otherwise, blocks)
+    }
+
+    // `left` against `right`, ordered the way `numberOrder` orders numbers.
+    function numberBeside(borrow mut self, left: KirAddress, right: KirAddress, predicate: Comparison) -> KirValue {
+        kir.argument(kir.pointer(left))
+        kir.argument(kir.pointer(right))
+        let order = kir.call(functions[program.numberFunctions[1]], types.integer64)
+        return kir.compare(kirPredicate(predicate, true), order, kir.integer(types.integer64, 0))
+    }
+
+    function isOtherwise(borrow self, arm: CheckedArm) -> Bool {
+        return arm.variant < 0 && arm.literal.isNone() && arm.also.count == 0
+            && arm.ranges.count == 0 && arm.texts.count == 0
+            && arm.decimals.count == 0 && arm.decimalRanges.count == 0
+    }
+
+    // Takes the arm when `taken` holds, and goes on testing otherwise.
+    function branchToArm(borrow mut self, taken: KirValue, arm: KirBlockBuilder) {
+        let next = kir.block()
+        kir.branchIf(taken, arm, next)
+        enter(next)
+    }
+
+    function finishTests(borrow mut self, otherwise: Int, blocks: [KirBlockBuilder]) {
+        if otherwise >= 0 {
+            kir.branch(blocks[otherwise])
+        } else {
+            kir.unreachable()
+        }
+    }
+
+    // The binding owns the payload. From a temporary or a `move` it takes
+    // the payload over, and the subject, whose one live payload that was, is
+    // no longer dropped; from a named value it takes a copy, which the
+    // checker allows only for a payload that runs no `drop` (3399).
+    function bindPayload(borrow mut self, subject: Int, scrutinee: Optional<KirAddress>, subjectType: Type, variant: Int, binding: Int) {
+        match scrutinee {
+            Some(place) -> {
+                let payloadType = checked.locals[binding].valueType
+                let payload = payloadPlace(place, subjectType, variant)
+                releaseTracked(storage[binding])
+                if movesBinding(subject) || isTemporaryAddress(place) {
+                    moveValue(payload, storage[binding], payloadType)
+                    forgetTracked(place)
+                } else {
+                    copyValue(payload, storage[binding], payloadType)
+                }
+                markInitialized(storage[binding])
+            }
+            None -> {}
+        }
+    }
+
+    // A `match` used as a value, into a temporary each arm that ends writes.
+    function choiceInto(borrow mut self, subject: Int, arms: [CheckedArm], valueType: Type) -> KirAddress {
+        let destination = temporary(valueType)
+        dispatch(subject, arms, .Some(destination))
+        markInitialized(destination)
+        return destination
+    }
+}

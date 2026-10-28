@@ -1,0 +1,69 @@
+// `traceText` walks a value's type: fields to a few levels, an array's first
+// elements and its length, an enum's case and payload, a string quoted and
+// cut short. A `Traced` type says itself what a trail shows.
+
+import Foundation
+
+struct Mesh {
+    let name: String
+    let vertices: [Float]
+}
+
+extend Mesh: Traced {
+    function traced(borrow self) -> Trace {
+        if vertices.count == 0 { return Trace("empty", name) }
+        return Trace(name, vertices: vertices.count)
+    }
+}
+
+struct Point {
+    let x: Float
+    let y: Int
+}
+
+struct Deep {
+    let inner: Inner
+}
+
+struct Inner {
+    let point: Point
+}
+
+struct Outer {
+    let deep: Deep
+}
+
+enum Shape {
+    Dot(Point)
+    Hull(Mesh)
+    Empty
+}
+
+enum Holder<Value> {
+    Holding(Value)
+    Nothing
+}
+
+@Main
+function main() -> Int {
+    print(traceText(42))
+    let float: Float = 1.0
+    print(traceText(float))
+    print(traceText(true))
+    print(traceText("tab\there \"quoted\""))
+    print(traceText(Point { x = 2.5, y = 3 }))
+    print(traceText([1, 2, 3, 4, 5]))
+    let none: [Int] = []
+    print(traceText(none))
+    print(traceText(Shape.Dot(Point { x = 0.5, y = 1 })))
+    print(traceText(Shape.Empty))
+    print(traceText(Mesh { name = "hull", vertices = [1.0, 2.0] }))
+    print(traceText(Shape.Hull(Mesh { name = "bare", vertices = [] })))
+    print(traceText(Outer { deep = Deep { inner = Inner { point = Point { x = 0.0, y = 0 } } } }))
+    let held: Holder<Int> = .Holding(7)
+    print(traceText(held))
+    var long = ""
+    for index in 0..30 { long = long + "abcd" }
+    print(traceText(long))
+    return 0
+}

@@ -1,0 +1,266 @@
+extend Checker {
+    function checkStyle(borrow mut self) {
+        for global in tree.globals {
+            if !ownSource(global.span.file) { continue }
+            // A thread's own copy is no state another thread shares.
+            let threadLocal = hasAttribute(global.annotations, .ThreadLocal)
+            if global.binding.mutable && !tree.framework && !threadLocal { report(.GlobalMutableState, global.span) }
+            lintName(global.binding.name)
+        }
+        var linted: [Int] = []
+        for declared in tree.functions {
+            if !ownSource(declared.span.file) { continue }
+            // A foreign function is named by the symbol it binds, which is
+            // the foreign library's name, prefix and all.
+            if !hasAttribute(declared.annotations, .Foreign) { lintName(declared.name) }
+            lintBody(declared.body, linted)
+        }
+        for structure in tree.structs {
+            if !ownSource(structure.name.span.file) || structure.specialized { continue }
+            for method in structure.methods { lintBody(method.body, linted) }
+        }
+    }
+
+    // A method can reach the tree both as a function and as a member, so
+    // each body is linted once.
+    function lintBody(borrow self, body: [Int], linted: borrow mut [Int]) {
+        if body.count == 0 || contains(linted, body[0]) { return }
+        linted.append(body[0])
+        lintStatements(body)
+    }
+
+    // Whether the last statement of `body` steps `name` up by one, the shape
+    // of a loop a `for` range would write.
+    function stepsByOne(borrow self, name: String, body: [Int]) -> Bool {
+        if body.count == 0 { return false }
+        for index in 0..body.count - 1 {
+            if movesCounter(name, body[index]) { return false }
+        }
+        match tree.statements[body[body.count - 1]].kind {
+            CompoundAssignment(operator, target, value) -> {
+                return operator == .Add && namedAs(target, name) && isOne(value)
+            }
+            Assignment(target, value) -> {
+                match tree.expressions[value].kind.binaryOperands(.Add) {
+                    Some(sum) -> return namedAs(target, name) && namedAs(sum.left, name) && isOne(sum.right)
+                    None -> return false
+                }
+            }
+            Binding -> return false
+            Evaluation -> return false
+            If -> return false
+            While -> return false
+            For -> return false
+            ForEach -> return false
+            Match -> return false
+            Attempt -> return false
+            Return -> return false
+            Break -> return false
+            Continue -> return false
+        }
+    }
+
+    // Whether `statement` changes `name` or skips ahead with `continue`, either
+    // of which a `for` range cannot say.
+    function movesCounter(borrow self, name: String, statement: Int) -> Bool {
+        match tree.statements[statement].kind {
+            Assignment(target, value) -> return namedAs(target, name)
+            CompoundAssignment(operator, target, value) -> return namedAs(target, name)
+            Continue -> return true
+            If(condition, yes, no) -> return anyMovesCounter(name, yes) || anyMovesCounter(name, no)
+            While(condition, body) -> return anyMovesCounter(name, body)
+            For(variable, low, high, body) -> return anyMovesCounter(name, body)
+            ForEach(variable, source, body) -> return anyMovesCounter(name, body)
+            Match(subject, arms) -> {
+                for arm in arms {
+                    if anyMovesCounter(name, arm.body) { return true }
+                }
+                return false
+            }
+            Attempt(body, arms) -> {
+                if anyMovesCounter(name, body) { return true }
+                for arm in arms {
+                    if anyMovesCounter(name, arm.body) { return true }
+                }
+                return false
+            }
+            Binding -> return false
+            Evaluation -> return false
+            Return -> return false
+            Break -> return false
+        }
+    }
+
+    function anyMovesCounter(borrow self, name: String, body: [Int]) -> Bool {
+        for statement in body {
+            if movesCounter(name, statement) { return true }
+        }
+        return false
+    }
+
+    function namedAs(borrow self, expression: Int, name: String) -> Bool {
+        match tree.expressions[expression].kind.name() {
+            Some(identifier) -> return identifier.text == name
+            None -> return false
+        }
+    }
+
+    function isOne(borrow self, expression: Int) -> Bool {
+        match tree.expressions[expression].kind.wholeIntegerLiteral() {
+            Some(value) -> return value == 1
+            None -> return false
+        }
+    }
+
+    function ownSource(borrow self, file: Int) -> Bool {
+        for source in tree.sources {
+            if source.file == file { return source.module == 0 }
+        }
+        return false
+    }
+
+    // A two-letter lowercase lead that is no word, as in `dkSurfaces` or
+    // `uiLetterFor`, is a program prefix. A longer lead is a word or an
+    // acronym that is part of the name: `boxValue`, `keyName`, `kslCompiler`.
+    function lintName(borrow self, name: Identifier) {
+        if prefixLead(name.text) { report(.PrefixedName, name.span) }
+    }
+
+    function lintStatements(borrow self, body: [Int]) {
+        for index in body {
+            let statement = tree.statements[index]
+            match statement.kind {
+                Binding(binding) -> lintExpression(binding.value)
+                Evaluation(value) -> lintExpression(value)
+                Assignment(target, value) -> lintExpression(value)
+                CompoundAssignment(operator, target, value) -> lintExpression(value)
+                Return(value) -> { match value { Some(value) -> lintExpression(value) None -> {} } }
+                If(condition, yes, no) -> {
+                    lintExpression(condition)
+                    if no.count == 1 {
+                        match tree.statements[no[0]].kind {
+                            If(next, body, otherwise) -> {
+                                if sameComparedName(condition, next) { report(.ComparisonChain, statement.span) }
+                            }
+                            Binding -> {}
+                            Assignment -> {}
+                            CompoundAssignment -> {}
+                            Evaluation -> {}
+                            Return -> {}
+                            While -> {}
+                            For -> {}
+                            ForEach -> {}
+                            Match -> {}
+                            Attempt -> {}
+                            Break -> {}
+                            Continue -> {}
+                        }
+                    }
+                    lintStatements(yes)
+                    lintStatements(no)
+                }
+                While(condition, body) -> {
+                    match tree.expressions[condition].kind {
+                        Name -> report(.FlagLoop, statement.span)
+                        Binary(operator, left, right) -> {
+                            match tree.expressions[left].kind.name() {
+                                Some(counter) -> {
+                                    if (operator == .Less || operator == .LessEqual) && stepsByOne(counter.text, body) {
+                                        report(.CountedWhile, statement.span)
+                                    }
+                                }
+                                None -> {}
+                            }
+                        }
+                        IntegerLiteral -> {}
+                        FloatLiteral -> {}
+                        BooleanLiteral -> {}
+                        StringLiteral -> {}
+                        ArrayLiteral -> {}
+                        Index -> {}
+                        Transfer -> {}
+                        Labelled -> {}
+                        TypeQuery -> {}
+                        Member -> {}
+                        Quote -> {}
+                        ExpandedMacro -> {}
+                        MacroCall -> {}
+                        Call -> {}
+                        GenericCall -> {}
+                        MethodCall -> {}
+                        IndirectCall -> {}
+                        Lambda -> {}
+                        KeyPath -> {}
+                        Task -> {}
+                        Try -> {}
+                        Variant -> {}
+                        StructLiteral -> {}
+                        Unary -> {}
+                        Conditional -> {}
+                        MatchValue -> {}
+                        Content -> {}
+                    }
+                    lintStatements(body)
+                }
+                For(name, low, high, body) -> lintStatements(body)
+                ForEach(name, source, body) -> lintStatements(body)
+                Match(subject, arms) -> { for arm in arms { lintStatements(arm.body) } }
+                Attempt(body, arms) -> {
+                    lintStatements(body)
+                    for arm in arms { lintStatements(arm.body) }
+                }
+                Break -> {}
+                Continue -> {}
+            }
+        }
+    }
+
+    function sameComparedName(borrow self, first: Int, second: Int) -> Bool {
+        let left = comparedName(first)
+        let right = comparedName(second)
+        return utf8Count(left) > 0 && left == right
+    }
+
+    function comparedName(borrow self, index: Int) -> String {
+        match tree.expressions[index].kind.binaryOperands(.Equal) {
+            Some(operands) -> {
+                match tree.expressions[operands.left].kind.name() {
+                    Some(name) -> return name.text
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+        return ""
+    }
+
+    function lintExpression(borrow self, index: Int) {
+        match tree.expressions[index].kind.binaryOperands(.Equal) {
+            Some(operands) -> {
+                match tree.expressions[operands.right].kind.called() {
+                    Some(call) -> {
+                        if call.name.text == "U32" { report(.IntegerCodeComparison, tree.expressions[index].span) }
+                    }
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+    }
+}
+
+// Whether `text` starts with two lowercase letters that are no word, then a
+// capital.
+function prefixLead(text: String) -> Bool {
+    if utf8Count(text) < 4 { return false }
+    for index in 0..2 {
+        let letter = utf8Byte(text, index)
+        if letter < 97 || letter > 122 { return false }
+    }
+    let next = utf8Byte(text, 2)
+    if next < 65 || next > 90 { return false }
+    for word in ["as", "at", "by", "do", "go", "id", "if", "in", "is", "no", "of", "on", "or", "to", "up"] {
+        if startsWithText(text, word) { return false }
+    }
+    return true
+}

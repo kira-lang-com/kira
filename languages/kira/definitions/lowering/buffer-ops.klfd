@@ -1,0 +1,62 @@
+extend KirTypes {
+    function declareArrayBufferOps(borrow mut self, builder: KirModuleBuilder, program: CheckedProgram, functions: [KirFunctionBuilder]) {
+        if program.arrayFunctions.count == 0 { return }
+        for index in 0..program.structs.count {
+            let declared = program.structs[index]
+            if declared.name.text != "ArrayBufferOps" { continue }
+            let name = program.named(declared.baseNameSpan)
+            let global = kir_global_new_named(builder, name.start, name.end, structs[index], 1, 0)
+            for byte in 0..structSizes[index] { kir_global_byte(global, 0) }
+            arrayOpsGlobals.append(global)
+            let signature = kir_signature_new(builder, name.start, name.end, unit)
+            let symbol = "__kira_array_buffer_ops_init"
+            for byte in 0..utf8Count(symbol) { kir_signature_name_byte(signature, utf8Byte(symbol, byte)) }
+            let initializer = kir_signature_define(signature)
+            kir_function_initializer(initializer)
+            initializer.switchTo(initializer.entryBlock())
+            let address = kir_value_global_address(initializer, global)
+            initializer.store(initializer.integer(integer32, 1), initializer.field(address, 0, integer32))
+            initializer.store(initializer.integer(integer32, 0), initializer.field(address, 1, integer32))
+            for field in 2..4 {
+                let target = bufferOpsEntry(builder, program, functions, field + 5)
+                let reference = kir_value_function_reference(initializer, target)
+                let raw = initializer.convert(convertBitcast, reference, pointer)
+                initializer.store(raw, initializer.field(address, field, pointer))
+            }
+            initializer.returnVoid()
+            return
+        }
+    }
+
+    // What C, and code of other languages and engines, calls the ops'
+    // functions through: an entry with a C prototype calling the Kira
+    // function. Each unit with the table defines it alike, so the units
+    // agree on it whichever of them holds the Kira function's body, and a VM
+    // gives C a native entry to it rather than its own reference.
+    function bufferOpsEntry(borrow self, builder: KirModuleBuilder, program: CheckedProgram, functions: [KirFunctionBuilder], slot: Int) -> KirFunctionBuilder {
+        let checked = program.functions[program.arrayFunctions[slot]]
+        let name = program.named(checked.name)
+        let returns = !checked.result.equals(Type.void())
+        var result = unit
+        if returns { result = of(checked.result) }
+        let signature = kir_signature_new(builder, name.start, name.end, result)
+        let symbol = joinText(["__kira_array_buffer_ops_entry_", checked.symbol])
+        for byte in 0..utf8Count(symbol) { kir_signature_name_byte(signature, utf8Byte(symbol, byte)) }
+        for index in 0..checked.parameterCount {
+            kir_signature_parameter(signature, of(checked.locals[index].valueType))
+            cParameter(signature, program, checked.locals[index].valueType)
+        }
+        cResult(signature, program, checked.result)
+        let entry = kir_signature_define(signature)
+        entry.switchTo(entry.entryBlock())
+        for index in 0..checked.parameterCount { entry.argument(entry.parameter(index)) }
+        let target = functions[program.arrayFunctions[slot]]
+        if returns {
+            entry.returnValue(entry.call(target, result))
+        } else {
+            entry.callVoid(target)
+            entry.returnVoid()
+        }
+        return entry
+    }
+}

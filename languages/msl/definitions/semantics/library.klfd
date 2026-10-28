@@ -1,0 +1,334 @@
+// The `metal_stdlib` functions with a KSIR counterpart.
+//
+// Most take arguments of one type T, which is the widest argument's: its
+// lanes, and the scalar of the arguments that are not literals. Each
+// argument converts to T, a scalar being splatted. What T may be and what
+// the call yields is the function's form.
+
+enum Domain {
+    Floating
+    Numeric
+    Integral
+}
+
+enum Yield {
+    SameType
+    LaneScalar
+    BoolLanes
+}
+
+struct LibraryForm {
+    let ksir: String
+    let arity: Int
+    let domain: Domain
+    let yield: Yield
+    let vectorOnly: Bool
+}
+
+function form(ksir: String, arity: Int, domain: Domain, yield: Yield, vectorOnly: Bool) -> Optional<LibraryForm> {
+    return .Some(LibraryForm { ksir = ksir, arity = arity, domain = domain, yield = yield, vectorOnly = vectorOnly })
+}
+
+function unaryFloat(ksir: String) -> Optional<LibraryForm> {
+    return form(ksir, 1, .Floating, .SameType, false)
+}
+
+function libraryForm(name: String) -> Optional<LibraryForm> {
+    match name {
+        "sin" -> return unaryFloat("sin")
+        "cos" -> return unaryFloat("cos")
+        "tan" -> return unaryFloat("tan")
+        "asin" -> return unaryFloat("asin")
+        "acos" -> return unaryFloat("acos")
+        "atan" -> return unaryFloat("atan")
+        "sinh" -> return unaryFloat("sinh")
+        "cosh" -> return unaryFloat("cosh")
+        "tanh" -> return unaryFloat("tanh")
+        "asinh" -> return unaryFloat("asinh")
+        "acosh" -> return unaryFloat("acosh")
+        "atanh" -> return unaryFloat("atanh")
+        "exp" -> return unaryFloat("exp")
+        "exp2" -> return unaryFloat("exp2")
+        "log" -> return unaryFloat("log")
+        "log2" -> return unaryFloat("log2")
+        "sqrt" -> return unaryFloat("sqrt")
+        "rsqrt" -> return unaryFloat("inverse_sqrt")
+        "ceil" -> return unaryFloat("ceil")
+        "floor" -> return unaryFloat("floor")
+        "fract" -> return unaryFloat("fract")
+        "trunc" -> return unaryFloat("trunc")
+        "rint" -> return unaryFloat("round")
+        "round" -> return unaryFloat("round_away")
+        "saturate" -> return unaryFloat("saturate")
+        "sign" -> return unaryFloat("sign")
+        "pow" -> return form("pow", 2, .Floating, .SameType, false)
+        "powr" -> return form("pow", 2, .Floating, .SameType, false)
+        "atan2" -> return form("atan2", 2, .Floating, .SameType, false)
+        "step" -> return form("step", 2, .Floating, .SameType, false)
+        "fmin" -> return form("min", 2, .Floating, .SameType, false)
+        "fmax" -> return form("max", 2, .Floating, .SameType, false)
+        "fmod" -> return form("modulo", 2, .Floating, .SameType, false)
+        "mix" -> return form("mix", 3, .Floating, .SameType, false)
+        "smoothstep" -> return form("smoothstep", 3, .Floating, .SameType, false)
+        "fma" -> return form("fma", 3, .Floating, .SameType, false)
+        "abs" -> return form("abs", 1, .Numeric, .SameType, false)
+        "min" -> return form("min", 2, .Numeric, .SameType, false)
+        "max" -> return form("max", 2, .Numeric, .SameType, false)
+        "clamp" -> return form("clamp", 3, .Numeric, .SameType, false)
+        "length" -> return form("length", 1, .Floating, .LaneScalar, false)
+        "distance" -> return form("distance", 2, .Floating, .LaneScalar, false)
+        "dot" -> return form("dot", 2, .Floating, .LaneScalar, true)
+        "normalize" -> return form("normalize", 1, .Floating, .SameType, true)
+        "reflect" -> return form("reflect", 2, .Floating, .SameType, true)
+        "cross" -> return form("cross", 2, .Floating, .SameType, true)
+        "faceforward" -> return form("face_forward", 3, .Floating, .SameType, true)
+        "isnan" -> return form("is_nan", 1, .Floating, .BoolLanes, false)
+        "isinf" -> return form("is_inf", 1, .Floating, .BoolLanes, false)
+        "popcount" -> return form("count_one_bits", 1, .Integral, .SameType, false)
+        "clz" -> return form("count_leading_zeros", 1, .Integral, .SameType, false)
+        "ctz" -> return form("count_trailing_zeros", 1, .Integral, .SameType, false)
+        "reverse_bits" -> return form("reverse_bits", 1, .Integral, .SameType, false)
+        else -> {
+            let none: Optional<LibraryForm> = .None
+            return none
+        }
+    }
+}
+
+// The packing functions: their KSIR name, and the lanes of the float side.
+function packing(name: String) -> [String] {
+    match name {
+        "pack_float_to_unorm4x8" -> return ["pack4x8unorm", "4", "pack"]
+        "pack_float_to_snorm4x8" -> return ["pack4x8snorm", "4", "pack"]
+        "pack_float_to_unorm2x16" -> return ["pack2x16unorm", "2", "pack"]
+        "pack_float_to_snorm2x16" -> return ["pack2x16snorm", "2", "pack"]
+        "unpack_unorm4x8_to_float" -> return ["unpack4x8unorm", "4", "unpack"]
+        "unpack_snorm4x8_to_float" -> return ["unpack4x8snorm", "4", "unpack"]
+        "unpack_unorm2x16_to_float" -> return ["unpack2x16unorm", "2", "unpack"]
+        "unpack_snorm2x16_to_float" -> return ["unpack2x16snorm", "2", "unpack"]
+        else -> return []
+    }
+}
+
+// Library functions that exist in Metal but have no KSIR counterpart.
+function isUnsupportedLibrary(name: String) -> Bool {
+    let known = [
+        "exp10", "frexp", "ldexp", "modf", "nextafter", "sincos", "cospi", "sinpi", "tanpi", "acospi", "asinpi",
+        "atanpi", "atan2pi", "fdim", "ilogb", "log10", "logb", "copysign", "median3", "min3", "max3", "rotate",
+        "mad24", "mul24", "mulhi", "madhi", "hadd", "rhadd", "absdiff", "addsat", "subsat", "length_squared",
+        "distance_squared", "fast_normalize", "is_function_constant_defined", "is_null_texture",
+        "pack_half_to_unorm4x8", "quad_broadcast", "fence"
+    ]
+    return contains(known, name)
+}
+
+extend Checker {
+    // The type every argument of a uniform library call takes, or -1.
+    function libraryType(borrow mut self, arguments: [Int], span: Span) -> Int {
+        var width = 1
+        var scalar: Scalar = .Bool
+        var literalScalar: Scalar = .Bool
+        var typed = false
+        for argument in arguments {
+            let found = typeAt(typeOf(argument))
+            if !isLaned(typeOf(argument)) {
+                report(.TypeMismatch, span)
+                return -1
+            }
+            if found.shape == .Vector {
+                if width > 1 && found.width != width {
+                    report(.TypeMismatch, span)
+                    return -1
+                }
+                width = found.width
+            }
+            if program.expressions[argument].kind == .Literal {
+                if found.scalar.rank() > literalScalar.rank() { literalScalar = found.scalar }
+            } else if !typed || found.scalar.rank() > scalar.rank() {
+                scalar = found.scalar
+                typed = true
+            }
+        }
+        if !typed { scalar = literalScalar }
+        return vectorType(scalar, width)
+    }
+
+    // Each argument as `common`; a vector of another scalar is refused.
+    function libraryArguments(borrow mut self, arguments: [Int], common: Int, span: Span) -> [Int] {
+        var converted: [Int] = []
+        for argument in arguments {
+            let argumentType = typeOf(argument)
+            if isVector(argumentType) && typeAt(argumentType).scalar != typeAt(common).scalar {
+                report(.TypeMismatch, span)
+                return []
+            }
+            converted.append(convertTo(argument, common))
+        }
+        return converted
+    }
+
+    function libraryOf(borrow mut self, ksir: String, arguments: [Int], resultType: Int, span: Span) -> Int {
+        var made = expressionOf(.Library, resultType, span)
+        made.name = ksir
+        made.arguments = arguments
+        return add(made)
+    }
+
+    function libraryCall(borrow mut self, name: String, arguments: [Int], span: Span) -> Int {
+        match libraryForm(name) {
+            Some(found) -> return uniformCall(found, arguments, span)
+            None -> {}
+        }
+        let packed = packing(name)
+        if packed.count == 3 { return packingCall(packed, arguments, span) }
+        match name {
+            "select" -> return selectCall(arguments, span)
+            "transpose" -> return matrixCall(name, arguments, span)
+            "determinant" -> return matrixCall(name, arguments, span)
+            "refract" -> return refractCall(arguments, span)
+            "extract_bits" -> return bitsCall(name, arguments, 2, span)
+            "insert_bits" -> return bitsCall(name, arguments, 3, span)
+            "dfdx" -> return derivativeCall("x", arguments, span)
+            "dfdy" -> return derivativeCall("y", arguments, span)
+            "fwidth" -> return derivativeCall("width", arguments, span)
+            "all" -> return reductionCall(name, arguments, span)
+            "any" -> return reductionCall(name, arguments, span)
+            else -> {}
+        }
+        if startsWith(name, "simd_") || startsWith(name, "quad_") { return refuse(.SimdGroup, span) }
+        if isUnsupportedLibrary(name) || startsWith(name, "atomic_") { return refuse(.UnsupportedFunction, span) }
+        return refuse(.UnknownName, span)
+    }
+
+    function uniformCall(borrow mut self, found: LibraryForm, arguments: [Int], span: Span) -> Int {
+        if arguments.count != found.arity { return refuse(.ArgumentCount, span) }
+        let common = libraryType(arguments, span)
+        if common < 0 { return invalid(span) }
+        let scalar = typeAt(common).scalar
+        var fits = false
+        match found.domain {
+            Floating -> fits = scalar.isFloat()
+            Numeric -> fits = scalar != .Bool
+            Integral -> fits = scalar.isInteger()
+        }
+        if found.vectorOnly && !isVector(common) { fits = false }
+        if found.ksir == "cross" && lanes(common) != 3 { fits = false }
+        if !fits { return refuse(.NoMatch, span) }
+        let converted = libraryArguments(arguments, common, span)
+        if converted.count != arguments.count { return invalid(span) }
+        var resultType = common
+        match found.yield {
+            SameType -> resultType = common
+            LaneScalar -> resultType = scalarType(scalar)
+            BoolLanes -> resultType = withScalar(common, .Bool)
+        }
+        if found.ksir == "modulo" {
+            var made = expressionOf(.Binary, common, span)
+            made.operator = .Remainder
+            made.left = converted[0]
+            made.right = converted[1]
+            return add(made)
+        }
+        return libraryOf(found.ksir, converted, resultType, span)
+    }
+
+    // `select(a, b, c)`: `b` where `c` holds, else `a`, lane by lane.
+    function selectCall(borrow mut self, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 3 { return refuse(.ArgumentCount, span) }
+        let common = libraryType([arguments[0], arguments[1]], span)
+        if common < 0 { return invalid(span) }
+        let condition = arguments[2]
+        let conditionType = typeOf(condition)
+        let laned = isLaned(conditionType) && typeAt(conditionType).scalar == .Bool
+        if !laned || (isVector(conditionType) && lanes(conditionType) != lanes(common)) {
+            return refuse(.TypeMismatch, span)
+        }
+        let converted = libraryArguments([arguments[0], arguments[1]], common, span)
+        if converted.count != 2 { return invalid(span) }
+        var made = expressionOf(.Select, common, span)
+        made.left = condition
+        made.right = converted[1]
+        made.third = converted[0]
+        return add(made)
+    }
+
+    function matrixCall(borrow mut self, name: String, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 1 { return refuse(.ArgumentCount, span) }
+        let found = typeAt(typeOf(arguments[0]))
+        if found.shape != .Matrix { return refuse(.NoMatch, span) }
+        if name == "transpose" {
+            return libraryOf(name, arguments, matrixType(found.scalar, found.rows, found.width), span)
+        }
+        if found.width != found.rows { return refuse(.NoMatch, span) }
+        return libraryOf(name, arguments, scalarType(found.scalar), span)
+    }
+
+    function refractCall(borrow mut self, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 3 { return refuse(.ArgumentCount, span) }
+        let common = libraryType([arguments[0], arguments[1]], span)
+        if common < 0 { return invalid(span) }
+        if !isVector(common) || !isFloating(common) || !isScalar(typeOf(arguments[2])) { return refuse(.NoMatch, span) }
+        var converted = libraryArguments([arguments[0], arguments[1]], common, span)
+        if converted.count != 2 { return invalid(span) }
+        converted.append(convertTo(arguments[2], scalarType(typeAt(common).scalar)))
+        return libraryOf("refract", converted, common, span)
+    }
+
+    // `extract_bits(x, offset, bits)` and `insert_bits(base, insert,
+    // offset, bits)`: the offset and count are `uint`s.
+    function bitsCall(borrow mut self, name: String, arguments: [Int], values: Int, span: Span) -> Int {
+        if arguments.count != values + 1 { return refuse(.ArgumentCount, span) }
+        let first = values - 1
+        var leading: [Int] = []
+        for index in 0..first {
+            leading.append(arguments[index])
+        }
+        let common = libraryType(leading, span)
+        if common < 0 { return invalid(span) }
+        if !isIntegral(common) { return refuse(.NoMatch, span) }
+        var converted = libraryArguments(leading, common, span)
+        if converted.count != leading.count { return invalid(span) }
+        for index in first..arguments.count {
+            if !isScalar(typeOf(arguments[index])) || !isIntegral(typeOf(arguments[index])) {
+                return refuse(.TypeMismatch, span)
+            }
+            converted.append(convertTo(arguments[index], scalarType(.UInt)))
+        }
+        return libraryOf(name, converted, common, span)
+    }
+
+    function packingCall(borrow mut self, packed: [String], arguments: [Int], span: Span) -> Int {
+        if arguments.count != 1 { return refuse(.ArgumentCount, span) }
+        var width = 4
+        if packed[1] == "2" { width = 2 }
+        let floats = vectorType(.Float, width)
+        if packed[2] == "pack" {
+            let converted = convertImplicitly(arguments[0], floats, span)
+            if broken(converted) { return converted }
+            return libraryOf(packed[0], [converted], scalarType(.UInt), span)
+        }
+        let converted = convertImplicitly(arguments[0], scalarType(.UInt), span)
+        if broken(converted) { return converted }
+        return libraryOf(packed[0], [converted], floats, span)
+    }
+
+    // `dfdx`, `dfdy` and `fwidth`, which only a fragment function has.
+    function derivativeCall(borrow mut self, axis: String, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 1 { return refuse(.ArgumentCount, span) }
+        if stage == .VertexStage || stage == .KernelStage { return refuse(.WrongStage, span) }
+        if !isFloating(typeOf(arguments[0])) { return refuse(.NoMatch, span) }
+        var made = expressionOf(.Library, typeOf(arguments[0]), span)
+        made.name = "derivative"
+        made.detail = axis
+        made.arguments = arguments
+        return add(made)
+    }
+
+    function reductionCall(borrow mut self, name: String, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 1 { return refuse(.ArgumentCount, span) }
+        let argumentType = typeOf(arguments[0])
+        if !isLaned(argumentType) || typeAt(argumentType).scalar != .Bool { return refuse(.NoMatch, span) }
+        if isScalar(argumentType) { return arguments[0] }
+        return libraryOf(name, arguments, scalarType(.Bool), span)
+    }
+}

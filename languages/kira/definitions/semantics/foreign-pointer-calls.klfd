@@ -1,0 +1,67 @@
+// A call through a C function pointer: a value of an `@FFI.Callback` type
+// called as a function (KLF section 26.4). It is `call.foreign` through the
+// pointer, so each argument is converted to what C reads exactly as for a call
+// to an extern function, and a `CString` result is read back as a `String`.
+// A function type carries no C record layout, so a parameter or result C
+// passes as a struct by value cannot cross a pointer and is refused.
+
+extend Checker {
+    function checkPointerCall(borrow mut self, target: Int, callback: Int, arguments: [Int], span: Span) -> Int {
+        match callbackMark(callback) {
+            Some(mark) -> {
+                let parameters = callbackParameters(mark)
+                let result = callbackResult(mark)
+                if arguments.count != parameters.count {
+                    report(.ArgumentCount, span)
+                    return add(.Integer(0), Type.invalid(), span)
+                }
+                if !crossesPointer(parameters, result, span) { return add(.Integer(0), Type.invalid(), span) }
+                var values: [Int] = []
+                for index in 0..parameters.count {
+                    let value = expression(arguments[index], .Some(parameters[index]))
+                    values.append(foreignCoerce(value, parameters[index], false))
+                }
+                let call = add(.IndirectCall(target, values), result, span)
+                if !isCStringType(program, result) || program.foreignHelpers.count == 0 { return call }
+                let read = program.foreignHelpers[0]
+                return add(.Call(read, [call]), declarations.signatures[read].result, span)
+            }
+            None -> {
+                report(.ForeignCallbackShape, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+
+    // Whether every parameter and the result of a callback cross a C
+    // function pointer, reporting the first that does not.
+    function crossesPointer(borrow mut self, parameters: [Type], result: Type, span: Span) -> Bool {
+        for parameter in parameters {
+            if !pointerSeam(foreignSeam(program, parameter, true)) {
+                report(.ForeignSeamType, span)
+                return false
+            }
+        }
+        if !pointerSeam(foreignSeam(program, result, false)) {
+            report(.ForeignSeamType, span)
+            return false
+        }
+        return true
+    }
+}
+
+function pointerSeam(seam: Optional<Seam>) -> Bool {
+    match seam {
+        Some(found) -> {
+            match found {
+                Word -> return true
+                Field -> return true
+                Number -> return true
+                Elements -> return true
+                Nothing -> return true
+                Image -> return false
+            }
+        }
+        None -> return false
+    }
+}

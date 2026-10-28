@@ -1,0 +1,402 @@
+import Foundation
+import Kten
+
+// The content store and the action cache (DESIGN.md section 6.1):
+//
+//     $KIRA_BUILD_CACHE (default ~/.cache/kira/build)/
+//       store/<2 hex>/<62 hex>     every file, by SHA-256, read-only
+//       actions/<2 hex>/<62 hex>   an action record, by the action's key
+//       verified/<2 hex>/<62 hex>  an empty mark: the store held every file
+//                                  of the tree with that digest
+
+namespace StoreMode {
+    // What a stored file is: readable by everyone, writable by no one.
+    let readOnly: UNumber = 292
+    // The permission bits that let a file run.
+    let runnable: UNumber = 73
+    // What a directory placed from a tree keeps at least, so the build can
+    // fill and remove it: the owner's read, write and search bits.
+    let ownDirectory: UNumber = 448
+    // How many hexadecimal digits name a store's subdirectory.
+    let prefix: Number = 2
+}
+
+// What the engine knows of an artifact once it exists.
+struct Made {
+    // A file's SHA-256, or the SHA-256 of a tree's listing.
+    let digest: String
+    let tree: Bool
+    // A file's permission bits; 0 for a tree, whose listing holds them.
+    let mode: UNumber
+}
+
+// What an action that ran produced, kept under its key.
+struct ActionRecord {
+    let outputs: [Made]
+    let discovered: [Discovered] = []
+}
+
+struct ContentStore {
+    let root: String
+
+    function blobPath(borrow self, digest: borrow String) -> String {
+        return storedPath(joinPath(root, "store"), digest)
+    }
+
+    function recordPath(borrow self, key: borrow String) -> String {
+        return storedPath(joinPath(root, "actions"), key)
+    }
+
+    function verifiedPath(borrow self, digest: borrow String) -> String {
+        return storedPath(joinPath(root, "verified"), digest)
+    }
+
+    // Keeps the file at `path`, whose SHA-256 is `digest`, unless the store
+    // holds it already. A file the build owns moves in; any other is copied.
+    function keepFile(
+        borrow self,
+        path: borrow String,
+        digest: borrow String,
+        owned: Bool
+    ) -> Result<Void, BuildFailure> {
+        let blob = blobPath(digest)
+        if fileExists(blob) { return .Ok }
+        match makePathTree(parentPath(blob)) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        let part = blob + ".part"
+        var moved = false
+        if owned {
+            match renamePath(path, part) {
+                Ok -> moved = true
+                Error(failure) -> absorb failure
+            }
+        }
+        if !moved {
+            match copyFile(path, part) {
+                Ok -> {}
+                Error(failure) -> return .Error(
+                    .Files("cannot store \(path): \(traceText(failure))")
+                )
+            }
+        }
+        match setFileMode(part, StoreMode.readOnly) {
+            Ok -> {}
+            Error(failure) -> return .Error(.Files("cannot protect \(part): \(traceText(failure))"))
+        }
+        let size = match fileStatus(part) {
+            Ok(status) -> Number(status.size)
+            Error(failure) -> {
+                absorb failure
+                0
+            }
+        }
+        match renamePath(part, blob) {
+            Ok -> {}
+            Error(failure) -> return .Error(.Files("cannot store \(blob): \(traceText(failure))"))
+        }
+        noteKept(size)
+        return .Ok
+    }
+
+    // Keeps `bytes`, answering their SHA-256.
+    function keepBytes(borrow self, bytes: borrow [UN8]) -> Result<String, BuildFailure> {
+        let digest = match sha256Hex(bytes) {
+            Ok(hex) -> hex
+            Error(failure) -> return .Error(failure)
+        }
+        let blob = blobPath(digest)
+        if fileExists(blob) { return .Ok(digest) }
+        match makePathTree(parentPath(blob)) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        let part = blob + ".part"
+        match writeFileBytes(part, bytes) {
+            Ok -> {}
+            Error(failure) -> return .Error(.Files("cannot write \(part): \(traceText(failure))"))
+        }
+        match setFileMode(part, StoreMode.readOnly) {
+            Ok -> {}
+            Error(failure) -> return .Error(.Files("cannot protect \(part): \(traceText(failure))"))
+        }
+        match renamePath(part, blob) {
+            Ok -> {}
+            Error(failure) -> return .Error(.Files("cannot store \(blob): \(traceText(failure))"))
+        }
+        noteKept(Number(bytes.count))
+        return .Ok(digest)
+    }
+
+    // Keeps every file of the tree whose entries are `entries`, read under
+    // `directory`, and the tree's listing, answering the listing's SHA-256.
+    function keepTree(
+        borrow self,
+        directory: borrow String,
+        entries: borrow [TreeEntry],
+        owned: Bool
+    ) -> Result<String, BuildFailure> {
+        for entry in entries {
+            if entry.kind != .File { continue }
+            match keepFile(joinPath(directory, entry.path), entry.content, owned) {
+                Ok -> {}
+                Error(failure) -> return .Error(failure)
+            }
+        }
+        return keepBytes(listingKten(entries).encoded())
+    }
+
+    // The entries of the tree whose listing is stored as `digest`.
+    function treeEntries(borrow self, digest: borrow String) -> Result<[TreeEntry], BuildFailure> {
+        let blob = blobPath(digest)
+        let bytes = match readFileBytes(blob) {
+            Ok(read) -> read
+            Error(failure) -> return .Error(.Files("cannot read \(blob): \(traceText(failure))"))
+        }
+        return listingOf(bytes)
+    }
+
+    // Places the artifact `made` at `path`, which does not exist yet. A
+    // linked file is a second name for the stored one, for a reader the
+    // build trusts: a program running as root writes through read-only
+    // bits, so anything else gets a copy, cloned where the filesystem can.
+    function place(
+        borrow self,
+        made: borrow Made,
+        path: borrow String,
+        linked: Bool
+    ) -> Result<Void, BuildFailure> {
+        if !made.tree { return placeFile(made.digest, made.mode, path, linked) }
+        let entries = match treeEntries(made.digest) {
+            Ok(found) -> found
+            Error(failure) -> return .Error(failure)
+        }
+        match makePathTree(path) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        for entry in entries {
+            let full = joinPath(path, entry.path)
+            match entry.kind {
+                Directory -> match makeDirectory(full) {
+                    Ok -> {}
+                    Error(failure) -> return .Error(
+                        .Files("cannot make \(full): \(traceText(failure))")
+                    )
+                }
+                File -> match placeFile(entry.content, entry.mode, full, linked) {
+                    Ok -> {}
+                    Error(failure) -> return .Error(failure)
+                }
+                Link -> match makeSymbolicLink(entry.content, full) {
+                    Ok -> {}
+                    Error(failure) -> return .Error(
+                        .Files("cannot link \(full): \(traceText(failure))")
+                    )
+                }
+            }
+        }
+        // Modes last: a directory's own bits may forbid writing into it.
+        for entry in entries {
+            if entry.kind != .Directory { continue }
+            let full = joinPath(path, entry.path)
+            match setFileMode(full, entry.mode | StoreMode.ownDirectory) {
+                Ok -> {}
+                Error(failure) -> return .Error(
+                    .Files("cannot set the mode of \(full): \(traceText(failure))")
+                )
+            }
+        }
+        return .Ok
+    }
+
+    // Places the stored file `digest` at `path`: a second name for it when
+    // linked, or a copy of its own, always when it must run, since the store
+    // keeps no file runnable.
+    function placeFile(
+        borrow self,
+        digest: borrow String,
+        mode: UNumber,
+        path: borrow String,
+        linked: Bool
+    ) -> Result<Void, BuildFailure> {
+        let blob = blobPath(digest)
+        if linked && (mode & StoreMode.runnable) == 0 {
+            match makeHardLink(blob, path) {
+                Ok -> return .Ok
+                Error(failure) -> absorb failure
+            }
+        }
+        match copyFile(blob, path) {
+            Ok -> {}
+            Error(failure) -> return .Error(.Files("cannot place \(path): \(traceText(failure))"))
+        }
+        return match setFileMode(path, mode) {
+            Ok -> .Ok
+            Error(failure) -> .Error(
+                .Files("cannot set the mode of \(path): \(traceText(failure))")
+            )
+        }
+    }
+
+    // Whether the store still holds every file of `made`. A tree whose files
+    // were all found once is marked verified, and is not looked through
+    // again: only a full sweep removes files, and it keeps the mark of a
+    // tree only with every file of it (DESIGN.md section 6.1.1).
+    function holds(borrow self, made: borrow Made) -> Bool {
+        if !fileExists(blobPath(made.digest)) { return false }
+        if !made.tree { return true }
+        let mark = verifiedPath(made.digest)
+        if fileExists(mark) { return true }
+        match treeEntries(made.digest) {
+            Ok(entries) -> {
+                for entry in entries {
+                    if entry.kind == .File && !fileExists(blobPath(entry.content)) { return false }
+                }
+                markVerified(mark)
+                return true
+            }
+            Error(failure) -> {
+                absorb failure
+                return false
+            }
+        }
+    }
+
+    // Writes the empty mark at `mark`. A mark that cannot be written leaves
+    // the tree to be looked through again next time.
+    function markVerified(borrow self, mark: borrow String) {
+        match makePathTree(parentPath(mark)) {
+            Ok -> {}
+            Error(failure) -> {
+                absorb failure
+                return
+            }
+        }
+        let empty: [UN8] = []
+        match writeFileBytes(mark, empty) {
+            Ok -> {}
+            Error(failure) -> absorb failure
+        }
+    }
+
+    // The record kept under `key`, when there is one whose outputs the store
+    // still holds.
+    function record(borrow self, key: borrow String) -> ActionRecord? {
+        let path = recordPath(key)
+        if !fileExists(path) { return .None }
+        let value = match readKtenFile(path) {
+            Ok(read) -> read
+            Error(failure) -> {
+                absorb failure
+                return .None
+            }
+        }
+        let items = match value.field("outputs") {
+            Ok(list) -> match list.items() {
+                Ok(found) -> found
+                Error(failure) -> {
+                    absorb failure
+                    return .None
+                }
+            }
+            Error(failure) -> {
+                absorb failure
+                return .None
+            }
+        }
+        var outputs: [Made] = []
+        for item in items {
+            let made = Made {
+                digest: ktenTextField(item, "digest").or(""),
+                tree: ktenTextField(item, "kind").or("") == "tree",
+                mode: ktenNumberField(item, "mode").or(0)
+            }
+            if !holds(made) { return .None }
+            outputs.append(made)
+        }
+        var discovered: [Discovered] = []
+        match value.field("discovered") {
+            Ok(list) -> match list.items() {
+                Ok(found) -> {
+                    for item in found {
+                        discovered.append(
+                            Discovered {
+                                path: ktenTextField(item, "path").or(""),
+                                digest: ktenTextField(item, "digest").or(""),
+                                relative: ktenTextField(item, "relative").or("") == "yes"
+                            }
+                        )
+                    }
+                }
+                Error(failure) -> return .None
+            }
+            Error(failure) -> absorb failure
+        }
+        return .Some(ActionRecord { outputs: outputs, discovered: discovered })
+    }
+
+    function keepRecord(
+        borrow self,
+        key: borrow String,
+        record: borrow ActionRecord
+    ) -> Result<Void, BuildFailure> {
+        var items: [Kten] = []
+        for made in record.outputs {
+            items.append(
+                ktenBare(
+                    [
+                        ktenField("kind", .Text(made.tree ? "tree" : "file")),
+                        ktenField("digest", .Text(copy made.digest)),
+                        ktenField("mode", .Number(made.mode))
+                    ]
+                )
+            )
+        }
+        var discovered: [Kten] = []
+        for found in record.discovered {
+            discovered.append(
+                ktenBare(
+                    [
+                        ktenField("path", .Text(copy found.path)),
+                        ktenField("digest", .Text(copy found.digest)),
+                        ktenField("relative", .Text(found.relative ? "yes" : "no"))
+                    ]
+                )
+            )
+        }
+        let path = recordPath(key)
+        match makePathTree(parentPath(path)) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        let fields = [ktenField("outputs", .List(items)), ktenField(
+            "discovered",
+            .List(discovered)
+        )]
+        return writeKtenFile(path, ktenObject("Record", move fields))
+    }
+}
+
+function storedPath(directory: borrow String, digest: borrow String) -> String {
+    let split = StoreMode.prefix
+    return joinPath(
+        joinPath(directory, digest.substring(0, split)),
+        digest.substring(split, digest.count)
+    )
+}
+
+// The store `$KIRA_BUILD_CACHE` names, or `~/.cache/kira/build`.
+function openStore() -> Result<ContentStore, BuildFailure> {
+    var root = environmentValue("KIRA_BUILD_CACHE")
+    if root.count == 0 {
+        let home = environmentValue("HOME")
+        if home.count == 0 { return .Error(.Files("neither KIRA_BUILD_CACHE nor HOME is set")) }
+        root = joinPath(home, ".cache/kira/build")
+    }
+    return match makePathTree(root) {
+        Ok -> .Ok(ContentStore { root: root })
+        Error(failure) -> .Error(failure)
+    }
+}

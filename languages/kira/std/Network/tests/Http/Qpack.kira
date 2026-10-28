@@ -1,0 +1,64 @@
+import Foundation
+
+function fieldText(lines: borrow [Field]) -> String {
+    var parts: [String] = []
+    for line in lines { parts.append("\(line.name)=\(line.value)\(line.sensitive ? "!" : "")") }
+    return joined(parts, " ")
+}
+
+// RFC 7541 appendix C.4.1: "www.example.com" Huffman coded.
+@Test
+function huffmanMatchesRfc7541() {
+    let wanted: String = "true www.example.com false"
+    let coded = huffmanEncode("www.example.com".utf8())
+    let encoded = hexBytes("f1e3c2e5f23a6ba0ab90f4ff")
+    let decoded = match huffmanDecode(encoded) {
+        Some(value) -> value
+        None -> {
+            expect!(("refused") == wanted)
+            return
+        }
+    }
+    let text = match textFromBytes(decoded) {
+        Some(value) -> value
+        None -> "?"
+    }
+    // Eight bits of padding is refused.
+    let padded = huffmanDecode(joinedBytes(encoded, [255])).isSome()
+    expect!((coded == encoded) == (true))
+    expect!((text) == ("www.example.com"))
+    expect!((padded) == (false))
+}
+
+
+// RFC 9204 appendix B.1, then a section of every representation back and
+// forth.
+@Test
+function qpackStaticSectionsDecode() {
+    let sample = hexBytes("0000510b2f696e6465782e68746d6c")
+    let limits = FieldLimits {}
+    let first = match decodeFieldSection(sample, limits) {
+        Ok(lines) -> fieldText(lines)
+        Error(failure) -> traceText(failure)
+    }
+    let lines = [
+        Field { name: ":method", value: "GET" },
+        Field { name: ":path", value: "/v1/messages?stream=true" },
+        Field { name: "authorization", value: "Bearer secret", sensitive: true },
+        Field { name: "x-api-key", value: "k1", sensitive: true },
+        Field { name: "anthropic-version", value: "2023-06-01" }
+    ]
+    let second = match decodeFieldSection(encodeFieldSection(lines), limits) {
+        Ok(decoded) -> fieldText(decoded)
+        Error(failure) -> traceText(failure)
+    }
+    // A section that names the dynamic table is refused.
+    let dynamic = match decodeFieldSection([1, 0, 128], limits) {
+        Ok(_) -> "accepted"
+        Error(failure) -> traceText(failure)
+    }
+    expect!((first) == (":path=/index.html"))
+    expect!((second) == (":method=GET :path=/v1/messages?stream=true authorization=Bearer secret! x-api-key=k1! anthropic-version=2023-06-01"))
+    expect!((dynamic) == ("Http3Error.QpackDecompressionFailed"))
+}
+

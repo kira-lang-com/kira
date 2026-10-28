@@ -1,0 +1,126 @@
+import Foundation
+
+// fs-verity's file digest, as Linux's Documentation/filesystems/fsverity.rst
+// defines it for SHA-256 and 4096-byte blocks with no salt: every block of
+// the file, the last zero-padded, is hashed; those hashes, packed into blocks
+// of their own, are hashed again, level by level, until one hash is left, the
+// root. The digest is the hash of the 256-byte descriptor naming the
+// algorithm, the block size, the file's size and that root. An empty file's
+// root is all zeros.
+
+namespace FsVerityFormat {
+    let version: Number = 1
+    // FS_VERITY_HASH_ALG_SHA256.
+    let sha256: Number = 1
+    let blockLog: Number = 12
+    let block: Number = 4096
+    let hashSize: Number = 32
+    // The root hash field holds the largest digest any algorithm has.
+    let rootField: Number = 64
+    let saltField: Number = 32
+    let reserved: Number = 144
+    // How much of the file one read takes.
+    let run: Number = 1048576
+}
+
+/// The fs-verity digest of the file at `path`, read a run at a time.
+public function verityDigestOfFile(path: borrow String) -> Result<[UN8], ArchiveFailure> {
+    let file = match openFileHandle(path, .Read) {
+        Ok(opened) -> opened
+        Error(failure) -> return .Error(.Files("cannot open \(path): \(traceText(failure))"))
+    }
+    var hashes: [UN8] = []
+    var size: UNumber = 0
+    var failed: ArchiveFailure? = .None
+    while true {
+        let run = match file.read(size, FsVerityFormat.run) {
+            Ok(read) -> read
+            Error(failure) -> {
+                failed = .Some(.Files("cannot read \(path): \(traceText(failure))"))
+                break
+            }
+        }
+        if run.count == 0 { break }
+        size += run.count
+        match hashBlocks(run, hashes) {
+            Ok -> {}
+            Error(failure) -> {
+                failed = .Some(failure)
+                break
+            }
+        }
+        if run.count < FsVerityFormat.run { break }
+    }
+    match file.close() {
+        Ok -> {}
+        Error(failure) -> absorb failure
+    }
+    match failed {
+        Some(failure) -> return .Error(failure)
+        None -> {}
+    }
+    return verityDescriptorDigest(hashes, size)
+}
+
+/// The fs-verity digest of `bytes`, as a file holding them has it.
+public function verityDigestOfBytes(bytes: borrow [UN8]) -> Result<[UN8], ArchiveFailure> {
+    var hashes: [UN8] = []
+    match hashBlocks(bytes, hashes) {
+        Ok -> {}
+        Error(failure) -> return .Error(failure)
+    }
+    return verityDescriptorDigest(hashes, bytes.count)
+}
+
+// Appends to `hashes` the hash of each block of `bytes`, the last
+// zero-padded. Every run but a file's last is a whole number of blocks.
+function hashBlocks(bytes: borrow [UN8], hashes: borrow mut [UN8]) -> Result<Void, ArchiveFailure> {
+    var at: Number = 0
+    while at < bytes.count {
+        let end = min(at + FsVerityFormat.block, bytes.count)
+        var block = byteRun(bytes, at, end)
+        while block.count < FsVerityFormat.block { block.append(0) }
+        match sha256Bytes(block) {
+            Ok(sum) -> hashes.appendAll(sum)
+            Error(failure) -> return .Error(failure)
+        }
+        at = end
+    }
+    return .Ok
+}
+
+// The digest of the descriptor of a file of `size` bytes whose blocks hash
+// to `hashes`, which the tree above them reduces to the root.
+function verityDescriptorDigest(
+    hashes: borrow [UN8],
+    size: UNumber
+) -> Result<[UN8], ArchiveFailure> {
+    var level = copy hashes
+    while level.count > FsVerityFormat.hashSize {
+        var above: [UN8] = []
+        match hashBlocks(level, above) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        level = above
+    }
+    var descriptor: [UN8] = []
+    descriptor.append(UN8(FsVerityFormat.version))
+    descriptor.append(UN8(FsVerityFormat.sha256))
+    descriptor.append(UN8(FsVerityFormat.blockLog))
+    descriptor.append(0)
+    appendLittle(descriptor, 0, 4)
+    appendLittle(descriptor, size, 8)
+    descriptor.appendAll(level)
+    let unused = FsVerityFormat.rootField - level.count + FsVerityFormat.saltField
+        + FsVerityFormat.reserved
+    for index in 0..unused { descriptor.append(0) }
+    return sha256Bytes(descriptor)
+}
+
+function sha256Bytes(bytes: borrow [UN8]) -> Result<[UN8], ArchiveFailure> {
+    return match digest(.Sha256, bytes) {
+        Ok(sum) -> .Ok(sum)
+        Error(failure) -> .Error(.Files("cannot hash: \(traceText(failure))"))
+    }
+}

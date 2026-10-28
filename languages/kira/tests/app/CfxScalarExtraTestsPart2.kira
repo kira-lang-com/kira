@@ -1,0 +1,457 @@
+import Foundation
+
+// CfxScalarExtraTests.kira
+// Deep scalar test suite: arithmetic identities, operator precedence, integer
+// div/mod edge cases, comparison matrices, boolean truth tables, ternary chains,
+// float checksums, and Gauss/triangular/square-number cross-checks.
+// All top-level names use prefix cfxs / CfxS.
+
+// ---------------------------------------------------------------------------
+// Boolean truth-table folds
+// ---------------------------------------------------------------------------
+@Test
+function cfxSBoolAndTable() {
+    var trues = 0
+    for a in 0..2 {
+        for b in 0..2 {
+            let av = a == 1
+            let bv = b == 1
+            if av && bv {
+                trues = trues + 1
+            }
+        }
+    }
+    // only T,T => 1
+    expect!(trues == 1)
+}
+
+@Test
+function cfxSBoolOrTable() {
+    var trues = 0
+    for a in 0..2 {
+        for b in 0..2 {
+            let av = a == 1
+            let bv = b == 1
+            if av || bv {
+                trues = trues + 1
+            }
+        }
+    }
+    // F,T; T,F; T,T => 3
+    expect!(trues == 3)
+}
+
+@Test
+function cfxSBoolXorTable() {
+    var trues = 0
+    for a in 0..2 {
+        for b in 0..2 {
+            let av = a == 1
+            let bv = b == 1
+            if (av || bv) && !(av && bv) {
+                trues = trues + 1
+            }
+        }
+    }
+    // XOR: F,T and T,F => 2
+    expect!(trues == 2)
+}
+
+@Test
+function cfxSBoolNandTable() {
+    var trues = 0
+    for a in 0..2 {
+        for b in 0..2 {
+            let av = a == 1
+            let bv = b == 1
+            if !(av && bv) {
+                trues = trues + 1
+            }
+        }
+    }
+    // NAND: F,F; F,T; T,F => 3
+    expect!(trues == 3)
+}
+
+@Test
+function cfxSBoolNorTable() {
+    var trues = 0
+    for a in 0..2 {
+        for b in 0..2 {
+            let av = a == 1
+            let bv = b == 1
+            if !(av || bv) {
+                trues = trues + 1
+            }
+        }
+    }
+    // NOR: only F,F => 1
+    expect!(trues == 1)
+}
+
+@Test
+function cfxSBoolThreeVar() {
+    var trues = 0
+    for a in 0..2 {
+        for b in 0..2 {
+            for c in 0..2 {
+                let av = a == 1
+                let bv = b == 1
+                let cv = c == 1
+                if (av && bv) || (bv && cv) || (av && cv) {
+                    trues = trues + 1
+                }
+            }
+        }
+    }
+    // majority function: true when >=2 of 3 are true
+    // (T,T,F),(T,F,T),(F,T,T),(T,T,T) = 4
+    expect!(trues == 4)
+}
+
+@Test
+function cfxSBoolShortCircuit() {
+    var sideEffect = 0
+    let alwaysFalse = false
+    if alwaysFalse && (sideEffect == 0) {
+        sideEffect = 999
+    }
+    expect!(sideEffect == 0)
+}
+
+@Test
+function cfxSBoolDeMorgan1() {
+    var ok = 0
+    for a in 0..2 {
+        for b in 0..2 {
+            let av = a == 1
+            let bv = b == 1
+            let lhs = !(av && bv)
+            let rhs = (!av) || (!bv)
+            if lhs == rhs {
+                ok = ok + 1
+            }
+        }
+    }
+    // all 4 combos should match
+    expect!(ok == 4)
+}
+
+@Test
+function cfxSBoolDeMorgan2() {
+    var ok = 0
+    for a in 0..2 {
+        for b in 0..2 {
+            let av = a == 1
+            let bv = b == 1
+            let lhs = !(av || bv)
+            let rhs = (!av) && (!bv)
+            if lhs == rhs {
+                ok = ok + 1
+            }
+        }
+    }
+    expect!(ok == 4)
+}
+
+// ---------------------------------------------------------------------------
+// Ternary chains
+// ---------------------------------------------------------------------------
+
+@Test
+function cfxSTernarySimple() {
+    expect!((5 > 3 ? 100 : 200) == 100)
+}
+
+@Test
+function cfxSTernaryFalse() {
+    expect!((2 > 3 ? 100 : 200) == 200)
+}
+
+@Test
+function cfxSTernaryNested() {
+    let x = 55
+    var out = x > 100 ? 4 : (x > 50 ? 3 : (x > 20 ? 2 : (x > 0 ? 1 : 0)))
+    expect!(out == 3)
+}
+
+@Test
+function cfxSTernaryNestedLow() {
+    let x = 5
+    var out = x > 100 ? 4 : (x > 50 ? 3 : (x > 20 ? 2 : (x > 0 ? 1 : 0)))
+    expect!(out == 1)
+}
+
+@Test
+function cfxSTernaryZeroPath() {
+    let x = 0
+    var out = x > 100 ? 4 : (x > 50 ? 3 : (x > 20 ? 2 : (x > 0 ? 1 : 0)))
+    expect!(out == 0)
+}
+
+@Test
+function cfxSTernaryFoldLoop() {
+    var acc = 0
+    for i in 0..10 {
+        acc = acc + (i % 2 == 0 ? i * 2 : (0 - i))
+    }
+    // sum = 0-1+4-3+8-5+12-7+16-9 = 15
+    expect!(acc == 15)
+}
+
+@Test
+function cfxSTernaryBoolResult() {
+    let x = 7
+    let isLarge = x > 5 ? true : false
+    expect!((isLarge ? 1 : 0) == 1)
+}
+
+@Test
+function cfxSTernaryChainModulo() {
+    var acc = 0
+    for i in 0..30 {
+        var v = i % 3 == 0 ? 3 : (i % 2 == 0 ? 2 : 1)
+        acc = acc + v
+    }
+    // multiples of 3: 10 items => +30; even non-multiples: 10 items => +20; odd: 10 items => +10
+    // total = 60
+    expect!(acc == 60)
+}
+
+// ---------------------------------------------------------------------------
+// Bit-ish arithmetic via % and /
+// ---------------------------------------------------------------------------
+
+@Test
+function cfxSModPow2() {
+    // 255 = 15*16 + 15 => 15
+    expect!(255 % 16 == 15)
+}
+
+@Test
+function cfxSDivPow2() {
+    expect!(256 / 16 == 16)
+}
+
+@Test
+function cfxSDigitExtract() {
+    let n: Int = 98765
+    let d0 = n % 10
+    let d1 = (n / 10) % 10
+    let d2 = (n / 100) % 10
+    // d0=5, d1=6, d2=7 => 567
+    expect!(d0 * 100 + d1 * 10 + d2 == 567)
+}
+
+@Test
+function cfxSDigitSumLoop() {
+    var n: Int = 9999
+    var s: Int = 0
+    while n > 0 {
+        s = s + n % 10
+        n = n / 10
+    }
+    // 9+9+9+9 = 36
+    expect!(s == 36)
+}
+
+@Test
+function cfxSBitwiseMirrorDiv() {
+    var acc = 0
+    for i in 1..9 {
+        acc = acc + (256 / cfxsPow(2, i))
+    }
+    // 128+64+32+16+8+4+2+1 = 255
+    expect!(acc == 255)
+}
+
+@Test
+function cfxSPow2Mod() {
+    var acc = 0
+    for i in 0..8 {
+        acc = acc + cfxsPow(2, i) % 7
+    }
+    // 1+2+4+1+2+4+1+2 = 17
+    expect!(acc == 17)
+}
+
+// ---------------------------------------------------------------------------
+// Float accumulation to Int checksums
+// ---------------------------------------------------------------------------
+
+@Test
+function cfxSFloatExactSum() {
+    var f = 0.0
+    for i in 0..40 {
+        f = f + 0.25
+    }
+    // 40 * 0.25 = 10.0
+    expect!(f == 10.0)
+}
+
+@Test
+function cfxSFloatExactProduct() {
+    var f = 1.0
+    for i in 0..8 {
+        f = f * 0.5
+    }
+    // 0.5^8 = 1/256 = 0.00390625
+    expect!(f == 0.00390625)
+}
+
+@Test
+function cfxSFloatCompareLoop() {
+    var above = 0
+    var f = 0.0
+    for i in 0..20 {
+        f = f + 1.5
+        if f > 15.0 {
+            above = above + 1
+        }
+    }
+    // f at step i+1 = 1.5*(i+1); >15 when i+1>10 => steps 10..19 = 10
+    expect!(above == 10)
+}
+
+@Test
+function cfxSFloatNegArith() {
+    let a = (-3.5) + 1.5
+    expect!(a == (-2.0))
+}
+
+@Test
+function cfxSFloatDiv() {
+    let q = 9.0 / 4.0
+    expect!(q == 2.25)
+}
+
+@Test
+function cfxSFloatMod() {
+    let r = 9.0 % 4.0
+    expect!(r == 1.0)
+}
+
+@Test
+function cfxSFloatAccumChecksum() {
+    var f = 0.0
+    for k in 0..30 {
+        f = f + 1.5 * 2.0 - 0.5
+    }
+    // each step: 3.0 - 0.5 = 2.5; 30 * 2.5 = 75.0
+    let got = f > 74.9 && f < 75.1 ? 7500 : 0
+    expect!(got == 7500)
+}
+
+// ---------------------------------------------------------------------------
+// Gauss / triangular / square-number cross-checks
+// ---------------------------------------------------------------------------
+
+@Test
+function cfxSGaussFormula10() {
+    let n = 10
+    let loopSum = cfxsSumTo(n)
+    let formula = n * (n + 1) / 2
+    expect!(loopSum == formula)
+}
+
+@Test
+function cfxSGaussFormula100() {
+    let n = 100
+    let loopSum = cfxsSumTo(n)
+    expect!(loopSum == 5050)
+}
+
+@Test
+function cfxSGaussFormula200() {
+    let n = 200
+    expect!(n * (n + 1) / 2 == 20100)
+}
+
+@Test
+function cfxSSquareSumFormula() {
+    let n = 10
+    let loopVal = cfxsSquareSum(n)
+    let formula = n * (n + 1) * (2 * n + 1) / 6
+    expect!(loopVal == formula)
+}
+
+@Test
+function cfxSSquareSumValue() {
+    // 1+4+9+...+100 = 385
+    expect!(cfxsSquareSum(10) == 385)
+}
+
+@Test
+function cfxSCubeSum() {
+    var s = 0
+    for i in 1..6 {
+        s = s + i * i * i
+    }
+    // 1+8+27+64+125 = 225
+    expect!(s == 225)
+}
+
+@Test
+function cfxSCubeSumEqualsSquareGauss() {
+    // sum of cubes 1..n = (n*(n+1)/2)^2
+    let n = 8
+    var cubeSum = 0
+    for i in 1..(n + 1) {
+        cubeSum = cubeSum + i * i * i
+    }
+    let gauss = n * (n + 1) / 2
+    let gaussSq = gauss * gauss
+    expect!(cubeSum == gaussSq)
+}
+
+@Test
+function cfxSTriangularNumbers() {
+    var s = 0
+    for i in 1..11 {
+        s = s + i * (i + 1) / 2
+    }
+    // sum of T(1)..T(10) = 220
+    expect!(s == 220)
+}
+
+@Test
+function cfxSOblong() {
+    var s = 0
+    for i in 1..9 {
+        s = s + i * (i + 1)
+    }
+    // 2+6+12+20+30+42+56+72 = 240
+    expect!(s == 240)
+}
+
+@Test
+function cfxSPentagonal() {
+    // Pentagonal(n) = n*(3n-1)/2
+    var s = 0
+    for i in 1..7 {
+        s = s + i * (3 * i - 1) / 2
+    }
+    // 1,5,12,22,35,51 => sum=126
+    expect!(s == 126)
+}
+
+@Test
+function cfxSPerfectSquareCount() {
+    var count = 0
+    for i in 1..101 {
+        let root = cfxsSumTo(0) // we'll test differently
+        var j = 1
+        var found = false
+        while j * j <= i {
+            if j * j == i {
+                found = true
+            }
+            j = j + 1
+        }
+        if found {
+            count = count + 1
+        }
+    }
+    // perfect squares 1..100: 10
+    expect!(count == 10)
+}

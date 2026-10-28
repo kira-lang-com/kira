@@ -1,0 +1,145 @@
+// Entry wrappers: the KSIR entry is an ordinary function, and the HLSL
+// entry point takes and returns structs whose members carry semantics.
+
+function hlslBuiltin(builtin: String) -> String {
+    match builtin {
+        "position" -> return "SV_Position"
+        "vertex_index" -> return "SV_VertexID"
+        "instance_index" -> return "SV_InstanceID"
+        "front_facing" -> return "SV_IsFrontFace"
+        "frag_depth" -> return "SV_Depth"
+        "sample_index" -> return "SV_SampleIndex"
+        "sample_mask" -> return "SV_Coverage"
+        "global_invocation_id" -> return "SV_DispatchThreadID"
+        "local_invocation_id" -> return "SV_GroupThreadID"
+        "local_invocation_index" -> return "SV_GroupIndex"
+        "workgroup_id" -> return "SV_GroupID"
+        "clip_distances" -> return "SV_ClipDistance"
+        else -> return typeFailure(joinText(["the ", builtin, " built-in, which HLSL does not provide"]))
+    }
+}
+
+extend TextOut {
+    function semantic(borrow self, leaf: Leaf, stage: String, output: Bool) -> String {
+        let builtin = leafBuiltin(leaf)
+        if utf8Count(builtin) > 0 { return hlslBuiltin(builtin) }
+        if leafField(leaf, "blend_src") >= 0 { return typeFailure("dual-source blending") }
+        if stage == "fragment" && output { return joinText(["SV_Target", decimalText(leafLocation(leaf))]) }
+        return joinText(["TEXCOORD", decimalText(leafLocation(leaf))])
+    }
+
+    function modifiers(borrow self, leaf: Leaf, integer: Bool) -> String {
+        if utf8Count(leafBuiltin(leaf)) > 0 { return "" }
+        var pieces: [String] = []
+        let mode = leafText(leaf, "interpolation")
+        if mode == "flat" || (utf8Count(mode) == 0 && integer) {
+            pieces.append("nointerpolation ")
+        } else if mode == "linear" {
+            pieces.append("noperspective ")
+        }
+        let sampling = leafText(leaf, "sampling")
+        if sampling == "centroid" {
+            pieces.append("centroid ")
+        } else if sampling == "sample" {
+            pieces.append("sample ")
+        }
+        return joinText(pieces)
+    }
+
+    // One semantic-carrying struct.
+    function interfaceStruct(borrow self, which: Int, name: String, leaves: [Leaf], stage: String, output: Bool) {
+        var pieces: [String] = [joinText(["struct ", name, " {\n"])]
+        let varying = (stage == "fragment" && !output) || (stage == "vertex" && output)
+        for position in 0..leaves.count {
+            let leaf = leaves[position]
+            var written = semantic(leaf, stage, output)
+            if failedText(written) {
+                refuseAt(failureText(written), "functions", -1, which)
+                written = ""
+            }
+            var qualifier = ""
+            if varying { qualifier = modifiers(leaf, integerScalar(typeText(leaf.typeIndex, "scalar"))) }
+            let declared = declare(leaf.typeIndex, joinText(["_ksir_", decimalText(position)]))
+            pieces.append(joinText(["    ", qualifier, declared, " : ", written, ";\n"]))
+        }
+        pieces.append("};\n\n")
+        write(joinText(pieces))
+    }
+
+    function writeEntry(borrow mut self, which: Int) {
+        let name = entryNames[entryIndex(which)]
+        let stage = text("functions", -1, which, "stage")
+        var names = copiedTexts(used)
+        let inner = availableFresh(name, names)
+        names.append(inner)
+        writeFunction(which, inner)
+        let inputs = inputLeaves(which)
+        let inputName = availableFresh(joinText([name, "_input"]), names)
+        names.append(inputName)
+        let outputName = availableFresh(joinText([name, "_output"]), names)
+        names.append(outputName)
+        if inputs.count > 0 { interfaceStruct(which, inputName, inputs, stage, false) }
+        let outputs = resultLeaves(which)
+        let resultIndex = field("functions", -1, which, "result")
+        if resultIndex >= 0 { interfaceStruct(which, outputName, outputs, stage, true) }
+        var pieces: [String] = []
+        if stage == "compute" {
+            var values: [String] = []
+            for axis in 0..3 {
+                var size = 1
+                if fieldCount("functions", -1, which, "workgroup") == 3 {
+                    size = fieldItem("functions", -1, which, "workgroup", axis)
+                }
+                if size < 0 {
+                    refuseAt("a workgroup size from a kept override", "functions", -1, which)
+                    size = 1
+                }
+                values.append(decimalText(size))
+            }
+            pieces.append(joinText(["[numthreads(", joinWith(values, ", "), ")]\n"]))
+        }
+        var result = "void"
+        if resultIndex >= 0 { result = outputName }
+        var parameter = ""
+        if inputs.count > 0 { parameter = joinText([inputName, " input"]) }
+        pieces.append(joinText([result, " ", name, "(", parameter, ") {\n"]))
+        var arguments: [String] = []
+        let argumentCount = count("arguments", which)
+        for argument in 0..argumentCount {
+            let local = joinText(["_ksir_arg", decimalText(argument)])
+            let argumentType = field("arguments", which, argument, "type")
+            var zero = zeroText(argumentType)
+            if failedText(zero) { zero = "" }
+            let declared = declare(argumentType, local)
+            pieces.append(joinText(["    ", declared, " = ", zero, ";\n"]))
+            for position in 0..inputs.count {
+                if inputs[position].argument == argument {
+                    var target = local
+                    if inputs[position].member >= 0 {
+                        target = joinText([local, ".", memberName(argumentType, inputs[position].member)])
+                    }
+                    pieces.append(joinText(["    ", target, " = input._ksir_", decimalText(position), ";\n"]))
+                }
+            }
+            arguments.append(local)
+        }
+        let call = joinText([inner, "(", joinWith(arguments, ", "), ")"])
+        if resultIndex < 0 {
+            pieces.append(joinText(["    ", call, ";\n"]))
+        } else {
+            let declared = declare(resultIndex, "_ksir_result")
+            pieces.append(joinText(["    ", declared, " = ", call, ";\n"]))
+            pieces.append(joinText(["    ", outputName, " output;\n"]))
+            for position in 0..outputs.count {
+                var value = "_ksir_result"
+                if outputs[position].member >= 0 {
+                    value = joinText(["_ksir_result.", memberName(resultIndex, outputs[position].member)])
+                }
+                pieces.append(joinText(["    output._ksir_", decimalText(position), " = ", value, ";\n"]))
+            }
+            pieces.append("    return output;\n")
+        }
+        pieces.append("}\n\n")
+        write(joinText(pieces))
+    }
+}

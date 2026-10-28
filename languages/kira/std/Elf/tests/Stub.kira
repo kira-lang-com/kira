@@ -1,0 +1,98 @@
+import Foundation
+
+// The interface stub of the sample shared library: what it keeps, what it
+// drops, and what it refuses. Builders for the sample are in Support.kira.
+
+// The bytes as lowercase hexadecimal.
+function stubHex(bytes: borrow [UN8]) -> String {
+    let digits = "0123456789abcdef".utf8()
+    var text: [UN8] = []
+    for byte in bytes {
+        text.append(digits[Number(byte) >> 4])
+        text.append(digits[Number(byte) & 15])
+    }
+    return textFromBytes(text).or("")
+}
+
+// What `interfaceStub` makes of the sample, as hexadecimal.
+function expectedStub() -> String {
+    let lines = [
+        "7f454c4602010100000000000000000003003e000100000000000000000000000000000000000000",
+        "70010000000000000000000040003800000040000500040000000000000000000000000000000000",
+        "00000000000000001100000020000000000000000000000000000000000000000100000016000100",
+        "00000000000000000400000000000000060000001100010000000000000000000800000000000000",
+        "0c000000120001000000000000000000000000000000000000736c6f740076616c7565007a657461",
+        "00616c706861006c6962632e736f2e36006c696273616d706c652e736f2e31000600000000000000",
+        "40000000000000000500000000000000b8000000000000000a000000000000003000000000000000",
+        "010000000000000017000000000000000e0000000000000021000000000000000000000000000000",
+        "0000000000000000002e64796e737472002e64796e73796d002e64796e616d6963002e7368737472",
+        "74616200000000000000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000090000000b000000",
+        "02000000000000004000000000000000400000000000000078000000000000000200000001000000",
+        "0800000000000000180000000000000001000000030000000200000000000000b800000000000000",
+        "b8000000000000003000000000000000000000000000000001000000000000000000000000000000",
+        "11000000060000000200000000000000e800000000000000e8000000000000006000000000000000",
+        "0200000000000000080000000000000010000000000000001a000000030000000000000000000000",
+        "48010000000000004801000000000000240000000000000000000000000000000100000000000000",
+        "0000000000000000"
+    ]
+    return joined(lines, "")
+}
+
+
+// The stub holds the soname of the library and the names it exports; `gone` and
+// `hidden` are left out.
+@Test
+function theStubMatchesLlvmIfs() {
+    let stub = match interfaceStub(sampleShared()) {
+        Ok(stub) -> stubHex(stub)
+        Error(failure) -> elfFailureText(failure)
+    }
+    expect!((stub) == (expectedStub()))
+}
+
+// A stub reads back as a shared library of the same machine.
+@Test
+function theStubReadsBackAsTheSameMachine() {
+    let stub = match interfaceStub(sampleShared()) {
+        Ok(stub) -> stub
+        Error(failure) -> {
+            expect!((elfFailureText(failure)) == "")
+            return
+        }
+    }
+    let machine = match elfMachine(stub) {
+        Ok(found) -> found
+        Error(failure) -> {
+            expect!((elfFailureText(failure)) == "")
+            return
+        }
+    }
+    expect!((machine) == (62))
+}
+
+// An indirect function symbol cannot be stubbed, because its address is only
+// known at run time.
+@Test
+function indirectSymbolIsRefused() {
+    var indirect = sampleShared()
+    indirect[64 + 2 * 24 + 4] = 26
+    let kind = match interfaceStub(indirect) {
+        Ok(stub) -> "stub"
+        Error(failure) -> elfFailureText(failure)
+    }
+    expect!((kind) == "unsupported ELF: symbol zeta is of type 10, which a stub does not carry")
+}
+
+// A symbol given twice must agree in type and size, or the stub would have to
+// pick one.
+@Test
+function aResizedDuplicateSymbolIsRefused() {
+    var resized = sampleShared()
+    resized[64 + 7 * 24 + 16] = 9
+    let twice = match interfaceStub(resized) {
+        Ok(stub) -> "stub"
+        Error(failure) -> elfFailureText(failure)
+    }
+    expect!((twice) == "unsupported ELF: symbol value is given twice, with different types or sizes")
+}

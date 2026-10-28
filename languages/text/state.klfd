@@ -1,0 +1,334 @@
+// What the text outs (MSL, HLSL, GLSL and WGSL) share: the reader, naming,
+// struct padding, constant values, and the body writer with its rule for
+// temporaries (KLF-KSL section 22.10). A package takes this directory in
+// through its `include` file and defines `Dialect`, its own state, and the
+// `dialect*` functions the body writer calls for what its target spells
+// its own way.
+
+struct TextOut {
+    let unit: ShaderUnit
+    var dialect: Dialect
+    // The words no name the out chooses may be.
+    var reserved: [String]
+    // Every name the module scope has taken.
+    var used: [String]
+    // Per type: a struct's name, empty for every other type.
+    var typeNames: [String]
+    var memberNames: [[String]]
+    var constantNames: [String]
+    var overrideNames: [String]
+    var globalNames: [String]
+    // Per function, not counting entry points.
+    var functionNames: [String]
+    var entryNames: [String]
+    // The function being written, by its number (section 6.7).
+    var current: Int
+    // The names taken inside the function being written.
+    var scope: [String]
+    var argumentNames: [String]
+    var localNames: [String]
+    // Per expression of the current function: its temporary, or empty.
+    var baked: [String]
+    // Where the last line directive placed the body.
+    var lastFile: Int
+    var lastLine: Int
+}
+
+function textOut(unit: ShaderUnit, dialect: Dialect) -> TextOut {
+    return TextOut {
+        unit = unit, dialect = dialect, reserved = [], used = [], typeNames = [], memberNames = [],
+        constantNames = [], overrideNames = [], globalNames = [], functionNames = [], entryNames = [],
+        current = -1, scope = [], argumentNames = [], localNames = [], baked = [], lastFile = -1, lastLine = -1
+    }
+}
+
+extend TextOut {
+    function count(borrow self, table: String, owner: Int) -> Int {
+        return shader_read_count(unit, table, owner)
+    }
+
+    function kind(borrow self, table: String, owner: Int, index: Int) -> String {
+        return shaderText(unit, shader_read_kind(unit, table, owner, index))
+    }
+
+    function field(borrow self, table: String, owner: Int, index: Int, name: String) -> Int {
+        return shader_read_int(unit, table, owner, index, name, 0)
+    }
+
+    function fieldItem(borrow self, table: String, owner: Int, index: Int, name: String, item: Int) -> Int {
+        return shader_read_int(unit, table, owner, index, name, item)
+    }
+
+    // How many items a list field holds.
+    function fieldCount(borrow self, table: String, owner: Int, index: Int, name: String) -> Int {
+        return shader_read_int(unit, table, owner, index, name, -1)
+    }
+
+    function text(borrow self, table: String, owner: Int, index: Int, name: String) -> String {
+        return shaderText(unit, shader_read_text(unit, table, owner, index, name, 0))
+    }
+
+    function textItem(borrow self, table: String, owner: Int, index: Int, name: String, item: Int) -> String {
+        return shaderText(unit, shader_read_text(unit, table, owner, index, name, item))
+    }
+
+    function textCount(borrow self, table: String, owner: Int, index: Int, name: String) -> Int {
+        return shader_read_text(unit, table, owner, index, name, -1)
+    }
+
+    function flag(borrow self, table: String, owner: Int, index: Int, name: String) -> Bool {
+        return shader_read_int(unit, table, owner, index, name, 0) == 1
+    }
+
+    function unitText(borrow self, name: String) -> String {
+        return text("unit", -1, 0, name)
+    }
+
+    function write(borrow self, piece: String) {
+        shader_out_write(unit, piece)
+    }
+
+    function writeLine(borrow self, content: String) {
+        shader_out_write(unit, joinText([content, "\n"]))
+    }
+
+    // A line of a body, `depth` levels in.
+    function line(borrow self, depth: Int, content: String) {
+        var pieces: [String] = []
+        for level in 0..depth {
+            pieces.append("    ")
+        }
+        pieces.append(content)
+        pieces.append("\n")
+        shader_out_write(unit, joinText(pieces))
+    }
+
+    // Records that the target cannot spell `what`, with no place in the
+    // source, as the body writer reports most refusals.
+    function refuse(borrow self, what: String) {
+        shader_out_refuse(unit, what, -1, -1)
+    }
+
+    // Records that the target cannot spell `what`, at the record `index` of
+    // `table` under `owner`.
+    function refuseAt(borrow self, what: String, table: String, owner: Int, index: Int) {
+        shader_out_refuse_at(unit, what, table, owner, index)
+    }
+
+    function typeKind(borrow self, typeIndex: Int) -> String {
+        return kind("types", -1, typeIndex)
+    }
+
+    function typeField(borrow self, typeIndex: Int, name: String) -> Int {
+        return field("types", -1, typeIndex, name)
+    }
+
+    function typeText(borrow self, typeIndex: Int, name: String) -> String {
+        return text("types", -1, typeIndex, name)
+    }
+
+    function expressionKind(borrow self, expression: Int) -> String {
+        return kind("expressions", current, expression)
+    }
+
+    // An operand or field of an expression of the current function, -1
+    // when it has none.
+    function operandOf(borrow self, expression: Int, name: String) -> Int {
+        return field("expressions", current, expression, name)
+    }
+
+    function typeOf(borrow self, expression: Int) -> Int {
+        return field("expressions", current, expression, "type")
+    }
+
+    function typeKindOf(borrow self, expression: Int) -> String {
+        return typeKind(typeOf(expression))
+    }
+
+    // The scalar of an expression's type, as KSIR names it (`f32`), or
+    // empty for a type without one.
+    function scalarOf(borrow self, expression: Int) -> String {
+        return typeText(typeOf(expression), "scalar")
+    }
+
+    // The type a pointer expression points to, or -1.
+    function pointeeOf(borrow self, expression: Int) -> Int {
+        let typeIndex = typeOf(expression)
+        if typeKind(typeIndex) == "pointer" { return typeField(typeIndex, "base") }
+        return -1
+    }
+
+    function statementKind(borrow self, block: Int, position: Int) -> String {
+        return kind("statements", block, position)
+    }
+
+    function statementField(borrow self, block: Int, position: Int, name: String) -> Int {
+        return field("statements", block, position, name)
+    }
+
+    function memberName(borrow self, typeIndex: Int, member: Int) -> String {
+        return memberNames[typeIndex][member]
+    }
+
+    // The name of a struct type; an unnamed one the namer never saw has the
+    // name the Rust backends gave it.
+    function structName(borrow self, typeIndex: Int) -> String {
+        let name = typeNames[typeIndex]
+        if utf8Count(name) == 0 { return "_ksir_Struct" }
+        return name
+    }
+
+    function isEntry(borrow self, which: Int) -> Bool {
+        return kind("functions", -1, which) == "entry"
+    }
+
+    // The index among the unit's entry points of function number `which`.
+    function entryIndex(borrow self, which: Int) -> Int {
+        return which - functionNames.count
+    }
+
+    // Whether a struct ends in an array sized at run time.
+    function runtimeSized(borrow self, typeIndex: Int) -> Bool {
+        let shape = typeKind(typeIndex)
+        if shape == "array" { return typeField(typeIndex, "length") < 0 && typeField(typeIndex, "length_override") < 0 }
+        if shape == "struct" {
+            let members = count("members", typeIndex)
+            if members == 0 { return false }
+            return runtimeSized(field("members", typeIndex, members - 1, "type"))
+        }
+        return false
+    }
+
+    // Whether the last member of a struct is an array sized at run time.
+    function runtimeTail(borrow self, typeIndex: Int) -> Bool {
+        if typeKind(typeIndex) != "struct" { return false }
+        let members = count("members", typeIndex)
+        if members == 0 { return false }
+        let last = field("members", typeIndex, members - 1, "type")
+        return typeKind(last) == "array" && typeField(last, "length") < 0 && typeField(last, "length_override") < 0
+    }
+}
+
+function hasText(names: [String], name: String) -> Bool {
+    for known in names {
+        if known == name { return true }
+    }
+    return false
+}
+
+function hasInt(values: [Int], wanted: Int) -> Bool {
+    for value in values {
+        if value == wanted { return true }
+    }
+    return false
+}
+
+function joinWith(parts: [String], separator: String) -> String {
+    var pieces: [String] = []
+    for at in 0..parts.count {
+        if at > 0 { pieces.append(separator) }
+        pieces.append(parts[at])
+    }
+    return joinText(pieces)
+}
+
+function copiedTexts(values: [String]) -> [String] {
+    var result: [String] = []
+    for value in values {
+        result.append(value)
+    }
+    return result
+}
+
+function startsWithText(value: String, prefix: String) -> Bool {
+    if utf8Count(prefix) > utf8Count(value) { return false }
+    return utf8Slice(value, 0, utf8Count(prefix)) == prefix
+}
+
+function endsWithText(value: String, suffix: String) -> Bool {
+    let length = utf8Count(value)
+    let wanted = utf8Count(suffix)
+    if wanted > length { return false }
+    return utf8Slice(value, length - wanted, length) == suffix
+}
+
+function containsByte(value: String, byte: Int) -> Bool {
+    let length = utf8Count(value)
+    for at in 0..length {
+        if utf8Byte(value, at) == byte { return true }
+    }
+    return false
+}
+
+// The component a lane index names.
+function laneText(lane: Int) -> String {
+    let at = lane % 4
+    if at == 0 { return "x" }
+    if at == 1 { return "y" }
+    if at == 2 { return "z" }
+    return "w"
+}
+
+// A KSIR scalar's kind: `bool`, `sint`, `uint` or `float`.
+function scalarKind(scalar: String) -> String {
+    if scalar == "bool" { return "bool" }
+    if startsWithText(scalar, "i") { return "sint" }
+    if startsWithText(scalar, "u") { return "uint" }
+    if startsWithText(scalar, "f") { return "float" }
+    return ""
+}
+
+// A KSIR scalar's width in bytes; a `bool` is one.
+function scalarWidth(scalar: String) -> Int {
+    if scalar == "bool" { return 1 }
+    if utf8Count(scalar) < 2 { return 0 }
+    let bits = utf8Slice(scalar, 1, utf8Count(scalar))
+    if bits == "8" { return 1 }
+    if bits == "16" { return 2 }
+    if bits == "32" { return 4 }
+    if bits == "64" { return 8 }
+    return 0
+}
+
+function integerScalar(scalar: String) -> Bool {
+    let kind = scalarKind(scalar)
+    return kind == "sint" || kind == "uint"
+}
+
+// Rounds `value` up to a multiple of `align`.
+function alignUp(value: Int, align: Int) -> Int {
+    if align <= 1 { return value }
+    return (value + align - 1) / align * align
+}
+
+// A type's text that failed starts with `!`, followed by why.
+function failedText(value: String) -> Bool {
+    return utf8Count(value) > 0 && utf8Byte(value, 0) == 33
+}
+
+function failureText(value: String) -> String {
+    return utf8Slice(value, 1, utf8Count(value))
+}
+
+function typeFailure(message: String) -> String {
+    return joinText(["!", message])
+}
+
+// A failed text as a comment in a body, or the text itself.
+function commentedText(value: String) -> String {
+    if failedText(value) { return joinText(["/* ", failureText(value), " */"]) }
+    return value
+}
+
+// Whether `word` is one of the space-separated words of `words`.
+function containsWord(words: String, word: String) -> Bool {
+    var start = 0
+    let length = utf8Count(words)
+    for at in 0..length {
+        if utf8Byte(words, at) == 32 {
+            if utf8Slice(words, start, at) == word { return true }
+            start = at + 1
+        }
+    }
+    return utf8Slice(words, start, length) == word
+}

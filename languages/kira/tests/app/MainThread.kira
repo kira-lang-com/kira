@@ -1,0 +1,63 @@
+import Foundation
+
+// Main-thread event-loop coverage. The target annotations are compiler-owned;
+// the harness exercises invoke, spawn/await, and fire-and-forget post on every
+// executable backend.
+
+@MainThread
+function mainThreadIncrement(value: Int) -> Int {
+    return value + 1
+}
+
+@MainThread
+function mainThreadPost(value: Int) {
+    let unused = value + 1
+}
+
+@MainThread
+function mainThreadEcho(value: String) -> String {
+    return value + "!"
+}
+
+class MainThreadWindow {
+    let value: Int = 3
+
+    @MainThread
+    function read() -> Int {
+        return self.value
+    }
+}
+
+@Test
+function mtxMainThreadInvoke() {
+    let got = MainThread.invoke { mainThreadIncrement(40) }
+    expect!(got == 41)
+}
+
+@Test
+function mtxMainThreadSpawn() {
+    let handle = MainThread.spawn { mainThreadIncrement(41) }
+    let got = handle.await
+    expect!(got == 42)
+}
+
+@Test
+function mtxMainThreadPost() {
+    MainThread.post { mainThreadPost(1) }
+    let got = 42
+    expect!(got == 42)
+}
+
+function mainThreadSection() -> Int {
+    let invoked = MainThread.invoke { mainThreadIncrement(40) }
+    let handle = MainThread.spawn { mainThreadIncrement(41) }
+    let text = MainThread.invoke { mainThreadEcho("main") }
+    let textHandle = MainThread.spawn { mainThreadEcho("spawn") }
+    let window = MainThreadWindow()
+    let windowValue = MainThread.invoke { window.read() }
+    MainThread.post { mainThreadPost(1) }
+    MainThread.post { mainThreadEcho("post") }
+    let joined = handle.await
+    let joinedText = textHandle.await
+    return invoked + joined + text.count + joinedText.count + windowValue
+}

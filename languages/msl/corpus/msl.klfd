@@ -1,0 +1,86 @@
+construct Msl() extends Corpus {
+    let oracle: [String] = []
+    let compare: [String] = ["accept", "diagnostics"]
+    // The languages whose outs this corpus's cases ask a target of, as paths
+    // relative to this package. The driver the cases run against holds each of
+    // them, so a case naming `--target hlsl` is answered by the HLSL out rather
+    // than by a refusal that no out writes it.
+    let shaderLanguages: [String] = ["../ksl", "../hlsl", "../wgsl"]
+    let cases: [CorpusCase] = [
+        CorpusCase { name = "blit", sources = ["accepted/Blit.metal"], accept = true },
+        CorpusCase { name = "shadow", sources = ["accepted/Shadow.metal"], accept = true },
+        CorpusCase { name = "depth-only", sources = ["accepted/DepthOnly.metal"], accept = true },
+        CorpusCase { name = "reduce", sources = ["accepted/Reduce.metal"], arguments = ["--override", "scale=2"], accept = true },
+        CorpusCase { name = "reduce-kept", sources = ["accepted/Reduce.metal"], arguments = ["--overrides", "keep", "--target", "spirv,msl,wgsl"], accept = true },
+        CorpusCase { name = "packed", sources = ["accepted/Packed.metal"], arguments = ["--target", "spirv,msl,hlsl"], accept = true },
+        CorpusCase { name = "flow", sources = ["accepted/Flow.metal"], accept = true },
+        CorpusCase { name = "flow-ksl", sources = ["accepted/Flow.metal"], arguments = ["--target", "ksl"], accept = true },
+        CorpusCase {
+            name = "shadow-ksl", sources = ["accepted/Shadow.metal"], arguments = ["--target", "ksl"],
+            accept = false, diagnostics = ["230:0", "230:36", "230:51", "230:55", "230:55", "230:39"]
+        },
+        CorpusCase { name = "reduce-unset", sources = ["accepted/Reduce.metal"], accept = false, diagnostics = ["231:0"] },
+        CorpusCase {
+            name = "half-glsl", sources = ["refused/half_glsl.metal"], arguments = ["--target", "glsl_430"],
+            accept = false, diagnostics = ["237:0"]
+        },
+        CorpusCase { name = "ambiguous", sources = ["refused/ambiguous.metal"], accept = false, diagnostics = ["208:6"] },
+        CorpusCase { name = "argument-buffer", sources = ["refused/argument_buffer.metal"], accept = false, diagnostics = ["107:3"] },
+        CorpusCase { name = "argument-count", sources = ["refused/argument_count.metal"], accept = false, diagnostics = ["205:4"] },
+        CorpusCase { name = "bad-condition", sources = ["refused/bad_condition.metal"], accept = false, diagnostics = ["9:1"] },
+        CorpusCase { name = "bad-conditional", sources = ["refused/bad_conditional.metal"], accept = false, diagnostics = ["8:1"] },
+        CorpusCase { name = "bad-directive", sources = ["refused/bad_directive.metal"], accept = false, diagnostics = ["5:3"] },
+        CorpusCase { name = "bad-entry-parameter", sources = ["refused/bad_entry_parameter.metal"], accept = false, diagnostics = ["210:3"] },
+        CorpusCase { name = "bad-interface", sources = ["refused/bad_interface.metal"], accept = false, diagnostics = ["211:4"] },
+        CorpusCase { name = "bad-literal", sources = ["refused/bad_literal.metal"], accept = false, diagnostics = ["4:4"] },
+        CorpusCase { name = "bad-operator", sources = ["refused/bad_operator.metal"], accept = false, diagnostics = ["217:4"] },
+        CorpusCase { name = "bad-threadgroup", sources = ["refused/bad_threadgroup.metal"], accept = false, diagnostics = ["220:4"] },
+        CorpusCase { name = "class-template", sources = ["refused/class_template.metal"], accept = false, diagnostics = ["113:3"] },
+        CorpusCase { name = "compute-entries", sources = ["refused/compute_entries.metal"], accept = false, diagnostics = ["103:6"] },
+        CorpusCase { name = "constexpr-sampler", sources = ["refused/constexpr_sampler.metal"], accept = false, diagnostics = ["115:3"] },
+        CorpusCase { name = "deduction", sources = ["refused/deduction.metal"], accept = false, diagnostics = ["216:5"] },
+        CorpusCase { name = "duplicate-case", sources = ["refused/duplicate_case.metal"], accept = false, diagnostics = ["218:6"] },
+        CorpusCase { name = "error-directive", sources = ["refused/error_directive.metal"], accept = false, diagnostics = ["10:1"] },
+        CorpusCase { name = "fall-through", sources = ["refused/fall_through.metal"], accept = false, diagnostics = ["123:7"] },
+        CorpusCase { name = "foreign-pointer", sources = ["refused/foreign_pointer.metal"], accept = false, diagnostics = ["106:6"] },
+        CorpusCase { name = "function-table", sources = ["refused/function_table.metal"], accept = false, diagnostics = ["108:3"] },
+        CorpusCase { name = "defined-constant", sources = ["refused/defined_constant.metal"], accept = false, diagnostics = ["112:3"] },
+        CorpusCase { name = "gated-parameter", sources = ["refused/gated_parameter.metal"], accept = false, diagnostics = ["112:4"] },
+        CorpusCase { name = "graphics-entries", sources = ["refused/graphics_entries.metal"], accept = false, diagnostics = ["102:4"] },
+        CorpusCase { name = "include-depth", sources = ["refused/include_depth.metal"], accept = false, diagnostics = ["11:1"] },
+        CorpusCase { name = "lambda", sources = ["refused/lambda.metal"], accept = false, diagnostics = ["114:4"] },
+        CorpusCase { name = "memory-order", sources = ["refused/memory_order.metal"], accept = false, diagnostics = ["124:4"] },
+        CorpusCase { name = "mesh", sources = ["refused/mesh.metal"], accept = false, diagnostics = ["109:3"] },
+        CorpusCase { name = "missing-include", sources = ["refused/missing_include.metal"], accept = false, diagnostics = ["7:1"] },
+        CorpusCase { name = "missing-return", sources = ["refused/missing_return.metal"], accept = false, diagnostics = ["214:3"] },
+        CorpusCase { name = "mixed-stages", sources = ["refused/mixed_stages.metal"], accept = false, diagnostics = ["101:5"] },
+        CorpusCase { name = "no-entry", sources = ["refused/no_entry.metal"], accept = false, diagnostics = ["126:1"] },
+        CorpusCase { name = "no-match", sources = ["refused/no_match.metal"], accept = false, diagnostics = ["207:9"] },
+        CorpusCase { name = "no-such-member", sources = ["refused/no_such_member.metal"], accept = false, diagnostics = ["206:6"] },
+        CorpusCase { name = "not-assignable", sources = ["refused/not_assignable.metal"], accept = false, diagnostics = ["209:4"] },
+        CorpusCase { name = "not-constant", sources = ["refused/not_constant.metal"], accept = false, diagnostics = ["213:5"] },
+        CorpusCase { name = "not-declaration", sources = ["refused/not_declaration.metal"], accept = false, diagnostics = ["2:3"] },
+        CorpusCase { name = "outside-loop", sources = ["refused/outside_loop.metal"], accept = false, diagnostics = ["215:4"] },
+        CorpusCase { name = "pointer-arithmetic", sources = ["refused/pointer_arithmetic.metal"], accept = false, diagnostics = ["104:4"] },
+        CorpusCase { name = "printf", sources = ["refused/printf.metal"], accept = false, diagnostics = ["116:4"] },
+        CorpusCase { name = "recursion", sources = ["refused/recursion.metal"], accept = false, diagnostics = ["117:3"] },
+        CorpusCase { name = "redeclared", sources = ["refused/redeclared.metal"], accept = false, diagnostics = ["203:5"] },
+        CorpusCase { name = "simdgroup", sources = ["refused/simdgroup.metal"], accept = false, diagnostics = ["111:3"] },
+        CorpusCase { name = "slot-conflict", sources = ["refused/slot_conflict.metal"], accept = false, diagnostics = ["212:4", "205:4"] },
+        CorpusCase { name = "stored-pointer", sources = ["refused/stored_pointer.metal"], accept = false, diagnostics = ["105:3", "119:3"] },
+        CorpusCase { name = "tile", sources = ["refused/tile.metal"], accept = false, diagnostics = ["110:3"] },
+        CorpusCase { name = "type-mismatch", sources = ["refused/type_mismatch.metal"], accept = false, diagnostics = ["204:4"] },
+        CorpusCase { name = "unexpected", sources = ["refused/unexpected.metal"], accept = false, diagnostics = ["1:3"] },
+        CorpusCase { name = "unknown-header", sources = ["refused/unknown_header.metal"], accept = false, diagnostics = ["6:1"] },
+        CorpusCase { name = "unknown-name", sources = ["refused/unknown_name.metal"], accept = false, diagnostics = ["202:4"] },
+        CorpusCase { name = "unknown-type", sources = ["refused/unknown_type.metal"], accept = false, diagnostics = ["201:3"] },
+        CorpusCase { name = "unsupported-attribute", sources = ["refused/unsupported_attribute.metal"], accept = false, diagnostics = ["120:3"] },
+        CorpusCase { name = "unsupported-construct", sources = ["refused/unsupported_construct.metal"], accept = false, diagnostics = ["125:4"] },
+        CorpusCase { name = "unsupported-function", sources = ["refused/unsupported_function.metal"], accept = false, diagnostics = ["121:4"] },
+        CorpusCase { name = "unsupported-statement", sources = ["refused/unsupported_statement.metal"], accept = false, diagnostics = ["122:4"] },
+        CorpusCase { name = "unsupported-struct", sources = ["refused/unsupported_struct.metal"], accept = false, diagnostics = ["119:3"] },
+        CorpusCase { name = "unsupported-type", sources = ["refused/unsupported_type.metal"], accept = false, diagnostics = ["118:3"] },
+        CorpusCase { name = "unterminated", sources = ["refused/unterminated.metal"], accept = false, diagnostics = ["3:3"] },
+        CorpusCase { name = "wrong-stage", sources = ["refused/wrong_stage.metal"], accept = false, diagnostics = ["219:4"] }
+    ]
+}

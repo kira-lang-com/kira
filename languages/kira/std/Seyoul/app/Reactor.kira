@@ -1,0 +1,211 @@
+import Foundation
+import Heap
+
+// Seyoul's reactor: one `klf.net` poller and, per watched socket, the task
+// waiting to read and the task waiting to write.
+//
+// A socket is watched once, for both directions, when it is made; the
+// poller reports readiness when it changes, so a task tries its operation
+// first and only on `WouldBlock` leaves its waker here. A turn waits on the
+// poller into one event buffer allocated with the reactor, and wakes the
+// tasks the events name: nothing is allocated per turn, and the per-socket
+// state is three parallel arrays indexed by the socket's token.
+
+namespace ReactorUnits {
+    // Events taken in one wait; more stay ready for the next.
+    let eventRoom: Number = 256
+    let eventBytes: Number = 16
+    let readable: UNumber = 1
+    let writable: UNumber = 2
+    let closed: UNumber = 4
+    let failed: UNumber = 8
+}
+
+class Reactor: Drop {
+    var poller: Poller? = .None
+    // By token - 1: the task waiting to read, the one waiting to write, and
+    // the readiness bits seen since the last `takeReadiness`.
+    var readers: [Waker?] = []
+    var writers: [Waker?] = []
+    var readiness: [UNumber] = []
+    var spare: [Number] = []
+    var spareCount: Number = 0
+    // Wakers left here: while there are some, a turn may block.
+    var waiting: Number = 0
+    let events: RawPtr = Heap.allocateRaw(256 * 16, 8)
+
+    // The poller, made on first use.
+    function ensurePoller() -> Result<Poller, NetFailure> {
+        match self.poller {
+            Some(made) -> return .Ok(made)
+            None -> {}
+        }
+        match makePoller() {
+            Ok(made) -> {
+                self.poller = .Some(made)
+                return .Ok(made)
+            }
+            Error(failure) -> return .Error(failure)
+        }
+    }
+
+    // Watches `socket` for both directions; answers its token.
+    function register(socket: NetHandle) -> Result<Number, NetFailure> {
+        var poller = Poller { handle = socket }
+        match self.ensurePoller() {
+            Ok(made) -> poller = made
+            Error(failure) -> return .Error(failure)
+        }
+        var slot = self.readers.count
+        if self.spareCount > 0 {
+            self.spareCount -= 1
+            slot = self.spare[self.spareCount]
+        } else {
+            self.readers.append(.None)
+            self.writers.append(.None)
+            self.readiness.append(0)
+        }
+        match poller.watch(socket, .Both, slot + 1) {
+            Ok -> return .Ok(slot + 1)
+            Error(failure) -> {
+                self.forgetSlot(slot)
+                return .Error(failure)
+            }
+        }
+    }
+
+    // Stops watching `socket`, registered as `token`. A task still waiting
+    // on it is woken, to find the socket gone.
+    function deregister(socket: NetHandle, token: Number) {
+        match self.poller {
+            Some(poller) -> {
+                let stopped = poller.watch(socket, .None, token)
+            }
+            None -> {}
+        }
+        self.wakeReader(token - 1)
+        self.wakeWriter(token - 1)
+        self.forgetSlot(token - 1)
+    }
+
+    function forgetSlot(slot: Number) {
+        self.readiness[slot] = 0
+        if self.spareCount < self.spare.count {
+            self.spare[self.spareCount] = slot
+        } else {
+            self.spare.append(slot)
+        }
+        self.spareCount += 1
+    }
+
+    // Leaves `waker` to be called when `token`'s socket turns readable.
+    function awaitReadable(token: Number, waker: Waker) {
+        match self.readers[token - 1] {
+            Some(held) -> {}
+            None -> self.waiting += 1
+        }
+        self.readers[token - 1] = .Some(waker)
+    }
+
+    // Leaves `waker` to be called when `token`'s socket turns writable.
+    function awaitWritable(token: Number, waker: Waker) {
+        match self.writers[token - 1] {
+            Some(held) -> {}
+            None -> self.waiting += 1
+        }
+        self.writers[token - 1] = .Some(waker)
+    }
+
+    // The readiness bits seen for `token` since this was last asked.
+    function takeReadiness(token: Number) -> UNumber {
+        let bits = self.readiness[token - 1]
+        self.readiness[token - 1] = 0
+        return bits
+    }
+
+    function wakeReader(slot: Number) {
+        match self.readers[slot] {
+            Some(waker) -> {
+                self.readers[slot] = .None
+                self.waiting -= 1
+                waker.wakeUp()
+            }
+            None -> {}
+        }
+    }
+
+    function wakeWriter(slot: Number) {
+        match self.writers[slot] {
+            Some(waker) -> {
+                self.writers[slot] = .None
+                self.waiting -= 1
+                waker.wakeUp()
+            }
+            None -> {}
+        }
+    }
+
+    // Waits for readiness up to `timeout` nanoseconds (-1 for as long as it
+    // takes, 0 to take only what is ready) and wakes the tasks it names.
+    function wait(timeout: Number) -> Result<Void, NetFailure> {
+        var poller = Poller { handle = NetHandle(0) }
+        match self.ensurePoller() {
+            Ok(made) -> poller = made
+            Error(failure) -> return .Error(failure)
+        }
+        var answer: Number = 0
+        match poller.waitInto(timeout, self.events, ReactorUnits.eventRoom) {
+            Ok(written) -> answer = written
+            Error(failure) -> return .Error(failure)
+        }
+        for index in 0..answer {
+            let token = Number(heapLoad<U64>(self.events, index * ReactorUnits.eventBytes))
+            // A wake names no socket.
+            if token == 0 { continue }
+            let bits = UNumber(heapLoad<U64>(self.events, index * ReactorUnits.eventBytes + 8))
+            let slot = token - 1
+            if slot >= self.readers.count { continue }
+            self.readiness[slot] = self.readiness[slot] | bits
+            let ended = (bits & (ReactorUnits.closed | ReactorUnits.failed)) != 0
+            if ended || (bits & ReactorUnits.readable) != 0 { self.wakeReader(slot) }
+            if ended || (bits & ReactorUnits.writable) != 0 { self.wakeWriter(slot) }
+        }
+        return .Ok
+    }
+
+    // Ends a wait from any thread.
+    function interrupt() {
+        match self.poller {
+            Some(poller) -> {
+                let woken = poller.wake()
+            }
+            None -> {}
+        }
+    }
+
+    function drop(borrow mut self) {
+        match self.poller {
+            Some(poller) -> {
+                let closed = poller.close()
+            }
+            None -> {}
+        }
+        Heap.freeRaw(self.events)
+    }
+}
+
+// Whether `failure` only says the operation would have to wait.
+function wouldBlock(failure: borrow NetFailure) -> Bool {
+    return match failure {
+        WouldBlock -> true
+        Refused -> false
+        Unreachable -> false
+        AddressInUse -> false
+        InvalidHandle -> false
+        InvalidAddress -> false
+        TimedOut -> false
+        Reset -> false
+        NotFound -> false
+        Io -> false
+    }
+}

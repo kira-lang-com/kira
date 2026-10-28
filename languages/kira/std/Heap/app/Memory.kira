@@ -1,0 +1,132 @@
+// Memory by the byte: blocks taken from the heap and given back, and the
+// bytes in them copied, moved, filled and compared. A count below zero, or
+// a range that would wrap the address space, traps rather than reaching
+// memory it does not name.
+
+// A block of `layout.size` bytes on `layout.alignment`. Its bytes hold
+// whatever was there before: `allocateZeroed` clears them.
+function allocate(layout: borrow MemoryLayout) -> RawPtr {
+    return heapAllocateRaw(layout.size, layout.alignment)
+}
+
+function allocateZeroed(layout: borrow MemoryLayout) -> RawPtr {
+    let block = heapAllocateRaw(layout.size, layout.alignment)
+    heapFillBytes(block, U8(0), layout.size)
+    return block
+}
+
+// The block given back. A null pointer is ignored, so a block that was
+// never made can be given back as freely as one that was.
+function deallocate(block: RawPtr) {
+    if isNull(block) { return }
+    heapFreeRaw(block)
+}
+
+// A block of `newSize` bytes on the old layout's alignment holding the old
+// block's bytes, as many as both share. The old block is given back; a
+// null one is allocated fresh.
+function reallocate(block: RawPtr, old: borrow MemoryLayout, newSize: Int) -> RawPtr {
+    let layout = memoryLayout(newSize, old.alignment)
+    let replacement = allocate(layout)
+    if isNull(block) { return replacement }
+    heapCopyBytes(replacement, block, old.size < newSize ? old.size : newSize)
+    heapFreeRaw(block)
+    return replacement
+}
+
+// `count` bytes copied from `source` to `destination`. The ranges must not
+// overlap, and copying between overlapping ones traps: `moveBytes` copies
+// between those.
+function copyBytes(destination: RawPtr, source: RawPtr, count: Int) {
+    requireRange(destination, count)
+    requireRange(source, count)
+    let distance = pointerDistance(source, destination)
+    if distance < count && 0 - distance < count && count > 0 { runtimeTrap() }
+    heapCopyBytes(destination, source, count)
+}
+
+// `count` bytes copied from `source` to `destination` as though through a
+// buffer, so the ranges may overlap.
+function moveBytes(destination: RawPtr, source: RawPtr, count: Int) {
+    requireRange(destination, count)
+    requireRange(source, count)
+    heapMoveBytes(destination, source, count)
+}
+
+function fillBytes(destination: RawPtr, byte: U8, count: Int) {
+    requireRange(destination, count)
+    heapFillBytes(destination, byte, count)
+}
+
+function zeroBytes(destination: RawPtr, count: Int) {
+    requireRange(destination, count)
+    heapFillBytes(destination, U8(0), count)
+}
+
+// The order of two runs of `count` bytes, compared byte by byte as unsigned
+// numbers: below zero when `left` sorts first, zero when they are equal.
+function compareBytes(left: RawPtr, right: RawPtr, count: Int) -> Int {
+    requireRange(left, count)
+    requireRange(right, count)
+    var start: Int = 0
+    for word in 0..count / 8 {
+        if heapLoad<U64>(left, word * 8) != heapLoad<U64>(right, word * 8) { break }
+        start = word * 8 + 8
+    }
+    for at in start..count {
+        let a = heapLoad<U8>(left, at)
+        let b = heapLoad<U8>(right, at)
+        if a != b { return a < b ? -1 : 1 }
+    }
+    return 0
+}
+
+function bytesEqual(left: RawPtr, right: RawPtr, count: Int) -> Bool {
+    return compareBytes(left, right, count) == 0
+}
+
+function nullPointer() -> RawPtr {
+    return RawPtr(0)
+}
+
+function isNull(pointer: RawPtr) -> Bool {
+    return rawPointerWord(pointer) == 0
+}
+
+// The pointer's address as a number, and the pointer at a number.
+function pointerAddress(pointer: RawPtr) -> Int {
+    return Int(rawPointerWord(pointer))
+}
+
+function pointerAt(address: Int) -> RawPtr {
+    return RawPtr(address)
+}
+
+// The bytes from `from` to `to`, below zero when `to` lies before it.
+function pointerDistance(from: RawPtr, to: RawPtr) -> Int {
+    return pointerAddress(to) - pointerAddress(from)
+}
+
+function isAligned(pointer: RawPtr, alignment: Int) -> Bool {
+    return alignDown(pointerAddress(pointer), alignment) == pointerAddress(pointer)
+}
+
+// The first address at or after `pointer` on `alignment`.
+function alignPointer(pointer: RawPtr, alignment: Int) -> RawPtr {
+    return heapOffset(
+        pointer,
+        alignUp(pointerAddress(pointer), alignment) - pointerAddress(pointer)
+    )
+}
+
+// A range of `count` bytes from `start`: the count is not negative, and the
+// range does not wrap past the top of the address space.
+function requireRange(start: RawPtr, count: Int) {
+    if count < 0 { runtimeTrap() }
+    let address = pointerAddress(start)
+    if address < 0 || address > maximumAddress() - count { runtimeTrap() }
+}
+
+function maximumAddress() -> Int {
+    return 9223372036854775807
+}

@@ -1,0 +1,74 @@
+import Foundation
+
+// Names an app's own declarations reuse: none of them may take the app's.
+public enum Value {
+    Unused
+}
+
+public function total(first: Number, second: Number) -> Number {
+    return first * second
+}
+
+public struct Pair {
+    let left: Number
+    let right: Number
+}
+
+// A generic method whose function-typed parameter names the type parameter
+// a dependency of the caller also declares as a type.
+extend Pair {
+    function combined<Value>(seed: Value, step: (Value, Number) -> Value) -> Value {
+        return step(step(seed, left), right)
+    }
+}
+
+// A family an `extend` gives a generic method. Once the block has joined the
+// family, its type parameter still stands for itself, in the signature and in
+// a type argument written inside another in the body.
+public construct Shape {
+    @Required let size: Number
+}
+
+public Shape Square {
+    let size: Number = 2
+}
+
+struct Held<Item> {
+    var value: Item
+}
+
+function passed<Item>(item: Item) -> Item {
+    return item
+}
+
+extend Shape {
+    function scaled<Value>(of: Value, step: (Value, Number) -> Value) -> Value {
+        let held = passed<Held<Value>>(Held<Value> { value: copy of })
+        return step(copy held.value, size)
+    }
+}
+
+public enum Spacing {
+    Default
+    Length(Number)
+}
+
+public construct Measure {
+    @Required function points() -> Number
+}
+
+// A header and an init both take `spacing`: a leading-dot argument names a
+// case, so only the header's enum can take it, and the init's call to the
+// header is not taken back by the init itself.
+public construct Gap(spacing: Spacing = .Default) extends Measure {
+    init(spacing: Number) {
+        return Gap(spacing: .Length(spacing))
+    }
+
+    function points() -> Number {
+        return match spacing {
+            Default -> 1
+            Length(value) -> value
+        }
+    }
+}

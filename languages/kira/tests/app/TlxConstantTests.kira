@@ -1,0 +1,79 @@
+import Foundation
+
+// TlxConstantTests.kira
+// `Test` cases over the module constants declared in TlxConstants.kira.
+
+@Test
+function tlxAnswerHoldsItsValue() {
+    let got = tlxAnswer
+    expect!(got == 42)
+}
+
+@Test
+function tlxAnnotatedConstantHoldsItsValue() {
+    let got = tlxScaled
+    expect!(got == 420)
+}
+
+@Test
+function tlxStringConstantBuiltFromACall() {
+    let got = tlxGreeting
+    expect!(got == "tlx-constants")
+}
+
+@Test
+function tlxBoolConstantIsComputed() {
+    let got = tlxFlag
+    expect!(got == true)
+}
+
+@Test
+function tlxArrayConstantIsBuiltOnce() {
+    let got = tlxTable.count * 100 + tlxTable[0] + tlxTable[4]
+    expect!(got == 588)
+}
+
+@Test
+function tlxStructConstantHoldsItsFields() {
+    let got = tlxPoint.x + tlxPoint.y
+    expect!(got == 462)
+}
+
+@Test
+function tlxClosureConstantIsCallable() {
+    let got = tlxAdder(58)
+    expect!(got == 100)
+}
+
+@Test
+function tlxReadsCopyNotAlias() {
+    // A read is a copy with value semantics: growing the copy leaves the
+    // constant exactly as its initializer built it.
+    var copy = tlxTable
+    copy.append(999)
+    let got = copy.count * 10 + tlxTable.count
+    expect!(got == 65)
+}
+
+@Test
+function tlxConstantReadInsideAClosure() {
+    let got = tlxThroughClosure()
+    expect!(got == 465)
+}
+
+// `tlxStack` calls `TlxCatalogSource.tlxMeasure`; the same-named method on
+    // `TlxCatalogReader` reads `tlxStack` and never runs during initialization.
+function tlxSharedMethodNameIsNoCycleAnswer() -> Number {
+let reader = TlxCatalogReader {} return tlxStack * 100 + reader.tlxMeasure()
+}
+
+@Test
+function tlxSharedMethodNameIsNoCycle() {
+    expect!(tlxSharedMethodNameIsNoCycleAnswer() == 4041)
+}
+
+@Test
+function tlxEvaluationFollowsHiddenDefaultReads() {
+    let got = tlxDerived
+    expect!(got == 16)
+}

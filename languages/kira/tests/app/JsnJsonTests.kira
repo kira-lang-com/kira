@@ -1,0 +1,325 @@
+import Foundation
+
+// Kira Test coverage for Foundation's JSON: what the grammar accepts, what it
+// refuses and where, how number literals land on the nearest `Number`, what the
+// accessors answer for a document that is not shaped the way a caller hoped,
+// and that writing a value back out produces text that reads as the same value.
+//
+// The refusals carry their offset here as well as their reason. An offset that
+// drifted would still be "a refusal", so a test that only asked whether the
+// parse failed would pass while the one useful thing about the failure rotted.
+
+// A parse rendered as text: what it read, or why it stopped and where.
+function jsnRead(text: borrow String) -> String {
+    match parseJson(text) {
+        Ok(value) -> return writeJson(value)
+        Error(problem) -> return jsnFailureName(problem.reason) + "@" + String(problem.at)
+    }
+}
+
+function jsnFailureName(reason: borrow JsonFailure) -> String {
+    match reason {
+        UnexpectedEnd -> return "UnexpectedEnd"
+        UnexpectedCharacter -> return "UnexpectedCharacter"
+        InvalidNumber -> return "InvalidNumber"
+        NumberOutOfRange -> return "NumberOutOfRange"
+        InvalidEscape -> return "InvalidEscape"
+        InvalidText -> return "InvalidText"
+        UnterminatedText -> return "UnterminatedText"
+        DepthExceeded -> return "DepthExceeded"
+        TrailingText -> return "TrailingText"
+    }
+}
+
+// What an accessor answered, written out, or `none`.
+function jsnShown(answer: borrow JsonValue?) -> String {
+    match answer {
+        Some(value) -> return writeJson(value)
+        None -> return "none"
+    }
+}
+
+// The text a document holds, or nothing when it holds none.
+function jsnTextOf(value: borrow JsonValue) -> String {
+    match value.text() {
+        Some(text) -> return text
+        None -> return ""
+    }
+}
+
+// The number a document is, or -1 when it is not one.
+function jsnNumberOf(text: borrow String) -> Number {
+    match jsnValue(text).number() {
+        Some(number) -> return number
+        None -> return 0 - 1
+    }
+}
+
+// The parsed document, or `Null` when the text was refused.
+function jsnValue(text: borrow String) -> JsonValue {
+    match parseJson(text) {
+        Ok(value) -> return value
+        Error(problem) -> return .Null
+    }
+}
+@Test
+function jsnReadsEveryScalar() {
+    let got = jsnRead("null") + " " + jsnRead("true") + " " + jsnRead("false")
+        + " " + jsnRead("0") + " " + jsnRead("\"text\"")
+    expect!(got == "null true false 0 \"text\"")
+}
+
+@Test
+function jsnReadsAnObjectAndWritesItBack() {
+    let got = jsnRead("{\"a\":1,\"b\":[true,null],\"c\":\"x\"}")
+    expect!(got == "{\"a\":1,\"b\":[true,null],\"c\":\"x\"}")
+}
+
+@Test
+function jsnIgnoresWhitespaceBetweenTokens() {
+    let got = jsnRead("  {\n\t\"a\" : [ 1 , 2 ]\r\n}  ")
+    expect!(got == "{\"a\":[1,2]}")
+}
+
+@Test
+function jsnReadsEmptyContainers() {
+    let got = jsnRead("[]") + jsnRead("{}") + jsnRead("[[],{}]")
+    expect!(got == "[]{}[[],{}]")
+}
+
+@Test
+function jsnReadsEveryTwoCharacterEscape() {
+    let value = jsnValue("\"\\\"\\\\\\/\\b\\f\\n\\r\\t\"")
+    let text = jsnTextOf(value)
+    // Eight escapes, each one byte once read: the quote, the backslash and
+    // the solidus, then the five control characters.
+    let got = String(text.count) + ":" + String(text.charAt(0))
+        + "," + String(text.charAt(1)) + "," + String(text.charAt(2))
+        + "," + String(text.charAt(3)) + "," + String(text.charAt(7))
+    expect!(got == "8:34,92,47,8,9")
+}
+
+@Test
+function jsnDecodesAUnicodeEscape() {
+    let text = jsnTextOf(jsnValue("\"\\u00e9\\u0041\""))
+    // Three bytes: two for the é, one for the A.
+    let got = String(text.count) + ":" + text
+    expect!(got == "3:éA")
+}
+
+@Test
+function jsnDecodesASurrogatePair() {
+    let text = jsnTextOf(jsnValue("\"\\ud83d\\ude00\""))
+    let got = String(text.count) + ":" + text
+    expect!(got == "4:😀")
+}
+
+@Test
+function jsnRefusesHalfASurrogatePair() {
+    let got = jsnRead("\"\\ud83d\"") + " " + jsnRead("\"\\ude00\"")
+    expect!(got == "InvalidText@2 InvalidText@2")
+}
+
+@Test
+function jsnRefusesAnUnknownEscape() {
+    expect!(jsnRead("\"a\\qb\"") == "InvalidEscape@3")
+}
+
+@Test
+function jsnRefusesAnUnterminatedString() {
+    expect!(jsnRead("\"abc") == "UnterminatedText@4")
+}
+
+@Test
+function jsnRefusesARawControlCharacterInAString() {
+    expect!(jsnRead("\"a\nb\"") == "InvalidText@2")
+}
+
+@Test
+function jsnCarriesUtf8ThroughUnescaped() {
+    expect!(jsnRead("[\"héllo 😀\"]") == "[\"héllo 😀\"]")
+}
+
+@Test
+function jsnRefusesTrailingText() {
+    expect!(jsnRead("{\"a\":1} x") == "TrailingText@8")
+}
+
+@Test
+function jsnRefusesATrailingComma() {
+    let got = jsnRead("[1,]") + " " + jsnRead("{\"a\":1,}")
+    expect!(got == "UnexpectedCharacter@3 UnexpectedCharacter@7")
+}
+
+@Test
+function jsnRefusesWhatIsNotTheFormat() {
+    let got = jsnRead("{'a':1}") + " " + jsnRead("{a:1}") + " " + jsnRead("")
+    expect!(got == "UnexpectedCharacter@1 UnexpectedCharacter@1 UnexpectedEnd@0")
+}
+
+@Test
+function jsnRefusesNumbersThatAreNotNumbers() {
+    let got = jsnRead("01") + " " + jsnRead("1.") + " " + jsnRead("1e")
+        + " " + jsnRead("-") + " " + jsnRead("+1")
+    expect!(
+        got == "InvalidNumber@0 InvalidNumber@0 InvalidNumber@0 InvalidNumber@0 UnexpectedCharacter@0"
+    )
+}
+
+@Test
+function jsnRefusesAnUnclosedContainer() {
+    let got = jsnRead("[1,2") + " " + jsnRead("{\"a\":")
+    expect!(got == "UnexpectedEnd@4 UnexpectedEnd@5")
+}
+
+@Test
+function jsnRefusesNestingPastTheDepthLimit() {
+    var deep = ""
+    for level in 0..Json.maxDepth + 1 { deep = deep + "[" }
+    // Reaching the limit exactly is not the failure; one past it is.
+    var atLimit = ""
+    for level in 0..Json.maxDepth { atLimit = atLimit + "[" }
+    for level in 0..Json.maxDepth { atLimit = atLimit + "]" }
+    let got = jsnFailureNameOf(deep) + " " + String(jsnRead(atLimit).count)
+    expect!(got == "DepthExceeded 256")
+}
+
+// The reason a text is refused, or `"read"` when it is not.
+function jsnFailureNameOf(text: borrow String) -> String {
+    match parseJson(text) {
+        Ok(value) -> return "read"
+        Error(problem) -> return jsnFailureName(problem.reason)
+    }
+}
+
+@Test
+function jsnReadsEverySpellingOfANumberAsOneValue() {
+    // `3`, `3.0` and `30e-1` are the same number, as the format says, and
+    // write back as one spelling.
+    let same = jsnNumberOf("3.0") == 3
+    let got = writeJson(jsnValue("3")) + " " + writeJson(jsnValue("3.0")) + " " + writeJson(
+        jsnValue("30e-1")
+    ) + " " + String(same)
+    expect!(got == "3 3 3 true")
+}
+
+@Test
+function jsnReadsNegativesAndExponents() {
+    let got = jsnRead("[-3,1e3,2.5e-2,-0.5,1E+2]")
+    expect!(got == "[-3,1000,0.025,-0.5,100]")
+}
+
+@Test
+function jsnReadsTheWholeMantissaRange() {
+    // Both ends of `Int` and a `U64`'s largest stay exact. One past that
+    // has no nearest `Number`, so it is refused rather than rounded.
+    let got = jsnRead("9223372036854775807") + " " + jsnRead("-9223372036854775808")
+        + " " + jsnRead("18446744073709551615") + " " + jsnRead("18446744073709551616")
+    expect!(
+        got == "9223372036854775807 -9223372036854775808 18446744073709551615 NumberOutOfRange@0"
+    )
+}
+
+@Test
+function jsnRoundsPrecisionANumberDoesNotKeep() {
+    // More fractional digits than a `Number` keeps, and a mantissa wider
+    // than it holds: both read as the nearest `Number`, as a reader into
+    // floats reads them as the nearest float.
+    let got = jsnRead("0.123456789012345678901") + " " + jsnRead("0.9999999999999999999")
+        + " " + jsnRead("12345678901234567890.5")
+    expect!(got == "0.123456789012345679 1 12345678901234567891")
+}
+
+@Test
+function jsnBoundsAnAbsurdExponent() {
+    // An exponent no `Number` can reach, at both ends: the large one has
+    // no nearest value, and the small one is zero. Neither costs a reader
+    // more than reading the digits.
+    let got = jsnRead("1e1000000") + " " + jsnRead("1e-1000000") + " " + jsnRead("0e999999")
+    expect!(got == "NumberOutOfRange@0 0 0")
+}
+
+@Test
+function jsnReadsDecimalsExactly() {
+    let sum = jsnNumberOf("0.1") + jsnNumberOf("0.2")
+    let got = jsnRead("0.1") + " " + jsnRead("[1.5,0.0625]") + " " + String(sum)
+    expect!(got == "0.1 [1.5,0.0625] 0.3")
+}
+
+@Test
+function jsnAccessorsAnswerForEveryShape() {
+    let document = jsnValue("{\"n\":2,\"t\":\"x\",\"f\":true,\"a\":[10,20],\"z\":null}")
+    let got = jsnShown(document.field("n")) + jsnShown(document.field("t"))
+        + jsnShown(document.field("f")) + jsnShown(document.field("a"))
+        + jsnShown(jsnValue("[10,20]").at(1)) + jsnShown(document.field("z"))
+    expect!(got == "2\"x\"true[10,20]20null")
+}
+
+@Test
+function jsnAccessorsAnswerRatherThanTrap() {
+    let document = jsnValue("{\"a\":[1]}")
+    let list = jsnValue("[1]")
+    // Absent name, index past the end, negative index, and a value of the
+    // wrong shape: every one answers.
+    let got = jsnShown(document.field("missing")) + " " + jsnShown(list.at(5))
+        + " " + jsnShown(list.at(0 - 1)) + " " + String(document.number().isNone())
+        + " " + String(list.text().isNone())
+    expect!(got == "none none none true true")
+}
+
+@Test
+function jsnTellsAbsentFromNull() {
+    let document = jsnValue("{\"here\":null}")
+    let got = String(document.has("here")) + " " + String(document.has("gone"))
+        + " " + jsnShown(document.field("here"))
+    expect!(got == "true false null")
+}
+
+@Test
+function jsnKeepsRepeatedNamesAndReadsTheLast() {
+    let document = jsnValue("{\"a\":1,\"a\":2}")
+    let got = jsnShown(document.field("a")) + " " + writeJson(document)
+    expect!(got == "2 {\"a\":1,\"a\":2}")
+}
+
+// The member names of an object, joined in document order, or "none".
+function jsnJoinedNames() -> String {
+    match jsnValue("{\"b\":1,\"a\":2,\"b\":3}").names() {
+        Some(names) -> {
+            var out = ""
+            for name in names { out = out + name }
+            return out
+        }
+        None -> return "none"
+    }
+}
+
+@Test
+function jsnListsMemberNamesInDocumentOrder() {
+    expect!(jsnJoinedNames() == "bab")
+}
+
+@Test
+function jsnWritesEscapesTheFormatRequires() {
+    var members: [JsonMember] = []
+    members.append(JsonMember { name = "quote\"", value = .Text("a\\b\nc" + encodedScalar(1)) })
+    let document: JsonValue = .Object(move members)
+    expect!(writeJson(document) == "{\"quote\\\"\":\"a\\\\b\\nc\\u0001\"}")
+}
+
+@Test
+function jsnPrettyPrintsOneElementToALine() {
+    let got = writeJsonPretty(jsnValue("{\"a\":[1,{}],\"b\":{\"c\":true}}"))
+    expect!(got == "{\n  \"a\": [\n    1,\n    {}\n  ],\n  \"b\": {\n    \"c\": true\n  }\n}")
+}
+
+@Test
+function jsnWrittenTextReadsBackAsTheSameValue() {
+    let source = "{\"a\":[1,-2.5,\"t\\n\",true,null,{}],\"b\":{\"c\":[[]]}}"
+    let once = writeJson(jsnValue(source))
+    let twice = writeJson(jsnValue(once))
+    let pretty = writeJson(jsnValue(writeJsonPretty(jsnValue(source))))
+    expect!(once == twice)
+    expect!(once == pretty)
+    expect!(once == "{\"a\":[1,-2.5,\"t\\n\",true,null,{}],\"b\":{\"c\":[[]]}}")
+}

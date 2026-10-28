@@ -1,0 +1,498 @@
+import Foundation
+
+// ControlFlow.kira
+// Control flow + recursion + numeric coverage for the kik harness.
+// Every top-level name is prefixed `cf`. Entry point: cflSection() -> Int.
+// All arithmetic is chosen to be backend-identical:
+//   * modulo operands are kept non-negative (negative `%` diverges across backends),
+//   * integer division truncates toward zero (consistent, negatives allowed),
+//   * ordinary integer arithmetic traps on overflow; `wrappingAdd`/`wrappingMul` wrap,
+//   * floats use exact binary fractions only and fold to Int via comparisons.
+
+// ---------------------------------------------------------------------------
+// Enums used by the match sub-sections.
+// ---------------------------------------------------------------------------
+
+enum cfDir {
+    North
+    East
+    South
+    West
+}
+
+// Single-payload enum.
+enum cfStep {
+    Halt
+    Go(Int)
+    Skip(Int)
+}
+
+// ---------------------------------------------------------------------------
+// Recursion helpers (kept shallow, <= 100 frames).
+// ---------------------------------------------------------------------------
+
+function cflFactorial(n: Int) -> Int {
+    if n <= 1 {
+        return 1
+    }
+    return n * cflFactorial(n - 1)
+}
+
+function cflFib(n: Int) -> Int {
+    if n < 2 {
+        return n
+    }
+    return cflFib(n - 1) + cflFib(n - 2)
+}
+
+function cflGcd(a: Int, b: Int) -> Int {
+    if b == 0 {
+        return a
+    }
+    return cflGcd(b, a % b)
+}
+
+// Mutual recursion.
+function cflIsEven(n: Int) -> Bool {
+    if n == 0 {
+        return true
+    }
+    return cflIsOdd(n - 1)
+}
+
+function cflIsOdd(n: Int) -> Bool {
+    if n == 0 {
+        return false
+    }
+    return cflIsEven(n - 1)
+}
+
+// Recursive sum 1..=n via accumulator-free self call (shallow).
+function cflTriangular(n: Int) -> Int {
+    if n <= 0 {
+        return 0
+    }
+    return n + cflTriangular(n - 1)
+}
+
+// ---------------------------------------------------------------------------
+// A long if/else chain: many comparisons against one subject, then a fallback.
+// ---------------------------------------------------------------------------
+
+function cflGrade(score: Int) -> Int {
+    // score is reduced into a 0..=10 bucket, then compared against each.
+    let bucket = score / 10
+    match bucket {
+        10 -> {
+            return 100
+        }
+        9 -> {
+            return 90
+        }
+        8 -> {
+            return 80
+        }
+        7 -> {
+            return 70
+        }
+        6 -> {
+            return 60
+        }
+        5 -> {
+            return 50
+        }
+        4 -> {
+            return 40
+        }
+        3 -> {
+            return 30
+        }
+        2 -> {
+            return 20
+        }
+        1 -> {
+            return 10
+        }
+        0 -> {
+            return 0
+        }
+        else -> {
+            return -1
+        }
+    }
+}
+
+// An if/else chain driving an enum selection, then folded.
+function cflDirWeight(i: Int) -> Int {
+    var d: cfDir = .North
+    if (i % 4) == 0 {
+        d = .North
+    } else if (i % 4) == 1 {
+        d = .East
+    } else if (i % 4) == 2 {
+        d = .South
+    } else if (i % 4) == 3 {
+        d = .West
+    } else {
+        d = .North
+    }
+    return cflDirScore(d)
+}
+
+// ---------------------------------------------------------------------------
+// match in statement position (returning directly from each arm).
+// ---------------------------------------------------------------------------
+
+function cflDirScore(d: borrow cfDir) -> Int {
+    match d {
+        North -> { return 1 }
+        East -> { return 2 }
+        South -> { return 4 }
+        West -> { return 8 }
+    }
+}
+
+function cflStepValue(s: borrow cfStep) -> Int {
+    match s {
+        Halt -> { return 0 }
+        Go(v) -> { return v * 3 }
+        Skip(v) -> { return v + 100 }
+    }
+}
+
+function cflStepFor(i: Int) -> cfStep {
+    // Build a payload-carrying enum based on i, returning enums directly per branch.
+    if i % 5 == 0 {
+        return .Halt
+    }
+    if i % 2 == 0 {
+        return .Go(i)
+    }
+    return .Skip(i)
+}
+
+// ---------------------------------------------------------------------------
+// Nested ternary (?:) folded into an Int.
+// ---------------------------------------------------------------------------
+
+function cflTernary(x: Int) -> Int {
+    // Nested conditional expression: classify into signed ladder.
+    let band = x > 100 ? 4 : (x > 50 ? 3 : (x > 20 ? 2 : (x > 0 ? 1 : 0)))
+    let parity = x % 2 == 0 ? 10 : 20
+    return band * parity
+}
+
+// ---------------------------------------------------------------------------
+// Early return from inside a loop.
+// ---------------------------------------------------------------------------
+
+function cflFirstDivisible(start: Int, divisor: Int, limit: Int) -> Int {
+    var n = start
+    for steps in 0..limit {
+        if n % divisor == 0 {
+            return n
+        }
+        n = n + 1
+    }
+    return -1
+}
+
+// Linear scan with early return over an array.
+function cflFindOver(xs: borrow [Int], threshold: Int) -> Int {
+    for v in xs {
+        if v > threshold {
+            return v
+        }
+    }
+    return -1
+}
+
+// ---------------------------------------------------------------------------
+// Closures: owned, passed with `move`. Captures of let by value and var shared.
+// ---------------------------------------------------------------------------
+
+function cflApply(f: (Int) -> Int, n: Int) -> Int {
+    var acc = 0
+    for i in 0..n {
+        acc = acc + f(i)
+    }
+    return acc
+}
+
+// ---------------------------------------------------------------------------
+// Iterative numeric helper exercising %10 // /10 digit extraction.
+// ---------------------------------------------------------------------------
+
+function cflDigitSum(value: Int) -> Int {
+    var n = value
+    var sum = 0
+    while n > 0 {
+        sum = sum + (n % 10)
+        n = n / 10
+    }
+    return sum
+}
+
+function cflPow2(exp: Int) -> Int {
+    var result = 1
+    for i in 0..exp {
+        result = result * 2
+    }
+    return result
+}
+
+// ---------------------------------------------------------------------------
+// Struct + method + borrow mut writeback on a LOCAL var.
+// ---------------------------------------------------------------------------
+
+struct cfCounter {
+    var value: Int
+    var steps: Int
+}
+
+function cflBump(c: borrow mut cfCounter, by: Int) {
+    c.value = c.value + by
+    c.steps = c.steps + 1
+}
+
+// ---------------------------------------------------------------------------
+// Float arithmetic, folded into an Int via comparisons (no float->int cast).
+// Only exact binary fractions are used so every backend agrees bit-for-bit.
+// ---------------------------------------------------------------------------
+
+function cflFloatFold() -> Int {
+    var acc = 0
+
+    // Exact sum: 0.5 + 1.25 + 2.75 + 0.125 + 4.0 + 0.625 = 9.25
+    let xs: [Float] = [0.5, 1.25, 2.75, 0.125, 4.0, 0.625]
+    var sum: Float = 0.0
+    for x in xs {
+        sum = sum + x
+    }
+    if sum == 9.25 {
+        acc = acc + 1000
+    }
+    if sum > 9.0 {
+        acc = acc + 7
+    }
+    if sum < 9.5 {
+        acc = acc + 3
+    }
+
+    // Exact product: 2.0 * 0.5 * 4.0 * 0.25 = 1.0
+    let ys: [Float] = [2.0, 0.5, 4.0, 0.25]
+    var prod: Float = 1.0
+    for y in ys {
+        prod = prod * y
+    }
+    if prod == 1.0 {
+        acc = acc + 500
+    }
+
+    // Exact division by a power of two: 9.0 / 4.0 = 2.25
+    let q = 9.0 / 4.0
+    if q == 2.25 {
+        acc = acc + 200
+    }
+    // Float modulo (positive operands): 9.0 % 4.0 = 1.0
+    let r = 9.0 % 4.0
+    if r == 1.0 {
+        acc = acc + 60
+    }
+
+    // Comparison ladder folded across a loop.
+    var fv = 0.0
+    for i in 0..8 {
+        fv = fv + 0.25
+        if fv > 1.0 {
+            acc = acc + 2
+        }
+        if fv == 2.0 {
+            acc = acc + 11
+        }
+    }
+
+    // Negative float arithmetic (consistent for +/-/*).
+    let neg = (-3.5) + 1.5
+    if neg == (-2.0) {
+        acc = acc + 17
+    }
+    if neg < 0.0 {
+        acc = acc + 5
+    }
+
+    return acc
+}
+
+// Closures live in a small dedicated function (one callback plan per function):
+// owned closures, captures of a `let` by value and a `var` shared-mutable.
+function cflClosureFold() -> Int {
+    var cloAcc = 0
+    let bias = 3
+    let square: (Int) -> Int = { x in
+        return x * x + bias
+    }
+    cloAcc = cloAcc + cflApply(move square, 10)
+
+    var running = 0
+    let accumulate: (Int) -> Int = { x in
+        running = running + x
+        return running
+    }
+    cloAcc = cloAcc + cflApply(move accumulate, 8)
+    cloAcc = cloAcc + running // var mutated through the closure
+    return cloAcc
+}
+
+// ---------------------------------------------------------------------------
+// Entry point: do a LOT of in-depth work and fold into ONE deterministic Int.
+// ---------------------------------------------------------------------------
+
+function cflSection() -> Int {
+    // Rolling polynomial fold. Overflow is intentional and wraps identically
+    // (two's-complement i64) on vm / llvm / hybrid.
+    var checksum = 0
+
+    // --- Part 1: nested while loops with break + continue, early break ---
+    var loopAcc = 0
+    var a = 0
+    while a < 6 {
+        var b = 0
+        while b < 6 {
+            if b == 4 {
+                break
+            }
+            if (a + b) % 2 == 0 {
+                b = b + 1
+                continue
+            }
+            loopAcc = loopAcc + (a * 10 + b)
+            b = b + 1
+        }
+        if a == 5 {
+            break
+        }
+        a = a + 1
+    }
+    checksum = wrappingAdd(wrappingMul(checksum, 131), loopAcc)
+
+    // --- Part 2: nested for-in loops with a skip guard ---
+    // (`continue` is exercised in while loops; for-in skips via a guard.)
+    var forAcc = 0
+    let rows: [Int] = [1, 2, 3, 4]
+    let cols: [Int] = [10, 20, 30]
+    for r in rows {
+        for c in cols {
+            if r != 3 {
+                forAcc = forAcc + (r * c)
+            }
+        }
+    }
+    checksum = wrappingAdd(wrappingMul(checksum, 131), forAcc)
+
+    // --- Part 3: a long comparison chain with a fallback, over varied inputs ---
+    var gradeAcc = 0
+    var s = 0
+    while s <= 110 {
+        gradeAcc = gradeAcc + cflGrade(s)
+        s = s + 7
+    }
+    checksum = wrappingAdd(wrappingMul(checksum, 131), gradeAcc)
+
+    // --- Part 4: match (statement position) over enum selection ---
+    var matchAcc = 0
+    for di in 0..24 {
+        matchAcc = matchAcc + cflDirWeight(di)
+    }
+    for pi in 0..30 {
+        let step = cflStepFor(pi)
+        matchAcc = matchAcc + cflStepValue(step)
+    }
+    checksum = wrappingAdd(wrappingMul(checksum, 131), matchAcc)
+
+    // --- Part 5: nested ternary expressions (non-negative inputs only) ---
+    var ternAcc = 0
+    var t = 0
+    while t <= 120 {
+        ternAcc = ternAcc + cflTernary(t)
+        t = t + 13
+    }
+    checksum = wrappingAdd(wrappingMul(checksum, 131), ternAcc)
+
+    // --- Part 6: early returns from loops ---
+    var earlyAcc = 0
+    earlyAcc = earlyAcc + cflFirstDivisible(50, 7, 100)
+    earlyAcc = earlyAcc + cflFirstDivisible(100, 11, 100)
+    earlyAcc = earlyAcc + cflFirstDivisible(3, 1000, 5)
+    let probe: [Int] = [2, 4, 8, 16, 32, 64]
+    earlyAcc = earlyAcc + cflFindOver(probe, 20)
+    earlyAcc = earlyAcc + cflFindOver(probe, 1000)
+    checksum = wrappingAdd(wrappingMul(checksum, 131), earlyAcc)
+
+    // --- Part 7: recursion (factorial / fib / gcd / triangular / mutual) ---
+    var recAcc = 0
+    for f in 1..13 {
+        recAcc = recAcc + cflFactorial(f)
+    }
+    for fb in 0..26 {
+        recAcc = recAcc + cflFib(fb)
+    }
+    recAcc = recAcc + cflGcd(1071, 462)
+    recAcc = recAcc + cflGcd(270, 192)
+    recAcc = recAcc + cflTriangular(50)
+    var even = 0
+    for ei in 0..64 {
+        if cflIsEven(ei) {
+            even = even + 1
+        }
+    }
+    recAcc = recAcc + even
+    checksum = wrappingAdd(wrappingMul(checksum, 131), recAcc)
+
+    // --- Part 8: wrapping arithmetic is spelled out (ordinary `+` and `*` trap) ---
+    var ovAcc = 0
+    let nearMax = 9223372036854775807
+    ovAcc = wrappingAdd(ovAcc, wrappingAdd(nearMax, 1)) // wraps to i64 min
+    ovAcc = wrappingAdd(ovAcc, wrappingMul(nearMax, 2)) // wraps to -2
+    var wrap = 1
+    for w in 0..64 {
+        wrap = wrappingMul(wrap, 2) // eventually wraps past i64 range
+    }
+    ovAcc = ovAcc + wrap // 2^64 wrapped == 0
+    checksum = wrappingAdd(wrappingMul(checksum, 131), ovAcc)
+
+    // --- Part 9: division + modulo over varied + negative values ---
+    // (modulo operands stay non-negative; division covers negative operands).
+    var numAcc = 0
+    let divisors: [Int] = [1, 2, 3, 4, 5, 7, 11]
+    for d in divisors {
+        for k in 0..40 {
+            numAcc = numAcc + (k / d)
+            numAcc = numAcc + (k % d)
+        }
+    }
+    numAcc = numAcc + ((-100) / 7) // -14 (truncated)
+    numAcc = numAcc + (100 / (-7)) // -14
+    numAcc = numAcc + ((-100) / (-7)) // 14
+    numAcc = numAcc + cflDigitSum(123456789)
+    numAcc = numAcc + cflDigitSum(999999)
+    numAcc = numAcc + cflPow2(10) // 1024
+    checksum = wrappingAdd(wrappingMul(checksum, 131), numAcc)
+
+    // --- Part 10: closures (owned, moved; let-by-value + var shared-mutable) ---
+    checksum = wrappingAdd(wrappingMul(checksum, 131), cflClosureFold())
+
+    // --- Part 11: struct method + borrow mut writeback on a LOCAL var ---
+    var structAcc = 0
+    var counter = cfCounter { value: 0, steps: 0 }
+    for ci in 1..11 {
+        cflBump(counter, ci)
+    }
+    structAcc = counter.value + counter.steps
+    checksum = wrappingAdd(wrappingMul(checksum, 131), structAcc)
+
+    // --- Part 12: float arithmetic folded into an Int ---
+    checksum = wrappingAdd(wrappingMul(checksum, 131), cflFloatFold())
+
+    return checksum
+}

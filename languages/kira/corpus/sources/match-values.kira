@@ -1,0 +1,93 @@
+// `match` on integers and Bools, `else`, and `match` used as a value: an
+// arm's expression or the one its block ends with, an arm that returns, and
+// a value of each kind.
+
+import Foundation
+
+enum Shape {
+    Circle(Int)
+    Square(Int)
+    Empty
+}
+
+struct Pair {
+    let a: Int
+    let b: String
+}
+
+function area(shape: Shape) -> Int {
+    return match shape {
+        Circle(r) -> 3 * r * r
+        Square(s) -> {
+            let side = s
+            side * side
+        }
+        Empty -> 0
+    }
+}
+
+function name(n: Int) -> String {
+    return match n {
+        1 -> "one"
+        -1 -> "minus one"
+        else -> match n > 1 {
+            true -> "many"
+            false -> "few"
+        }
+    }
+}
+
+function early(n: Int) -> Int {
+    let doubled = match n {
+        0 -> { return 100 }
+        else -> n * 2
+    }
+    return doubled + 1
+}
+
+function pair(flag: Bool) -> Pair {
+    return match flag {
+        true -> Pair { a = 1, b = "yes" }
+        false -> Pair { a = 2, b = "no" }
+    }
+}
+
+struct Entry {
+    let shape: Shape
+}
+
+function indexedArea(entries: borrow [Entry], index: Int) -> Int {
+    return match entries[index].shape {
+        Circle(radius) -> radius * radius
+        Square(side) -> side * side
+        Empty -> 0
+    }
+}
+
+function indexedNumber(numbers: [Int], index: Int) -> Int {
+    return match numbers[index] {
+        7 -> 49
+        else -> 0
+    }
+}
+
+@Main
+function main() -> Int {
+    var total = 0
+    match 3 {
+        3 -> total += 1
+        else -> total += 100
+    }
+    match Shape.Empty {
+        Circle -> total += 100
+        else -> total += 1
+    }
+    if area(Shape.Circle(2)) != 12 || area(Shape.Square(3)) != 9 || area(Shape.Empty) != 0 { return 1 }
+    if name(1) != "one" || name(-1) != "minus one" || name(5) != "many" || name(-4) != "few" { return 2 }
+    if early(0) != 100 || early(4) != 9 { return 3 }
+    if pair(false).b != "no" || pair(true).a != 1 { return 4 }
+    let entries = [Entry { shape = Shape.Circle(7) }, Entry { shape = Shape.Empty }]
+    if indexedArea(entries, 0) != 49 || indexedArea(entries, 1) != 0 { return 5 }
+    if indexedNumber([7, 0], 0) != 49 || indexedNumber([7, 0], 1) != 0 { return 6 }
+    return total + 40
+}

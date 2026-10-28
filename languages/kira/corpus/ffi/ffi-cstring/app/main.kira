@@ -1,0 +1,118 @@
+// A `CString` member of a C-layout struct, and a struct handed to C by address.
+//
+// Ordinary calls borrow the descriptor storage and release it on return.
+// `ffi_desc_keep` says it retains the descriptor, so that call consumes the
+// value and transfers its ownership tree to the runtime registry.
+
+@FFI.Struct { layout: c }
+struct ffi_desc {
+    let tag: I32 = 0
+    let title: CString
+}
+
+@FFI.Pointer { target: ffi_desc, ownership: borrowed }
+struct ffi_desc_ptr {}
+
+@FFI.Extern { library: ffifixture, symbol: ffi_desc_by_value, abi: c }
+function ffiDescByValue(d: ffi_desc): I32
+@FFI.Extern { library: ffifixture, symbol: ffi_desc_by_pointer, abi: c }
+function ffiDescByPointer(d: ffi_desc_ptr): I32
+@FFI.Extern {
+    library: ffifixture,
+    symbol: ffi_desc_keep,
+    abi: c,
+    retains: d
+}
+function ffiDescKeep(d: ffi_desc_ptr): Void
+@FFI.Extern {
+    library: ffifixture,
+    symbol: ffi_desc_keep_value,
+    abi: c,
+    retains: d
+}
+function ffiDescKeepValue(d: ffi_desc): Void
+@FFI.Extern {
+    library: ffifixture,
+    symbol: ffi_cstr_keep,
+    abi: c,
+    retains: text
+}
+function ffiCstrKeep(text: CString): Void
+@FFI.Extern { library: ffifixture, symbol: ffi_desc_recall, abi: c }
+function ffiDescRecall(): I32
+
+function zeroFilled() -> I32 {
+    // `title` is left out, so it zero-fills — and a C string's zero is NULL,
+    // which is a different value from a pointer to the empty string.
+    let d = ffi_desc { tag: 7 }
+    return ffiDescByPointer(move d)
+}
+
+function byPointer(name: borrow String) -> I32 {
+    let d = ffi_desc {
+        tag: 9,
+        title: name
+    }
+    return ffiDescByPointer(move d)
+}
+
+function byValue(name: borrow String) -> I32 {
+    let d = ffi_desc {
+        tag: 8,
+        title: name
+    }
+    return ffiDescByValue(move d)
+}
+
+// C keeps the pointer and reads it later, which is the case a call-scoped
+// buffer would get wrong.
+function keepIt(name: borrow String) -> Void {
+    let d = ffi_desc {
+        tag: 6,
+        title: name
+    }
+    ffiDescKeep(move d)
+    return
+}
+
+function recallIt() -> I32 {
+    return ffiDescRecall()
+}
+
+function keepValue(name: borrow String) -> Void {
+    let d = ffi_desc {
+        tag: 4,
+        title: name
+    }
+    ffiDescKeepValue(move d)
+    return
+}
+
+function keepText() -> Void {
+    let text = "kira"
+    ffiCstrKeep(move text)
+    return
+}
+
+function emptyTitle() -> I32 {
+    let d = ffi_desc {
+        tag: 5,
+        title: ""
+    }
+    return ffiDescByPointer(move d)
+}
+
+@Main
+function main() {
+    print(zeroFilled())
+    print(byPointer("kira"))
+    print(byValue("kira"))
+    print(emptyTitle())
+    keepIt("kira")
+    print(recallIt())
+    keepValue("kira")
+    print(recallIt())
+    keepText()
+    print(recallIt())
+    return
+}

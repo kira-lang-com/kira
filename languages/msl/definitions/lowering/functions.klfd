@@ -1,0 +1,305 @@
+// Functions and statements.
+//
+// Every value parameter and entry input is copied into a local, so a body
+// may write any of them; a `thread` or `threadgroup` reference parameter
+// is the pointer it receives. A loop is KSIR's: its condition tested first
+// in the body (`for`, `while`) or as the continuing block's break-if
+// (`do`), and a `for` step in the continuing block, where `continue`
+// leads.
+
+function stageWord(stage: StageWord) -> String {
+    match stage {
+        VertexStage -> return "vertex"
+        FragmentStage -> return "fragment"
+        KernelStage -> return "compute"
+        NoStage -> return ""
+    }
+}
+
+extend Lowering {
+    // The calls in `body` and everything under it.
+    function callsIn(borrow self, body: [Int], found: borrow mut [Int]) {
+        for index in body {
+            let statement = program.statements[index]
+            callsUnder(statement.value, found)
+            callsUnder(statement.step, found)
+            callsIn(statement.initial, found)
+            callsIn(statement.body, found)
+            callsIn(statement.otherwise, found)
+            for case in statement.cases {
+                callsIn(case.body, found)
+            }
+        }
+    }
+
+    function callsUnder(borrow self, expression: Int, found: borrow mut [Int]) {
+        if expression < 0 { return }
+        let checked = program.expressions[expression]
+        if checked.kind == .Call { found.append(expression) }
+        callsUnder(checked.left, found)
+        callsUnder(checked.right, found)
+        callsUnder(checked.third, found)
+        for argument in checked.arguments {
+            callsUnder(argument, found)
+        }
+    }
+
+    // The globals a call binds to its callee's bound parameters, -1 for
+    // each other parameter, as seen from the function being lowered with
+    // `outer` bound.
+    function boundBy(borrow self, call: CheckedExpression, outer: [Int]) -> [Int] {
+        var bound: [Int] = []
+        let parameters = program.functions[call.target].parameters
+        for index in 0..parameters.count {
+            if parameters[index].mode != .Bound {
+                bound.append(-1)
+                continue
+            }
+            let argument = program.expressions[call.arguments[index]]
+            if argument.kind == .Global {
+                bound.append(argument.target)
+            } else {
+                bound.append(outer[argument.target])
+            }
+        }
+        return bound
+    }
+
+    // The KSIR function for `routine` with `outer` bound, lowered on first
+    // use with its callees before it.
+    function specialization(borrow mut self, routine: Int, outer: [Int]) -> Int {
+        for known in specializations {
+            if known.routine == routine && sameTypes(known.bound, outer) { return known.handle }
+        }
+        let checked = program.functions[routine]
+        var calls: [Int] = []
+        callsIn(checked.body, calls)
+        for call in calls {
+            let expression = program.expressions[call]
+            specialization(expression.target, boundBy(expression, outer))
+        }
+        shader_span(module, checked.span.file, checked.span.start, checked.span.end)
+        var resultType = -1
+        if program.types[checked.result].shape != .Void { resultType = typeHandle(checked.result) }
+        for parameter in checked.parameters {
+            match parameter.mode {
+                ByValue -> shader_param(module, parameter.name, typeHandle(parameter.parameterType), "")
+                ThreadReference -> shader_param(module, parameter.name, pointerType("function", parameter.parameterType), "")
+                ThreadgroupReference -> shader_param(module, parameter.name, pointerType("workgroup", parameter.parameterType), "")
+                Bound -> {}
+            }
+        }
+        builder = shader_function(module, freshFunctionName(checked.name), resultType, "")
+        beginBody(routine, outer)
+        var argument = 0
+        for position in 0..checked.parameters.count {
+            let parameter = checked.parameters[position]
+            match parameter.mode {
+                ByValue -> {
+                    let pointer = newLocal(parameter.name, parameter.parameterType)
+                    shader_stmt_store(module, builder, pointer, shader_expr_argument(module, builder, argument))
+                    places[position] = pointer
+                    argument += 1
+                }
+                ThreadReference -> {
+                    places[position] = shader_expr_argument(module, builder, argument)
+                    argument += 1
+                }
+                ThreadgroupReference -> {
+                    places[position] = shader_expr_argument(module, builder, argument)
+                    argument += 1
+                }
+                Bound -> {}
+            }
+        }
+        lowerBody(checked)
+        let handle = shader_function_finish(module, builder)
+        specializations.append(Specialization { routine = routine, bound = outer, handle = handle })
+        return handle
+    }
+
+    function pointerType(borrow mut self, space: String, pointee: Int) -> Int {
+        return shader_type(module, joinText(["ptr<", space, ", ", typeText(pointee), ">"]))
+    }
+
+    function beginBody(borrow mut self, routine: Int, outer: [Int]) {
+        current = routine
+        bound = outer
+        places = []
+        localNames = []
+        for local in program.functions[routine].locals {
+            places.append(-1)
+        }
+    }
+
+    function lowerBody(borrow mut self, checked: CheckedFunction) {
+        lowerBlock(checked.body)
+        if program.types[checked.result].shape == .Void && finishes(checked.body) {
+            shader_stmt_return(module, builder, -1)
+        }
+    }
+
+    // Whether control may reach the end of `body`: its last statement is
+    // not a return.
+    function finishes(borrow self, body: [Int]) -> Bool {
+        if body.count == 0 { return true }
+        return program.statements[body[body.count - 1]].kind != .ReturnValue
+    }
+
+    // An entry point: its built-ins and stage input as parameters, copied
+    // into the locals its body reads.
+    function lowerEntry(borrow mut self, entry: CheckedEntry) -> Int {
+        let checked = program.functions[entry.routine]
+        var outer: [Int] = []
+        for parameter in checked.parameters {
+            outer.append(-1)
+        }
+        var calls: [Int] = []
+        callsIn(checked.body, calls)
+        for call in calls {
+            let expression = program.expressions[call]
+            specialization(expression.target, boundBy(expression, outer))
+        }
+        shader_span(module, checked.span.file, checked.span.start, checked.span.end)
+        for input in entry.inputs {
+            if input.builtin == "workgroup_size" { continue }
+            var binding = ""
+            if utf8Count(input.builtin) > 0 { binding = joinText(["@builtin(", input.builtin, ")"]) }
+            shader_param(module, program.functions[entry.routine].locals[input.parameter].name, typeHandle(input.ksirType), binding)
+        }
+        var resultType = -1
+        if program.types[checked.result].shape != .Void { resultType = typeHandle(checked.result) }
+        var resultBinding = ""
+        if utf8Count(entry.resultBuiltin) > 0 { resultBinding = joinText(["@builtin(", entry.resultBuiltin, ")"]) }
+        if entry.resultLocation >= 0 { resultBinding = joinText(["@location(", decimalText(entry.resultLocation), ")"]) }
+        let name = freshFunctionName(checked.name)
+        builder = shader_entry(module, name, stageWord(checked.stage), resultType, resultBinding)
+        if checked.stage == .KernelStage {
+            shader_entry_workgroup(module, builder, 1, 1, 1)
+            for axis in 0..3 {
+                shader_entry_workgroup_override(module, builder, axis, shader_expr_override(module, -1, workgroup[axis]))
+            }
+        }
+        beginBody(entry.routine, outer)
+        var argument = 0
+        for input in entry.inputs {
+            var read = -1
+            if input.builtin == "workgroup_size" {
+                for axis in 0..3 {
+                    shader_push(module, shader_expr_override(module, builder, workgroup[axis]))
+                }
+                read = shader_expr_compose(module, builder, typeHandle(input.ksirType))
+            } else {
+                read = shader_expr_argument(module, builder, argument)
+                argument += 1
+            }
+            if input.lanes == 1 && program.types[input.ksirType].shape == .Vector {
+                read = shader_expr_access_index(module, builder, read, 0)
+            } else if input.lanes > 1 && input.lanes < program.types[input.ksirType].width {
+                read = shader_expr_swizzle(module, builder, read, utf8Slice("xyzw", 0, input.lanes))
+            }
+            let local = program.functions[entry.routine].locals[input.parameter]
+            let pointer = newLocal(local.name, local.localType)
+            shader_stmt_store(module, builder, pointer, read)
+            places[input.parameter] = pointer
+        }
+        lowerBody(checked)
+        return shader_function_finish(module, builder)
+    }
+
+    // A function-space variable under a name no other local of this
+    // function has; the pointer naming it.
+    function newLocal(borrow mut self, name: String, localType: Int) -> Int {
+        var base = name
+        if utf8Count(base) == 0 { base = "value" }
+        var candidate = base
+        var suffix = 1
+        while contains(localNames, candidate) {
+            candidate = joinText([base, "_", decimalText(suffix)])
+            suffix += 1
+        }
+        localNames.append(candidate)
+        let local = shader_local(module, builder, candidate, typeHandle(localType), -1)
+        return shader_expr_local(module, builder, local)
+    }
+
+    function lowerBlock(borrow mut self, body: [Int]) {
+        for index in body {
+            lowerStatement(index)
+        }
+    }
+
+    function lowerStatement(borrow mut self, index: Int) {
+        let statement = program.statements[index]
+        shader_span(module, statement.span.file, statement.span.start, statement.span.end)
+        match statement.kind {
+            DeclareLocal -> {
+                let local = program.functions[current].locals[statement.local]
+                let pointer = newLocal(local.name, local.localType)
+                places[statement.local] = pointer
+                if statement.value >= 0 { shader_stmt_store(module, builder, pointer, value(statement.value)) }
+            }
+            EvaluateValue -> value(statement.value)
+            IfElse -> {
+                shader_stmt_if(module, builder, value(statement.value))
+                lowerBlock(statement.body)
+                if statement.otherwise.count > 0 {
+                    shader_stmt_else(module, builder)
+                    lowerBlock(statement.otherwise)
+                }
+                shader_stmt_end_if(module, builder)
+            }
+            SwitchCases -> lowerSwitch(statement)
+            LoopFor -> lowerLoop(statement)
+            BreakOut -> shader_stmt_break(module, builder)
+            ContinueOn -> shader_stmt_continue(module, builder)
+            ReturnValue -> {
+                var returned = -1
+                if statement.value >= 0 { returned = value(statement.value) }
+                shader_stmt_return(module, builder, returned)
+            }
+            Nested -> lowerBlock(statement.body)
+        }
+    }
+
+    function lowerLoop(borrow mut self, statement: CheckedStatement) {
+        lowerBlock(statement.initial)
+        shader_stmt_loop(module, builder)
+        if statement.value >= 0 && !statement.testAfter {
+            let stop = shader_expr_unary(module, builder, "not", value(statement.value))
+            shader_stmt_if(module, builder, stop)
+            shader_stmt_break(module, builder)
+            shader_stmt_end_if(module, builder)
+        }
+        lowerBlock(statement.body)
+        shader_stmt_continuing(module, builder)
+        if statement.step >= 0 { value(statement.step) }
+        var breakIf = -1
+        if statement.value >= 0 && statement.testAfter {
+            breakIf = shader_expr_unary(module, builder, "not", value(statement.value))
+        }
+        shader_stmt_end_loop(module, builder, breakIf)
+    }
+
+    // Each case's labels but the last fall through, empty, to the one
+    // that holds the body.
+    function lowerSwitch(borrow mut self, statement: CheckedStatement) {
+        shader_stmt_switch(module, builder, value(statement.value))
+        for case in statement.cases {
+            var labels: [String] = []
+            for label in case.labels {
+                labels.append(joinText([label.text, label.scalar.ksir()]))
+            }
+            if case.hasDefault { labels.append("default") }
+            for position in 0..labels.count {
+                let last = position == labels.count - 1
+                var fall = 1
+                if last { fall = 0 }
+                shader_stmt_case(module, builder, labels[position], fall)
+                if last { lowerBlock(case.body) }
+                shader_stmt_end_case(module, builder)
+            }
+        }
+        shader_stmt_end_switch(module, builder)
+    }
+}

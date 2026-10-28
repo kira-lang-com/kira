@@ -1,0 +1,201 @@
+import Foundation
+
+// SgxTests.kira — migrated corpus cases from tests/pass/run/{string_*,call_*}.
+// PREFIX: sgx / Sgx (all top-level names use this prefix).
+// This file imports Foundation (imports are file-scoped); Test/Result/TestFailure/print already available.
+
+// ---------------------------------------------------------------------------
+// Helpers (copied from source programs, prefixed)
+// ---------------------------------------------------------------------------
+
+function sgxGreet(name: String) -> String {
+    return "hello, " + name
+}
+
+function sgxPick(i: Int) -> String {
+    if i == 0 {
+        return "alpha"
+    }
+    return "beta"
+}
+
+function sgxPickWord(i: Int) -> String {
+    if i == 0 {
+        return "hello"
+    }
+    return "worldwide"
+}
+
+function sgxEchoText(value: String) -> String {
+    return value
+}
+
+function sgxAddPair(left: Int, right: Int) -> Int {
+    return left + right
+}
+
+function sgxEchoFlag(value: Bool) -> Bool {
+    return value
+}
+
+// ---------------------------------------------------------------------------
+// string_array_overwrite_no_leak
+// ---------------------------------------------------------------------------
+
+@Test
+function sgxArrayOverwriteNoLeak() {
+    let head = "item"
+    let sep = "-"
+    var names: [String] = []
+    names.append("seed-a")
+    names.append("seed-b")
+    names.append("seed-c")
+    for round in 0..200 {
+        // Each store is a freshly heap-allocated concatenation; the previous
+        // cloned buffer in the slot must be released, not orphaned.
+        names[0] = head + sep + "alpha"
+        names[1] = head + sep + "beta"
+        names[2] = head + sep + "gamma"
+    }
+    expect!(names[0] + "|" + names[2] == "item-alpha|item-gamma")
+}
+
+// ---------------------------------------------------------------------------
+// string_concat_parity
+// ---------------------------------------------------------------------------
+
+@Test
+function sgxConcatSimple() {
+    expect!("a" + "b" == "ab")
+}
+
+@Test
+function sgxConcatEmptyLeft() {
+    expect!("" + "x" == "x")
+}
+
+@Test
+function sgxConcatEmptyRight() {
+    expect!("y" + "" == "y")
+}
+
+@Test
+function sgxConcatGreet() {
+    expect!(sgxGreet("kira") == "hello, kira")
+}
+
+@Test
+function sgxConcatLoopAccum() {
+    var s = ""
+    for i in 0..4 {
+        s = s + "ab"
+    }
+    expect!(s == "abababab")
+}
+
+@Test
+function sgxConcatLoopEquality() {
+    var s = ""
+    for i in 0..4 {
+        s = s + "ab"
+    }
+    expect!(s == "abababab")
+}
+
+@Test
+function sgxConcatNested() {
+    expect!(("p" + "q") + ("r" + "s") == "pqrs")
+}
+
+// ---------------------------------------------------------------------------
+// string_count_parity
+// ---------------------------------------------------------------------------
+
+@Test
+function sgxCountTitle() {
+    let title = "KIRA"
+    expect!(title.count == 4)
+}
+
+@Test
+function sgxCountSubtitle() {
+    let subtitle = "UI FOUNDATION"
+    expect!(subtitle.count == 13)
+}
+
+// ---------------------------------------------------------------------------
+// string_equality_parity
+// ---------------------------------------------------------------------------
+
+@Test
+function sgxEqAlphaAlpha() {
+    expect!("alpha" == "alpha")
+}
+
+@Test
+function sgxEqAlphaBeta() {
+    expect!(!("alpha" == "beta"))
+}
+
+@Test
+function sgxNeqAlphaBeta() {
+    expect!("alpha" != "beta")
+}
+
+@Test
+function sgxEqEmptyEmpty() {
+    expect!("" == "")
+}
+
+@Test
+function sgxEqPrefixMismatch() {
+    expect!(!("a" == "ab"))
+}
+
+@Test
+function sgxEqPickComputed() {
+    expect!(sgxPick(0) == "alpha")
+}
+
+@Test
+function sgxEqPickPick() {
+    expect!(sgxPick(1) == sgxPick(1))
+}
+
+// ---------------------------------------------------------------------------
+// call_temp_string_count_parity
+// ---------------------------------------------------------------------------
+
+@Test
+function sgxCallTempCountHello() {
+    expect!(sgxPickWord(0).count == 5)
+}
+
+@Test
+function sgxCallTempCountWorldwide() {
+    expect!(sgxPickWord(1).count == 9)
+}
+
+// ---------------------------------------------------------------------------
+// call_value_parity
+// ---------------------------------------------------------------------------
+
+@Test
+function sgxCallEchoText() {
+    expect!(sgxEchoText("hello parity") == "hello parity")
+}
+
+@Test
+function sgxCallAddPair() {
+    expect!(sgxAddPair(20, 22) == 42)
+}
+
+@Test
+function sgxCallEchoFlagTrue() {
+    expect!(sgxEchoFlag(true) == true)
+}
+
+@Test
+function sgxCallEchoFlagFalse() {
+    expect!(sgxEchoFlag(false) == false)
+}

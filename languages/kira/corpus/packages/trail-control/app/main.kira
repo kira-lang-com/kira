@@ -1,0 +1,46 @@
+import Foundation
+
+enum Net: LogCategory {
+    Tls
+    Dns
+
+    function threshold(borrow self) -> TrailThreshold {
+        match self {
+            Tls -> return .Off
+            Dns -> return .Off
+        }
+    }
+}
+
+function outcome(result: Result<Void, LogConfigFailure>) -> String {
+    match result {
+        Ok -> return "ok"
+        Error(failure) -> return "error"
+    }
+}
+
+function absorbed(result: Result<Void, LogConfigFailure>) {
+    match result {
+        Ok -> {}
+        Error(failure) -> absorb failure
+    }
+}
+
+@Main
+function main() -> Number {
+    print(outcome(Log.enable("", .Trace)))
+    print(outcome(Log.enable("Control..Tls", .Trace)))
+    print(outcome(Log.enable("Control.Net.Tls", .Trace)))
+    print(outcome(Log.reset("Control.Net.Tls")))
+    print(outcome(Log.disable("Control.Net.*")))
+    log(category: Net.Tls, "tls one", n: 1)
+    log(category: Net.Dns, "dns one", n: 2)
+    absorbed(Log.set("Control.Net.Dns", .UpTo(.Info)))
+    log(category: Net.Dns, "dns two", n: 3)
+    log(category: Net.Tls, "tls two", n: 4)
+    for info in Log.categories() {
+        print(info.path)
+    }
+    print(Log.categories().count)
+    return 0
+}

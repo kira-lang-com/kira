@@ -1,0 +1,261 @@
+// The bare heap builtins: memory read and written as C lays it out.
+//
+// `heapLoad<T>(pointer, offset)` and `heapStore(pointer, offset, value)` move
+// one value between a Kira binding and the bytes at an address. The value
+// crosses as its C image (`lowering/foreign-images.klfd`), so a `Bool` is a
+// byte, an enum its case's number as a C int and an `@FFI.Struct` its fields
+// at C offsets: what a kernel structure or a foreign buffer holds. The fixed
+// width spellings that came first, `heapReadInt` and the rest, are the same
+// operations at one type each.
+
+enum TypedHeapBuiltin {
+    ReadInteger
+    ReadByte
+    WriteInteger
+    WriteByte
+    CopyBytes
+    MoveBytes
+    FillBytes
+    Offset
+    Load
+    Store
+}
+
+// Which number `sizeOf` and `alignOf` answer about a type's C layout.
+enum LayoutMeasure {
+    Size
+    Alignment
+}
+
+function typedHeapBuiltin(name: String) -> Optional<TypedHeapBuiltin> {
+    match name {
+        "heapReadInt" -> return .Some(.ReadInteger)
+        "heapReadByte" -> return .Some(.ReadByte)
+        "heapWriteInt" -> return .Some(.WriteInteger)
+        "heapWriteByte" -> return .Some(.WriteByte)
+        "heapCopyBytes" -> return .Some(.CopyBytes)
+        "heapMoveBytes" -> return .Some(.MoveBytes)
+        "heapFillBytes" -> return .Some(.FillBytes)
+        "heapOffset" -> return .Some(.Offset)
+        "heapLoad" -> return .Some(.Load)
+        "heapStore" -> return .Some(.Store)
+        else -> return .None
+    }
+}
+
+// The generic spellings: `heapLoad<T>`, `heapStore<T>`, `sizeOf<T>` and
+// `alignOf<T>`. A program's own generic function of one of these names is
+// called instead.
+function typedHeapGeneric(name: String) -> Bool {
+    match name {
+        "heapLoad", "heapStore", "sizeOf", "alignOf" -> return true
+        else -> return false
+    }
+}
+
+extend Checker {
+    function typedHeapCall(borrow mut self, builtin: TypedHeapBuiltin, arguments: [Int], expected: Optional<Type>, span: Span) -> Int {
+        match builtin {
+            ReadInteger -> return heapReadCall(arguments, Type.int(), span)
+            ReadByte -> return heapReadCall(arguments, Type.integer(8, false), span)
+            WriteInteger -> return heapWriteCall(arguments, Type.int(), span)
+            WriteByte -> return heapWriteCall(arguments, Type.integer(8, false), span)
+            CopyBytes -> return heapCopyCall(arguments, false, span)
+            MoveBytes -> return heapCopyCall(arguments, true, span)
+            FillBytes -> return heapFillCall(arguments, span)
+            Offset -> return heapOffsetCall(arguments, span)
+            Load -> return heapLoadCall(valueExpected(expected), arguments, span)
+            Store -> return heapStoreCall(.None, arguments, span)
+        }
+    }
+
+    function typedHeapGenericCall(borrow mut self, name: Identifier, types: [TypeReference], arguments: [Int], span: Span) -> Int {
+        if types.count != 1 {
+            report(.ArgumentCount, name.span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let given = resolveType(types[0])
+        if given.isInvalid() { return add(.Integer(0), Type.invalid(), span) }
+        match name.text {
+            "heapLoad" -> return heapLoadCall(.Some(given), arguments, span)
+            "heapStore" -> return heapStoreCall(.Some(given), arguments, span)
+            "sizeOf" -> return heapLayoutCall(given, .Size, arguments, span)
+            else -> return heapLayoutCall(given, .Alignment, arguments, span)
+        }
+    }
+
+    // `heapLoad<T>(pointer)` or `heapLoad<T>(pointer, offset)`: the `T` C
+    // laid out at that address. Without `<T>` the position names the type.
+    // The type a value is wanted as, or none where none is: a call standing
+    // as a statement is expected as `Void`, which names no type to read.
+    function valueExpected(borrow self, expected: Optional<Type>) -> Optional<Type> {
+        match expected {
+            Some(wanted) -> {
+                if wanted.kind == .Void { return .None }
+                return expected
+            }
+            None -> return .None
+        }
+    }
+
+    function heapLoadCall(borrow mut self, given: Optional<Type>, arguments: [Int], span: Span) -> Int {
+        if arguments.count < 1 || arguments.count > 2 {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        match given {
+            Some(loaded) -> {
+                if !requireMemoryShape(loaded, span) { return add(.Integer(0), Type.invalid(), span) }
+                let address = heapAddress(arguments, arguments.count - 1, span)
+                return add(.HeapRead(address), loaded, span)
+            }
+            None -> {
+                report(.TypedMemoryUntyped, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+
+    // `heapStore(pointer, value)` or `heapStore(pointer, offset, value)`: the
+    // value written as C lays it out. Without `<T>` the value's own type.
+    function heapStoreCall(borrow mut self, given: Optional<Type>, arguments: [Int], span: Span) -> Int {
+        if arguments.count < 2 || arguments.count > 3 {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let address = heapAddress(arguments, arguments.count - 2, span)
+        let written = arguments[arguments.count - 1]
+        let value = storedValue(given, written)
+        let stored = typeOf(value)
+        if stored.isInvalid() || !requireMemoryShape(stored, program.expressions[value].span) {
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        return add(.HeapWrite(address, value), Type.void(), span)
+    }
+
+    // The value a store writes, at the type it names when it names one.
+    function storedValue(borrow mut self, given: Optional<Type>, written: Int) -> Int {
+        match given {
+            Some(stored) -> return coerce(expression(written, .Some(stored)), stored, .ArgumentTypeMismatch)
+            None -> return expression(written, .None)
+        }
+    }
+
+    function heapLayoutCall(borrow mut self, measured: Type, measure: LayoutMeasure, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 0 {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        if !requireMemoryShape(measured, span) { return add(.Integer(0), Type.invalid(), span) }
+        // A sized number's image is its storage integer.
+        let image = measured.isSizedNumber() ? measured.storage() : measured
+        return add(.HeapLayout(image, measure), Type.int(), span)
+    }
+
+    // The pointer argument, moved `offset` bytes on when the call has an
+    // offset argument (`offsetCount` is 1) or taken as it is (0).
+    function heapAddress(borrow mut self, arguments: [Int], offsetCount: Int, span: Span) -> Int {
+        let pointer = heapPointerArgument(arguments[0])
+        if offsetCount == 0 { return pointer }
+        let offset = coerce(expression(arguments[1], .Some(Type.int())), Type.int(), .ArgumentTypeMismatch)
+        return add(.HeapOffset(pointer, offset), Type.pointer(), span)
+    }
+
+    function requireMemoryShape(borrow mut self, valueType: Type, span: Span) -> Bool {
+        if memoryShaped(valueType) { return true }
+        report(.TypedMemoryShape, span)
+        return false
+    }
+
+    // Whether a value of this type has a C image the heap can hold.
+    function memoryShaped(borrow self, valueType: Type) -> Bool {
+        match valueType.kind {
+            Integer -> return true
+            Floating -> return true
+            Boolean -> return true
+            Pointer -> return true
+            Decimal -> return valueType.isSizedNumber()
+            Void -> return false
+            Invalid -> return true
+            Enumeration -> {
+                for variant in program.enums[valueType.declaration].variants {
+                    if variant.payload.isSome() { return false }
+                }
+                return true
+            }
+            Structure -> {
+                let structure = program.structs[valueType.declaration]
+                match structure.shape {
+                    CLayout -> return true
+                    CUnion -> return true
+                    CArray -> return true
+                    Callback -> return true
+                    CPointer -> return true
+                    Plain -> {
+                        if structure.genericBase != "Distinct" { return false }
+                        return memoryShaped(structure.fields[0].valueType)
+                    }
+                }
+            }
+        }
+    }
+
+    function heapPointerArgument(borrow mut self, argument: Int) -> Int {
+        return coerce(expression(argument, .Some(Type.pointer())), Type.pointer(), .ArgumentTypeMismatch)
+    }
+
+    function heapReadCall(borrow mut self, arguments: [Int], result: Type, span: Span) -> Int {
+        if arguments.count != 1 {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let pointer = heapPointerArgument(arguments[0])
+        return add(.HeapRead(pointer), result, span)
+    }
+
+    function heapWriteCall(borrow mut self, arguments: [Int], stored: Type, span: Span) -> Int {
+        if arguments.count != 2 {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let pointer = heapPointerArgument(arguments[0])
+        let checked = coerce(expression(arguments[1], .Some(stored)), stored, .ArgumentTypeMismatch)
+        return add(.HeapWrite(pointer, checked), Type.void(), span)
+    }
+
+    // `heapCopyBytes` and `heapMoveBytes(destination, source, count)`: `count`
+    // bytes copied, between ranges a move lets overlap.
+    function heapCopyCall(borrow mut self, arguments: [Int], overlapping: Bool, span: Span) -> Int {
+        if arguments.count != 3 {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let destination = heapPointerArgument(arguments[0])
+        let source = heapPointerArgument(arguments[1])
+        let count = coerce(expression(arguments[2], .Some(Type.int())), Type.int(), .ArgumentTypeMismatch)
+        return add(.HeapCopy(destination, source, count, overlapping), Type.void(), span)
+    }
+
+    // `heapFillBytes(destination, byte, count)`: `count` bytes set to `byte`.
+    function heapFillCall(borrow mut self, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 3 {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let destination = heapPointerArgument(arguments[0])
+        let byteType = Type.integer(8, false)
+        let byte = coerce(expression(arguments[1], .Some(byteType)), byteType, .ArgumentTypeMismatch)
+        let count = coerce(expression(arguments[2], .Some(Type.int())), Type.int(), .ArgumentTypeMismatch)
+        return add(.HeapFill(destination, byte, count), Type.void(), span)
+    }
+
+    function heapOffsetCall(borrow mut self, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 2 {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let pointer = heapPointerArgument(arguments[0])
+        let offset = coerce(expression(arguments[1], .Some(Type.int())), Type.int(), .ArgumentTypeMismatch)
+        return add(.HeapOffset(pointer, offset), Type.pointer(), span)
+    }
+}

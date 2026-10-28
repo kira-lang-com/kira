@@ -1,0 +1,148 @@
+import Foundation
+
+// SDK name resolution, the manifest and pin readers, the dependency literals,
+// and the diagnostics, on text and candidates so no test touches the file system.
+
+function tessera(version: String) -> SdkCandidate {
+    return SdkCandidate { name: "Tessera", version: version, path: "/sdks/Tessera/" + version }
+}
+
+@Test
+function manifestNamesItsSdk() {
+    let text = "construct Core extends Package {\n    let sdk: String = \"Tessera\"\n}\n"
+    expect!(sdkNameInManifest(text) == "Tessera")
+}
+
+@Test
+function manifestWithoutSdkNamesNothing() {
+    expect!(sdkNameInManifest("construct Core extends Package {\n    let kind: PackageKind = .Library\n}\n") == "")
+    expect!(sdkNameInManifest("    let sdk: String = Tessera\n") == "")
+}
+
+@Test
+function pinNamesSdkAndVersion() {
+    match sdkRequestFromPin("/p/kira-sdk.toml", "name = \"Tessera\"\nversion = \"0.1.0\"\n") {
+        Named(named) -> {
+            expect!(named.name == "Tessera")
+            expect!(named.version == "0.1.0")
+        }
+        NoSdk -> expect!(false)
+        Unusable(text) -> expect!(false)
+    }
+}
+
+@Test
+function pinWithoutNameIsUnusable() {
+    match sdkRequestFromPin("/p/kira-sdk.toml", "version = \"0.1.0\"\n") {
+        Unusable(text) -> expect!(text.contains("error[SDK0003]"))
+        Named(named) -> expect!(false)
+        NoSdk -> expect!(false)
+    }
+}
+
+@Test
+function singleMatchResolves() {
+    let request = SdkName { name: "Tessera", version: "", source: "/p/kira-sdk.toml" }
+    match resolveSdk(request, [tessera("0.1.0")], ["/sdks"]) {
+        Resolved(found) -> expect!(found.path == "/sdks/Tessera/0.1.0")
+        Missing(text) -> expect!(false)
+        Ambiguous(text) -> expect!(false)
+    }
+}
+
+@Test
+function pinnedVersionPicksOneOfSeveral() {
+    let request = SdkName { name: "Tessera", version: "0.2.0", source: "/p/kira-sdk.toml" }
+    match resolveSdk(request, [tessera("0.1.0"), tessera("0.2.0")], ["/sdks"]) {
+        Resolved(found) -> expect!(found.version == "0.2.0")
+        Missing(text) -> expect!(false)
+        Ambiguous(text) -> expect!(false)
+    }
+}
+
+@Test
+function unpinnedAmbiguityIsAnError() {
+    let request = SdkName { name: "Tessera", version: "", source: "/p/kira-sdk.toml" }
+    match resolveSdk(request, [tessera("0.1.0"), tessera("0.2.0")], ["/sdks"]) {
+        Resolved(found) -> expect!(false)
+        Missing(text) -> expect!(false)
+        Ambiguous(text) -> {
+            expect!(text.contains("error[SDK0002]"))
+            expect!(text.contains("0.1.0"))
+            expect!(text.contains("0.2.0"))
+            expect!(text.contains("= help: name the version"))
+        }
+    }
+}
+
+@Test
+function missingSdkNamesSearchedRoots() {
+    let request = SdkName { name: "Tessera", version: "", source: "/p/kira-sdk.toml" }
+    match resolveSdk(request, [], ["/one", "/two"]) {
+        Resolved(found) -> expect!(false)
+        Ambiguous(text) -> expect!(false)
+        Missing(text) -> {
+            expect!(text.contains("note[SDK0001]: no SDK named `Tessera`"))
+            expect!(text.contains("= searched: /one/Tessera/<version>/, /two/Tessera/<version>/"))
+            expect!(text.contains("= help: install the SDK"))
+            expect!(text.contains("/p/kira-sdk.toml"))
+        }
+    }
+}
+
+@Test
+function missingPinnedVersionIsNamed() {
+    let request = SdkName { name: "Tessera", version: "9.9.9", source: "/p/kira-sdk.toml" }
+    match resolveSdk(request, [tessera("0.1.0")], ["/sdks"]) {
+        Resolved(found) -> expect!(false)
+        Ambiguous(text) -> expect!(false)
+        Missing(text) -> expect!(text.contains("version `9.9.9`"))
+    }
+}
+
+// A dependency literal yields its fields, whichever separator it uses.
+@Test
+function dependencyLiteralsYieldTheirFields() {
+    let text = "let dependencies: [Dependency] = [\n    Dependency { name: \"Ember\", sdk: \"Tessera\", path: \"../ember\" },\n    Dependency { name: \"KiraUI\", sdk: \"Tessera\", url: \"git@github.com:kira-lang-com/kira-ui.git\", rev: \"706e6adf\" },\n    Dependency { name = \"Core\", path = \"../core\" }\n]\n"
+    let specs = dependencySpecs(text)
+    expect!(specs.count == 3)
+    expect!(specs[0].name == "Ember")
+    expect!(specs[0].sdk == "Tessera")
+    expect!(specs[0].path == "../ember")
+    expect!(specs[1].url == "git@github.com:kira-lang-com/kira-ui.git")
+    expect!(specs[1].rev == "706e6adf")
+    expect!(specs[1].path.isEmpty())
+    expect!(specs[2].name == "Core")
+    expect!(specs[2].sdk.isEmpty())
+}
+
+// A framework the SDK holds is provided; an absent SDK provides nothing.
+@Test
+function absentSdkProvidesNothing() {
+    expect!(!sdkProvides("", "Ember"))
+    expect!(!sdkProvides("/nonexistent-sdk-root", "Ember"))
+}
+
+@Test
+function onlyCompileVerbsTakeSdk() {
+    expect!(isCompileVerb("build"))
+    expect!(isCompileVerb("check"))
+    expect!(!isCompileVerb("fmt"))
+    expect!(!isCompileVerb("install"))
+}
+
+@Test
+function flagsAreFoundByName() {
+    expect!(hasFlag(["check", ".", "--sdk", "/x"], "--sdk"))
+    expect!(hasFlag(["check", "--sdk=/x"], "--sdk"))
+    expect!(!hasFlag(["check", "--sdkx"], "--sdk"))
+}
+
+// A package with no manifest and no pin passes through unchanged.
+@Test
+function packageWithoutSdkPassesThrough() {
+    match withPackageArguments(["check", "."], "/nonexistent-start") {
+        Ok(extended) -> expect!(extended.count == 2)
+        Error(text) -> expect!(false)
+    }
+}

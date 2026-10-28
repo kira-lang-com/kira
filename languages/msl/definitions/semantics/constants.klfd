@@ -1,0 +1,162 @@
+// Constants: integers the checker needs before lowering (array extents,
+// attribute indices, case labels, template values), folded from the
+// syntax; and which checked expressions KSIR can evaluate before any
+// invocation runs.
+
+function foldBinary(operator: Operator, left: Int, right: Int) -> Optional<Int> {
+    let none: Optional<Int> = .None
+    match operator {
+        Add -> return .Some(left + right)
+        Subtract -> return .Some(left - right)
+        Multiply -> return .Some(left * right)
+        Divide -> {
+            if right == 0 { return none }
+            return .Some(left / right)
+        }
+        Remainder -> {
+            if right == 0 { return none }
+            return .Some(left % right)
+        }
+        Equal -> return .Some(truthValue(left == right))
+        NotEqual -> return .Some(truthValue(left != right))
+        Less -> return .Some(truthValue(left < right))
+        LessEqual -> return .Some(truthValue(left <= right))
+        Greater -> return .Some(truthValue(left > right))
+        GreaterEqual -> return .Some(truthValue(left >= right))
+        LogicalAnd -> return .Some(truthValue(left != 0 && right != 0))
+        LogicalOr -> return .Some(truthValue(left != 0 || right != 0))
+        BitAnd -> return .Some(left & right)
+        BitOr -> return .Some(left | right)
+        BitXor -> return .Some(left ^ right)
+        ShiftLeft -> {
+            if right < 0 || right > 31 { return none }
+            return .Some(left << right)
+        }
+        ShiftRight -> {
+            if right < 0 || right > 31 { return none }
+            return .Some(left >> right)
+        }
+        Negate -> return none
+        Plus -> return none
+        Not -> return none
+        BitNot -> return none
+        Dereference -> return none
+        AddressOf -> return none
+        Increment -> return none
+        Decrement -> return none
+        Comma -> return none
+        Plain -> return none
+    }
+}
+
+function truthValue(holds: Bool) -> Int {
+    if holds { return 1 }
+    return 0
+}
+
+extend Checker {
+    // The integer a written expression folds to, or none.
+    function fold(borrow self, index: Int) -> Optional<Int> {
+        let none: Optional<Int> = .None
+        let syntax = tree.expressions[index]
+        match syntax.kind {
+            IntegerLiteral -> {
+                match integerValue(syntax.text) {
+                    Some(found) -> return .Some(found.value)
+                    None -> return none
+                }
+            }
+            BooleanLiteral -> return .Some(truthValue(syntax.text == "true"))
+            Name -> return foldedNamed(syntax.text)
+            Unary -> {
+                match fold(syntax.left) {
+                    Some(value) -> {
+                        if syntax.operator == .Negate { return .Some(0 - value) }
+                        if syntax.operator == .Plus { return .Some(value) }
+                        if syntax.operator == .Not { return .Some(truthValue(value == 0)) }
+                        if syntax.operator == .BitNot { return .Some(0 - value - 1) }
+                        return none
+                    }
+                    None -> return none
+                }
+            }
+            Binary -> {
+                match fold(syntax.left) {
+                    Some(left) -> {
+                        match fold(syntax.right) {
+                            Some(right) -> return foldBinary(syntax.operator, left, right)
+                            None -> return none
+                        }
+                    }
+                    None -> return none
+                }
+            }
+            Conditional -> {
+                match fold(syntax.left) {
+                    Some(condition) -> {
+                        if condition != 0 { return fold(syntax.right) }
+                        return fold(syntax.third)
+                    }
+                    None -> return none
+                }
+            }
+            Cast -> return fold(syntax.left)
+            FloatLiteral -> return none
+            Member -> return none
+            Index -> return none
+            Call -> return none
+            Construct -> return none
+            InitializerList -> return none
+            Postfix -> return none
+            Assign -> return none
+            Bitcast -> return none
+        }
+    }
+
+    // Whether KSIR can evaluate `expression` at module scope: literals,
+    // constants, function constants and pure operations over them.
+    function isConstantExpression(borrow self, expression: Int) -> Bool {
+        if expression < 0 { return true }
+        let checked = program.expressions[expression]
+        var parts = true
+        match checked.kind {
+            Literal -> return true
+            Zero -> return true
+            Global -> {
+                let kind = program.globals[checked.target].kind
+                return kind == .ConstantGlobal || kind == .FunctionConstant
+            }
+            Library -> parts = checked.name != "derivative"
+            Construct -> parts = true
+            Splat -> parts = true
+            Convert -> parts = true
+            Bitcast -> parts = true
+            Unary -> parts = true
+            Binary -> parts = true
+            Select -> parts = true
+            Swizzle -> parts = true
+            Member -> parts = true
+            Index -> parts = true
+            Local -> return false
+            BoundParameter -> return false
+            Call -> return false
+            ImageCall -> return false
+            Atomic -> return false
+            Barrier -> return false
+            Discard -> return false
+            Choose -> return false
+            ShortCircuit -> return false
+            Assign -> return false
+            Step -> return false
+            Sequence -> return false
+            Invalid -> return true
+        }
+        if !parts { return false }
+        if !isConstantExpression(checked.left) || !isConstantExpression(checked.right) { return false }
+        if !isConstantExpression(checked.third) { return false }
+        for argument in checked.arguments {
+            if !isConstantExpression(argument) { return false }
+        }
+        return true
+    }
+}

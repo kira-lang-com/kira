@@ -1,0 +1,304 @@
+import Foundation
+
+// TCP and UDP as futures on Seyoul's reactor.
+//
+//     let listener = listen("127.0.0.1:0")
+//     let incoming = listener.accept().await
+//     let bytes = incoming.connection.read(4096).await
+//
+// Every operation tries the socket first and leaves its task's waker with
+// the reactor only on `WouldBlock`, so a socket with data ready answers
+// without a turn. A socket closes when the last value holding it goes, the
+// socket's own value and every future made from it, or earlier with
+// `close()`, which also stops the reactor watching it; a future still
+// holding it then finds it gone.
+
+// A socket the reactor watches, shared by the value that owns it and the
+// futures made from it.
+class Watched: Drop {
+    let handle: NetHandle
+    let token: Number
+    var open: Bool = true
+
+    function close() -> Result<Void, NetFailure> {
+        if !self.open { return .Ok }
+        self.open = false
+        seyoul.reactor.deregister(self.handle, self.token)
+        return closeHandle(self.handle)
+    }
+
+    function drop(borrow mut self) {
+        let closed = self.close()
+    }
+}
+
+// Watches `handle` on the reactor, closing it when the reactor refuses.
+function watched(handle: NetHandle) -> Result<Watched, NetFailure> {
+    match seyoul.reactor.register(handle) {
+        Ok(token) -> return .Ok(Watched { handle = handle, token = token })
+        Error(failure) -> {
+            let closed = closeHandle(handle)
+            return .Error(failure)
+        }
+    }
+}
+
+// A TCP stream on the reactor.
+struct Connection {
+    let stream: TcpStream
+    let watch: Watched
+
+    // Up to `capacity` bytes, when some have come; none at all is the peer's
+    // end of the stream.
+    function read(borrow self, capacity: UNumber) -> Read {
+        return Read { stream = stream, watch = watch, capacity = capacity }
+    }
+
+    // Every byte of `bytes`, sent in as many writes as the stream needs.
+    function writeAll(borrow self, bytes: [UN8]) -> WriteAll {
+        return WriteAll { stream = stream, watch = watch, bytes = bytes, sent = 0 }
+    }
+
+    // Closes the sending side; the peer reads the end of the stream.
+    function shutdown(borrow self) -> Result<Void, NetFailure> {
+        return stream.shutdown()
+    }
+
+    function localAddress(borrow self) -> Result<String, NetFailure> {
+        return stream.localAddress()
+    }
+
+    function close(borrow self) -> Result<Void, NetFailure> {
+        return watch.close()
+    }
+}
+
+struct Read: Future<Result<[UN8], NetFailure>> {
+    let stream: TcpStream
+    let watch: Watched
+    let capacity: UNumber
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Result<[UN8], NetFailure>> {
+        match stream.receive(capacity) {
+            Ok(bytes) -> return .Ready(.Ok(bytes))
+            Error(failure) -> {
+                if !wouldBlock(failure) { return .Ready(.Error(failure)) }
+            }
+        }
+        seyoul.reactor.awaitReadable(watch.token, context.waker)
+        return .Pending
+    }
+}
+
+struct WriteAll: Future<Result<Void, NetFailure>> {
+    let stream: TcpStream
+    let watch: Watched
+    let bytes: [UN8]
+    var sent: Number
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Result<Void, NetFailure>> {
+        while self.sent < self.bytes.count {
+            match self.stream.sendFrom(self.bytes, self.sent) {
+                Ok(taken) -> self.sent += taken
+                Error(failure) -> {
+                    if !wouldBlock(failure) { return .Ready(.Error(failure)) }
+                    seyoul.reactor.awaitWritable(self.watch.token, context.waker)
+                    return .Pending
+                }
+            }
+        }
+        return .Ready(.Ok)
+    }
+}
+
+// Connects to `address`, `host:port` with the host an IP address; a name is
+// looked up with `resolve` first.
+function connect(address: String) -> Connect {
+    return Connect { address = address, stream = .None, watch = .None }
+}
+
+struct Connect: Future<Result<Connection, NetFailure>> {
+    let address: String
+    var stream: TcpStream?
+    var watch: Watched?
+
+    function poll(
+        borrow mut self,
+        context: borrow Context
+    ) -> Poll<Result<Connection, NetFailure>> {
+        match self.stream {
+            Some(stream) -> {
+                let watch = match self.watch {
+                    Some(value) -> value
+                    None -> return .Ready(.Error(.Io))
+                }
+                let bits = seyoul.reactor.takeReadiness(watch.token)
+                if (bits & ReactorUnits.failed) != 0 || (bits & ReactorUnits.closed) != 0 {
+                    let closed = watch.close()
+                    self.stream = .None
+                    self.watch = .None
+                    return .Ready(.Error(.Refused))
+                }
+                if (bits & ReactorUnits.writable) != 0 {
+                    self.stream = .None
+                    self.watch = .None
+                    return .Ready(.Ok(Connection { stream = stream, watch = watch }))
+                }
+                seyoul.reactor.awaitWritable(watch.token, context.waker)
+                return .Pending
+            }
+            None -> {}
+        }
+        match connectTcp(self.address) {
+            Ok(stream) -> {
+                match watched(stream.handle) {
+                    Ok(watch) -> {
+                        seyoul.reactor.awaitWritable(watch.token, context.waker)
+                        self.stream = .Some(stream)
+                        self.watch = .Some(watch)
+                        return .Pending
+                    }
+                    Error(failure) -> return .Ready(.Error(failure))
+                }
+            }
+            Error(failure) -> return .Ready(.Error(failure))
+        }
+    }
+}
+
+// A TCP listener on the reactor.
+struct Listener {
+    let listener: TcpListener
+    let watch: Watched
+
+    // The next connection, when one comes.
+    function accept(borrow self) -> Accept {
+        return Accept { listener = listener, watch = watch }
+    }
+
+    function localAddress(borrow self) -> Result<String, NetFailure> {
+        return listener.localAddress()
+    }
+
+    function close(borrow self) -> Result<Void, NetFailure> {
+        return watch.close()
+    }
+}
+
+// A connection a listener accepted, and the peer's address.
+struct Incoming {
+    let connection: Connection
+    let peer: String
+}
+
+struct Accept: Future<Result<Incoming, NetFailure>> {
+    let listener: TcpListener
+    let watch: Watched
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Result<Incoming, NetFailure>> {
+        match listener.accept() {
+            Ok(accepted) -> {
+                match watched(accepted.stream.handle) {
+                    Ok(watch) -> {
+                        let connection = Connection { stream = accepted.stream, watch = watch }
+                        return .Ready(
+                            .Ok(Incoming { connection = connection, peer = accepted.peer })
+                        )
+                    }
+                    Error(failure) -> return .Ready(.Error(failure))
+                }
+            }
+            Error(failure) -> {
+                if !wouldBlock(failure) { return .Ready(.Error(failure)) }
+            }
+        }
+        seyoul.reactor.awaitReadable(watch.token, context.waker)
+        return .Pending
+    }
+}
+
+// Listens on `address`, `host:port`; port 0 takes any free one, which
+// `localAddress` then names.
+function listen(address: String) -> Result<Listener, NetFailure> {
+    match listenTcp(address, 128) {
+        Ok(listener) -> {
+            match watched(listener.handle) {
+                Ok(watch) -> return .Ok(Listener { listener = listener, watch = watch })
+                Error(failure) -> return .Error(failure)
+            }
+        }
+        Error(failure) -> return .Error(failure)
+    }
+}
+
+// A UDP socket on the reactor.
+struct UdpPort {
+    let socket: UdpSocket
+    let watch: Watched
+
+    // Sends `bytes` to `peer` as one datagram.
+    function send(borrow self, bytes: [UN8], peer: String) -> SendDatagram {
+        return SendDatagram { socket = socket, watch = watch, bytes = bytes, peer = peer }
+    }
+
+    // The next datagram, cut to `capacity` bytes, and who sent it.
+    function receive(borrow self, capacity: UNumber) -> ReceiveDatagram {
+        return ReceiveDatagram { socket = socket, watch = watch, capacity = capacity }
+    }
+
+    function localAddress(borrow self) -> Result<String, NetFailure> {
+        return socket.localAddress()
+    }
+
+    function close(borrow self) -> Result<Void, NetFailure> {
+        return watch.close()
+    }
+}
+
+struct SendDatagram: Future<Result<Void, NetFailure>> {
+    let socket: UdpSocket
+    let watch: Watched
+    let bytes: [UN8]
+    let peer: String
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Result<Void, NetFailure>> {
+        match socket.send(bytes, peer) {
+            Ok -> return .Ready(.Ok)
+            Error(failure) -> {
+                if !wouldBlock(failure) { return .Ready(.Error(failure)) }
+            }
+        }
+        seyoul.reactor.awaitWritable(watch.token, context.waker)
+        return .Pending
+    }
+}
+
+struct ReceiveDatagram: Future<Result<Datagram, NetFailure>> {
+    let socket: UdpSocket
+    let watch: Watched
+    let capacity: UNumber
+
+    function poll(borrow mut self, context: borrow Context) -> Poll<Result<Datagram, NetFailure>> {
+        match socket.receive(capacity) {
+            Ok(datagram) -> return .Ready(.Ok(datagram))
+            Error(failure) -> {
+                if !wouldBlock(failure) { return .Ready(.Error(failure)) }
+            }
+        }
+        seyoul.reactor.awaitReadable(watch.token, context.waker)
+        return .Pending
+    }
+}
+
+// Binds a UDP socket to `address`, `host:port`.
+function bind(address: String) -> Result<UdpPort, NetFailure> {
+    match bindUdp(address) {
+        Ok(socket) -> {
+            match watched(socket.handle) {
+                Ok(watch) -> return .Ok(UdpPort { socket = socket, watch = watch })
+                Error(failure) -> return .Error(failure)
+            }
+        }
+        Error(failure) -> return .Error(failure)
+    }
+}

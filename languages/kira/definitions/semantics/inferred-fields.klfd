@@ -1,0 +1,203 @@
+// A construct member written `let name = value` takes its initializer's
+// type. Declarations are all known by then, so the initializer may name any
+// type or function; it is checked as a default is, seeing no local and no
+// receiver, against no expected type. What it reports is reported here, once:
+// each literal that leaves the member out checks it again with its
+// diagnostics held back. An initializer that types as nothing without saying
+// why is 3383. A family reads such a member through its cases, so what the
+// family's reader returns is the type the first case gave it; a case that gave
+// it another fails the reader's own check.
+
+extend Checker {
+    function inferFieldTypes(borrow mut self) {
+        for index in 0..declarations.structs.count { inferStructFields(index) }
+        for index in 0..declarations.signatures.count {
+            let signature = declarations.signatures[index]
+            match signature.declaration.result {
+                Some(reference) -> {
+                    if isInferredReference(reference) {
+                        if isWitnessedMember(signature) {
+                        inferWitnessedResult(index)
+                    } else if isComputedOfStruct(signature) {
+                        inferComputedResult(index)
+                    } else {
+                        inferReaderResult(index)
+                    }
+                    }
+                }
+                None -> {}
+            }
+        }
+    }
+
+    function inferReaderResult(borrow mut self, index: Int) {
+        let signature = declarations.signatures[index]
+        var result = Type.invalid()
+        match signature.owner {
+            Some(owner) -> {
+                // A declaration's reader of a member its crossing family
+                // reads through the table (`witnessReader`).
+                let reader = witnessReaderName("")
+                if owner.kind == .Structure && startsWithText(signature.name.text, reader) {
+                    result = memberType(owner, utf8Slice(signature.name.text, utf8Count(reader), utf8Count(signature.name.text)))
+                }
+                if owner.kind == .Enumeration {
+                    for variant in declarations.enums[owner.declaration].variants {
+                        if !result.equals(Type.invalid()) { break }
+                        match variant.payload {
+                            Some(payload) -> result = memberType(payload, signature.member)
+                            None -> {}
+                        }
+                    }
+                }
+            }
+            None -> {}
+        }
+        inferredResult(index, result)
+    }
+
+    // A computed member written without a type, `let name { ... }`, has the
+    // type of the value its block ends with. The block is checked once for
+    // that, its diagnostics held back for the check every function has, so
+    // a member reading another member written so sees its type only if that
+    // one is declared first.
+    function inferComputedResult(borrow mut self, index: Int) {
+        diag_hold()
+        checkFunction(index)
+        diag_release(0)
+        var result = Type.invalid()
+        let body = program.functions[index].body
+        if body.count > 0 {
+            match program.statements[body[body.count - 1]].returned() {
+                Some(returned) -> result = typeOf(returned)
+                None -> {}
+            }
+        }
+        if result.isInvalid() { report(.MemberTypeNotInferred, declarations.signatures[index].name.span) }
+        inferredResult(index, result)
+    }
+
+    function isComputedOfStruct(borrow self, signature: borrow Signature) -> Bool {
+        if !hasAttribute(signature.declaration.annotations, .Computed) { return false }
+        match signature.owner {
+            Some(owner) -> return owner.kind == .Structure
+            None -> return false
+        }
+    }
+
+    // `result` as what the function at `index` returns.
+    function inferredResult(borrow mut self, index: Int, result: Type) {
+        let signature = declarations.signatures[index]
+        declarations.signatures[index] = Signature {
+            name = signature.name, symbol = signature.symbol, member = signature.member, owner = signature.owner,
+            receiver = signature.receiver, parameters = signature.parameters, result = result,
+            entry = signature.entry, declaration = signature.declaration
+        }
+        let checked = program.functions[index]
+        program.functions[index] = CheckedFunction {
+            symbol = checked.symbol, name = checked.name, result = result, parameterCount = checked.parameterCount,
+            locals = checked.locals, body = checked.body, entry = checked.entry, lambda = checked.lambda,
+            captures = checked.captures, globalInitializer = checked.globalInitializer, service = checked.service,
+            foreign = checked.foreign, memberName = checked.memberName
+        }
+    }
+
+    // What a member initializer types as, seeing no local and no receiver.
+    function initializerType(borrow mut self, initial: Int) -> Type {
+        let savedVisible = visible
+        let savedBareMembers = bareMembers
+        let savedSource = sourceOverride
+        visible = []
+        bareMembers = false
+        sourceOverride = .Some(tree.expressions[initial].span.file)
+        let valueType = typeOf(expression(initial, .None))
+        sourceOverride = savedSource
+        bareMembers = savedBareMembers
+        visible = savedVisible
+        return valueType
+    }
+
+    // A family whose values cross RIDL is the struct `Any Family` of a box
+    // and its witness table, and reads each member through the table, so
+    // no case gives a member its type. The family's own declaration does:
+    // a stored member's initializer, or the block of the default its
+    // computed member has (`addWitnessedMember`). The initializer is
+    // reported where each declaration's own copy of the member is.
+    function isWitnessedMember(borrow self, signature: borrow Signature) -> Bool {
+        match signature.owner {
+            Some(owner) -> return owner.kind == .Structure && program.structs[owner.declaration].genericBase == "Witnessed"
+            None -> return false
+        }
+    }
+
+    function inferWitnessedResult(borrow mut self, index: Int) {
+        let signature = declarations.signatures[index]
+        let owner = signature.owner.unwrap()
+        let name = signature.name.text
+        if startsWithText(name, witnessDefaultName("")) {
+            // Typed already when its member was.
+            if signature.result.isInvalid() { inferComputedResult(index) }
+            return
+        }
+        var result = Type.invalid()
+        let familyName = program.structs[owner.declaration].name.text
+        for declared in tree.constructs {
+            if declared.parameters.isSome() || familyTypeName(declared.name.text) != familyName { continue }
+            for field in declared.fields {
+                if field.name.text != name { continue }
+                match field.initial {
+                    Some(initial) -> {
+                        diag_hold()
+                        result = initializerType(initial)
+                        diag_release(0)
+                    }
+                    None -> {}
+                }
+            }
+        }
+        if result.isInvalid() {
+            let defaultName = witnessDefaultName(name)
+            for other in 0..declarations.signatures.count {
+                let candidate = declarations.signatures[other]
+                if candidate.name.text != defaultName || candidate.owner.isNone() || !candidate.owner.unwrap().equals(owner) { continue }
+                inferComputedResult(other)
+                result = declarations.signatures[other].result
+            }
+        }
+        if result.isInvalid() { report(.MemberTypeNotInferred, signature.name.span) }
+        inferredResult(index, result)
+    }
+
+    function memberType(borrow self, payload: Type, name: String) -> Type {
+        if payload.kind != .Structure { return Type.invalid() }
+        for field in declarations.structs[payload.declaration].fields {
+            if field.name.text == name { return field.valueType }
+        }
+        return Type.invalid()
+    }
+
+    function inferStructFields(borrow mut self, index: Int) {
+        let count = declarations.structs[index].fields.count
+        for slot in 0..count {
+            let field = declarations.structs[index].fields[slot]
+            if !field.inferred { continue }
+            match field.initial {
+                Some(initial) -> {
+                    diag_hold()
+                    let valueType = initializerType(initial)
+                    let reported = diag_release(1)
+                    if valueType.equals(Type.invalid()) && reported == 0 {
+                        report(.MemberTypeNotInferred, tree.expressions[initial].span)
+                    }
+                    declarations.structs[index].fields[slot] = Field {
+                        name = field.name, valueType = valueType, mutable = field.mutable,
+                        initial = field.initial, inferred = true
+                    }
+                    program.structs = declarations.structs
+                }
+                // One a wrapper was to take up and did not.
+                None -> report(.MemberTypeNotInferred, field.name.span)
+            }
+        }
+    }
+}

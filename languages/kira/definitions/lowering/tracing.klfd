@@ -1,0 +1,349 @@
+// `traceText(value)`: the value's text, written through Foundation's trace
+// functions into one buffer and taken back from the mark it started at. A
+// struct or an enum is written by its own tracer, which takes the depth it
+// sits at, so a recursive type is walked by calls and a deep value is cut off
+// rather than written out whole.
+
+// Values nested deeper than this show their type and `…`.
+function traceDepthLimit() -> Int {
+    return 3
+}
+
+// The most elements of an array a trace writes.
+function traceElementLimit() -> Int {
+    return 3
+}
+
+extend KirTypes {
+    function declareTracers(borrow mut self, builder: KirModuleBuilder, program: CheckedProgram) {
+        if program.traceFunctions.count == 0 { return }
+        for index in 0..program.structs.count + program.enums.count {
+            let valueType = helperType(program, index)
+            let name = program.named(helperSpan(program, valueType))
+            let signature = kir_signature_new_named(builder, name.start, name.end, unit, generatedSuffix(builder, "trace", typeKey(program, valueType)))
+            kir_signature_parameter(signature, address(valueType))
+            kir_signature_parameter(signature, integer64)
+            tracers.append(kir_signature_declare(signature))
+        }
+    }
+}
+
+// The tracers lowered bodies name, and the ones those name in turn.
+function lowerTracers(program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder]) {
+    var lowered: [Bool] = []
+    for index in 0..types.tracers.count { lowered.append(false) }
+    var lowering = true
+    while lowering {
+        lowering = false
+        for index in 0..types.tracers.count {
+            if !lowered[index] && kir_function_referenced(types.tracers[index]) == 1 {
+                lowerTracer(program, types, functions, helperType(program, index))
+                lowered[index] = true
+                lowering = true
+            }
+        }
+    }
+    for index in 0..types.tracers.count {
+        if !lowered[index] { kir_function_discard(types.tracers[index]) }
+    }
+}
+
+function lowerTracer(program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder], valueType: Type) {
+    let helper = types.tracers[types.helperIndex(program, valueType)]
+    var tracer = FunctionLowering.startChecked(program, types, functions, helperChecked(helperSpan(program, valueType), Type.void()), helper)
+    let body = tracer.kir.block()
+    tracer.enter(body)
+    if uninhabited(program, valueType) {
+        tracer.kir.unreachable()
+    } else {
+        let at = tracer.kir.memory(tracer.kir.parameter(0), types.of(valueType))
+        tracer.traceNominalBody(at, valueType, tracer.kir.parameter(1))
+        tracer.kir.returnVoid()
+    }
+    tracer.kir.switchTo(tracer.entry)
+    tracer.kir.branch(body)
+}
+
+extend FunctionLowering {
+    function traceText(borrow mut self, at: KirAddress, valueType: Type, resultType: Type) -> KirAddress {
+        let mark = kir.call(traceRuntime(0), types.integer64)
+        traceValue(at, valueType, kir.integer(types.integer64, 0))
+        let destination = temporary(resultType)
+        kir.argument(kir.pointer(destination))
+        kir.argument(mark)
+        kir.callVoid(traceRuntime(1))
+        markInitialized(destination)
+        return destination
+    }
+
+    // Foundation's trace function `index`, in `traceRuntimeNames` order.
+    function traceRuntime(borrow self, index: Int) -> KirFunctionBuilder {
+        return functions[program.traceFunctions[index]]
+    }
+
+    function traceLiteral(borrow mut self, text: String) {
+        for index in 0..utf8Count(text) { kir_value_text_byte(kir, utf8Byte(text, index)) }
+        kir.argument(kir_value_text(kir))
+        kir.argument(kir.integer(types.integer64, utf8Count(text)))
+        kir.callVoid(traceRuntime(2))
+    }
+
+    function traceValue(borrow mut self, at: KirAddress, valueType: Type, depth: KirValue) {
+        match valueType.kind {
+            Integer -> {
+                let loaded = kir.load(at)
+                if !valueType.signed && valueType.bits >= 64 {
+                    kir.argument(loaded)
+                    kir.callVoid(traceRuntime(4))
+                    return
+                }
+                var word = loaded
+                if valueType.bits < 64 { word = kir.convert(valueType.signed ? convertSignExtend : convertZeroExtend, loaded, types.integer64) }
+                kir.argument(word)
+                kir.callVoid(traceRuntime(3))
+            }
+            Boolean -> {
+                kir.argument(kir.load(at))
+                kir.callVoid(traceRuntime(6))
+            }
+            Decimal -> {
+                kir.argument(kir.pointer(at))
+                kir.callVoid(traceRuntime(11))
+            }
+            Floating -> {
+                var loaded = kir.load(at)
+                if valueType.bits < 64 { loaded = kir.convert(8, loaded, types.float64) }
+                kir.argument(loaded)
+                kir.callVoid(traceRuntime(5))
+            }
+            Pointer -> traceLiteral("<pointer>")
+            Void -> traceLiteral("()")
+            Invalid -> {}
+            Enumeration -> traceNominal(at, valueType, depth)
+            Structure -> {
+                if program.isNumberWords(valueType) {
+                    kir.argument(kir.pointer(at))
+                    kir.callVoid(traceRuntime(11))
+                    return
+                }
+                traceNominal(at, valueType, depth)
+            }
+        }
+    }
+
+    function traceNominal(borrow mut self, at: KirAddress, valueType: Type, depth: KirValue) {
+        kir.argument(kir.pointer(at))
+        kir.argument(depth)
+        kir.callVoid(types.tracers[types.helperIndex(program, valueType)])
+    }
+
+    function traceNominalBody(borrow mut self, at: KirAddress, valueType: Type, depth: KirValue) {
+        let traced = tracedFunctionFor(program, valueType)
+        if traced >= 0 {
+            traceByConformance(at, valueType, traced)
+            return
+        }
+        if valueType.kind == .Enumeration {
+            traceEnumBody(at, valueType, depth)
+            return
+        }
+        let declared = program.structs[valueType.declaration]
+        let name = shownTypeName(declared.name.text)
+        if isStringType(program, valueType) {
+            kir.argument(kir.pointer(at))
+            kir.callVoid(traceRuntime(7))
+            return
+        }
+        if isDistinctType(program, valueType) {
+            traceValue(kir.field(at, 0, types.of(declared.fields[0].valueType)), declared.fields[0].valueType, depth)
+            traceLiteral(joinText([" ", name]))
+            return
+        }
+        if isArrayType(program, valueType) {
+            traceArrayBody(at, valueType, depth)
+            return
+        }
+        if !tracesFields(program, valueType) {
+            traceLiteral(joinText(["<", name, ">"]))
+            return
+        }
+        if declared.fields.count == 0 {
+            traceLiteral(name)
+            return
+        }
+        let shallow = kir.block()
+        let deep = kir.block()
+        let done = kir.block()
+        kir.branchIf(kir.compare(kirPredicate(.Less, true), depth, kir.integer(types.integer64, traceDepthLimit())), shallow, deep)
+        enter(deep)
+        traceLiteral(joinText([name, " { … }"]))
+        flowInto(done)
+        enter(shallow)
+        let deeper = kir.binary(kirOperator(.Add, true), false, true, depth, kir.integer(types.integer64, 1))
+        for index in 0..declared.fields.count {
+            let opening = index == 0 ? joinText([name, " { "]) : ", "
+            traceLiteral(joinText([opening, declared.fields[index].name.text, ": "]))
+            let fieldType = declared.fields[index].valueType
+            traceValue(kir.field(at, index, types.of(fieldType)), fieldType, deeper)
+        }
+        traceLiteral(" }")
+        flowInto(done)
+        enter(done)
+    }
+
+    // `[a, b, c, … 9 more]`: the first elements, then how many are left out;
+    // past the depth limit only the count.
+    function traceArrayBody(borrow mut self, at: KirAddress, arrayType: Type, depth: KirValue) {
+        let elementType = program.structs[arrayType.declaration].typeArguments[0]
+        let length = kir.load(kir.field(at, 1, types.integer64))
+        let shown = temporary(Type.int())
+        kir.store(length, shown)
+        let long = kir.block()
+        let measured = kir.block()
+        kir.branchIf(kir.compare(kirPredicate(.Greater, true), length, kir.integer(types.integer64, traceElementLimit())), long, measured)
+        enter(long)
+        kir.store(kir.integer(types.integer64, traceElementLimit()), shown)
+        flowInto(measured)
+        enter(measured)
+        let deep = kir.block()
+        let walk = kir.block()
+        kir.branchIf(kir.compare(kirPredicate(.Less, true), depth, kir.integer(types.integer64, traceDepthLimit())), walk, deep)
+        enter(deep)
+        kir.store(kir.integer(types.integer64, 0), shown)
+        flowInto(walk)
+        enter(walk)
+        traceLiteral("[")
+        let counter = temporary(Type.int())
+        kir.store(kir.integer(types.integer64, 0), counter)
+        let test = kir.block()
+        let body = kir.block()
+        let done = kir.block()
+        flowInto(test)
+        enter(test)
+        let index = kir.load(counter)
+        kir.branchIf(kir.compare(kirPredicate(.Less, true), index, kir.load(shown)), body, done)
+        enter(body)
+        let separate = kir.block()
+        let element = kir.block()
+        kir.branchIf(kir.compare(kirPredicate(.Greater, true), index, kir.integer(types.integer64, 0)), separate, element)
+        enter(separate)
+        traceLiteral(", ")
+        flowInto(element)
+        enter(element)
+        let deeper = kir.binary(kirOperator(.Add, true), false, true, depth, kir.integer(types.integer64, 1))
+        traceValue(arrayElement(at, arrayType, index), elementType, deeper)
+        kir.store(kir.binary(kirOperator(.Add, true), false, true, index, kir.integer(types.integer64, 1)), counter)
+        flowInto(test)
+        enter(done)
+        kir.argument(kir.load(shown))
+        kir.argument(length)
+        kir.callVoid(traceRuntime(9))
+        traceLiteral("]")
+    }
+
+    // `Failure.Truncated`, `Failure.Bad(5)`; a generic enum's cases, such as
+    // `Some(5)` or `Error(…)`, without the enum's name.
+    function traceEnumBody(borrow mut self, at: KirAddress, valueType: Type, depth: KirValue) {
+        let declared = program.enums[valueType.declaration]
+        let variants = declared.variants
+        if declared.open {
+            traceOpenEnum(at, declared)
+            return
+        }
+        var prefix = joinText([shownTypeName(declared.name.text), "."])
+        if declared.typeArguments.count > 0 { prefix = "" }
+        let done = kir.block()
+        var blocks: [KirBlockBuilder] = []
+        for index in 0..variants.count {
+            let block = kir.block()
+            blocks.append(block)
+            kir.switchCase(index, block)
+        }
+        kir.switchEnum(at)
+        for index in 0..variants.count {
+            enter(blocks[index])
+            let label = joinText([prefix, variants[index].name.text])
+            match variants[index].payload {
+                Some(payload) -> {
+                    let shallow = kir.block()
+                    let deep = kir.block()
+                    let written = kir.block()
+                    kir.branchIf(kir.compare(kirPredicate(.Less, true), depth, kir.integer(types.integer64, traceDepthLimit())), shallow, deep)
+                    enter(deep)
+                    traceLiteral(joinText([label, "(…)"]))
+                    flowInto(written)
+                    enter(shallow)
+                    traceLiteral(joinText([label, "("]))
+                    let deeper = kir.binary(kirOperator(.Add, true), false, true, depth, kir.integer(types.integer64, 1))
+                    traceValue(payloadPlace(at, valueType, index), payload, deeper)
+                    traceLiteral(")")
+                    flowInto(written)
+                    enter(written)
+                }
+                None -> traceLiteral(label)
+            }
+            flowInto(done)
+        }
+        enter(done)
+    }
+
+    // `Key.F12` for a case the enum names, and `Key(7)` for a code it does
+    // not.
+    function traceOpenEnum(borrow mut self, at: KirAddress, declared: EnumType) {
+        let tag = kir.tag(at)
+        let done = kir.block()
+        for index in 0..declared.variants.count {
+            let named = kir.block()
+            let next = kir.block()
+            kir.branchIf(kir.compare(kirPredicate(.Equal, false), tag, kir.integer(types.integer64, declared.tag(index))), named, next)
+            enter(named)
+            traceLiteral(joinText([shownTypeName(declared.name.text), ".", declared.variants[index].name.text]))
+            flowInto(done)
+            enter(next)
+        }
+        traceLiteral(joinText([shownTypeName(declared.name.text), "("]))
+        kir.argument(tag)
+        kir.callVoid(traceRuntime(3))
+        traceLiteral(")")
+        flowInto(done)
+        enter(done)
+    }
+
+    // A `Traced` type, by the `Trace` its `traced()` makes; a trace already
+    // nested too deep in other `traced()` calls shows only the type.
+    function traceByConformance(borrow mut self, at: KirAddress, valueType: Type, traced: Int) {
+        var name = ""
+        if valueType.kind == .Structure {
+            name = shownTypeName(program.structs[valueType.declaration].name.text)
+        } else {
+            name = shownTypeName(program.enums[valueType.declaration].name.text)
+        }
+        let nested = kir.call(traceRuntime(10), types.boolean)
+        let shown = kir.block()
+        let cut = kir.block()
+        let done = kir.block()
+        kir.branchIf(nested, shown, cut)
+        enter(cut)
+        traceLiteral(joinText([name, " { … }"]))
+        flowInto(done)
+        enter(shown)
+        let traceType = program.functions[traced].result
+        let made = temporary(traceType)
+        kir.argument(kir.pointer(made))
+        if valueType.isAggregate() {
+            kir.argument(kir.pointer(at))
+        } else {
+            kir.argument(kir.load(at))
+        }
+        kir.callVoid(functions[traced])
+        markInitialized(made)
+        for index in 0..utf8Count(name) { kir_value_text_byte(kir, utf8Byte(name, index)) }
+        kir.argument(kir_value_text(kir))
+        kir.argument(kir.integer(types.integer64, utf8Count(name)))
+        kir.argument(kir.pointer(made))
+        kir.callVoid(traceRuntime(8))
+        releaseTracked(made)
+        flowInto(done)
+        enter(done)
+    }
+}

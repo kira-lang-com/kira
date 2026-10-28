@@ -1,0 +1,358 @@
+import Foundation
+
+// The compilers knvm manages: what each is called, what binary dispatches it,
+// what a usable tree of it carries, and how a checkout of it is built.
+//
+// The registry is data and the machinery around it is not. The framework's own
+// `klf` is built in, because it is what builds every other one. Every other
+// language is registered by `binstall` from the `toolchain.klfd` of the
+// repository that defines it, and recorded under its own directory of the tree,
+// so install, selection, pinning, listing, removal and dispatch read a
+// `Compiler` and never ask which language they are working on.
+
+// One compiler knvm manages.
+public struct Compiler {
+    // What it is called in an invocation and as a directory of the tree.
+    var name: String = ""
+    // The binary inside an installed toolchain that dispatches it, and the name
+    // the launcher is installed under on PATH.
+    var binary: String = ""
+    // Whether an invocation that names no compiler acts on this one.
+    var isDefault: Bool = false
+    // Paths, relative to a toolchain root, that must exist for the compiler to
+    // work. Anything missing is a tree that cannot be dispatched to, listed as
+    // broken rather than offered as a selection.
+    var parts: [String] = []
+    // The file naming a checkout's version, relative to the checkout root.
+    var versionFile: String = ""
+    // Paths, relative to a checkout root, that make a directory a checkout of
+    // this compiler. All of them: a directory holding one of a checkout's parts
+    // is a subtree of it, and building from there stages a toolchain that is
+    // missing the rest.
+    var markers: [String] = []
+    // How a checkout is turned into this compiler's toolchain.
+    var route: BuildRoute = .Registered
+    // The repository its releases are published under, "" when none publishes
+    // them.
+    var repository: String = ""
+    // The variable naming a directory laid out exactly like a published feed.
+    var feedVariable: String = ""
+}
+
+// How a checkout of a compiler is built into that compiler's toolchain.
+public enum BuildRoute {
+    // A definition package a manifest lists: `klf build <path> -o bin/<binary>`,
+    // then the manifest's files copied beside it.
+    Definition(ToolchainLanguage)
+    // A language known from its registration record alone. Building it means
+    // finding the manifest that lists it, which turns it into a `Definition`.
+    Registered
+    // A compiler that comes from its releases alone: nothing here builds it.
+    Published
+}
+
+// The record `binstall` leaves under a registered language's directory.
+public let registrationFileName: String = "language.toml"
+
+// Every compiler knvm manages: the default first, the other registered
+// languages by name, and `klf` last. A published language nobody registered
+// yet is known too, so a machine with nothing built can install it.
+public function allCompilers() -> [Compiler] {
+    var compilers: [Compiler] = []
+    var registered = registeredCompilers()
+    for published in publishedLanguages() {
+        match compilerNamed(registered, published.name) {
+            Some(found) -> {}
+            None -> registered.append(published)
+        }
+    }
+    for compiler in registered {
+        if compiler.isDefault { compilers.append(compiler) }
+    }
+    for compiler in registered {
+        if !compiler.isDefault { compilers.append(compiler) }
+    }
+    compilers.append(klfCompiler())
+    return compilers
+}
+
+// Every language a registration record names, by name.
+public function registeredCompilers() -> [Compiler] {
+    var compilers: [Compiler] = []
+    let root = toolchainsRoot()
+    if root.isEmpty() || !isDirectory(root) { return compilers }
+    var names: [String] = []
+    for name in entriesOf(root) {
+        if name.startsWith(".") || name == klfCompilerName { continue }
+        names.append(name)
+    }
+    for name in sortedText(names) {
+        match readRegistration(joinPath(joinPath(root, name), registrationFileName)) {
+            Some(compiler) -> { compilers.append(compiler) }
+            None -> {}
+        }
+    }
+    return compilers
+}
+
+// The language a registration record describes, or nothing when `path` is not one.
+public function readRegistration(path: borrow String) -> Optional<Compiler> {
+    if !fileExists(path) { return .None }
+    let fields = match textOf(path) {
+        Some(text) -> tomlFields(text)
+        None -> return .None
+    }
+    let name = textOrEmpty(fields.get("name"))
+    let binary = textOrEmpty(fields.get("binary"))
+    if name.isEmpty() || binary.isEmpty() { return .None }
+    let partList = textOrEmpty(fields.get("parts"))
+    var parts: [String] = []
+    if !partList.isEmpty() {
+        for part in partList.split(",") {
+            parts.append(part)
+        }
+    }
+    return .Some(
+        Compiler {
+            name: name,
+            binary: binary,
+            isDefault: textOrEmpty(fields.get("default")) == "true",
+            parts: copy parts,
+            versionFile: "",
+            markers: manifestMarkers(),
+            route: .Registered,
+            repository: languagesRepository,
+            feedVariable: feedVariableFor(name)
+        }
+    )
+}
+
+// The languages published on the release feed, as `toolchain.klfd` in
+// languages/klf-kira lists them: what an install of each carries. A language
+// `binstall` registered replaces its entry here.
+public function publishedLanguages() -> [Compiler] {
+    var compilers: [Compiler] = []
+    let kiraFiles: [String] = ["definitions", "std", "formatter.json"]
+    compilers.append(publishedLanguage("kira", "kira", true, kiraFiles))
+    let kslFiles: [String] = ["share/ksl/library"]
+    compilers.append(publishedLanguage("ksl", "ksl", false, kslFiles))
+    let none: [String] = []
+    compilers.append(publishedLanguage("msl", "kmsl", false, none))
+    compilers.append(publishedLanguage("glsl", "kglsl", false, none))
+    compilers.append(publishedLanguage("hlsl", "khlsl", false, none))
+    compilers.append(publishedLanguage("wgsl", "kwgsl", false, none))
+    return compilers
+}
+
+public function publishedLanguage(name: borrow String, binary: borrow String, isDefault: Bool, files: borrow [String]) -> Compiler {
+    var parts: [String] = []
+    parts.append(joinPath(binaryDirectoryName, binary))
+    for file in files {
+        parts.append(file)
+    }
+    return Compiler {
+        name: copy name,
+        binary: copy binary,
+        isDefault: isDefault,
+        parts: copy parts,
+        versionFile: "",
+        markers: manifestMarkers(),
+        route: .Registered,
+        repository: languagesRepository,
+        feedVariable: feedVariableFor(name)
+    }
+}
+
+// Whether `compiler` has its registration record yet.
+public function isRegistered(compiler: borrow Compiler) -> Bool {
+    return fileExists(joinPath(compilerRoot(compiler), registrationFileName))
+}
+
+// Records `compiler` so every later invocation, and every launcher, knows it.
+public function register(compiler: borrow Compiler) -> Bool {
+    let directory = compilerRoot(compiler)
+    if !makeDirectoryTree(directory) { return false }
+    let text = "# Written by `knvm binstall` from the `" + manifestFileName + "` that lists this language.\n"
+        + "name = \"" + compiler.name + "\"\n"
+        + "binary = \"" + compiler.binary + "\"\n"
+        + "default = \"" + (compiler.isDefault ? "true" : "false") + "\"\n"
+        + "parts = \"" + joinedWith(compiler.parts, ",") + "\"\n"
+    return succeeded(writeFile(joinPath(directory, registrationFileName), text))
+}
+
+// The compiler a manifest's language entry describes.
+public function languageCompiler(language: borrow ToolchainLanguage) -> Compiler {
+    var parts: [String] = []
+    parts.append(joinPath(binaryDirectoryName, language.binary))
+    for file in language.files {
+        parts.append(file.to)
+    }
+    return Compiler {
+        name: language.name,
+        binary: language.binary,
+        isDefault: language.isDefault,
+        parts: copy parts,
+        versionFile: joinPath(
+            joinPath(language.path, definitionsDirectoryName),
+            languageDefinitionName
+        ),
+        markers: manifestMarkers(),
+        route: .Definition(language),
+        repository: languagesRepository,
+        feedVariable: feedVariableFor(language.name)
+    }
+}
+
+// What makes a directory a repository of languages: its manifest.
+public function manifestMarkers() -> [String] {
+    let markers: [String] = [manifestFileName]
+    return markers
+}
+
+// The framework's own compiler: what builds a toolchain, so it is what is
+// installed before anything else. It comes from the framework's releases,
+// which `klf setup` installs as well.
+public function klfCompiler() -> Compiler {
+    let parts: [String] = [
+        joinPath(binaryDirectoryName, klfBinary),
+        platformsDirectoryName
+    ]
+    return Compiler {
+        name: klfCompilerName,
+        binary: klfBinary,
+        isDefault: false,
+        parts: copy parts,
+        versionFile: "",
+        markers: [],
+        route: .Published,
+        repository: klfRepository,
+        feedVariable: feedVariableFor(klfCompilerName)
+    }
+}
+
+// `KNVM_<NAME>_RELEASE_DIR`: the variable naming a local feed for `name`.
+public function feedVariableFor(name: borrow String) -> String {
+    return "KNVM_" + upperCased(name) + "_RELEASE_DIR"
+}
+
+// `text` with its ASCII letters in upper case, and `-` as `_`, so it can name a
+// variable.
+public function upperCased(text: borrow String) -> String {
+    let upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    var result = ""
+    for index in 0..text.count {
+        let byte = text.charAt(index)
+        if byte >= 97 && byte <= 122 {
+            result = result + upper.substring(byte - 97, byte - 96)
+        } else if byte == 45 {
+            result = result + "_"
+        } else {
+            result = result + text.substring(index, index + 1)
+        }
+    }
+    return result
+}
+
+// The compiler an invocation that names none acts on, or nothing when no
+// registered language is the default.
+public function defaultCompiler(compilers: borrow [Compiler]) -> Optional<Compiler> {
+    for compiler in compilers {
+        if compiler.isDefault { return .Some(compiler) }
+    }
+    return .None
+}
+
+// The compiler `name` names, or nothing when knvm manages none by that name.
+public function compilerNamed(compilers: borrow [Compiler], name: borrow String) -> Optional<Compiler> {
+    if name.isEmpty() { return .None }
+    for compiler in compilers {
+        if compiler.name == name { return .Some(compiler) }
+    }
+    return .None
+}
+
+// The compiler whose binary is `name`.
+//
+// What a launcher installed under that name resolves to: the launcher reads its
+// own name rather than being told which compiler it stands for, so one binary
+// serves every compiler it is installed under.
+public function compilerForBinary(
+    compilers: borrow [Compiler],
+    name: borrow String
+) -> Optional<Compiler> {
+    if name.isEmpty() { return .None }
+    for compiler in compilers {
+        if compiler.binary == name { return .Some(compiler) }
+    }
+    return .None
+}
+
+// Every compiler's name, for the messages that have to list them.
+public function compilerNames(compilers: borrow [Compiler]) -> [String] {
+    var names: [String] = []
+    for compiler in compilers {
+        names.append(compiler.name)
+    }
+    return names
+}
+
+// `parts` joined by `separator`.
+public function joinedWith(parts: borrow [String], separator: borrow String) -> String {
+    var text = ""
+    for index in 0..parts.count {
+        if index > 0 { text = text + separator }
+        text = text + parts[index]
+    }
+    return text
+}
+
+// `names` in byte order.
+public function sortedText(names: borrow [String]) -> [String] {
+    var sorted: [String] = []
+    for name in names {
+        var placed: [String] = []
+        var inserted = false
+        for existing in sorted {
+            if !inserted && compareText(name, existing) < 0 {
+                placed.append(name)
+                inserted = true
+            }
+            placed.append(existing)
+        }
+        if !inserted { placed.append(name) }
+        sorted = placed
+    }
+    return sorted
+}
+
+// The command that gets a toolchain of `compiler` onto a machine that has none.
+//
+// `install latest` where there is a feed to install from, a repository or a
+// local directory standing in for one, and `binstall` where there is none:
+// telling a user to install from a feed that does not exist is a second failure
+// handed over as advice.
+public function provisionCommand(compiler: borrow Compiler) -> String {
+    return provisionCommandFrom(compiler, defaultSource(compiler))
+}
+
+// The same, asked of a source rather than of the environment.
+public function provisionCommandFrom(compiler: borrow Compiler, source: borrow ReleaseSource) -> String {
+    return match source {
+        Unpublished(variable) -> toolName + " " + compiler.name + " binstall"
+        Directory(root) -> toolName + " " + compiler.name + " install latest"
+        GitHub(repository) -> toolName + " " + compiler.name + " install latest"
+        Cairn(url) -> toolName + " " + compiler.name + " install latest"
+    }
+}
+
+// The command that installs one version, its channel spelled out when it is not
+// the default: a hint that drops `--channel dev` installs a different toolchain.
+public function installCommand(
+    compiler: borrow Compiler,
+    channel: borrow Channel,
+    version: borrow String
+) -> String {
+    let command = toolName + " " + compiler.name + " install " + version
+    if channel == defaultChannel { return command }
+    return command + " --channel " + channelName(channel)
+}

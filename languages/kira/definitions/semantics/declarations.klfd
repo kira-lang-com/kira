@@ -1,0 +1,633 @@
+// Declarations: every type, field, variant and function signature, resolved
+// before any body is checked.
+//
+// Names are declared before any is resolved, so a field or parameter may name
+// a type declared later in the file. A method joins the one function table as
+// `Owner.method`, its receiver leading its parameters.
+
+struct ParameterSignature {
+    let name: Identifier
+    let valueType: Type
+    let mode: PassingMode
+}
+
+struct Signature {
+    let name: Identifier
+    // What the backend calls the function, and, for a method, the part after
+    // its owner's name. An overloaded name gives each declaration its own by
+    // spelling out what it takes.
+    var symbol: String
+    var member: String
+    let owner: Optional<Type>
+    let receiver: Receiver
+    let parameters: [ParameterSignature]
+    let result: Type
+    let entry: Bool
+    let declaration: FunctionDeclaration
+}
+
+struct Declarations {
+    var structs: [StructType]
+    var enums: [EnumType]
+    var signatures: [Signature]
+    var functionIndex: [[Int]]
+    var typeIndex: [[Int]]
+    var spanIndex: [[Int]]
+    let sources: [SourceUnit]
+    // The exported (`public`) names of the program, for the types a module may see of another.
+    let exports: [Identifier]
+    // Per file id, its position in `sources`, or -1.
+    let sourceIndex: [Int]
+    let modules: [Module]
+    let aliases: [AliasDeclaration]
+    var globals: [GlobalSignature]
+
+    function typeNamed(borrow self, name: String) -> Optional<Type> {
+        match builtinType(name) {
+            Some(builtin) -> return .Some(builtin)
+            None -> {}
+        }
+        return indexedType(name)
+    }
+
+    // A type as Kira spells it, which names the methods it owns.
+    function typeName(borrow self, owner: Type) -> String {
+        match owner.kind {
+            Structure -> return structs[owner.declaration].name.text
+            Enumeration -> return enums[owner.declaration].name.text
+            Integer -> {
+                if owner.isInt() { return "Int" }
+                if owner.signed { return joinText(["I", decimalText(owner.bits)]) }
+                return joinText(["U", decimalText(owner.bits)])
+            }
+            Decimal -> return owner.numberName()
+            Floating -> {
+                if owner.bits == 32 { return "F32" }
+                return "Float"
+            }
+            Boolean -> return "Bool"
+            Pointer -> return "RawPtr"
+            Void -> return "Void"
+            Invalid -> return "Invalid"
+        }
+    }
+
+    // Every free function or, with an owner, every method called `name`.
+
+    // Gives a declaration of an overloaded name a symbol of its own. The
+    // symbol spells out the parameter types rather than counting, so it is
+    // the same whichever order the files were read in. A name declared once
+    // keeps its plain symbol, and a service keeps the one the kernel knows.
+    // Whether another declaration of `index`'s name and owner takes the same
+    // parameter types, so only the labels tell the two apart.
+    function sharesTypesWithAnother(borrow self, index: Int) -> Bool {
+        let signature = signatures[index]
+        let first = signature.parameters.count - signature.declaration.parameters.count
+        for other in overloadsOf(signature.owner, signature.name.text) {
+            if other != index && sameParameterTypes(signatures[other], signature.parameters, first) { return true }
+        }
+        return false
+    }
+
+    function nameOverload(borrow mut self, index: Int) {
+        let signature = signatures[index]
+        if hasAttribute(signature.declaration.annotations, .Service) { return }
+        if hasAttribute(signature.declaration.annotations, .Ridl) { return }
+        var parts: [String] = [symbolName(signature.name.text)]
+        let first = signature.parameters.count - signature.declaration.parameters.count
+        for slot in first..signature.parameters.count {
+            parts.append("$")
+            parts.append(typeName(signature.parameters[slot].valueType))
+        }
+        if hasAttribute(signature.declaration.annotations, .Foreign) {
+            parts.append("$result$")
+            parts.append(typeName(signature.result))
+        }
+        // Overloads told apart by their labels alone, as `pick(first:)` and
+        // `pick(second:)` are, spell the labels too. Any other keeps the
+        // symbol its types give it.
+        if sharesTypesWithAnother(index) {
+            for slot in first..signature.parameters.count {
+                parts.append("$$")
+                parts.append(signature.parameters[slot].name.text)
+            }
+        }
+        let member = joinText(parts)
+        signatures[index].member = member
+        match signature.owner {
+            Some(owner) -> signatures[index].symbol = joinText([typeName(owner), ".", member])
+            None -> {
+                match moduleOf(signature.name.span.file) {
+                    Some(module) -> signatures[index].symbol = joinText([member, "#", modules[module].name])
+                    None -> signatures[index].symbol = member
+                }
+            }
+        }
+    }
+
+    // The first free function or, with an owner, method called `name`.
+}
+
+function sameOwner(first: Optional<Type>, second: Optional<Type>) -> Bool {
+    match first {
+        Some(left) -> {
+            match second {
+                Some(right) -> return left.equals(right)
+                None -> return false
+            }
+        }
+        None -> return second.isNone()
+    }
+}
+
+// Each file's first source, by file id, or -1.
+function firstSourcePositions(sources: [SourceUnit]) -> [Int] {
+    var last = -1
+    for source in sources {
+        if source.file > last { last = source.file }
+    }
+    var positions: [Int] = []
+    for file in 0..last + 1 { positions.append(-1) }
+    for index in 0..sources.count {
+        let file = sources[index].file
+        if file >= 0 && positions[file] < 0 { positions[file] = index }
+    }
+    return positions
+}
+
+function sourcePositions(sources: [SourceUnit]) -> [Int] {
+    var last = -1
+    for source in sources {
+        if source.file > last { last = source.file }
+    }
+    var positions: [Int] = []
+    for file in 0..last + 1 { positions.append(-1) }
+    for index in 0..sources.count {
+        if sources[index].file >= 0 { positions[sources[index].file] = index }
+    }
+    return positions
+}
+
+function declare(tree: SyntaxTree) -> Declarations {
+    var declarations = Declarations {
+        structs = [], enums = [], signatures = [], functionIndex = emptyNameIndex(), typeIndex = emptyNameIndex(), spanIndex = emptyNameIndex(), sources = tree.sources, exports = tree.exports, sourceIndex = sourcePositions(tree.sources), modules = tree.modules, aliases = tree.aliases, globals = []
+    }
+    for declared in tree.structs { declarations.addStruct(declared) }
+    for declared in tree.enums { declarations.addEnum(declared) }
+    for marked in tree.openEnums {
+        for index in declarations.enumsAt(marked.span) { declarations.enums[index].open = true }
+    }
+    for tagged in tree.taggedEnums {
+        for index in declarations.enumsAt(tagged.name.span) {
+            declarations.enums[index].tags = tagged.tags
+            declarations.enums[index].representation = .Some(declarations.resolve(tagged.representation))
+        }
+    }
+    for index in 0..tree.structs.count { declarations.completeStruct(index, tree.structs[index]) }
+    for index in 0..tree.enums.count { declarations.completeEnum(index, tree.enums[index]) }
+    applyForeignShapes(declarations, tree)
+    checkGenericEnumNames(declarations, tree.genericEnums)
+    checkGenericStructNames(declarations, tree.genericStructs)
+    checkAliasNames(declarations)
+    rejectRecursiveStructs(declarations)
+    for declared in tree.functions {
+        declareFunction(declarations, tree, declared, .None)
+    }
+    for index in 0..tree.structs.count {
+        var methods = tree.structs[index].methods
+        if tree.structs[index].genericBase != "Class" {
+            methods = inferredReceivers(tree, methods, fieldNames(tree.structs[index].fields))
+        }
+        for method in methods {
+            if method.typeParameters.count > 0 { continue }
+            declareFunction(declarations, tree, method, .Some(Type.structure(index)))
+        }
+    }
+    for index in 0..tree.enums.count {
+        for method in tree.enums[index].methods {
+            if method.typeParameters.count > 0 { continue }
+            declareFunction(declarations, tree, method, .Some(Type.enumeration(index)))
+        }
+    }
+    declareExtensions(declarations, tree)
+    declareConformances(declarations, tree)
+    declareGlobals(declarations, tree.globals, tree.typeReferences)
+    if tree.testing { enterTestRunner(declarations) }
+    checkEntry(declarations, tree.testing)
+    nameEntry(declarations)
+    return declarations
+}
+
+extend Declarations {
+    // A type's name, before any field or payload is resolved, so a type may
+    // name one declared after it.
+    function addStruct(borrow mut self, declared: StructDeclaration) {
+        checkTypeName(self, declared.name)
+        fileStruct(declared.name)
+        structs.append(StructType {
+            name = declared.name, typeArguments = [], callableModes = declared.callableModes,
+            ancestors = instanceNames(declared.ancestors), genericBase = declared.genericBase, baseNameSpan = declared.baseNameSpan,
+            specialized = declared.specialized, typeSuffix = declared.typeSuffix, fields = [], shape = .Plain
+        })
+    }
+
+    function addEnum(borrow mut self, declared: EnumDeclaration) {
+        checkTypeName(self, declared.name)
+        fileEnum(declared.name)
+        enums.append(EnumType {
+            open = false, tags = [], representation = .None,
+            name = declared.name, typeArguments = [], baseNameSpan = declared.baseNameSpan,
+            specialized = declared.specialized, typeSuffix = declared.typeSuffix,
+            existential = declared.existential, variants = []
+        })
+    }
+
+    function completeStruct(borrow mut self, index: Int, declared: StructDeclaration) {
+        structs[index].fields = fields(self, declared)
+        structs[index].typeArguments = resolveAll(declared.typeArguments)
+    }
+
+    function completeEnum(borrow mut self, index: Int, declared: EnumDeclaration) {
+        enums[index].variants = variants(self, declared)
+        enums[index].typeArguments = resolveAll(declared.typeArguments)
+    }
+
+    // `valueType` as a reference spelled by its name, which is what a type
+    // argument inferred from a value is written as.
+    function reference(borrow self, valueType: Type, span: Span) -> TypeReference {
+        let name = typeName(valueType)
+        return TypeReference {
+            qualifier = .None, name = Identifier { text = name, span = span },
+            arguments = [], modes = [], instanceName = name
+        }
+    }
+
+    // `valueType` as a reference, a struct or enum named where it is declared,
+    // so it resolves in a file that does not import it.
+    function declaredReference(borrow self, valueType: Type, span: Span) -> TypeReference {
+        let nominal = valueType.kind == .Structure || valueType.kind == .Enumeration
+        return self.reference(valueType, nominal ? self.typeNameSpan(valueType) : span)
+    }
+
+    function typeNameSpan(borrow self, valueType: Type) -> Span {
+        if valueType.kind == .Structure { return structs[valueType.declaration].name.span }
+        if valueType.kind == .Enumeration { return enums[valueType.declaration].name.span }
+        return Span { file = sources[0].file, start = 0, end = 0 }
+    }
+
+    function resolveAll(borrow self, references: [TypeReference]) -> [Type] {
+        var resolved: [Type] = []
+        for reference in references { resolved.append(resolve(reference)) }
+        return resolved
+    }
+}
+
+// The template an instance's name spells, `Box` for `Box<Int>`.
+function templateName(name: String) -> String {
+    for index in 0..utf8Count(name) {
+        if utf8Byte(name, index) == 60 { return utf8Slice(name, 0, index) }
+    }
+    return name
+}
+
+function instanceNames(references: [TypeReference]) -> [String] {
+    var names: [String] = []
+    for reference in references { names.append(reference.instanceName) }
+    return names
+}
+
+function checkGenericStructNames(declarations: Declarations, templates: [StructDeclaration]) {
+    for index in 0..templates.count {
+        let template = templates[index]
+        if declarations.typeNamed(template.name.text).isSome() {
+            report(.DuplicateType, template.name.span)
+        }
+        for earlier in 0..index {
+            if templates[earlier].name.text == template.name.text {
+                report(.DuplicateType, template.name.span)
+                break
+            }
+        }
+    }
+}
+
+function checkGenericEnumNames(declarations: Declarations, templates: [EnumDeclaration]) {
+    for index in 0..templates.count {
+        let template = templates[index]
+        if declarations.typeNamed(template.name.text).isSome() {
+            report(.DuplicateType, template.name.span)
+        }
+        for earlier in 0..index {
+            if templates[earlier].name.text == template.name.text {
+                report(.DuplicateType, template.name.span)
+                break
+            }
+        }
+    }
+}
+
+function checkTypeName(declarations: Declarations, name: Identifier) {
+    if declarations.typeNamed(name.text).isSome() {
+        report(.DuplicateType, name.span)
+    }
+}
+
+function fields(declarations: Declarations, declared: StructDeclaration) -> [Field] {
+    var fields: [Field] = []
+    for field in declared.fields {
+        for earlier in fields {
+            if earlier.name.text == field.name.text { report(.DuplicateField, field.name.span) }
+        }
+        fields.append(Field {
+            name = field.name,
+            valueType = field.inferred ? Type.invalid() : declarations.resolve(field.annotation),
+            mutable = field.mutable,
+            initial = field.initial,
+            inferred = field.inferred
+        })
+    }
+    return fields
+}
+
+function variants(declarations: Declarations, declared: EnumDeclaration) -> [Variant] {
+    var variants: [Variant] = []
+    for case in declared.cases {
+        for earlier in variants {
+            if earlier.name.text == case.name.text { report(.DuplicateVariant, case.name.span) }
+        }
+        var payload: Optional<Type> = .None
+        var voided = false
+        match case.payload {
+            Some(reference) -> {
+                let resolved = declarations.resolve(reference)
+                if resolved.kind != .Void { payload = .Some(resolved) } else { voided = true }
+            }
+            None -> {}
+        }
+        variants.append(Variant { name = case.name, payload = payload, initial = case.initial, voided = voided })
+    }
+    return variants
+}
+
+// A struct that holds itself by value, directly or through other structs, has
+// no finite size. Each struct is searched from its own fields; the first one
+// that leads back to it is reported.
+function rejectRecursiveStructs(declarations: Declarations) {
+    for index in 0..declarations.structs.count {
+        let owner = declarations.structs[index]
+        if owner.genericBase == "Class" { continue }
+        for field in owner.fields {
+            if reachesStruct(declarations, field.valueType, index, 0) {
+                report(.RecursiveStruct, field.name.span)
+                break
+            }
+        }
+    }
+}
+
+function reachesStruct(declarations: Declarations, from: Type, target: Int, depth: Int) -> Bool {
+    if from.kind != .Structure || depth > declarations.structs.count { return false }
+    if declarations.structs[from.declaration].genericBase == "Class" { return false }
+    if from.declaration == target { return true }
+    for field in declarations.structs[from.declaration].fields {
+        if reachesStruct(declarations, field.valueType, target, depth + 1) { return true }
+    }
+    return false
+}
+
+// The name a declaration's symbol spells. KIR keeps `$` for the generic
+// parameters and instances it mangles, so a projection, `$name`, is spelled
+// `__projection_name` there.
+function symbolName(name: String) -> String {
+    if utf8Count(name) == 0 || utf8Byte(name, 0) != 36 { return name }
+    return joinText(["__projection_", utf8Slice(name, 1, utf8Count(name))])
+}
+
+function declareFunction(declarations: borrow mut Declarations, tree: SyntaxTree, declared: FunctionDeclaration, owner: Optional<Type>) {
+    var symbol = symbolName(declared.name.text)
+    match serviceSymbol(tree, declared.annotations) {
+        Some(service) -> symbol = service
+        None -> {}
+    }
+    var parameters: [ParameterSignature] = []
+    match owner {
+        Some(ownerType) -> {
+            symbol = joinText([declarations.typeName(ownerType), ".", symbolName(declared.name.text)])
+            if declared.receiver != .Static {
+                var receiverMode: PassingMode = .Borrowed
+                if declared.receiver == .MutablyBorrowed { receiverMode = .MutablyBorrowed }
+                let receiver = Identifier { text = "self", span = declared.name.span }
+                parameters.append(ParameterSignature { name = receiver, valueType = ownerType, mode = receiverMode })
+            }
+        }
+        None -> {
+            if declared.receiver != .Free { report(.ReceiverOutsideMethod, declared.name.span) }
+        }
+    }
+    for parameter in declared.parameters {
+        parameters.append(ParameterSignature {
+            name = parameter.name,
+            valueType = declarations.resolve(parameter.annotation),
+            mode = parameter.mode
+        })
+    }
+    var result = Type.void()
+    match declared.result {
+        Some(reference) -> {
+            if isInferredReference(reference) {
+                result = Type.invalid()
+            } else {
+                result = declarations.resolve(reference)
+            }
+        }
+        None -> {}
+    }
+    // Sharing a name is overloading; sharing a name, its labels and what it
+    // takes is redeclaring, which leaves a call no way to say which one it
+    // meant. The labels are part of the name, as Swift's are: `pick(first:)`
+    // and `pick(second:)` are two functions.
+    let first = parameters.count - declared.parameters.count
+    // A free function overloads only its own module's: another module's
+    // function of the name is a different function, and counting it would
+    // spell this one's symbol by what else the unit happens to read, so two
+    // units would name one function apart (KLF-KIR-9002).
+    var overloads = declarations.overloadsOf(owner, declared.name.text)
+    if owner.isNone() { overloads = sameModuleSignatures(declarations, overloads, declared.name.span.file) }
+    for other in overloads {
+        if hasAttribute(declared.annotations, .Foreign) && hasAttribute(declarations.signatures[other].declaration.annotations, .Foreign) && !result.equals(declarations.signatures[other].result) { continue }
+        if sameParameterTypes(declarations.signatures[other], parameters, first) && sameLabels(declarations.signatures[other], parameters, first) {
+            report(.DuplicateFunction, declared.name.span)
+            overloads = []
+        }
+    }
+    // An imported function's symbol is what the engine's adapter to the
+    // module's RIDL entry defines, kept apart from any Kira function's.
+    // A `#` would end the symbol a foreign function binds, so a method's
+    // owner is written by its RIDL name.
+    match ridlImportModule(tree, declared.annotations) {
+        Some(module) -> {
+            match owner {
+                Some(ownerType) -> symbol = joinText(["ridl.import.", module, ".", ridlName(declarations.typeName(ownerType)), ".", declared.name.text])
+                None -> symbol = joinText(["ridl.import.", module, ".", symbol])
+            }
+        }
+        None -> {}
+    }
+    if owner.isNone() && privateSymbol(declarations, tree, declared) {
+        match declarations.moduleOf(declared.name.span.file) {
+            Some(module) -> symbol = joinText([symbol, "#", declarations.modules[module].name])
+            None -> {}
+        }
+    }
+    // Two packages' free functions of one name are different functions, but their
+    // exported symbols would be the same name: qualify each with its module.
+    if owner.isNone() && !hasAttribute(declared.annotations, .Foreign) {
+        let ownInFoundation = declarations.inFoundation(declared.name.span.file)
+        for other in declarations.overloadsOf(.None, declared.name.text) {
+            let otherFile = declarations.signatures[other].name.span.file
+            if declarations.sameModule(otherFile, declared.name.span.file) { continue }
+            if hasAttribute(declarations.signatures[other].declaration.annotations, .Foreign) { continue }
+            // Foundation keeps its names, which the runtime and the
+            // language's own lowering call by; only the package's yields.
+            if !declarations.inFoundation(otherFile) && !containsText(declarations.signatures[other].symbol, "#") {
+                match declarations.moduleOf(otherFile) {
+                    Some(otherModule) -> declarations.signatures[other].symbol = joinText([declarations.signatures[other].symbol, "#", declarations.modules[otherModule].name])
+                    None -> {}
+                }
+            }
+            if !ownInFoundation && !containsText(symbol, "#") {
+                match declarations.moduleOf(declared.name.span.file) {
+                    Some(ownModule) -> symbol = joinText([symbol, "#", declarations.modules[ownModule].name])
+                    None -> {}
+                }
+            }
+        }
+    }
+    overloads.append(declarations.signatures.count)
+    declarations.addSignature(Signature {
+        name = declared.name,
+        symbol = symbol,
+        member = declared.name.text,
+        owner = owner,
+        receiver = declared.receiver,
+        parameters = parameters,
+        result = entryResult(declared, result),
+        entry = isEntry(declared),
+        declaration = declared
+    })
+    if overloads.count > 1 {
+        for overload in overloads { declarations.nameOverload(overload) }
+    }
+}
+
+// The signatures of `indices` declared in the module of `file`.
+function sameModuleSignatures(declarations: Declarations, indices: [Int], file: Int) -> [Int] {
+    var kept: [Int] = []
+    for index in indices {
+        if declarations.sameModule(declarations.signatures[index].name.span.file, file) { kept.append(index) }
+    }
+    return kept
+}
+
+// Whether a free function's symbol carries its module: one only its own
+// module can name, so two libraries' private functions of one name stay
+// apart when their units are linked together. Foundation's, an exported
+// one, an entry and one whose symbol something outside Kira binds keep
+// the name as written.
+function privateSymbol(declarations: Declarations, tree: SyntaxTree, declared: FunctionDeclaration) -> Bool {
+    if declarations.inFoundation(declared.name.span.file) { return false }
+    // A compile-time evaluation's entry, which the compiler finds by name.
+    if startsWithText(declared.name.text, "__source_macro_entry") { return false }
+    if isExportedName(tree, declared.name.span) { return false }
+    let annotations = declared.annotations
+    if hasAttribute(annotations, .Main) || hasAttribute(annotations, .Service) || hasAttribute(annotations, .Ridl) { return false }
+    if hasAttribute(annotations, .Foreign) || hasAttribute(annotations, .Export) || hasAttribute(annotations, .Native) { return false }
+    return !hasAttribute(annotations, .Runtime) && !hasAttribute(annotations, .Comptime)
+}
+
+// Whether `signature` takes exactly `parameters` past the receiver slots.
+function sameParameterTypes(signature: Signature, parameters: [ParameterSignature], first: Int) -> Bool {
+    let otherFirst = signature.parameters.count - signature.declaration.parameters.count
+    if signature.parameters.count - otherFirst != parameters.count - first { return false }
+    for index in 0..parameters.count - first {
+        if !signature.parameters[otherFirst + index].valueType.equals(parameters[first + index].valueType) { return false }
+    }
+    return true
+}
+
+function sameLabels(signature: Signature, parameters: [ParameterSignature], first: Int) -> Bool {
+    let otherFirst = signature.parameters.count - signature.declaration.parameters.count
+    if signature.parameters.count - otherFirst != parameters.count - first { return false }
+    for index in 0..parameters.count - first {
+        if signature.parameters[otherFirst + index].name.text != parameters[first + index].name.text { return false }
+    }
+    return true
+}
+
+// `main`'s value is the process's exit status, a machine word. A `main`
+// written to return a number returns that word: each `return` converts its
+// number the way `Int(n)` does, and one that does not fit traps.
+function entryResult(declared: FunctionDeclaration, result: Type) -> Type {
+    if isEntry(declared) && result.kind == .Decimal { return Type.int() }
+    return result
+}
+
+function isEntry(declared: FunctionDeclaration) -> Bool {
+    return hasAttribute(declared.annotations, .Main)
+}
+
+// A test build is entered through the `kiraTestMain` its test runner
+// generates rather than through `@Main`, which stays an ordinary function.
+function enterTestRunner(declarations: borrow mut Declarations) {
+    for index in 0..declarations.signatures.count {
+        let signature = declarations.signatures[index]
+        declarations.signatures[index].entry = signature.owner.isNone() && signature.name.text == "kiraTestMain"
+    }
+}
+
+// The entry is the module's `main`, whatever it is called in the source; a
+// free function that is not the entry but is called `main` takes another
+// name.
+function nameEntry(declarations: borrow mut Declarations) {
+    for index in 0..declarations.signatures.count {
+        if declarations.signatures[index].entry {
+            declarations.signatures[index].symbol = "main"
+        } else if declarations.signatures[index].symbol == "main" {
+            declarations.signatures[index].symbol = "main#function"
+        }
+    }
+}
+
+// A program has exactly one `@Main` function, and it takes no parameters. A
+// library is entered by the program that imports it and declares none, and
+// a package that is itself a library needs none.
+function checkEntry(declarations: Declarations, testing: Bool) {
+    var entries = 0
+    for signature in declarations.signatures {
+        if !signature.entry { continue }
+        match declarations.moduleOf(signature.name.span.file) {
+            Some(module) -> {
+                // A package built apart is read here for its declarations; its
+                // own unit checks its entry.
+                if declarations.modules[module].separate { continue }
+                // A test build's entry is the runner's `kiraTestMain`, which a
+                // library under test carries like any other package.
+                if declarations.modules[module].library && !testing {
+                    report(.MainInLibrary, signature.name.span)
+                    continue
+                }
+                entries += 1
+                if entries > 1 { report(.DuplicateMain, signature.name.span) }
+                if signature.parameters.count > 0 { report(.MainTakesParameters, signature.name.span) }
+                if hasAttribute(signature.declaration.annotations, .MainThread) { report(.MainThreadEntry, signature.name.span) }
+            }
+            None -> {}
+        }
+    }
+    if entries > 0 || declarations.modules[0].library { return }
+    if testing {
+        report(.NoTests, Span { file = declarations.sources[0].file, start = 0, end = 0 })
+    } else {
+        report(.MissingMain, Span { file = declarations.sources[0].file, start = 0, end = 0 })
+    }
+}

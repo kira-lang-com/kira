@@ -1,0 +1,196 @@
+extend Checker {
+    function checkExpandedMacro(borrow mut self, body: [Int], value: Optional<Int>, expected: Optional<Type>, span: Span) -> Int {
+        var statements: [Int] = []
+        for index in body { checkStatementInto(index, statements) }
+        var result = 0
+        match value {
+            Some(expressionIndex) -> result = expression(expressionIndex, expected)
+            None -> result = add(.Integer(0), Type.int(), span)
+        }
+        return add(.Sequence(statements, result), typeOf(result), span)
+    }
+
+    function checkMacro(borrow mut self, name: Identifier, arguments: [Int], expected: Optional<Type>, span: Span, statement: Bool) -> Int {
+        if macroDepth >= 64 {
+            report(.OutsideSubset, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        for declared in tree.macros {
+            if declared.name.text == name.text { return expandMacro(declared, arguments, expected, span, statement) }
+        }
+        report(.UndefinedFunction, name.span)
+        return add(.Integer(0), Type.invalid(), span)
+    }
+
+    function expandMacro(borrow mut self, declared: MacroDeclaration, arguments: [Int], expected: Optional<Type>, span: Span, statement: Bool) -> Int {
+        if arguments.count != declared.parameters.count {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        var names: [MacroName] = []
+        var body: [Int] = []
+        let suffix = decimalText(program.expressions.count)
+        openScope()
+        for index in 0..arguments.count {
+            let parameter = declared.parameters[index]
+            if parameter.place {
+                match tree.expressions[arguments[index]].kind.name() {
+                    Some(target) -> names.append(MacroName { name = parameter.name.text, replacement = target })
+                    None -> {
+                        report(.OutsideSubset, tree.expressions[arguments[index]].span)
+                        closeScope()
+                        return add(.Integer(0), Type.invalid(), span)
+                    }
+                }
+            } else {
+                let value = expression(arguments[index], .None)
+                let text = joinText(["__macro_", suffix, "_", parameter.name.text])
+                let bound = Identifier { text = text, span = parameter.name.span }
+                let local = declareLocal(text, typeOf(value), false, false)
+                body.append(program.addStatement(.Declare(local, value)))
+                names.append(MacroName { name = parameter.name.text, replacement = bound })
+            }
+        }
+        for index in macroBinders(declared) {
+            let binder = declared.tokens[index]
+            let text = utf8Slice(declared.source, binder.span.start, binder.span.end)
+            names.append(MacroName {
+                name = text,
+                replacement = Identifier { text = joinText(["__macro_", suffix, "_", text]), span = binder.span }
+            })
+        }
+        var parser = Parser {
+            source = declared.source, tokens = declared.tokens, position = declared.start,
+            tree = tree, imports = [], structLiterals = true, quotes = false, macroNames = names, handling = 0,
+            declared = false, excluded = false
+        }
+        let savedSource = sourceOverride
+        sourceOverride = .Some(declared.name.span.file)
+        macroDepth += 1
+        var result = 0
+        if statement {
+            match parser.block() {
+                Ok(statements) -> {
+                    if parser.position != declared.end + 1 { report(.OutsideSubset, span) }
+                    tree = parser.tree
+                    for index in statements { checkStatementInto(index, body) }
+                    result = add(.Integer(0), Type.int(), span)
+                }
+                Error(failure) -> { failure.report() result = add(.Integer(0), Type.invalid(), span) }
+            }
+        } else {
+            parser.advance()
+            match parser.expression() {
+                Ok(value) -> {
+                    if parser.position != declared.end { report(.OutsideSubset, span) }
+                    tree = parser.tree
+                    result = expression(value, expected)
+                }
+                Error(failure) -> { failure.report() result = add(.Integer(0), Type.invalid(), span) }
+            }
+        }
+        macroDepth -= 1
+        sourceOverride = savedSource
+        closeScope()
+        return add(.Sequence(body, result), typeOf(result), span)
+    }
+}
+
+// `Syntax` and `Diagnostics` are namespaces a macro body calls through, not
+// values: `Syntax.join(parts, separator: ", ")` and
+// `Diagnostics.error("...", at: target.syntax)`. Each call is the Foundation
+// function that does it.
+function comptimeNamespaceFunction(namespace: String, member: String) -> Optional<String> {
+    match namespace {
+        "Syntax" -> { if member == "join" { return .Some("joinSyntax") } }
+        "Diagnostics" -> { if member == "error" { return .Some("macroReportError") } }
+        else -> {}
+    }
+    return .None
+}
+
+extend Checker {
+    // `Build.testing()` and `Build.linting()`: what is being built, answered
+    // as the macro body is checked, since the body runs while the program
+    // compiles. kira has no lint verb, so a build is never linting.
+    // `Build.debug()` and `Build.release()` answer anywhere, as a constant:
+    // a build is release when `--release` is given and debug otherwise.
+    function buildQuery(borrow mut self, member: Identifier, arguments: [Int], span: Span) -> Optional<Int> {
+        if arguments.count != 0 { return .None }
+        match member.text {
+            "platform" -> return .Some(checkStringLiteral(.Some(buildPlatform(tree.buildTarget)), span))
+            "target" -> return .Some(checkStringLiteral(.Some(tree.buildTarget), span))
+            "testing" -> return .Some(add(.Boolean(tree.testing), Type.boolean(), span))
+            "linting" -> return .Some(add(.Boolean(false), Type.boolean(), span))
+            "debug" -> return .Some(add(.Boolean(!tree.release), Type.boolean(), span))
+            "release" -> return .Some(add(.Boolean(tree.release), Type.boolean(), span))
+            else -> return .None
+        }
+    }
+
+    // Whether the body being checked runs at compile time: a `comptime`
+    // function or a procedural macro's `expand`.
+    function inComptime(borrow self) -> Bool {
+        let declared = signature().declaration
+        if hasAttribute(declared.annotations, .Comptime) { return true }
+        let prefix = "__source_macro_"
+        let length = utf8Count(prefix)
+        return utf8Count(declared.name.text) > length && utf8Slice(declared.name.text, 0, length) == prefix
+    }
+}
+
+// Platform names are determined from the target, including cross builds.
+function buildPlatform(target: String) -> String {
+    // Tessera has Linux behind it and is a platform of its own (KLF-RIDL
+    // 5.8, 27.8), so it is asked before anything else.
+    if endsWithText(target, "-unknown-tessera") { return "tessera" }
+    if containsText(target, "ios") { return "ios" }
+    if containsText(target, "darwin") || containsText(target, "macos") { return "macos" }
+    if containsText(target, "windows") { return "windows" }
+    // Android's triples carry its kernel's name too, so it is asked first.
+    if containsText(target, "android") { return "android" }
+    if containsText(target, "linux") { return "linux" }
+    if containsText(target, "emscripten") { return "web" }
+    return "unknown"
+}
+
+// The tokens of every name a macro template binds: the name after `let`,
+// `var` and `for`, a payload a `match` arm or a `handle` arm takes apart, and
+// a closure's parameters. Each is renamed per expansion so it cannot capture a
+// fragment that mentions the same name.
+function macroBinders(declared: MacroDeclaration) -> [Int] {
+    var binders: [Int] = []
+    let tokens = declared.tokens
+    for index in declared.start + 1..declared.end {
+        let kind = tokens[index].kind
+        if (kind == .Let || kind == .Var || kind == .For) && tokens[index + 1].kind == .Identifier {
+            binders.append(index + 1)
+        }
+        if kind == .Identifier && armPayloadAt(tokens, index) { binders.append(index + 2) }
+        if kind == .LeftBrace && tokens[index + 1].kind == .Identifier {
+            var at = index + 1
+            while tokens[at].kind == .Identifier && tokens[at + 1].kind == .Comma && tokens[at + 2].kind == .Identifier { at += 2 }
+            if tokens[at].kind == .Identifier && tokens[at + 1].kind == .In {
+                var parameter = index + 1
+                while parameter <= at {
+                    binders.append(parameter)
+                    parameter += 2
+                }
+            }
+        }
+    }
+    return binders
+}
+
+// `Variant(name) ->` in a match, or `Variant(name) {` opening a handler: a
+// handler arm follows the `{` of `handle` or the `}` of the arm before it,
+// which no call followed by a block does.
+function armPayloadAt(tokens: [Token], index: Int) -> Bool {
+    if index + 4 >= tokens.count { return false }
+    if tokens[index + 1].kind != .LeftParen || tokens[index + 2].kind != .Identifier || tokens[index + 3].kind != .RightParen { return false }
+    let after = tokens[index + 4].kind
+    if after == .Arrow { return true }
+    if after != .LeftBrace || index == 0 { return false }
+    let before = tokens[index - 1].kind
+    return before == .LeftBrace || before == .RightBrace
+}

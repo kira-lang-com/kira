@@ -1,0 +1,369 @@
+// `Number`, the exact decimal. A value is two words, a signed 65-bit mantissa
+// and a scale of at most eighteen fractional digits, with trailing fractional
+// zeros shed so equal values are equal words. A mantissa that fits an `Int` is
+// the first word; one past it, up to a `U64`'s largest or down to its
+// negation, sets bit 8 of the second word and keeps its low 64 bits in the
+// first. Foundation's `Number.kira` does the
+// arithmetic, inline when it can and through the `klfsvc_number` service when
+// it cannot; the checker turns operators, conversions and literals into
+// calls to it. Once checked, a `Number` is Foundation's `NumberWords`
+// (`number-words.klfd`).
+
+// The Foundation functions `Number` runs on. `numberFunctions[0]` is
+// `numberArithmetic(operation, left, right)`, numbered as the service numbers
+// its operations, and `[1]` answers -1, 0 or 1 for an ordering. The rest
+// follow `names` below.
+function numberRuntimeFunctions(declarations: Declarations) -> [Int] {
+    if declarations.findFunction(.None, "numberArithmetic").isNone() { return [] }
+    var functions: [Int] = []
+    let names: [String] = ["numberArithmetic", "numberOrder", "numberFromInt", "numberToInt", "numberFromFloat", "numberToFloat", "numberFromString", "numberToString", "numberNegate", "numberComplement", "numberFromUnsigned", "numberToUnsigned"]
+    for name in names {
+        match declarations.findFunction(.None, name) {
+            Some(target) -> functions.append(target)
+            None -> report(.UndefinedFunction, declarations.signatures[0].name.span)
+        }
+    }
+    return functions
+}
+
+// The struct a `Number` is stored as, or -1 without Foundation.
+function numberWordsDeclaration(declarations: Declarations) -> Int {
+    match declarations.typeNamed("NumberWords") {
+        Some(found) -> {
+            if found.kind == .Structure { return found.declaration }
+            return -1
+        }
+        None -> return -1
+    }
+}
+
+// The service's operation numbers.
+function numberAdd() -> Int { return 0 }
+function numberSubtract() -> Int { return 1 }
+function numberMultiply() -> Int { return 2 }
+function numberDivide() -> Int { return 3 }
+function numberAnd() -> Int { return 11 }
+function numberOr() -> Int { return 12 }
+function numberXor() -> Int { return 13 }
+function numberShiftLeft() -> Int { return 14 }
+function numberShiftRight() -> Int { return 15 }
+// The math functions start at 32, and the remainder is the 26th.
+function numberRemainder() -> Int { return 58 }
+
+// The two words of the decimal `text` spells, digits with at most one `.`,
+// or an empty list when it spells none or its mantissa passes 65 bits. A
+// mantissa past `Int` sets the extended bit (256) of the second word, and the
+// first holds its low 64 bits, as Foundation's `NumberWords` says.
+function numberWordsOf(text: String) -> [Int] {
+    var digits: [Int] = []
+    var scale = 0
+    var fraction = false
+    var negative = false
+    for index in 0..utf8Count(text) {
+        let byte = utf8Byte(text, index)
+        if byte == 45 && !negative && digits.count == 0 && !fraction {
+            negative = true
+            continue
+        }
+        if byte == 46 {
+            if fraction { return [] }
+            fraction = true
+            continue
+        }
+        if byte == 95 { continue }
+        if byte < 48 || byte > 57 { return [] }
+        digits.append(byte - 48)
+        if fraction { scale = scale + 1 }
+    }
+    if digits.count == 0 { return [] }
+    // Trailing fractional zeros are shed before the digits are read, so a
+    // mantissa fits whenever the value does.
+    var kept = digits.count
+    while scale > 0 && digits[kept - 1] == 0 {
+        kept = kept - 1
+        scale = scale - 1
+    }
+    if scale > 18 { return [] }
+    var mantissa = 0
+    var wide = false
+    for index in 0..kept {
+        let digit = digits[index]
+        if wide { return [] }
+        if mantissa > 922337203685477580 || (mantissa == 922337203685477580 && digit > 7) {
+            match wideMantissa(mantissa, digit, negative) {
+                Some(bits) -> mantissa = bits
+                None -> return []
+            }
+            wide = true
+            continue
+        }
+        mantissa = mantissa * 10 + digit
+    }
+    if !wide {
+        // The sign is carried on the mantissa, so `-0.5` is five tenths of a
+        // negative and not the value it would be read as if it came first.
+        if negative { return [0 - mantissa, scale] }
+        return [mantissa, scale]
+    }
+    let smallest = 0 - 9223372036854775807 - 1
+    // 2^63 negated is `Int`'s smallest, which needs no extension.
+    if negative && mantissa == smallest { return [smallest, scale] }
+    // 2^64 negated is the mantissa's smallest, whose low 64 bits are zero.
+    if negative && mantissa == 0 { return [0, scale | 256] }
+    if negative { return [0 - mantissa, scale | 256] }
+    return [mantissa, scale | 256]
+}
+
+// `mantissa * 10 + digit` past `Int`'s largest, as the `Int` of its low 64
+// bits, or none past 2^64 (past 2^64 - 1 when it stays positive). 2^64 itself
+// answers zero.
+function wideMantissa(mantissa: Int, digit: Int, negative: Bool) -> Optional<Int> {
+    var last = 5
+    if negative { last = 6 }
+    if mantissa > 1844674407370955161 || (mantissa == 1844674407370955161 && digit > last) { return .None }
+    if mantissa == 1844674407370955161 && digit == 6 { return .Some(0) }
+    // `mantissa * 10 + digit - 2^63`, which fits, grouped so no step passes
+    // `Int`'s largest; then less 2^63 more.
+    let past = (mantissa - 922337203685477581) * 10 + (digit + 2)
+    return .Some(past - 9223372036854775807 - 1)
+}
+
+extend Checker {
+    function numberFunction(borrow self, index: Int, span: Span) -> Optional<Int> {
+        if index < program.numberFunctions.count { return .Some(program.numberFunctions[index]) }
+        report(.UndefinedFunction, span)
+        return .None
+    }
+
+    function numberCall(borrow mut self, index: Int, arguments: [Int], result: Type, span: Span) -> Int {
+        match numberFunction(index, span) {
+            Some(target) -> return add(.Call(target, arguments), result, span)
+            None -> return add(.Integer(0), Type.invalid(), span)
+        }
+    }
+
+    // The `Number` `mantissa * 10^-scale`, already canonical: its two words
+    // built as a `NumberWords` and taken as the `Number` they are.
+    function numberValue(borrow mut self, mantissa: Int, scale: Int, span: Span) -> Int {
+        let built = numberWordsValue(mantissa, scale, span)
+        if typeOf(built).isInvalid() { return built }
+        return add(.Bitcast(built), Type.number(), span)
+    }
+
+    // The same two words as the struct they are stored as, which is what the
+    // functions that order numbers are handed: a place, not a value read out
+    // of one.
+    function numberWordsValue(borrow mut self, mantissa: Int, scale: Int, span: Span) -> Int {
+        if program.numberWords < 0 {
+            report(.UndefinedFunction, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let words = [add(.Integer(mantissa), Type.int(), span), add(.Integer(scale), Type.int(), span)]
+        return add(.Construct(words), Type.structure(program.numberWords), span)
+    }
+
+    // The decimal a whole integer literal writes, remembered as that word.
+    function wholeLiteral(borrow mut self, word: Int, span: Span) -> Int {
+        let made = numberLiteral(decimalText(word), span)
+        wholeLiterals.append(WholeLiteral { expression = made, word = word })
+        return made
+    }
+
+    // The word written by the whole integer literal `expression` was made
+    // from, if it was made from one. Expressions are only ever added, so the
+    // literals are in index order and a binary search finds one.
+    function wholeLiteralWord(borrow self, expression: Int) -> Optional<Int> {
+        var low = 0
+        var high = wholeLiterals.count
+        while low < high {
+            let middle = (low + high) / 2
+            let found = wholeLiterals[middle].expression
+            if found == expression { return .Some(wholeLiterals[middle].word) }
+            if found < expression { low = middle + 1 } else { high = middle }
+        }
+        return .None
+    }
+
+    // A literal written where a `Number` is expected is that decimal exactly,
+    // read while checking: `var a: Number = 1.1` holds eleven tenths.
+    function numberLiteral(borrow mut self, text: String, span: Span) -> Int {
+        let words = numberWordsOf(text)
+        if words.count == 0 {
+            report(.LiteralOutOfRange, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        return numberValue(words[0], words[1], span)
+    }
+
+    // `a + b`, `a - b`, `a * b`, `a / b` and `a % b` on two `Number`s, and
+    // `&`, `|`, `^`, `<<` and `>>` on two whole ones, as on 65-bit two's
+    // complement integers.
+    function numberArithmetic(borrow mut self, arithmetic: ArithmeticOperator, operands: Operands, span: Span) -> Int {
+        if typeOf(operands.left).isSizedNumber() { return sizedArithmetic(arithmetic, operands, span) }
+        var operation = -1
+        match arithmetic {
+            Add -> operation = numberAdd()
+            Subtract -> operation = numberSubtract()
+            Multiply -> operation = numberMultiply()
+            Divide -> operation = numberDivide()
+            Remainder -> operation = numberRemainder()
+            ShiftLeft -> operation = numberShiftLeft()
+            ShiftRight -> operation = numberShiftRight()
+            BitAnd -> operation = numberAnd()
+            BitOr -> operation = numberOr()
+            BitXor -> operation = numberXor()
+        }
+        if operation < 0 {
+            report(.OperatorOperand, program.expressions[operands.left].span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let code = add(.Integer(operation), Type.int(), span)
+        return numberCall(0, [code, operands.left, operands.right], typeOf(operands.left), span)
+    }
+
+    // A signed number negates to its own type; an unsigned one has no
+    // negative values, so its negation is a `Number`.
+    function numberNegation(borrow mut self, operand: Int, span: Span) -> Int {
+        let operandType = typeOf(operand)
+        if operandType.signed { return numberCall(8, [operand], operandType, span) }
+        return numberCall(8, [operand], Type.number(), span)
+    }
+
+    // `~n` on a whole `Number`.
+    function numberComplement(borrow mut self, operand: Int, span: Span) -> Int {
+        return numberCall(9, [operand], typeOf(operand), span)
+    }
+
+    // A hexadecimal literal written where a `Number` is expected names the
+    // 64 bits a `U64` holds: `0xffffffffffffffff` is that `U64`'s largest.
+    function numberBitsLiteral(borrow mut self, bits: Int, span: Span) -> Int {
+        if bits < 0 { return numberValue(bits, 256, span) }
+        return numberValue(bits, 0, span)
+    }
+
+    // Equal words are equal values; an ordering aligns the scales.
+    function numberComparison(borrow mut self, comparison: Comparison, operands: Operands, span: Span) -> Int {
+        if comparison == .Equal || comparison == .NotEqual || typeOf(operands.left).isSizedNumber() {
+            return add(.Compare(comparison, operands.left, operands.right), Type.boolean(), span)
+        }
+        let order = numberCall(1, [operands.left, operands.right], Type.int(), span)
+        return add(.Compare(comparison, order, add(.Integer(0), Type.int(), span)), Type.boolean(), span)
+    }
+
+    // `Number(x)` from an `Int`, a `Float` or a `String`.
+    function toNumber(borrow mut self, argument: Int, span: Span) -> Int {
+        var value = expression(argument, .Some(Type.number()))
+        var source = typeOf(value)
+        // A distinct value converts from its representation, as it does to
+        // an integer width.
+        if isDistinctType(program, source) {
+            source = program.structs[source.declaration].fields[0].valueType
+            value = add(.Member(value, 0), source, span)
+        }
+        if source.isSizedNumber() { return numberFromSized(value, span) }
+        if source.isInvalid() || source.kind == .Decimal { return value }
+        if source.isInteger() && !source.signed && source.bits == 64 { return numberCall(10, [value], Type.number(), span) }
+        if source.isInteger() { return numberCall(2, [coerce(value, Type.int(), .ArgumentTypeMismatch)], Type.number(), span) }
+        if source.kind == .Floating { return numberCall(4, [coerce(value, Type.floating(64), .ArgumentTypeMismatch)], Type.number(), span) }
+        if isStringType(program, source) { return numberCall(6, [value], Type.number(), span) }
+        report(.ConversionArguments, span)
+        return add(.Integer(0), Type.invalid(), span)
+    }
+
+    // `Int(n)` truncates toward zero and `Float(n)` takes the nearest float.
+    // A sized value is already an integer, and converts as one.
+    function fromNumber(borrow mut self, value: Int, target: Type, span: Span) -> Int {
+        if typeOf(value).isSizedNumber() { return add(.Convert(value), target, span) }
+        if target.kind == .Floating {
+            let float = numberCall(5, [value], Type.floating(64), span)
+            if target.bits == 64 { return float }
+            return add(.Convert(float), target, span)
+        }
+        if target.isInteger() && !target.signed && target.bits == 64 {
+            let unsigned = numberCall(11, [value], Type.integer(64, false), span)
+            if target.equals(Type.integer(64, false)) { return unsigned }
+            return add(.Convert(unsigned), target, span)
+        }
+        let integer = numberCall(3, [value], Type.int(), span)
+        if target.isInt() { return integer }
+        return add(.Convert(integer), target, span)
+    }
+
+    function numberText(borrow mut self, value: Int, stringType: Type, span: Span) -> Int {
+        return numberCall(7, [asNumber(value)], stringType, span)
+    }
+}
+
+// The whole number `Number(<integer literal>)` writes, looking through the
+// expansion `klist!` leaves, so `U32(klist!(...))` in a release build is that
+// integer, range-checked, with no `Number` made at run time.
+function numberConstantSyntax(tree: SyntaxTree, index: Int) -> Optional<Int> {
+    match tree.expressions[index].kind {
+        Quote -> return .None
+        IntegerLiteral(value, hexadecimal) -> {
+            // Past `Int`'s largest the bits are a `U64`'s, which only a
+            // conversion at run time reads as one.
+            if hexadecimal && value < 0 { return .None }
+            return .Some(value)
+        }
+        FloatLiteral -> return .None
+        BooleanLiteral -> return .None
+        StringLiteral -> return .None
+        ArrayLiteral -> return .None
+        Index -> return .None
+        Transfer -> return .None
+        Labelled -> return .None
+        TypeQuery -> return .None
+        Name -> return .None
+        Member -> return .None
+        ExpandedMacro(body, value) -> {
+            if body.count != 0 { return .None }
+            match value {
+                Some(result) -> return numberConstantSyntax(tree, result)
+                None -> return .None
+            }
+        }
+        MacroCall -> return .None
+        Call(callee, arguments) -> {
+            if callee.text != "Number" || arguments.count != 1 { return .None }
+            return numberConstantSyntax(tree, arguments[0])
+        }
+        GenericCall -> return .None
+        MethodCall -> return .None
+        IndirectCall -> return .None
+        Lambda -> return .None
+        KeyPath -> return .None
+        Task -> return .None
+        Try -> return .None
+        Variant -> return .None
+        StructLiteral -> return .None
+        Unary -> return .None
+        Binary -> return .None
+        Conditional -> return .None
+        MatchValue -> return .None
+        Content -> return .None
+    }
+}
+
+extend Checker {
+    // An array's or a string's `count` is a quantity, so a program reads it as
+    // a `Number`. Foundation and Heap, which lay those buffers out, keep the
+    // stored `Int` they do their memory arithmetic in.
+    function countedAsNumber(borrow self, owner: StructType, field: String, span: Span) -> Bool {
+        if field != "count" { return false }
+        if owner.name.text != "String" && owner.genericBase != "Array" { return false }
+        for source in tree.sources {
+            if source.file == span.file {
+                let module = tree.modules[source.module]
+                return !(module.library && (module.name == "Foundation" || module.name == "Heap"))
+            }
+        }
+        return true
+    }
+}
+
+// A decimal a whole integer literal became, and the word it was written as.
+struct WholeLiteral {
+    let expression: Int
+    let word: Int
+}

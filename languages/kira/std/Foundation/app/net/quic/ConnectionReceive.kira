@@ -1,0 +1,301 @@
+// Datagrams in: coalesced packets cut apart, opened at their level, and
+// their frames applied. A packet that cannot be read is dropped; a frame
+// that breaks the protocol closes the connection.
+
+extend QuicConnection {
+    function receive(borrow mut self, datagram: borrow [UN8], now: QuicInstant) {
+        if state == .Closed || state == .Draining { return }
+        bytesReceived += datagram.count
+        var at = 0
+        while at < datagram.count {
+            let raw = match quicReadHeader(datagram, at, localId.count) {
+                Ok(value) -> value
+                // Nothing after a header that does not parse can be found.
+                Error(drop) -> {
+                    absorb drop
+                    return
+                }
+            }
+            at = raw.end
+            if raw.retry {
+                takeRetry(datagram, raw)
+                return
+            }
+            takePacket(datagram, raw, now)
+            if state == .Closed { return }
+        }
+    }
+
+    function openingKeys(borrow self, level: TlsEncryptionLevel) -> TlsTrafficKeys? {
+        return match keys(level) {
+            Some(both) -> .Some(both.open)
+            None -> .None
+        }
+    }
+
+    function takePacket(
+        borrow mut self,
+        datagram: borrow [UN8],
+        raw: borrow QuicRawHeader,
+        now: QuicInstant
+    ) {
+        if raw.destination != localId && !(
+            role == .Server && raw.destination == originalDestination
+        ) { return }
+        let opening = match openingKeys(raw.level) {
+            Some(value) -> value
+            None -> return
+        }
+        let largest = recovery.space(raw.level).largestReceived
+        let packet = match openApplication(datagram, raw, opening, move largest) {
+            Some(value) -> value
+            None -> {
+                if raw.level == .Application {
+                    // Whether it was a reset, the datagram is done with.
+                    let _ = takeStatelessReset(datagram, now)
+                }
+                return
+            }
+        }
+        if recovery.space(raw.level).received.contains(packet.number) { return }
+        if state == .Closing {
+            // A closing endpoint answers with its CONNECTION_CLOSE again.
+            closeSent = false
+            return
+        }
+        if packet.reservedSet { return fail(.ProtocolViolation) }
+        lastActivity = now
+        // The first server Initial names the ID the client sends to from
+        // now on (RFC 9000 section 7.2).
+        if role == .Client && raw.level == .Initial && recovery.space(
+            .Initial
+        ).largestReceived.isNone() {
+            peerId = copy raw.source
+        }
+        // A Handshake packet from the client proves its address, and both
+        // sides then drop the Initial keys (RFC 9001 section 4.9.1).
+        if raw.level == .Handshake {
+            addressValidated = true
+            if role == .Server { dropInitial() }
+        }
+        match takeFrames(raw.level, packet, now) {
+            Ok -> {}
+            Error(failure) -> return fail(failure)
+        }
+    }
+
+    // A packet opened; a 1-RTT packet in the other key phase is tried with
+    // the next keys, and when they open it this side moves to them too
+    // (RFC 9001 section 6.2).
+    function openApplication(
+        borrow mut self,
+        datagram: borrow [UN8],
+        raw: borrow QuicRawHeader,
+        opening: borrow TlsTrafficKeys,
+        largest: Number?
+    ) -> QuicIncomingPacket? {
+        match quicOpenPacket(datagram, raw, opening, copy largest) {
+            Ok(packet) -> {
+                if raw.level != .Application || packet.keyPhase == keyPhase { return .Some(packet) }
+                // The current keys opened a packet of the other phase: it
+                // cannot be, so it is dropped.
+                return .None
+            }
+            Error(drop) -> {
+                absorb drop
+                if raw.level != .Application { return .None }
+                return openNextPhase(datagram, raw, move largest)
+            }
+        }
+    }
+
+    function openNextPhase(
+        borrow mut self,
+        datagram: borrow [UN8],
+        raw: borrow QuicRawHeader,
+        largest: Number?
+    ) -> QuicIncomingPacket? {
+        let secrets = match phaseSecrets {
+            Some(value) -> value
+            None -> return .None
+        }
+        if !handshakeConfirmed { return .None }
+        let nextOpening = try tlsUpdatedSecret(
+            secrets.parameters,
+            secrets.opening,
+            .Quic
+        ) otherwise return .None
+        let nextSealing = try tlsUpdatedSecret(
+            secrets.parameters,
+            secrets.sealing,
+            .Quic
+        ) otherwise return .None
+        let open = try tlsTrafficKeys(secrets.parameters, nextOpening, .Quic) otherwise return .None
+        let seal = try tlsTrafficKeys(secrets.parameters, nextSealing, .Quic) otherwise return .None
+        let packet = try quicOpenPacket(datagram, raw, open, move largest) otherwise return .None
+        if packet.keyPhase == keyPhase { return .None }
+        // Header protection keys do not change in an update.
+        let current = match applicationKeys {
+            Some(value) -> value
+            None -> return .None
+        }
+        applicationKeys = .Some(
+            QuicLevelKeys {
+                seal: TlsTrafficKeys {
+                    key: seal.key,
+                    iv: seal.iv,
+                    header: copy current.seal.header
+                },
+                open: TlsTrafficKeys {
+                    key: open.key,
+                    iv: open.iv,
+                    header: copy current.open.header
+                }
+            }
+        )
+        phaseSecrets = .Some(
+            QuicPhaseSecrets {
+                parameters: copy secrets.parameters,
+                sealing: nextSealing,
+                opening: nextOpening
+            }
+        )
+        keyPhase = packet.keyPhase
+        return .Some(packet)
+    }
+
+    function takeFrames(
+        borrow mut self,
+        level: TlsEncryptionLevel,
+        packet: borrow QuicIncomingPacket,
+        now: QuicInstant
+    ) -> Result<Void, QuicTransportError> {
+        let frames = try quicDecodeFrames(packet.payload)
+        var eliciting = false
+        for frame in frames {
+            if level != .Application && !quicAllowedDuringHandshake(frame) {
+                return .Error(.ProtocolViolation)
+            }
+            if quicElicitsAck(frame) { eliciting = true }
+            try takeFrame(level, frame, now)
+            if state == .Draining || state == .Closed { return .Ok }
+        }
+        var space = recovery.space(level)
+        space.noteReceived(packet.number, now)
+        if eliciting {
+            space.received.elicitingUnacknowledged += 1
+            // Handshake levels and every second packet are acknowledged at
+            // once; otherwise within max_ack_delay (RFC 9000 section 13.2.1).
+            if level != .Application || space.received.elicitingUnacknowledged >= QuicAckPolicy.elicitingBeforeAck {
+                space.received.ackDue = true
+            } else {
+                ackDeadline = quicEarliest(
+                    ackDeadline,
+                    .Some(now.plus(Number(limits.maxAckDelayMilliseconds) * QuicTime.millisecond))
+                )
+            }
+        }
+        recovery.store(level, move space)
+        return .Ok
+    }
+
+    function takeFrame(
+        borrow mut self,
+        level: TlsEncryptionLevel,
+        frame: borrow QuicFrame,
+        now: QuicInstant
+    ) -> Result<Void, QuicTransportError> {
+        match frame {
+            Padding -> {}
+            Ping -> {}
+            Ack(ack) -> try takeAck(level, ack, now)
+            Crypto(crypto) -> try takeCrypto(level, crypto, now)
+            Stream(stream) -> try takeStream(stream)
+            ResetStream(reset) -> try takeReset(reset)
+            StopSending(stop) -> try takeStop(stop)
+            MaxData(maximum) -> sendLimit = max(sendLimit, maximum)
+            MaxStreamData(credit) -> try takeCredit(credit)
+            MaxStreams(count) -> takeStreamCount(count)
+            DataBlocked(_) -> {}
+            StreamDataBlocked(_) -> {}
+            StreamsBlocked(_) -> {}
+            // One connection ID each way is used for now; further ones are
+            // not needed until migration.
+            NewConnectionId(_) -> {}
+            RetireConnectionId(_) -> {}
+            NewToken(_) -> if role == .Server { return .Error(.ProtocolViolation) }
+            PathChallenge(data) -> control.append(.PathResponse(copy data))
+            PathResponse(_) -> {}
+            Close(close) -> takeClose(close, now)
+            HandshakeDone -> {
+                if role == .Server { return .Error(.ProtocolViolation) }
+                confirmHandshake()
+            }
+            Datagram(data) -> {
+                if limits.maxDatagramFrame == 0 { return .Error(.ProtocolViolation) }
+                events.append(.Datagram(copy data))
+            }
+        }
+        return .Ok
+    }
+
+    function takeAck(
+        borrow mut self,
+        level: TlsEncryptionLevel,
+        ack: borrow QuicAckFrame,
+        now: QuicInstant
+    ) -> Result<Void, QuicTransportError> {
+        let outcome = try recovery.onAck(level, ack, now)
+        for packet in outcome.acknowledged { acknowledged(packet.frames) }
+        for packet in outcome.lost { requeue(level, packet.frames) }
+        return .Ok
+    }
+
+    // A short packet that does not open and ends in the server's stateless
+    // reset token says the server lost the connection (RFC 9000 section
+    // 10.3.1).
+    // Whether it was one.
+    function takeStatelessReset(borrow mut self, datagram: borrow [UN8], now: QuicInstant) -> Bool {
+        if role != .Client || state == .Draining || state == .Closed { return false }
+        let parameters = match peerParameters {
+            Some(value) -> value
+            None -> return false
+        }
+        let token = match parameters.statelessResetToken {
+            Some(value) -> value
+            None -> return false
+        }
+        if datagram.count < Quic.smallestReset { return false }
+        let tail = byteRun(datagram, datagram.count - token.count, datagram.count)
+        if !tlsFinishedMatches(tail, token) { return false }
+        state = .Draining
+        lingerFrom(now)
+        events.append(
+            .Closed(
+                QuicConnectionEnd {
+                    application: false,
+                    error: 0,
+                    reason: "stateless reset",
+                    byPeer: true
+                }
+            )
+        )
+        return true
+    }
+
+    function takeClose(borrow mut self, close: borrow QuicCloseFrame, now: QuicInstant) {
+        let reason = match textFromBytes(close.reason) {
+            Some(text) -> text
+            None -> ""
+        }
+        let end = QuicConnectionEnd {
+            application: close.application,
+            error: close.error,
+            reason: reason,
+            byPeer: true
+        }
+        if state != .Closing { events.append(.Closed(end)) }
+        state = .Draining
+        lingerFrom(now)
+    }
+}

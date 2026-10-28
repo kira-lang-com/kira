@@ -1,0 +1,89 @@
+extend Parser {
+    function lambdaAhead(borrow self) -> Bool {
+        if !at(.LeftBrace) { return false }
+        if peek(1).kind == .In { return true }
+        if peek(1).kind != .Identifier { return false }
+        let second = peek(2).kind
+        if second != .In && second != .Comma && second != .Colon { return false }
+        for index in position + 1..tokens.count {
+            let kind = tokens[index].kind
+            if kind == .In { return true }
+            if kind == .LeftBrace || kind == .RightBrace || kind == .Return || kind == .Let || kind == .Var || kind == .Equals || kind == .IntegerLiteral || kind == .StringLiteral || kind == .End { return false }
+        }
+        return false
+    }
+
+    function lambdaLiteral(borrow mut self) -> Result<Int, Failure> {
+        let start = try expect(.LeftBrace)
+        var parameters: [Identifier] = []
+        var annotations: [Optional<TypeReference>] = []
+        while !at(.In) {
+            parameters.append(macroName(try identifier(.ExpectedParameterName)))
+            var annotation: Optional<TypeReference> = .None
+            if eat(.Colon) { annotation = .Some(try typeReference()) }
+            annotations.append(annotation)
+            if !eat(.Comma) { break }
+        }
+        try expect(.In)
+        var body: [Int] = []
+        while !at(.RightBrace) && !at(.End) {
+            for entry in try statements() { body.append(entry) }
+        }
+        try expect(.RightBrace)
+        let span = spanFrom(start.span)
+        return .Ok(tree.addExpression(.Lambda(LambdaDeclaration {
+            parameters = parameters, annotations = annotations, body = body, span = span
+        }), span))
+    }
+
+    function attachTrailingLambda(borrow mut self, node: Int, argument: Int, span: Span) -> Int {
+        match tree.expressions[node].kind {
+            Name(name) -> return tree.addExpression(.Call(name, [argument]), span)
+            Member(base, member) -> return tree.addExpression(.MethodCall(base, member, [argument]), span)
+            Call(name, arguments) -> {
+                var values = arguments
+                values.append(argument)
+                return tree.addExpression(.Call(name, values), span)
+            }
+            GenericCall(name, types, arguments) -> {
+                var values = arguments
+                values.append(argument)
+                return tree.addExpression(.GenericCall(name, types, values), span)
+            }
+            MethodCall(base, member, arguments) -> {
+                var values = arguments
+                values.append(argument)
+                return tree.addExpression(.MethodCall(base, member, values), span)
+            }
+            IndirectCall(base, arguments) -> {
+                var values = arguments
+                values.append(argument)
+                return tree.addExpression(.IndirectCall(base, values), span)
+            }
+            IntegerLiteral -> {}
+            FloatLiteral -> {}
+            BooleanLiteral -> {}
+            StringLiteral -> {}
+            ArrayLiteral -> {}
+            Index -> {}
+            Transfer -> {}
+            Labelled -> {}
+            TypeQuery -> {}
+            Lambda -> {}
+            KeyPath -> {}
+            Task -> {}
+            ExpandedMacro -> {}
+            Quote -> {}
+            MacroCall -> {}
+            Try -> {}
+            Variant -> {}
+            StructLiteral -> {}
+            Unary -> {}
+            Binary -> {}
+            Conditional -> {}
+            MatchValue -> {}
+            Content -> {}
+        }
+        return tree.addExpression(.IndirectCall(node, [argument]), span)
+    }
+}

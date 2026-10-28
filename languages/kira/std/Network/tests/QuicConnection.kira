@@ -1,0 +1,201 @@
+import Foundation
+
+// A client and a server connection talking through memory, on a clock the
+// test moves itself.
+
+namespace TestClock {
+    // How far the clock moves between exchanges.
+    let step: Number = 1000
+    let rounds: Number = 40
+    // Past any linger the default RTT estimate allows.
+    let lingerEnd: Number = 10000000
+}
+
+function testQuicServer(first: borrow [UN8], now: QuicInstant) -> Result<QuicConnection, String> {
+    let key = try loadSigningKey(QuicTestPki.leafKey) otherwise return .Error("key")
+    let identity = TlsServerIdentity {
+        certificates: [QuicTestPki.leaf],
+        key: key,
+        scheme: .EcdsaSecp256r1Sha256
+    }
+    let raw = try quicReadHeader(first, 0, Quic.connectionIdBytes) otherwise return .Error("header")
+    let settings = QuicServerSettings { identity: identity, protocols: ["h3"] }
+    let local = try quicFreshConnectionId() otherwise return .Error("id")
+    let start = QuicServerStart {
+        first: raw,
+        local: local,
+        resetToken: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    }
+    let server = try quicServer(move settings, start, now) otherwise return .Error("server")
+    return .Ok(server)
+}
+
+function testQuicClient(now: QuicInstant) -> Result<QuicConnection, String> {
+    let settings = QuicClientSettings {
+        serverName: "localhost",
+        protocols: ["h3"],
+        seconds: QuicTestPki.seconds,
+        anchors: NetworkTesting.anchors()
+    }
+    let client = try quicClient(move settings, now) otherwise return .Error("client")
+    return .Ok(client)
+}
+
+// A pair of connections, the clock, and what each side reported.
+struct QuicPair {
+    var client: QuicConnection
+    var server: QuicConnection
+    var now: QuicInstant
+    var notes: [String] = []
+
+    // Datagrams both ways until neither side has any, then events noted.
+    function exchange(borrow mut self) {
+        for _ in 0..TestClock.rounds {
+            let fromClient = deliver(client, server, now)
+            let fromServer = deliver(server, client, now)
+            now = now.plus(TestClock.step)
+            if !fromClient && !fromServer { break }
+        }
+        note("client", client)
+        note("server", server)
+    }
+
+    function note(borrow mut self, side: String, connection: borrow mut QuicConnection) {
+        while true {
+            let next = connection.event()
+            let event = match next {
+                Some(value) -> value
+                None -> return
+            }
+            notes.append("\(side) \(describe(event))")
+        }
+    }
+}
+
+// Every datagram `from` has now goes to `to`; whether there was one.
+function deliver(
+    from: borrow mut QuicConnection,
+    to: borrow mut QuicConnection,
+    now: QuicInstant
+) -> Bool {
+    var any = false
+    while true {
+        let next = from.transmit(now)
+        let datagram = match next {
+            Some(value) -> value
+            None -> return any
+        }
+        any = true
+        to.receive(datagram, now)
+    }
+    return any
+}
+
+function describe(event: borrow QuicEvent) -> String {
+    return match event {
+        Connected(agreement) -> "connected \(traceText(agreement.applicationProtocol))"
+        StreamOpened(id) -> "opened \(id.raw)"
+        StreamReadable(id) -> "readable \(id.raw)"
+        StreamReset(failure) -> "reset \(failure.error)"
+        StreamStopped(failure) -> "stopped \(failure.error)"
+        Datagram(data) -> "datagram \(data.count)"
+        Closed(end) -> "closed \(end.error) \(end.reason) \(end.byPeer)"
+    }
+}
+
+function quicPair() -> Result<QuicPair, String> {
+    let start = QuicInstant(0)
+    var client = try testQuicClient(start)
+    let first = match client.transmit(start) {
+        Some(value) -> value
+        None -> return .Error("no first datagram")
+    }
+    if first.count < Quic.minimumDatagram { return .Error("short first datagram") }
+    var server = try testQuicServer(first, start)
+    server.receive(first, start)
+    return .Ok(QuicPair { client: client, server: server, now: start })
+}
+
+function readAll(connection: borrow mut QuicConnection, id: QuicStreamNumber) -> String {
+    let result = match connection.read(id) {
+        Ok(value) -> value
+        Error(problem) -> return traceText(problem)
+    }
+    let text = match textFromBytes(result.data) {
+        Some(value) -> value
+        None -> "?"
+    }
+    return "\(text) \(result.finished)"
+}
+
+function streamRoundTrip(pair: borrow mut QuicPair) -> String {
+    let id = match pair.client.openStream(.Bidirectional) {
+        Ok(value) -> value
+        Error(problem) -> return traceText(problem)
+    }
+    absorb pair.client.write(id, "hello".utf8(), true)
+    pair.exchange()
+    let request = readAll(pair.server, id)
+    absorb pair.server.write(id, "world".utf8(), true)
+    pair.exchange()
+    let response = readAll(pair.client, id)
+    return "\(request) / \(response)"
+}
+
+@Test
+function quicConnectionCarriesAStream() {
+    let expected: String = "client connected Some(\"h3\"); server connected Some(\"h3\"); server opened 0; server readable 0; client readable 0; client closed 0 done false; server closed 0 done true | hello true / world true | QuicConnectionState.Closing QuicConnectionState.Draining true true"
+    var pair = match quicPair() {
+        Ok(value) -> value
+        Error(text) -> {
+            expect!((text) == expected)
+            return
+        }
+    }
+    pair.exchange()
+    let streams = streamRoundTrip(pair)
+    pair.client.close(0, "done", true)
+    pair.exchange()
+    let lingering = "\(traceText(pair.client.state)) \(traceText(pair.server.state))"
+    // Both sides are gone once three probe timeouts have passed.
+    let later = pair.now.plus(TestClock.lingerEnd)
+    pair.client.expire(later)
+    pair.server.expire(later)
+    let ends = "\(lingering) \(pair.client.isClosed()) \(pair.server.isClosed())"
+    expect!((joined(pair.notes, "; ")) == ("client connected Some(\"h3\"); server connected Some(\"h3\"); server opened 0; server readable 0; client readable 0; client closed 0 done false; server closed 0 done true"))
+    expect!((streams) == ("hello true / world true"))
+    expect!((ends) == ("QuicConnectionState.Closing QuicConnectionState.Draining true true"))
+}
+
+
+// A reset that keeps its first bytes: the server reads them, then hears
+// the reset; the bytes past them never arrive.
+@Test
+function quicResetDeliversItsReliableBytes() {
+    let expected: String = "Ok header false | server opened 0; server readable 0; server reset 7"
+    var pair = match quicPair() {
+        Ok(value) -> value
+        Error(text) -> {
+            expect!((text) == expected)
+            return
+        }
+    }
+    pair.exchange()
+    pair.notes = []
+    let id = match pair.client.openStream(.Bidirectional) {
+        Ok(value) -> value
+        Error(problem) -> {
+            expect!((traceText(problem)) == expected)
+            return
+        }
+    }
+    absorb pair.client.write(id, "headerpayload".utf8(), false)
+    let reset = pair.client.resetStreamAt(id, 7, 6)
+    pair.exchange()
+    let read = readAll(pair.server, id)
+    pair.exchange()
+    expect!((traceText(reset)) == ("Ok"))
+    expect!((read) == ("header false"))
+    expect!((joined(pair.notes, "; ")) == ("server opened 0; server readable 0; server reset 7"))
+}
+

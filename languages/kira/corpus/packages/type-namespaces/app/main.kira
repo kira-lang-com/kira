@@ -1,0 +1,27 @@
+import Foundation
+
+// The package's own `Point` shadows Foundation's. Foundation's own code,
+// such as `Rect.contains`, still means its own, and `Foundation.Point`
+// names it here.
+struct Point {
+    let x: Int
+    let y: Int
+}
+
+function width(point: Foundation.Point) -> Float {
+    return point.x
+}
+
+// An own function also shadows Foundation's function of the same signature.
+function freeBytes(pointer: RawPtr) -> Int { return 42 }
+
+@Main
+function main() -> Int {
+    if freeBytes(RawPtr(0)) != 42 { return 0 }
+    let mine = Point(x: 3, y: 4)
+    let area = Rect(x: 0.0, y: 0.0, width: 2.0, height: 5.0)
+    var score = mine.x * 10 + mine.y + Int(area.maxY())
+    let own: Any = mine
+    if own is Point { score = score + 100 }
+    return score
+}

@@ -1,0 +1,36 @@
+// A value where an optional is wanted becomes that optional holding it, as
+// Swift promotes `x` to `x?`: an argument, a binding, a field and a returned
+// value alike. `.None` stays the way to say there is none.
+
+import Foundation
+
+struct Settings {
+    var width: Int? = .None
+    var title: String? = .None
+}
+
+function widthOr(width: Int?, fallback: Int) -> Int {
+    match width {
+        Some(value) -> return value
+        None -> return fallback
+    }
+}
+
+function found(key: String) -> String? {
+    if key == "a" { return "apple" }
+    return .None
+}
+
+@Main
+function main() -> Int {
+    if widthOr(7, 0) != 7 { return 1 }
+    if widthOr(.None, 3) != 3 { return 2 }
+    let named: String? = "kira"
+    if named != .Some("kira") { return 3 }
+    var settings = Settings { width: 12 }
+    if widthOr(settings.width, 0) != 12 { return 4 }
+    settings.title = "Table"
+    if settings.title != .Some("Table") { return 5 }
+    if found("a") != .Some("apple") || found("b").isSome() { return 6 }
+    return 42
+}

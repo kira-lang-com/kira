@@ -1,0 +1,48 @@
+// An owned `@FFI.Pointer`: C hands the handle over, and dropping it calls
+// the function its `free:` names, once.
+
+@FFI.Struct { layout: c }
+struct SeamBox {
+    let value: I32
+    let live: I32
+}
+
+@FFI.Pointer { target: SeamBox, ownership: owned, free: boxFree }
+struct SeamBoxPtr {}
+
+@FFI.Extern { library: klfseam, symbol: seam_box_new, abi: c }
+function boxNew(value: I32) -> SeamBoxPtr
+
+@FFI.Extern { library: klfseam, symbol: seam_box_value, abi: c }
+function boxValue(box: borrow SeamBoxPtr) -> I32
+
+@FFI.Extern { library: klfseam, symbol: seam_box_free, abi: c }
+function boxFree(box: RawPtr)
+
+@FFI.Extern { library: klfseam, symbol: seam_box_frees, abi: c }
+function boxFrees() -> I32
+
+@FFI.Extern { library: klfseam, symbol: seam_box_live, abi: c }
+function boxLive() -> I32
+
+function scoped() -> I32 {
+    let first = boxNew(4)
+    let second = boxNew(5)
+    return boxValue(first) + boxValue(second)
+}
+
+function consume(box: SeamBoxPtr) -> I32 {
+    return box.value
+}
+
+@Main
+function main() {
+    print(scoped())
+    print(boxFrees())
+    let kept = boxNew(6)
+    print(boxLive())
+    print(consume(move kept))
+    print(boxFrees())
+    print(boxLive())
+    return
+}

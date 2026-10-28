@@ -1,0 +1,39 @@
+// Reads find a program's bundled assets the way Kira's runtime finds them. A
+// build stages each package's declared `assets` under
+// `.kira-build/<package>.klbundle/resources/<declared path>`, so a program asks
+// for `Resources/Default.kcui` by the path its author declared and finds it
+// even when the file ships inside a library's bundle.
+//
+// An installed program has no build directory beside it, and a service is
+// started from `/`, not from its source tree. A system that installs a library
+// installs its assets in that library's framework,
+// `/System/Library/Frameworks/<package>.framework/<declared path>`, as Apple
+// does, so the same declared path is looked for there after the build's
+// bundles.
+//
+// Only a relative path with nothing at it in the working directory is
+// redirected, and only to a bundle entry that exists: a real file wins, an
+// absolute path is never rewritten, and a path that is nowhere reads as itself.
+function bundledReadPath(path: borrow String) -> String {
+    if path.count == 0 || path.startsWith("/") || pathExists(path) { return path }
+    let bundles = ".kira-build"
+    for entry in directoryEntries(bundles) {
+        if entry.endsWith(".klbundle") {
+            let candidate = bundles + "/" + entry + "/resources/" + path
+            if pathExists(candidate) { return candidate }
+        }
+    }
+    let frameworks = Bundles.installedFrameworks
+    for entry in directoryEntries(frameworks) {
+        if entry.endsWith(".framework") {
+            let candidate = frameworks + "/" + entry + "/" + path
+            if pathExists(candidate) { return candidate }
+        }
+    }
+    return path
+}
+
+namespace Bundles {
+    // Where an installed library's framework, and so its assets, lives.
+    let installedFrameworks: String = "/System/Library/Frameworks"
+}

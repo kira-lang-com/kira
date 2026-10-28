@@ -1,0 +1,234 @@
+import Foundation
+
+// The server side of the driver (DESIGN.md section 8.3): one address served
+// over QUIC on UDP and over TLS on TCP, each request handed over whole as
+// `Incoming`, and the answer written back through `respond`, `write` and
+// `finish`. Routing belongs to the program.
+
+extend Network {
+    function serve(borrow mut self, serving: borrow ServeOptions) -> Result<ServerId, NetFailure> {
+        let quic = serving.protocols.contains(.Http3)
+        let tcp = serving.protocols.contains(.Http1)
+        if !quic && !tcp { return .Error(.InvalidAddress) }
+        let id = ServerId(takeToken())
+        var address = copy serving.address
+        var altService: String? = .None
+        if quic {
+            let settings = QuicEndpointSettings {
+                server: .Some(
+                    QuicServerSettings {
+                        identity: copy serving.identity,
+                        protocols: [DriverLimit.alpn],
+                        limits: copy options.quic
+                    }
+                )
+            }
+            let slot = try openSlot(serving.address, move settings, .Some(id))
+            // TCP takes the port UDP got, so one address serves both.
+            address = try slots[slot].socket.localAddress()
+            let parts = address.split(":")
+            altService = .Some("\(DriverLimit.alpn)=\":\(parts[parts.count - 1])\"")
+        }
+        if tcp {
+            let listener = try listenTcp(address, LinkLimit.backlog)
+            let token = takeToken()
+            try poller.watch(listener.handle, .Readable, token)
+            listeners.append(
+                TcpListening {
+                    socket: listener,
+                    token: token,
+                    server: id,
+                    identity: copy serving.identity,
+                    altService: altService
+                }
+            )
+        }
+        return .Ok(id)
+    }
+
+    // The address `server` listens on, with the port the kernel chose when
+    // it was asked for any.
+    function address(borrow self, server: ServerId) -> Result<String, NetFailure> {
+        for slot in slots {
+            if slot.server == .Some(server) { return slot.socket.localAddress() }
+        }
+        for listener in listeners {
+            if listener.server == server { return listener.socket.localAddress() }
+        }
+        return .Error(.InvalidHandle)
+    }
+
+    // Sessions for the connections clients opened to slot `slot`.
+    function acceptSessions(borrow mut self, slot: Number, server: ServerId) {
+        absorb server
+        while true {
+            let next = slots[slot].endpoint.accept()
+            let handle = match next {
+                Some(value) -> value
+                None -> return
+            }
+            let peer = match slots[slot].endpoint.index(handle) {
+                Some(index) -> copy slots[slot].endpoint.connections[index].peer
+                None -> continue
+            }
+            let key = takeToken()
+            sessions.append(
+                SessionEntry {
+                    id: key,
+                    slot: slot,
+                    handle: handle,
+                    origin: "",
+                    peer: peer,
+                    http: http3Session(.Server)
+                }
+            )
+        }
+    }
+
+    // The response's head; an informational status may come first.
+    function respond(
+        borrow mut self,
+        id: RequestId,
+        head: borrow ResponseHead
+    ) -> Result<Void, HttpFailure> {
+        let index = try servedRequest(id)
+        match linkIndex(served[index].session) {
+            Some(link) -> return respondOnLink(link, index, head)
+            None -> {}
+        }
+        let place = try servedPlace(index)
+        let sent = sessions[place.session].http.respond(
+            slots[place.slot].endpoint.connections[place.connection].connection,
+            served[index].stream,
+            head
+        )
+        return problemFailure(sent)
+    }
+
+    function write(
+        borrow mut self,
+        id: RequestId,
+        bytes: borrow [UN8]
+    ) -> Result<Void, HttpFailure> {
+        let index = try servedRequest(id)
+        if served[index].bodiless || bytes.count == 0 { return .Ok }
+        match linkIndex(served[index].session) {
+            Some(link) -> return sendOnLink(link, http1Chunk(bytes))
+            None -> {}
+        }
+        let place = try servedPlace(index)
+        let sent = sessions[place.session].http.sendData(
+            slots[place.slot].endpoint.connections[place.connection].connection,
+            served[index].stream,
+            bytes,
+            false
+        )
+        return problemFailure(sent)
+    }
+
+    // Ends the response, with trailers when there are any.
+    function finish(
+        borrow mut self,
+        id: RequestId,
+        trailers: borrow Fields
+    ) -> Result<Void, HttpFailure> {
+        let index = try servedRequest(id)
+        match linkIndex(served[index].session) {
+            Some(link) -> {
+                let ended = finishOnLink(link, index, trailers)
+                dropServed(index)
+                return ended
+            }
+            None -> {}
+        }
+        let place = try servedPlace(index)
+        let stream = served[index].stream
+        let sent = trailers.entries.count > 0 && !served[index].bodiless ? sessions[place.session].http.sendTrailers(
+            slots[place.slot].endpoint.connections[place.connection].connection,
+            stream,
+            trailers
+        ) : sessions[place.session].http.sendData(
+            slots[place.slot].endpoint.connections[place.connection].connection,
+            stream,
+            [],
+            true
+        )
+        dropServed(index)
+        return problemFailure(sent)
+    }
+
+    // A request the program was given and has not finished.
+    function servedRequest(borrow self, id: RequestId) -> Result<Number, HttpFailure> {
+        for (index, request) in served.enumerated() {
+            if request.id == id && request.received { return .Ok(index) }
+        }
+        return .Error(.Closed)
+    }
+
+    function servedPlace(borrow self, index: Number) -> Result<ServedPlace, HttpFailure> {
+        let session = match sessionIndex(served[index].session) {
+            Some(value) -> value
+            None -> return .Error(.Closed)
+        }
+        let connection = match connectionIndex(session) {
+            Some(value) -> value
+            None -> return .Error(.Closed)
+        }
+        return .Ok(
+            ServedPlace { session: session, slot: sessions[session].slot, connection: connection }
+        )
+    }
+
+    function servedIndex(borrow self, session: Number, stream: QuicStreamNumber) -> Number? {
+        for (index, request) in served.enumerated() {
+            if request.session == session && request.stream == stream { return .Some(index) }
+        }
+        return .None
+    }
+
+    // The request still arriving on `stream` of `session`.
+    function receivingIndex(borrow self, session: Number, stream: QuicStreamNumber) -> Number? {
+        for (index, request) in served.enumerated() {
+            if request.session == session && request.stream == stream && !request.received {
+                return .Some(index)
+            }
+        }
+        return .None
+    }
+
+    function dropServed(borrow mut self, index: Number) {
+        var kept: [ServerRequest] = []
+        for (position, request) in served.enumerated() {
+            if position != index { kept.append(copy request) }
+        }
+        served = kept
+    }
+}
+
+// Where a served request's stream lives.
+struct ServedPlace {
+    let session: Number
+    let slot: Number
+    let connection: Number
+}
+
+function problemFailure(sent: borrow Result<Void, Http3Problem>) -> Result<Void, HttpFailure> {
+    return match sent {
+        Ok -> .Ok
+        Error(problem) -> .Error(http3Failure(problem))
+    }
+}
+
+function http3Failure(problem: borrow Http3Problem) -> HttpFailure {
+    return match problem {
+        Stream(reason) -> match reason {
+            ConnectionClosed -> .Closed
+            Blocked -> .Protocol(code(Http3Error.InternalError))
+            UnknownStream -> .Closed
+            NotWritable -> .Closed
+            NotReadable -> .Protocol(code(Http3Error.InternalError))
+        }
+        Invalid(error) -> .Protocol(code(error))
+        WrongRole -> .Protocol(code(Http3Error.InternalError))
+    }
+}

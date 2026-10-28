@@ -1,0 +1,328 @@
+import Foundation
+
+// HTTP/3 messages on bidirectional streams: HEADERS, DATA, then optional
+// trailing HEADERS (RFC 9114 section 4.1), read as they arrive and written
+// through the session's calls.
+
+// What a stream's incoming message is.
+enum Incoming {
+    Request
+    Response
+}
+
+enum MessageStage {
+    Head
+    Body
+    Trailers
+}
+
+struct MessageStream {
+    let id: QuicStreamNumber
+    let incoming: Incoming
+    var buffer: [UN8] = []
+    // Bytes of the current DATA frame, or of an unknown frame being
+    // skipped, still to come.
+    var dataLeft: Number = 0
+    var skipLeft: Number = 0
+    var stage: MessageStage = .Head
+    var trailers: Fields = Fields {}
+    var expectedLength: Number? = .None
+    var bodyBytes: Number = 0
+    // A frame was read, so WT_STREAM can no longer come.
+    var started: Bool = false
+    // A server's bidirectional stream, which must open with WT_STREAM.
+    let signalOnly: Bool = false
+    // WT_STREAM named this session: the stream leaves for WebTransport.
+    var opening: QuicStreamNumber? = .None
+    // A WebTransport session's CONNECT stream: DATA carries capsules.
+    var capsules: Bool = false
+}
+
+// What reading a stream's bytes came to.
+enum StreamOutcome {
+    Fine
+    // The message is malformed: the stream is reset with this error.
+    StreamError(Http3Error)
+    ConnectionError(Http3Error)
+}
+
+extend Http3Session {
+    function messageIndex(borrow self, id: QuicStreamNumber) -> Number? {
+        for (index, stream) in messages.enumerated() {
+            if stream.id == id { return .Some(index) }
+        }
+        return .None
+    }
+
+    function forgetMessage(borrow mut self, id: QuicStreamNumber) {
+        var kept: [MessageStream] = []
+        for stream in messages {
+            if stream.id != id { kept.append(stream) }
+        }
+        messages = kept
+    }
+
+    function readMessage(borrow mut self, quic: borrow mut QuicConnection, id: QuicStreamNumber) {
+        let index = match messageIndex(id) {
+            Some(value) -> value
+            None -> return
+        }
+        let read = match quic.read(id) {
+            Ok(value) -> value
+            Error(problem) -> {
+                absorb problem
+                return
+            }
+        }
+        var stream = copy messages[index]
+        stream.buffer.appendAll(read.data)
+        var outcome = takeFrames(stream)
+        match stream.opening {
+            Some(session) -> {
+                forgetMessage(id)
+                return adoptStream(quic, id, .Some(session), stream.buffer, read.finished)
+            }
+            None -> {}
+        }
+        if stream.capsules {
+            messages[index] = stream
+            return takeConnectStream(quic, id, outcome, read.finished)
+        }
+        if read.finished {
+            match outcome {
+                Fine -> outcome = finishMessage(stream)
+                StreamError(_) -> {}
+                ConnectionError(_) -> {}
+            }
+        }
+        messages[index] = stream
+        match outcome {
+            Fine -> if read.finished { forgetMessage(id) }
+            StreamError(error) -> {
+                match quic.stopSending(id, code(error)) {
+                    Ok -> {}
+                    Error(failure) -> absorb failure
+                }
+                match quic.resetStream(id, code(error)) {
+                    Ok -> {}
+                    Error(failure) -> absorb failure
+                }
+                forgetMessage(id)
+            }
+            ConnectionError(error) -> fail(quic, error)
+        }
+    }
+
+    function takeFrames(borrow mut self, stream: borrow mut MessageStream) -> StreamOutcome {
+        while stream.buffer.count > 0 {
+            if stream.dataLeft > 0 || stream.skipLeft > 0 {
+                takePayload(stream)
+                continue
+            }
+            let start = match readFrameStart(stream.buffer) {
+                Some(value) -> value
+                None -> return .Fine
+            }
+            // WT_STREAM opens a WebTransport stream, its session in place
+            // of a length (draft-ietf-webtrans-http3 section 4.3).
+            if start.kind == .WtStream {
+                if stream.started || stream.incoming == .Response && !stream.signalOnly {
+                    return .ConnectionError(.FrameError)
+                }
+                stream.opening = .Some(QuicStreamNumber(start.length))
+                stream.buffer = byteRun(stream.buffer, start.payloadAt, stream.buffer.count)
+                return .Fine
+            }
+            if stream.signalOnly { return .ConnectionError(.StreamCreationError) }
+            stream.started = true
+            if !requestFrameAllowed(start.kind) { return .ConnectionError(.FrameUnexpected) }
+            match start.kind {
+                Data -> {
+                    if stream.stage != .Body { return .ConnectionError(.FrameUnexpected) }
+                    stream.dataLeft = start.length
+                    stream.buffer = byteRun(stream.buffer, start.payloadAt, stream.buffer.count)
+                }
+                Headers -> {
+                    if start.length > limits.sectionSize { return .StreamError(.ExcessiveLoad) }
+                    let end = start.payloadAt + start.length
+                    if stream.buffer.count < end { return .Fine }
+                    let section = byteRun(stream.buffer, start.payloadAt, end)
+                    stream.buffer = byteRun(stream.buffer, end, stream.buffer.count)
+                    let outcome = takeHeaders(stream, section)
+                    match outcome {
+                        Fine -> {}
+                        StreamError(_) -> return outcome
+                        ConnectionError(_) -> return outcome
+                    }
+                }
+                // Unknown frame types are skipped (RFC 9114 section 9).
+                else -> {
+                    stream.skipLeft = start.length
+                    stream.buffer = byteRun(stream.buffer, start.payloadAt, stream.buffer.count)
+                }
+            }
+        }
+        return .Fine
+    }
+
+    // As much of the current DATA or skipped frame as has arrived.
+    function takePayload(borrow mut self, stream: borrow mut MessageStream) {
+        let left = stream.dataLeft > 0 ? stream.dataLeft : stream.skipLeft
+        let take = min(left, stream.buffer.count)
+        let bytes = byteRun(stream.buffer, 0, take)
+        stream.buffer = byteRun(stream.buffer, take, stream.buffer.count)
+        if stream.dataLeft > 0 {
+            stream.dataLeft -= take
+            stream.bodyBytes += take
+            if stream.capsules {
+                holdCapsuleBytes(stream.id, bytes)
+            } else {
+                events.append(.Body(StreamBody { stream: stream.id, bytes: bytes }))
+            }
+        } else {
+            stream.skipLeft -= take
+        }
+    }
+
+    function takeHeaders(
+        borrow mut self,
+        stream: borrow mut MessageStream,
+        section: borrow [UN8]
+    ) -> StreamOutcome {
+        let lines = match decodeFieldSection(section, limits) {
+            Ok(value) -> value
+            Error(error) -> {
+                // A section that does not decompress breaks the shared
+                // state, so it ends the connection (RFC 9204 section 2.2).
+                if error == .QpackDecompressionFailed { return .ConnectionError(error) }
+                return .StreamError(error)
+            }
+        }
+        match stream.stage {
+            Head -> return takeHead(stream, lines)
+            Body -> {
+                match parseTrailers(lines) {
+                    Ok(fields) -> stream.trailers = fields
+                    Error(error) -> return .StreamError(error)
+                }
+                stream.stage = .Trailers
+            }
+            Trailers -> return .ConnectionError(.FrameUnexpected)
+        }
+        return .Fine
+    }
+
+    function takeHead(
+        borrow mut self,
+        stream: borrow mut MessageStream,
+        lines: borrow [Field]
+    ) -> StreamOutcome {
+        let head = match stream.incoming {
+            Request -> match parseRequestHead(lines) {
+                Ok(value) -> MessageHead.RequestHead(value)
+                Error(error) -> return .StreamError(error)
+            }
+            Response -> match parseResponseHead(lines) {
+                Ok(value) -> MessageHead.ResponseHead(value)
+                Error(error) -> return .StreamError(error)
+            }
+        }
+        let fields = match head {
+            RequestHead(request) -> copy request.fields
+            ResponseHead(response) -> copy response.fields
+        }
+        stream.expectedLength = declaredLength(fields)
+        // An informational response comes before the final one (RFC 9114
+        // section 4.1).
+        var interim = false
+        match head {
+            ResponseHead(response) -> interim = code(response.status) < StatusRange.informationalEnd
+            RequestHead(_) -> {}
+        }
+        if !interim { stream.stage = .Body }
+        if !interim { settleTransport(stream, head) }
+        events.append(.Head(StreamHead { stream: stream.id, head: head }))
+        return .Fine
+    }
+
+    // The end of a stream: the message must be whole, and as long as it
+    // said (RFC 9114 section 4.1.2).
+    function finishMessage(borrow mut self, stream: borrow MessageStream) -> StreamOutcome {
+        if stream.buffer.count > 0 || stream.dataLeft > 0 || stream.stage == .Head {
+            return .StreamError(.MessageError)
+        }
+        match stream.expectedLength {
+            Some(length) -> if length != stream.bodyBytes { return .StreamError(.MessageError) }
+            None -> {}
+        }
+        events.append(.Ended(StreamEnded { stream: stream.id, trailers: copy stream.trailers }))
+        return .Fine
+    }
+}
+
+extend Http3Session {
+    // A client's session is established by a 2xx and refused by any other
+    // final status (draft-ietf-webtrans-http3 section 3.2).
+    function settleTransport(
+        borrow mut self,
+        stream: borrow mut MessageStream,
+        head: borrow MessageHead
+    ) {
+        let index = match transportIndex(stream.id) {
+            Some(value) -> value
+            None -> return
+        }
+        match head {
+            ResponseHead(response) -> {
+                let status = code(response.status)
+                if status < WebTransport.successEnd {
+                    transports[index].established = true
+                    stream.capsules = true
+                } else {
+                    transports[index].ended = true
+                }
+            }
+            RequestHead(_) -> {}
+        }
+    }
+
+    // A session's CONNECT stream after the frames were read: its capsules,
+    // and its end, which ends the session (section 6).
+    function takeConnectStream(
+        borrow mut self,
+        quic: borrow mut QuicConnection,
+        id: QuicStreamNumber,
+        outcome: borrow StreamOutcome,
+        finished: Bool
+    ) {
+        match outcome {
+            Fine -> {}
+            StreamError(_) -> return malformedCapsules(quic, id)
+            ConnectionError(error) -> return fail(quic, error)
+        }
+        takeCapsules(quic, id)
+        if finished { transportFinished(quic, id) }
+    }
+}
+
+namespace LengthLimit {
+    // More digits than this could overflow; no body is that long.
+    let digits: Number = 15
+}
+
+// The content-length a head declared, when it is one plain number.
+function declaredLength(fields: borrow Fields) -> Number? {
+    let text = match fields.first("content-length") {
+        Some(value) -> value
+        None -> return .None
+    }
+    let bytes = text.utf8()
+    if bytes.count == 0 || bytes.count > LengthLimit.digits { return .None }
+    var length = 0
+    for byte in bytes {
+        let digit = Number(byte) - StatusRange.zero
+        if digit < 0 || digit >= StatusRange.radix { return .None }
+        length = length * StatusRange.radix + digit
+    }
+    return .Some(length)
+}

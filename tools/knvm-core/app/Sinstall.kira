@@ -1,0 +1,300 @@
+import Foundation
+
+// Installing knvm and the launchers out of a checkout: `knvm sinstall`.
+//
+// `binstall` provisions a *toolchain*; this provisions the *tools* — `knvm`
+// itself and a launcher per compiler, each of which dispatches to that
+// compiler's selected toolchain. They live outside any toolchain version because
+// they are what selects between versions. All are compiled from the enclosing
+// checkout by a Kira compiler, and landed in `<klf-home>/bin`, with the host
+// pointed at that directory the way rustup points one at `~/.cargo/bin` — by a
+// sourced `env` script.
+//
+// Everything here is idempotent. The binaries are replaced by staging beside the
+// destination and renaming, and the PATH entry is added only where it is not
+// already present.
+//
+// # One launcher, built once per name
+//
+// A single launcher binary serves every compiler: it reads the name it was
+// invoked under and dispatches to that compiler's toolchain. It is still
+// *built* once per name rather than built once and copied, because nothing a
+// program here can reach sets a file's mode — a copy arrives 0644, and a
+// launcher that cannot be executed is not a launcher.
+//
+// # Replacing the running knvm
+//
+// This command's whole job is to replace the executable that is running it.
+// Unix lets a rename land on a busy binary; Windows refuses to open the file
+// behind a running image for delete, which is `sinstall` failing at exactly the
+// step it exists for. So a tool that is already installed is renamed out of the
+// way rather than deleted — the running image holds the file open under its old
+// name, and the new name is what the next run will resolve.
+
+// The directory the tools are installed into, under the KLF home.
+public let toolsDirectoryName: String = "bin"
+
+// The script the shell startup file sources to put the tools on PATH.
+public let environmentScriptName: String = "env"
+
+// The prefix every staged and displaced file carries, so a sweep can tell this
+// command's leavings from an installed tool by name alone.
+public let displacedPrefix: String = ".knvm-"
+
+// What a self-install did.
+public struct SelfInstalled {
+    var binDirectory: String = ""
+    // The names installed, in the order they were installed.
+    var tools: [String] = []
+    // The `env` script that prepends the bin directory to `PATH`.
+    var environmentScript: String = ""
+    // The startup file the user's shell actually reads.
+    var startupFile: String = ""
+    // Whether this run appended the source line, or found it there.
+    var updatedPath: Bool = false
+}
+
+public enum SinstallFailure {
+    NotACheckout(String)
+    NoCompiler(String)
+    BuildFailed(String)
+    MissingBuildArtifact(String)
+    Staging(String)
+}
+
+public enum SinstallOutcome {
+    Installed(SelfInstalled)
+    Failed(SinstallFailure)
+}
+
+// Builds knvm and the launchers from the enclosing checkout and installs them.
+//
+// `start` is where the checkout search begins. `shell` is the user's shell
+// (`$SHELL`), which decides *which* startup file: a line in a file the shell
+// never reads configures nothing.
+public function selfInstall(
+    start: borrow String,
+    shellHome: borrow String,
+    shell: borrow String
+) -> SinstallOutcome {
+    match enclosingToolsCheckout(start) {
+        None -> { return .Failed(.NotACheckout(start)) }
+        Some(root) -> {
+            let compiler = compilerForBuild(toolsLanguageBinary)
+            if compiler.isEmpty() {
+                return .Failed(
+                    .NoCompiler(
+                        "no Kira compiler to build with: install a toolchain (`knvm install latest`), " + "or put a `kira` on PATH"
+                    )
+                )
+            }
+            return installTools(root, compiler, shellHome, shell)
+        }
+    }
+    return .Failed(.NotACheckout(start))
+}
+
+// The tools are Kira packages, so a Kira compiler builds them.
+public let toolsLanguageBinary: String = "kira"
+
+// The nearest directory above `start` that keeps knvm's own package under
+// `tools/`.
+public function enclosingToolsCheckout(start: borrow String) -> Optional<String> {
+    var current = start
+    if current.isEmpty() { return .None }
+    while true {
+        if isDirectory(joinPath(toolDirectory(current), managerToolName)) { return .Some(current) }
+        let parent = directoryOfPath(current)
+        if parent.isEmpty() || parent == current { return .None }
+        current = parent
+    }
+}
+
+public function installTools(
+    checkout: borrow String,
+    compiler: borrow String,
+    shellHome: borrow String,
+    shell: borrow String
+) -> SinstallOutcome {
+    // Staged under the toolchains root rather than under `bin`, because a sweep
+    // of `bin` clears by name prefix and a staged tool carries that prefix: a
+    // sweep would delete the tools this run is about to install.
+    let staging = joinPath(stagingRoot(), "tools-" + processTag())
+    if !makeDirectoryTree(staging) { return .Failed(.Staging(staging)) }
+
+    let names = installedToolNames()
+    for name in names {
+        let built = joinPath(staging, name)
+        if !buildPackage(compiler, joinPath(toolDirectory(checkout), toolPackageOf(name)), built) {
+            removeTree(staging)
+            return .Failed(.BuildFailed(toolPackageOf(name)))
+        }
+    }
+
+    let binDirectory = joinPath(klfHome(), toolsDirectoryName)
+    if !makeDirectoryTree(binDirectory) {
+        removeTree(staging)
+        return .Failed(.Staging(binDirectory))
+    }
+    sweepDisplaced(binDirectory)
+    for name in names {
+        let destination = joinPath(binDirectory, name)
+        if !displace(destination) {
+            removeTree(staging)
+            return .Failed(.Staging(destination))
+        }
+        if !succeeded(renamePath(joinPath(staging, name), destination)) {
+            removeTree(staging)
+            return .Failed(.Staging(destination))
+        }
+    }
+    removeTree(staging)
+
+    let configured = configurePath(shellHome, shell, binDirectory)
+    match configured {
+        Failed(failure) -> { return .Failed(.Staging(failure)) }
+        Ready(report) -> {
+            return .Installed(
+                SelfInstalled {
+                    binDirectory: binDirectory,
+                    tools: copy names,
+                    environmentScript: report.environmentScript,
+                    startupFile: report.startupFile,
+                    updatedPath: report.updated
+                }
+            )
+        }
+    }
+    return .Failed(.Staging(staging))
+}
+
+// Every name this installs, in a fixed order: the manager first, then one
+// launcher per compiler, in the order the registry lists them.
+public function installedToolNames() -> [String] {
+    var names: [String] = []
+    names.append(managerToolName)
+    for compiler in allCompilers() {
+        names.append(compiler.binary)
+    }
+    return names
+}
+
+// The package a name is built from.
+//
+// Every compiler's launcher is one package: a single binary, installed under
+// each name, dispatching by the name it was invoked under. Only the manager is
+// a package of its own.
+public function toolPackageOf(name: borrow String) -> String {
+    if name == managerToolName { return name }
+    return launcherPackage
+}
+
+// This tool, named as its own package and installed under its own name.
+public let managerToolName: String = "knvm"
+
+// The one package every compiler's launcher is built from.
+public let launcherPackage: String = "launcher"
+
+public function buildPackage(
+    compiler: borrow String,
+    package: borrow String,
+    output: borrow String
+) -> Bool {
+    if !makeDirectoryTree(directoryOfPath(output)) { return false }
+    var arguments: [String] = []
+    arguments.append(package)
+    arguments.append("-o")
+    arguments.append(output)
+    return runTool(compiler, arguments) == 0
+}
+
+// Moves an installed tool out of the way of its replacement.
+//
+// A tool that is not installed yet needs no room made. One that is running — the
+// knvm performing this install, every time — is renamed rather than deleted,
+// because the running image holds the file open under its old name.
+public function displace(destination: borrow String) -> Bool {
+    if !pathExists(destination) { return true }
+    let name = lastComponentOfPath(destination)
+    let displaced = joinPath(
+        directoryOfPath(destination),
+        displacedPrefix + "old-" + name + "-" + processTag()
+    )
+    if pathExists(displaced) { succeeded(removePath(displaced)) }
+    if !succeeded(renamePath(destination, displaced)) { return false }
+    // The running image cannot be deleted until it exits, and it is this
+    // process: the next run's sweep is what clears it.
+    succeeded(removePath(displaced))
+    return true
+}
+
+// Deletes what earlier installs left behind, as far as the host allows.
+public function sweepDisplaced(binDirectory: borrow String) {
+    for name in entriesOf(binDirectory) {
+        if !name.startsWith(displacedPrefix) { continue }
+        succeeded(removePath(joinPath(binDirectory, name)))
+    }
+}
+
+// What putting the tools on PATH did.
+public struct PathSetup {
+    var environmentScript: String = ""
+    var startupFile: String = ""
+    var updated: Bool = false
+}
+
+public enum PathSetupResult {
+    Ready(PathSetup)
+    Failed(String)
+}
+
+// Points the host's PATH at `binDirectory`, idempotently.
+//
+// rustup's shape on unix: an `env` script under the KLF home that prepends the
+// bin directory, and one line in the startup file the user's shell actually
+// reads. A default macOS home has no dotfiles at all, and a line appended to
+// `.profile` configures nothing for the zsh that machine runs — so the file is
+// chosen from the shell, not from what happens to exist.
+public function configurePath(
+    shellHome: borrow String,
+    shell: borrow String,
+    binDirectory: borrow String
+) -> PathSetupResult {
+    let script = joinPath(klfHome(), environmentScriptName)
+    let contents = "# Added by `knvm sinstall`: puts the Kira tools on PATH.\n"
+        + "export PATH=\"" + binDirectory + ":$PATH\"\n"
+    if !succeeded(writeFile(script, contents)) { return .Failed(script) }
+
+    let startup = startupFileFor(shellHome, shell)
+    let line = ". \"" + script + "\""
+    var updated = true
+    match textOf(startup) {
+        Some(existing) -> {
+            if existing.contains(line) { updated = false }
+        }
+        None -> {}
+    }
+    if updated && !appendLine(startup, line) { return .Failed(startup) }
+    return .Ready(PathSetup { environmentScript: script, startupFile: startup, updated: updated })
+}
+
+// The startup file the user's shell actually reads: zsh reads `.zshenv` on every
+// invocation, bash reads `.bashrc`, anything else gets the POSIX `.profile`.
+public function startupFileFor(shellHome: borrow String, shell: borrow String) -> String {
+    let name = lastComponentOfPath(shell)
+    if name == "zsh" { return joinPath(shellHome, ".zshenv") }
+    if name == "bash" { return joinPath(shellHome, ".bashrc") }
+    return joinPath(shellHome, ".profile")
+}
+
+// Appends `line` and its newline to `file`, creating the file when it is not
+// there yet.
+public function appendLine(file: borrow String, line: borrow String) -> Bool {
+    var contents = ""
+    match textOf(file) {
+        Some(existing) -> contents = existing
+        None -> {}
+    }
+    if !contents.isEmpty() && !contents.endsWith("\n") { contents = contents + "\n" }
+    return succeeded(writeFile(file, contents + line + "\n"))
+}

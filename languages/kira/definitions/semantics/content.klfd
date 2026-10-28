@@ -1,0 +1,447 @@
+// Child content, filled into the slot or parameter its callee declares.
+//
+// A construction's trailing block fills its first child slot, a field
+// written `some Family` or `[some Family]`, and a fill `name: ...` fills the
+// slot it names. A call's trailing block fills the last parameter when that
+// is written the same way, and is otherwise the closure it also reads as.
+// A single slot takes one child. A list slot takes the children in order;
+// one holding a `For` or `if` builder becomes a block that appends each
+// produced child to a fresh array, which is the value the slot receives.
+// Each case is rewritten as the call it means and checked as one.
+
+// A child slot: a construct field or the last parameter of a call.
+struct ContentSlot {
+    let name: Identifier
+    let annotation: TypeReference
+    let list: Bool
+    let parameter: Bool
+}
+
+function contentSlot(name: Identifier, annotation: TypeReference, parameter: Bool) -> ContentSlot {
+    return ContentSlot { name = name, annotation = annotation, list = !isSomeReference(annotation), parameter = parameter }
+}
+
+// Where the structs construct declarations became sit in the tree.
+function constructStructs(tree: SyntaxTree) -> [Int] {
+    var found: [Int] = []
+    for index in 0..tree.structs.count {
+        if tree.structs[index].genericBase == "Construct" { found.append(index) }
+    }
+    return found
+}
+
+// The slots of the construct declaration named `name`, in field order,
+// among the tree's construct `structs`.
+function constructSlotsAmong(tree: SyntaxTree, structs: [Int], name: String) -> [ContentSlot] {
+    var slots: [ContentSlot] = []
+    for index in structs {
+        if tree.structs[index].name.text != name { continue }
+        for field in tree.structs[index].fields {
+            if isContentReference(field.annotation) { slots.append(contentSlot(field.name, field.annotation, false)) }
+        }
+    }
+    return slots
+}
+
+// The slots of a generic declaration's template, in field order.
+function templateSlots(template: StructDeclaration) -> [ContentSlot] {
+    var slots: [ContentSlot] = []
+    for field in template.fields {
+        if isContentReference(field.annotation) { slots.append(contentSlot(field.name, field.annotation, false)) }
+    }
+    return slots
+}
+
+// The content parameter of `declaration`: its last, when written as a slot.
+function parameterSlots(declaration: FunctionDeclaration) -> [ContentSlot] {
+    if declaration.parameters.count == 0 { return [] }
+    let last = declaration.parameters[declaration.parameters.count - 1]
+    if !isContentReference(last.annotation) { return [] }
+    return [contentSlot(last.name, last.annotation, true)]
+}
+
+function slotNamed(slots: [ContentSlot], name: String) -> Optional<Int> {
+    for index in 0..slots.count {
+        if slots[index].name.text == name { return .Some(index) }
+    }
+    return .None
+}
+
+extend Checker {
+    function checkContent(borrow mut self, content: ContentSyntax, expected: Optional<Type>, span: Span) -> Int {
+        match content.call {
+            Some(call) -> return contentCall(call, content, expected, span)
+            None -> {
+                match content.closure {
+                    Some(closure) -> return expression(closure, expected)
+                    None -> {
+                        report(.ContentWithoutSlot, span)
+                        return add(.Integer(0), Type.invalid(), span)
+                    }
+                }
+            }
+        }
+    }
+
+    function contentCall(borrow mut self, call: Int, content: ContentSyntax, expected: Optional<Type>, span: Span) -> Int {
+        match tree.expressions[call].kind.contentCallee() {
+            None -> {
+                report(.OutsideSubset, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+            Some(callee) -> {
+                match callee.receiver {
+                    Some(base) -> return contentMethodCall(base, callee, content, expected, span)
+                    None -> {}
+                }
+                var slots: [ContentSlot] = []
+                var labelled = false
+                match declarations.findFunction(.None, callee.name.text) {
+                    Some(target) -> {
+                        if lookup(callee.name.text).isNone() { slots = parameterSlots(declarations.signatures[target].declaration) }
+                    }
+                    None -> {
+                        match constructorOwner(callee.name, expected) {
+                            Some(owner) -> {
+                                if callee.types.isNone() {
+                                    match chosenInit(owner, callee.arguments, hasChildren(content)) {
+                                        Some(init) -> {
+                                            slots = parameterSlots(declarations.signatures[init].declaration)
+                                            return call(init, .None, contentArguments(callee.arguments, slots, false, content, span), span)
+                                        }
+                                        None -> {}
+                                    }
+                                }
+                                slots = constructSlotsAmong(tree, constructIndices, program.structs[owner].name.text)
+                                labelled = true
+                                if slots.count == 0 && program.structs[owner].genericBase == "Construct" && hasChildren(content) {
+                                    report(.ContentWithoutSlot, span)
+                                    return add(.Integer(0), Type.invalid(), span)
+                                }
+                            }
+                            None -> {
+                                // A generic declaration's slots are its
+                                // template's, whichever instance the call is.
+                                match genericStruct(tree.genericStructs, callee.name.text) {
+                                    Some(template) -> {
+                                        if template.genericBase == "Construct" {
+                                            slots = templateSlots(template)
+                                            labelled = true
+                                            if slots.count == 0 && hasChildren(content) {
+                                                report(.ContentWithoutSlot, span)
+                                                return add(.Integer(0), Type.invalid(), span)
+                                            }
+                                        }
+                                    }
+                                    None -> {}
+                                }
+                            }
+                        }
+                    }
+                }
+                let arguments = contentArguments(callee.arguments, slots, labelled, content, span)
+                match callee.types {
+                    Some(types) -> return expression(tree.addExpression(.GenericCall(callee.name, types, arguments), span), expected)
+                    None -> return expression(tree.addExpression(.Call(callee.name, arguments), span), expected)
+                }
+            }
+        }
+    }
+
+    // `base.method(arguments) { ... }`. A receiver that names a type reaches
+    // a static method, whose parameters are known without checking it.
+    function contentMethodCall(borrow mut self, base: Int, callee: ContentCallee, content: ContentSyntax, expected: Optional<Type>, span: Span) -> Int {
+        match tree.expressions[base].kind.name() {
+            Some(name) -> {
+                if lookup(name.text).isNone() && !namesMember(name.text) && declarations.globalVisibleAt(name.text, name.span.file).isNone() {
+                    var slots: [ContentSlot] = []
+                    match declarations.typeNamedAt(name.text, name.span.file) {
+                        Some(owner) -> {
+                            match declarations.findFunction(.Some(owner), callee.name.text) {
+                                Some(target) -> slots = parameterSlots(declarations.signatures[target].declaration)
+                                None -> {}
+                            }
+                        }
+                        None -> {}
+                    }
+                    let arguments = contentArguments(callee.arguments, slots, false, content, span)
+                    return expression(tree.addExpression(.MethodCall(base, callee.name, arguments), span), expected)
+                }
+            }
+            None -> {}
+        }
+        let value = expression(base, .None)
+        let receiverType = typeOf(value)
+        if receiverType.isInvalid() { return value }
+        var slots: [ContentSlot] = []
+        match methodOf(receiverType, callee.name.text) {
+            Some(target) -> slots = parameterSlots(declarations.signatures[target].declaration)
+            None -> {}
+        }
+        return checkMethodOn(value, callee.name, contentArguments(callee.arguments, slots, false, content, span), span)
+    }
+
+    // The arguments `arguments` and the content after them make: the block
+    // fills the first slot, a fill naming a slot fills that one, and the
+    // block and the fills are closures otherwise. A construction names its
+    // slots with labels; a call's single slot is its last position.
+    function contentArguments(borrow mut self, arguments: [Int], slots: [ContentSlot], labelled: Bool, content: ContentSyntax, span: Span) -> [Int] {
+        var result = arguments
+        var filled: [String] = []
+        for argument in arguments {
+            match tree.expressions[argument].kind.argumentLabel() {
+                Some(field) -> filled.append(field.name.text)
+                None -> {}
+            }
+        }
+        var children = false
+        match content.items {
+            Some(items) -> children = slots.count > 0 || labelled
+            None -> {}
+        }
+        if children {
+            match content.items {
+                Some(items) -> {
+                    if items.count > 0 && slots.count > 0 {
+                        let slot = slots[0]
+                        let value = slotValue(slot, items, span)
+                        if hasBoundName(filled, slot.name.text) { report(.SlotFilledTwice, span) }
+                        filled.append(slot.name.text)
+                        if labelled {
+                            result.append(tree.addExpression(.Labelled(slot.name, value), span))
+                        } else {
+                            result.append(value)
+                        }
+                    }
+                }
+                None -> {}
+            }
+        } else {
+            match content.closure {
+                Some(closure) -> result.append(closure)
+                None -> report(.ContentWithoutSlot, span)
+            }
+        }
+        for fill in content.fills {
+            match tree.expressions[fill].kind.argumentLabel() {
+                Some(field) -> result.append(fillValue(fill, field, slots, filled))
+                None -> result.append(fill)
+            }
+        }
+        return result
+    }
+
+    // One `name: value` fill: a slot's content when it names a slot and is a
+    // bare block, and otherwise its value, a bare block being its closure.
+    function fillValue(borrow mut self, fill: Int, field: FieldValue, slots: [ContentSlot], filled: borrow mut [String]) -> Int {
+        let span = tree.expressions[fill].span
+        match tree.expressions[field.value].kind.blockContent() {
+            None -> return fill
+            Some(block) -> {
+                match slotNamed(slots, field.name.text) {
+                    Some(slot) -> {
+                        match block.items {
+                            Some(items) -> {
+                                if hasBoundName(filled, field.name.text) { report(.SlotFilledTwice, field.name.span) }
+                                filled.append(field.name.text)
+                                return tree.addExpression(.Labelled(field.name, slotValue(slots[slot], items, span)), span)
+                            }
+                            None -> {}
+                        }
+                    }
+                    None -> {}
+                }
+                match block.closure {
+                    Some(closure) -> return tree.addExpression(.Labelled(field.name, closure), span)
+                    None -> return fill
+                }
+            }
+        }
+    }
+
+    // The value `items` give `slot`, as syntax to check against its type.
+    function slotValue(borrow mut self, slot: ContentSlot, items: [Int], span: Span) -> Int {
+        var children: [Int] = []
+        var built = false
+        for item in items {
+            match tree.contentItems[item] {
+                Child(value) -> children.append(value)
+                For -> built = true
+                If -> built = true
+            }
+        }
+        if !slot.list {
+            if built {
+                report(.SlotBuilder, span)
+            } else if children.count != 1 {
+                if slot.parameter { report(.ContentParameterChildCount, span) } else { report(.SlotChildCount, span) }
+            } else {
+                return children[0]
+            }
+            return tree.addExpression(.ArrayLiteral(children), span)
+        }
+        if !built { return tree.addExpression(.ArrayLiteral(children), span) }
+        let accumulator = Identifier { text = joinText(["__content#", decimalText(tree.expressions.count)]), span = span }
+        var body: [Int] = [tree.addStatement(.Binding(BindingStatement {
+            mutable = true, name = accumulator, annotation = .Some(tree.addTypeReference(slot.annotation)), prefix = .None, value = tree.addExpression(.ArrayLiteral([]), span)
+        }), span)]
+        for statement in appending(tree, items, accumulator, 0) { body.append(statement) }
+        let built = tree.addExpression(.Transfer(.Move, tree.addExpression(.Name(accumulator), span)), span)
+        return tree.addExpression(.ExpandedMacro(body, .Some(built)), span)
+    }
+}
+
+// The statements that append what `items` produce to `accumulator`. A child
+// in an arm of an `if` is appended at that arm's place, named by the `if`
+// and the arm, never zero, so a framework can tell the child of one arm
+// from the child of the other, and from a sibling after the `if`, as
+// SwiftUI's structural identity does (`#contentPlace`). A child outside every
+// `if` is at place zero.
+function appending(tree: borrow mut SyntaxTree, items: [Int], accumulator: Identifier, place: Int) -> [Int] {
+    var statements: [Int] = []
+    for item in items {
+        match tree.contentItems[item] {
+            Child(value) -> {
+                let span = tree.expressions[value].span
+                let target = tree.addExpression(.Name(accumulator), span)
+                let append = Identifier { text = "append", span = span }
+                let placed = contentPlaced(tree, value, place)
+                statements.append(tree.addStatement(.Evaluation(tree.addExpression(.MethodCall(target, append, [placed]), span)), span))
+            }
+            For(name, low, high, body) -> {
+                let span = tree.expressions[low].span
+                let inner = appending(tree, body, accumulator, place)
+                match high {
+                    Some(value) -> statements.append(tree.addStatement(.For(name, low, value, inner), span))
+                    None -> statements.append(tree.addStatement(.ForEach(name, low, inner), span))
+                }
+            }
+            If(condition, whenTrue, whenFalse) -> {
+                let span = tree.expressions[condition].span
+                let first = appending(tree, whenTrue, accumulator, item * 2 + 1)
+                let second = appending(tree, whenFalse, accumulator, item * 2 + 2)
+                statements.append(tree.addStatement(.If(condition, first, second), span))
+            }
+        }
+    }
+    return statements
+}
+
+// `value` at `place`: as it is outside every `if`, and otherwise handed to
+// `#contentPlace`, which no source name can spell.
+function contentPlaced(tree: borrow mut SyntaxTree, value: Int, place: Int) -> Int {
+    if place == 0 { return value }
+    let span = tree.expressions[value].span
+    let at = tree.addExpression(.IntegerLiteral(place, false), span)
+    return tree.addExpression(.Call(Identifier { text = "#contentPlace", span = span }, [value, at]), span)
+}
+
+function hasChildren(content: ContentSyntax) -> Bool {
+    match content.items {
+        Some(items) -> return items.count > 0
+        None -> return false
+    }
+}
+
+// What a block with content follows: a function or construction by name,
+// or a method on a receiver.
+struct ContentCallee {
+    let receiver: Optional<Int>
+    let name: Identifier
+    let types: Optional<[TypeReference]>
+    let arguments: [Int]
+}
+
+extend ExpressionKind {
+    function contentCallee(borrow self) -> Optional<ContentCallee> {
+        match self {
+            Quote -> return .None
+            IntegerLiteral -> return .None
+            FloatLiteral -> return .None
+            BooleanLiteral -> return .None
+            StringLiteral -> return .None
+            ArrayLiteral -> return .None
+            Index -> return .None
+            Transfer -> return .None
+            Labelled -> return .None
+            TypeQuery -> return .None
+            Name(name) -> return .Some(ContentCallee { receiver = .None, name = name, types = .None, arguments = [] })
+            Member(base, name) -> return .Some(ContentCallee { receiver = .Some(base), name = name, types = .None, arguments = [] })
+            ExpandedMacro -> return .None
+            MacroCall -> return .None
+            Call(name, arguments) -> return .Some(ContentCallee { receiver = .None, name = name, types = .None, arguments = arguments })
+            GenericCall(name, types, arguments) -> return .Some(ContentCallee { receiver = .None, name = name, types = .Some(types), arguments = arguments })
+            MethodCall(base, name, arguments) -> return .Some(ContentCallee { receiver = .Some(base), name = name, types = .None, arguments = arguments })
+            IndirectCall -> return .None
+            Lambda -> return .None
+            KeyPath -> return .None
+            Task -> return .None
+            Try -> return .None
+            Variant -> return .None
+            StructLiteral -> return .None
+            Unary -> return .None
+            Binary -> return .None
+            Conditional -> return .None
+            MatchValue -> return .None
+            Content -> return .None
+        }
+    }
+
+    // A fill's bare `{ ... }`.
+    function blockContent(borrow self) -> Optional<ContentSyntax> {
+        match self {
+            Quote -> return .None
+            IntegerLiteral -> return .None
+            FloatLiteral -> return .None
+            BooleanLiteral -> return .None
+            StringLiteral -> return .None
+            ArrayLiteral -> return .None
+            Index -> return .None
+            Transfer -> return .None
+            Labelled -> return .None
+            TypeQuery -> return .None
+            Name -> return .None
+            Member -> return .None
+            ExpandedMacro -> return .None
+            MacroCall -> return .None
+            Call -> return .None
+            GenericCall -> return .None
+            MethodCall -> return .None
+            IndirectCall -> return .None
+            Lambda -> return .None
+            KeyPath -> return .None
+            Task -> return .None
+            Try -> return .None
+            Variant -> return .None
+            StructLiteral -> return .None
+            Unary -> return .None
+            Binary -> return .None
+            Conditional -> return .None
+            MatchValue -> return .None
+            Content(content) -> {
+                if content.call.isNone() { return .Some(content) }
+                return .None
+            }
+        }
+    }
+}
+
+struct MethodTarget {
+    let target: Int
+    let owner: Type
+}
+
+extend Checker {
+    // `#contentPlace(child, place)`, a child of an `if`'s arm in a content
+    // block: `child.contentPlace(place)` when what it is answers
+    // `contentPlace`, as a framework's views do to carry their structural
+    // identity, and otherwise the child as it is.
+    function checkContentPlace(borrow mut self, arguments: [Int], expected: Optional<Type>, span: Span) -> Int {
+        let value = expression(arguments[0], expected)
+        let valueType = typeOf(value)
+        if valueType.isInvalid() { return value }
+        let name = "contentPlace"
+        if visibleOverloads(.Some(valueType), name).count == 0 && existentialMethod(valueType, name).isNone() { return value }
+        return checkMethodOn(value, Identifier { text = name, span = span }, [arguments[1]], span)
+    }
+}

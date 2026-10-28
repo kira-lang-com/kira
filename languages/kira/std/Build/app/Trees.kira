@@ -1,0 +1,574 @@
+import Foundation
+import Kten
+
+// The library's own actions on files and trees (DESIGN.md section 5.6): each
+// is a native action, keyed on what it is handed.
+
+/// What a tree holds at one path, from the tree's root, `/`-separated and without a leading `/`. A directory above an entry that no part names is made with the bits 493.
+public enum TreePart {
+    /// A file, or every entry of a tree under the path.
+    Place(TreePlace)
+    /// A directory at the path.
+    Directory(TreeDirectory)
+    /// A symbolic link at the path.
+    Link(TreeLink)
+}
+
+/// A file, or every entry of a tree, placed at a path.
+public struct TreePlace {
+    /// The path the artifact is placed at, from the tree's root.
+    let path: String
+    /// The artifact placed.
+    let artifact: Artifact
+    /// A file's permission bits; 0 keeps its own. A tree keeps its entries'.
+    let mode: UNumber = 0
+}
+
+/// A directory placed at a path.
+public struct TreeDirectory {
+    /// The directory's path, from the tree's root.
+    let path: String
+    /// The directory's permission bits; 493 is what `chmod 755` sets.
+    let mode: UNumber = 493
+}
+
+/// A symbolic link placed at a path.
+public struct TreeLink {
+    /// The link's path, from the tree's root.
+    let path: String
+    /// The link's target.
+    let target: String
+}
+
+namespace TreeMode {
+    // What a directory no part names gets: `chmod 755`.
+    let directory: UNumber = 493
+}
+
+// One entry a native action puts in a tree it writes.
+struct TreeSlot {
+    let path: String
+    let kind: TreeEntryKind
+    let mode: UNumber
+    // The file to copy for a file, the target for a link, empty for a
+    // directory.
+    let from: String
+    // What put it there, as a failure names it; empty for a directory made
+    // because something is under it.
+    let origin: String
+    // The SHA-256 the store keeps a file's bytes under; empty when unknown.
+    let digest: String = ""
+}
+
+// The entries of a tree being written, each path once.
+struct TreeAssembly {
+    var slots: [TreeSlot] = []
+    var places: Map<String, Number> = Map<String, Number>()
+
+    // Adds `slot` and the directories above it. A directory where one is
+    // already, with the same bits or made for what is under it, is that
+    // directory; anything else at a taken path fails.
+    function add(borrow mut self, slot: TreeSlot) -> Result<Void, BuildFailure> {
+        let parent = parentPath(slot.path)
+        if parent != "." {
+            let above = TreeSlot {
+                path: parent,
+                kind: .Directory,
+                mode: TreeMode.directory,
+                from: "",
+                origin: ""
+            }
+            match add(move above) {
+                Ok -> {}
+                Error(failure) -> return .Error(failure)
+            }
+        }
+        match places.value(slot.path) {
+            Some(place) -> {
+                let known = slots[place]
+                if known.kind == .Directory && slot.kind == .Directory {
+                    if slot.origin.count == 0 { return .Ok }
+                    if known.origin.count == 0 {
+                        slots[place] = slot
+                        return .Ok
+                    }
+                    if known.mode == slot.mode { return .Ok }
+                }
+                let first = known.origin.count == 0 ? "a directory above an entry" : known.origin
+                let second = slot.origin.count == 0 ? "a directory above an entry" : slot.origin
+                return .Error(.Failed("\(first) and \(second) both put something at \(slot.path)"))
+            }
+            None -> {
+                places.set(copy slot.path, slots.count)
+                slots.append(slot)
+                return .Ok
+            }
+        }
+    }
+
+    // Adds every entry of the tree placed at `directory`, whose entries are
+    // `entries`, under `under`.
+    function addTree(
+        borrow mut self,
+        directory: borrow String,
+        entries: borrow [TreeEntry],
+        under: borrow String,
+        origin: borrow String
+    ) -> Result<Void, BuildFailure> {
+        for entry in entries {
+            let from = match entry.kind {
+                File -> joinPath(directory, entry.path)
+                Link -> copy entry.content
+                Directory -> ""
+            }
+            let slot = TreeSlot {
+                path: joinPath(under, entry.path),
+                kind: entry.kind,
+                mode: entry.mode,
+                from: from,
+                origin: copy origin,
+                digest: entry.kind == .File ? copy entry.content : ""
+            }
+            match add(move slot) {
+                Ok -> {}
+                Error(failure) -> return .Error(failure)
+            }
+        }
+        return .Ok
+    }
+
+    // Writes every entry under `root`, which exists: parents first, and each
+    // directory's bits last, since they may forbid writing into it. Each file
+    // whose digest is known is told to `copied`.
+    function write(
+        borrow self,
+        root: borrow String,
+        copied: borrow (String, String) -> Void
+    ) -> Result<Void, BuildFailure> {
+        let ordered = slots.sorted(
+            { left, right in return orderStrings(left.path, right.path) < 0 }
+        )
+        for slot in ordered {
+            let full = joinPath(root, slot.path)
+            match slot.kind {
+                Directory -> match makeDirectory(full) {
+                    Ok -> {}
+                    Error(failure) -> return .Error(
+                        .Files("cannot make \(full): \(traceText(failure))")
+                    )
+                }
+                File -> match placeCopy(slot.from, full, slot.mode) {
+                    Ok -> if slot.digest.count > 0 { copied(copy full, copy slot.digest) }
+                    Error(failure) -> return .Error(failure)
+                }
+                Link -> match makeSymbolicLink(slot.from, full) {
+                    Ok -> {}
+                    Error(failure) -> return .Error(
+                        .Files("cannot link \(full): \(traceText(failure))")
+                    )
+                }
+            }
+        }
+        for index in 0..ordered.count {
+            let slot = ordered[ordered.count - 1 - index]
+            if slot.kind != .Directory { continue }
+            let full = joinPath(root, slot.path)
+            match setFileMode(full, slot.mode) {
+                Ok -> {}
+                Error(failure) -> return .Error(
+                    .Files("cannot set the mode of \(full): \(traceText(failure))")
+                )
+            }
+        }
+        return .Ok
+    }
+}
+
+extend Graph {
+    // A file holding `text`, with the permission bits `mode`.
+    function write(
+        borrow mut self,
+        name: borrow String,
+        text: borrow String,
+        mode: UNumber
+    ) -> Artifact {
+        return writeBytes(name, text.utf8(), mode)
+    }
+
+    // A file holding `bytes`, with the permission bits `mode`.
+    function writeBytes(
+        borrow mut self,
+        name: borrow String,
+        bytes: borrow [UN8],
+        mode: UNumber
+    ) -> Artifact {
+        checkTreePath(name, "write \(name)")
+        let held = copy bytes
+        return native(
+            NativeAction {
+                label: "write \(name)",
+                code: sourceDigest!("package"),
+                parameters: ktenBare(
+                    [ktenField("bytes", .Bytes(copy bytes)), ktenField("mode", .Number(mode))]
+                ),
+                outputs: [Output { name: lastName(name) }],
+                work: { run in
+                    match writeFileBytes(run.outputs[0], held) {
+                        Ok -> {}
+                        Error(failure) -> return .Error(
+                            .Files("cannot write \(run.outputs[0]): \(traceText(failure))")
+                        )
+                    }
+                    return match setFileMode(run.outputs[0], mode) {
+                        Ok -> .Ok
+                        Error(failure) -> .Error(
+                            .Files(
+                                "cannot set the mode of \(run.outputs[0]): \(traceText(failure))"
+                            )
+                        )
+                    }
+                }
+            }
+        )[0]
+    }
+
+    // The file `artifact` as `name`, with the permission bits `mode`.
+    function copied(
+        borrow mut self,
+        name: borrow String,
+        artifact: borrow Artifact,
+        mode: UNumber
+    ) -> Artifact {
+        checkArtifact(artifact, "copy \(name)")
+        if holdsTree(artifact) { problems.append("copy \(name) copies a tree, not a file") }
+        return native(
+            NativeAction {
+                label: "copy \(name)",
+                code: sourceDigest!("package"),
+                parameters: .Number(mode),
+                inputs: [artifact],
+                outputs: [Output { name: lastName(name) }],
+                work: { run in
+                    match placeCopy(run.inputs[0], run.outputs[0], mode) {
+                        Ok -> {}
+                        Error(failure) -> return .Error(failure)
+                    }
+                    run.copied(run.outputs[0], run.digests[0])
+                    return .Ok
+                }
+            }
+        )[0]
+    }
+
+    // A tree of `parts`. Two parts at one path fail it, but for directories
+    // with the same bits.
+    function tree(borrow mut self, name: borrow String, parts: borrow [TreePart]) -> Artifact {
+        let label = "tree \(name)"
+        var inputs: [Artifact] = []
+        var described: [Kten] = []
+        // For each part, the input it places, or -1, and whether it is a tree.
+        var placed: [Number] = []
+        var trees: [Bool] = []
+        for part in parts {
+            match part {
+                Place(place) -> {
+                    checkArtifact(place.artifact, label)
+                    checkTreePath(place.path, label)
+                    placed.append(inputs.count)
+                    trees.append(holdsTree(place.artifact))
+                    inputs.append(place.artifact)
+                    described.append(
+                        ktenBare(
+                            [
+                                ktenField("place", .Text(copy place.path)),
+                                ktenField("mode", .Number(place.mode))
+                            ]
+                        )
+                    )
+                }
+                Directory(directory) -> {
+                    checkTreePath(directory.path, label)
+                    placed.append(-1)
+                    trees.append(false)
+                    described.append(
+                        ktenBare(
+                            [
+                                ktenField("directory", .Text(copy directory.path)),
+                                ktenField("mode", .Number(directory.mode))
+                            ]
+                        )
+                    )
+                }
+                Link(link) -> {
+                    checkTreePath(link.path, label)
+                    placed.append(-1)
+                    trees.append(false)
+                    described.append(
+                        ktenBare(
+                            [
+                                ktenField("link", .Text(copy link.path)),
+                                ktenField("target", .Text(copy link.target))
+                            ]
+                        )
+                    )
+                }
+            }
+        }
+        var origins: [String] = []
+        for part in parts {
+            origins.append(
+                match part {
+                    Place(place) -> artifactName(place.artifact)
+                    Directory(directory) -> "the directory \(directory.path)"
+                    Link(link) -> "the link \(link.path)"
+                }
+            )
+        }
+        let held = copy parts
+        return native(
+            NativeAction {
+                label: label,
+                code: sourceDigest!("package"),
+                parameters: .List(described),
+                inputs: inputs,
+                outputs: [Output { name: lastName(name), kind: .Tree }],
+                work: { run in
+                    var assembly = TreeAssembly {}
+                    for index in 0..held.count {
+                        var added: Result<Void, BuildFailure> = .Ok
+                        match held[index] {
+                            Place(place) -> {
+                                let input = placed[index]
+                                if trees[index] {
+                                    added = assembly.addTree(
+                                        run.inputs[input],
+                                        run.trees[input],
+                                        place.path,
+                                        origins[index]
+                                    )
+                                } else {
+                                    added = assembly.add(
+                                        TreeSlot {
+                                            path: copy place.path,
+                                            kind: .File,
+                                            mode: place.mode == 0 ? run.modes[input] : place.mode,
+                                            from: copy run.inputs[input],
+                                            origin: copy origins[index],
+                                            digest: copy run.digests[input]
+                                        }
+                                    )
+                                }
+                            }
+                            Directory(directory) -> added = assembly.add(
+                                TreeSlot {
+                                    path: copy directory.path,
+                                    kind: .Directory,
+                                    mode: directory.mode,
+                                    from: "",
+                                    origin: copy origins[index]
+                                }
+                            )
+                            Link(link) -> added = assembly.add(
+                                TreeSlot {
+                                    path: copy link.path,
+                                    kind: .Link,
+                                    mode: 511,
+                                    from: copy link.target,
+                                    origin: copy origins[index]
+                                }
+                            )
+                        }
+                        match added {
+                            Ok -> {}
+                            Error(failure) -> return .Error(failure)
+                        }
+                    }
+                    return assembly.write(run.outputs[0], run.copied)
+                }
+            }
+        )[0]
+    }
+
+    // One tree holding every entry of `trees`. A directory several hold is
+    // one directory when its bits agree; any other path two trees hold fails
+    // it, naming both.
+    function union(borrow mut self, name: borrow String, trees: borrow [Artifact]) -> Artifact {
+        let label = "union \(name)"
+        var origins: [String] = []
+        for tree in trees {
+            checkArtifact(tree, label)
+            if !holdsTree(tree) {
+                problems.append("\(label) joins \(artifactName(tree)), which is no tree")
+            }
+            origins.append(artifactName(tree))
+        }
+        return native(
+            NativeAction {
+                label: label,
+                code: sourceDigest!("package"),
+                inputs: copy trees,
+                outputs: [Output { name: lastName(name), kind: .Tree }],
+                work: { run in
+                    var assembly = TreeAssembly {}
+                    for index in 0..run.inputs.count {
+                        match assembly.addTree(
+                            run.inputs[index],
+                            run.trees[index],
+                            "",
+                            origins[index]
+                        ) {
+                            Ok -> {}
+                            Error(failure) -> return .Error(failure)
+                        }
+                    }
+                    return assembly.write(run.outputs[0], run.copied)
+                }
+            }
+        )[0]
+    }
+
+    // The entries of `tree` under `path`, as a tree of their own. A path the
+    // tree holds no directory at fails it.
+    function subtree(
+        borrow mut self,
+        name: borrow String,
+        tree: borrow Artifact,
+        path: borrow String
+    ) -> Artifact {
+        let label = "subtree \(name)"
+        checkArtifact(tree, label)
+        checkTreePath(path, label)
+        if !holdsTree(tree) {
+            problems.append("\(label) reads \(artifactName(tree)), which is no tree")
+        }
+        let origin = artifactName(tree)
+        let under = copy path
+        return native(
+            NativeAction {
+                label: label,
+                code: sourceDigest!("package"),
+                parameters: .Text(copy path),
+                inputs: [tree],
+                outputs: [Output { name: lastName(name), kind: .Tree }],
+                work: { run in
+                    var found = false
+                    var entries: [TreeEntry] = []
+                    for entry in run.trees[0] {
+                        if entry.path == under {
+                            found = entry.kind == .Directory
+                        } else if entry.path.startsWith(under + "/") {
+                            entries.append(
+                                TreeEntry {
+                                    path: entry.path.substring(under.count + 1, entry.path.count),
+                                    kind: entry.kind,
+                                    mode: entry.mode,
+                                    content: copy entry.content
+                                }
+                            )
+                        }
+                    }
+                    if !found { return .Error(.Failed("\(origin) holds no directory at \(under)")) }
+                    var assembly = TreeAssembly {}
+                    match assembly.addTree(joinPath(run.inputs[0], under), entries, "", origin) {
+                        Ok -> {}
+                        Error(failure) -> return .Error(failure)
+                    }
+                    return assembly.write(run.outputs[0], run.copied)
+                }
+            }
+        )[0]
+    }
+
+    // The file at `path` in `tree`, on its own, with its permission bits. A
+    // path the tree holds no file at fails it.
+    function member(
+        borrow mut self,
+        name: borrow String,
+        tree: borrow Artifact,
+        path: borrow String
+    ) -> Artifact {
+        let label = "member \(name)"
+        checkArtifact(tree, label)
+        checkTreePath(name, label)
+        checkTreePath(path, label)
+        if !holdsTree(tree) {
+            problems.append("\(label) reads \(artifactName(tree)), which is no tree")
+        }
+        let origin = artifactName(tree)
+        let wanted = copy path
+        return native(
+            NativeAction {
+                label: label,
+                code: sourceDigest!("package"),
+                parameters: .Text(copy path),
+                inputs: [tree],
+                outputs: [Output { name: lastName(name) }],
+                work: { run in
+                    for entry in run.trees[0] {
+                        if entry.path == wanted && entry.kind == .File {
+                            let from = joinPath(run.inputs[0], wanted)
+                            match placeCopy(from, run.outputs[0], entry.mode) {
+                                Ok -> {}
+                                Error(failure) -> return .Error(failure)
+                            }
+                            run.copied(run.outputs[0], entry.content)
+                            return .Ok
+                        }
+                    }
+                    return .Error(.Failed("\(origin) holds no file at \(wanted)"))
+                }
+            }
+        )[0]
+    }
+
+    // A file of `length` bytes that are all zero, holding no storage where
+    // the filesystem allows: an empty disk image.
+    function sparse(borrow mut self, name: borrow String, length: UNumber) -> Artifact {
+        checkTreePath(name, "sparse \(name)")
+        return native(
+            NativeAction {
+                label: "sparse \(name)",
+                code: sourceDigest!("package"),
+                parameters: .Number(length),
+                outputs: [Output { name: lastName(name) }],
+                work: { run in
+                    let file = match openFileHandle(run.outputs[0], .CreateNew) {
+                        Ok(opened) -> opened
+                        Error(failure) -> return .Error(
+                            .Files("cannot make \(run.outputs[0]): \(traceText(failure))")
+                        )
+                    }
+                    let sized = file.truncate(length)
+                    match file.close() {
+                        Ok -> {}
+                        Error(failure) -> absorb failure
+                    }
+                    return match sized {
+                        Ok -> .Ok
+                        Error(failure) -> .Error(
+                            .Files("cannot size \(run.outputs[0]): \(traceText(failure))")
+                        )
+                    }
+                }
+            }
+        )[0]
+    }
+
+    // Whether `artifact` is a tree.
+    function holdsTree(borrow self, artifact: borrow Artifact) -> Bool {
+        if artifact.id < 0 || artifact.id >= origins.count { return false }
+        return match origins[artifact.id] {
+            Source(path) -> false
+            SourceTree(tree) -> true
+            Stored(reference) -> reference.kind == .Tree
+            Produced(made) -> actionOutputs(actions[made.action])[made.output].kind == .Tree
+        }
+    }
+
+    // Notes a path in a tree that is not `/`-separated names from its root.
+    function checkTreePath(borrow mut self, path: borrow String, user: borrow String) {
+        if path.count == 0 || path.startsWith("/") || plainPath(path) != path {
+            problems.append("\(user) names the path \(path), which is not one from a tree's root")
+        }
+    }
+}

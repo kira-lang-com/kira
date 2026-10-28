@@ -1,0 +1,198 @@
+import Foundation
+import Kten
+
+// What a build prints (DESIGN.md section 6.3): one line per action that
+// runs, every failure with what it ran and the end of its output, the steps
+// when none is asked for, and why an action runs under `-explain`.
+
+namespace ReportSize {
+    // How many lines of a failed command's output a report shows.
+    let tail: Number = 20
+}
+
+extend Graph {
+    function listSteps(borrow self) {
+        print("steps:")
+        for step in steps { print("  \(step.name)  \(step.summary)") }
+        if choices.count == 0 { return }
+        print("options:")
+        for choice in choices {
+            let values = choice.values.count == 0 ? "<text>" : joined(choice.values, "|")
+            let fallback = choice.fallback.count == 0 ? "" : " (\(choice.fallback) when not given)"
+            print("  -\(choice.name) \(values)  \(choice.summary)\(fallback)")
+        }
+    }
+
+    // Each action `needed` marks, with what it reads and makes.
+    function printGraph(borrow self, needed: borrow [Bool]) {
+        for action in 0..actions.count {
+            if !needed[action] { continue }
+            print(actionLabel(actions[action]))
+            var reads: [String] = []
+            for input in inputsOf(action) { reads.append(artifactName(input)) }
+            var makes: [String] = []
+            for output in actionOutputs(actions[action]) { makes.append(copy output.name) }
+            if reads.count > 0 { print("  reads \(joined(reads, ", "))") }
+            print("  makes \(joined(makes, ", "))")
+        }
+    }
+}
+
+extend Engine {
+    function lastPath(borrow self, label: borrow String) -> String {
+        return joinPath(joinPath(state, "last"), pathSafe(label))
+    }
+
+    // What `action` read under `key`, for the next `-explain`.
+    function keepLast(
+        borrow self,
+        graph: borrow Graph,
+        action: Number
+    ) -> Result<Void, BuildFailure> {
+        var inputs: [Kten] = []
+        for input in graph.inputsOf(action) {
+            inputs.append(
+                ktenBare(
+                    [
+                        ktenField("name", .Text(graph.artifactName(input))),
+                        ktenField("input", artifactKten(input))
+                    ]
+                )
+            )
+        }
+        let path = lastPath(actionLabel(graph.actions[action]))
+        match makePathTree(parentPath(path)) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        let value = ktenObject(
+            "Last",
+            [ktenField("key", .Text(copy keys[action])), ktenField("inputs", .List(inputs))]
+        )
+        return writeKtenFile(path, value)
+    }
+
+    // Why `action` runs, against what it read when it last ran here.
+    function explanation(borrow mut self, graph: borrow Graph, action: Number) -> String {
+        let path = lastPath(actionLabel(graph.actions[action]))
+        if !fileExists(path) { return "it has not run in this project before" }
+        let last = match readKtenFile(path) {
+            Ok(value) -> value
+            Error(failure) -> return "its last run here is unreadable: \(failureText(failure))"
+        }
+        let previous = ktenTextField(last, "key").or("")
+        if previous == keys[action] || store.hasVariant(keys[action], previous) {
+            match store.record(previous) {
+                Some(record) -> {
+                    var changed: [String] = []
+                    let sourceRoot = match actionSourceRoot(graph, action) {
+                        Ok(root) -> root
+                        Error(failure) -> return "the source hierarchy cannot be resolved"
+                    }
+                    for found in record.discovered {
+                        match pathDigest(found.relative ? joinPath(sourceRoot, found.path) : copy found.path) {
+                            Ok(digest) -> {
+                                if digest != found.digest { changed.append(copy found.path) }
+                            }
+                            Error(failure) -> changed.append(copy found.path)
+                        }
+                    }
+                    if changed.count > 0 { return "changed: \(joined(changed, ", "))" }
+                }
+                None -> {}
+            }
+            return "its outputs are no longer in the cache"
+        }
+        var before: Map<String, String> = Map<String, String>()
+        match last.field("inputs") {
+            Ok(list) -> match list.items() {
+                Ok(items) -> {
+                    for item in items {
+                        let written = match item.field("input") {
+                            Ok(input) -> input.written()
+                            Error(failure) -> traceText(failure)
+                        }
+                        before.set(ktenTextField(item, "name").or(""), move written)
+                    }
+                }
+                Error(failure) -> absorb failure
+            }
+            Error(failure) -> absorb failure
+        }
+        var changed: [String] = []
+        for input in graph.inputsOf(action) {
+            let name = graph.artifactName(input)
+            match before.value(name) {
+                Some(written) -> {
+                    if written != artifactKten(input).written() { changed.append(name) }
+                }
+                None -> changed.append(name)
+            }
+        }
+        if changed.count == 0 { return "its description or its program changed" }
+        return "changed: \(joined(changed, ", "))"
+    }
+
+    // A failure of `action`, as the build reports it.
+    function reportFailure(
+        borrow self,
+        graph: borrow Graph,
+        action: Number,
+        failure: borrow BuildFailure,
+        command: borrow String,
+        directory: borrow String
+    ) {
+        let label = actionLabel(graph.actions[action])
+        print("FAILED \(label): \(failureText(failure))")
+        if command.count == 0 { return }
+        print("  command: \(command)")
+        print("  in: \(directory)")
+        var paths = [logPath(label, ".err"), logPath(label, ".out")]
+        match graph.actions[action] {
+            Run(run) -> {
+                for index in 0..run.outputs.count {
+                    if run.outputs[index].name == run.standardOutput {
+                        paths.append(joinPath(directory, "outputs/" + run.standardOutput))
+                    }
+                }
+            }
+            Native(native) -> {}
+        }
+        for path in paths {
+            let lines = logTail(path)
+            if lines.count == 0 { continue }
+            print("  \(path), last lines:")
+            for line in lines { print("    \(line)") }
+        }
+    }
+
+    // Shows all a command wrote, under `-verbose`.
+    function reportOutput(borrow self, label: borrow String) {
+        for stream in [".err", ".out"] {
+            match readFile(logPath(label, stream)) {
+                Ok(contents) -> {
+                    let text = contents.text.trim()
+                    if text.count > 0 { print(text) }
+                }
+                Error(failure) -> absorb failure
+            }
+        }
+    }
+}
+
+// The last lines of the file at `path`.
+function logTail(path: borrow String) -> [String] {
+    let text = match readFile(path) {
+        Ok(contents) -> contents.text.trim()
+        Error(failure) -> {
+            absorb failure
+            return []
+        }
+    }
+    if text.count == 0 { return [] }
+    let lines = text.split("\n")
+    var tail: [String] = []
+    let first = lines.count > ReportSize.tail ? lines.count - ReportSize.tail : 0
+    for index in first..lines.count { tail.append(copy lines[index]) }
+    return tail
+}

@@ -1,0 +1,183 @@
+construct Ksl() extends ShaderLanguage<Tree, Program> {
+    let name: String = "ksl"
+    let driver: String = "ksl"
+    let version: String = "26.10.4"
+    let extensions: [String] = ["ksl"]
+    let layouts: LayoutDefaults = LayoutDefaults { uniform = .Explicit, storage = .Explicit, immediate = .Explicit }
+    let libraryRoot: String = "library"
+    // A `read_write` texture is a storage image that both loads and stores.
+    let capabilities: [ShaderCapability] = [.StorageImageReadWrite, .Float16]
+    let diagnostics: [DiagnosticSpec] = [
+        DiagnosticSpec { code = 1001, severity = .Error, title = "unexpected token",
+            explanation = "a token appeared where the grammar allows something else" },
+        DiagnosticSpec { code = 1002, severity = .Error, title = "expected a declaration",
+            explanation = "a file holds imports, types, constants, enums, functions and one shader" },
+        DiagnosticSpec { code = 1003, severity = .Error, title = "malformed resource",
+            explanation = "a resource is `uniform`, `storage`, `texture` or `sampler`, a name, `:` and a type" },
+        DiagnosticSpec { code = 1004, severity = .Error, title = "unknown access mode",
+            explanation = "an access mode is `read`, `read_write` or `write`" },
+        DiagnosticSpec { code = 1005, severity = .Error, title = "unknown annotation",
+            explanation = "KSL annotates fields with `@builtin(word)` and `@interpolate(word)`, and resources with `@binding(n)`" },
+        DiagnosticSpec { code = 1006, severity = .Error, title = "not a stage item",
+            explanation = "a stage holds `input`, `output`, `threads` and functions" },
+        DiagnosticSpec { code = 1007, severity = .Error, title = "`threads` needs three extents",
+            explanation = "`threads(x, y, z)` names one extent per axis" },
+        DiagnosticSpec { code = 1008, severity = .Error, title = "literal out of range",
+            explanation = "an integer literal is at most the largest UInt" },
+        DiagnosticSpec { code = 2001, severity = .Error, title = "unknown type",
+            explanation = "the written type names no built-in type or declared struct" },
+        DiagnosticSpec { code = 2002, severity = .Error, title = "unknown name",
+            explanation = "the name is bound to no local, resource, option, constant or function here" },
+        DiagnosticSpec { code = 2003, severity = .Error, title = "duplicate declaration",
+            explanation = "two declarations claim the same name" },
+        DiagnosticSpec { code = 2004, severity = .Error, title = "type mismatch",
+            explanation = "the expression's type is not the one its position accepts" },
+        DiagnosticSpec { code = 2005, severity = .Error, title = "wrong argument count",
+            explanation = "the call passes a different number of arguments than it takes" },
+        DiagnosticSpec { code = 2006, severity = .Error, title = "no such member",
+            explanation = "the member does not exist on the type it is read from" },
+        DiagnosticSpec { code = 2007, severity = .Error, title = "illegal built-in",
+            explanation = "the `@builtin` or `@interpolate` word is unknown, or the stage cannot carry it there" },
+        DiagnosticSpec { code = 2008, severity = .Error, title = "not assignable",
+            explanation = "only a local or a `read_write` storage element can be assigned" },
+        DiagnosticSpec { code = 2009, severity = .Error, title = "malformed stage",
+            explanation = "a stage needs one `entry`, and a compute stage three folded thread extents and no output" },
+        DiagnosticSpec { code = 2010, severity = .Error, title = "bad option default",
+            explanation = "an option's default is a constant of the option's type" },
+        DiagnosticSpec { code = 2011, severity = .Error, title = "unresolved import",
+            explanation = "no file `A/B.ksl` exists beside this one or in the library root" },
+        DiagnosticSpec { code = 2012, severity = .Error, title = "illegal resource type",
+            explanation = "a uniform holds a struct, a storage resource an array, a texture a texture and a sampler a sampler" },
+        DiagnosticSpec { code = 2013, severity = .Error, title = "more than one shader",
+            explanation = "a compilation declares at most one shader" },
+        DiagnosticSpec { code = 2014, severity = .Error, title = "operator does not apply",
+            explanation = "the operator does not accept these operand types" },
+        DiagnosticSpec { code = 2015, severity = .Error, title = "missing return",
+            explanation = "the function can finish without returning its result" },
+        DiagnosticSpec { code = 2016, severity = .Error, title = "target unsupported",
+            explanation = "a requested target cannot express this shader" },
+        DiagnosticSpec { code = 2017, severity = .Error, title = "constant does not fold",
+            explanation = "a `const` or enum variant does not fold to a finite value of its type" },
+        DiagnosticSpec { code = 2018, severity = .Error, title = "slot collision",
+            explanation = "two resources in one group take the same slot" },
+        DiagnosticSpec { code = 2019, severity = .Error, title = "non-uniform control flow",
+            explanation = "a barrier or derivative is reached under control flow that varies across invocations" },
+        DiagnosticSpec { code = 2020, severity = .Error, title = "index not constant",
+            explanation = "the index must be known when the shader is compiled" },
+        DiagnosticSpec { code = 2021, severity = .Error, title = "override unsupported",
+            explanation = "the target cannot specialize this option" },
+        DiagnosticSpec { code = 2022, severity = .Error, title = "recursive call",
+            explanation = "a function reaches itself through its calls, which no shader target can run" },
+        DiagnosticSpec { code = 2023, severity = .Error, title = "derivative outside a fragment",
+            explanation = "dpdx, dpdy and fwidth compare neighbouring fragments, so only a fragment entry may reach them" }
+    ]
+    // KLF-EDITOR section 21.1. The reserved words are the lexer's keyword
+    // table (`syntax/token.klfd`); the contextual ones the parser gives
+    // meaning by position, which may still name a value.
+    let editor: EditorSpec = EditorSpec {
+        displayName = "KSL", scope = "source.ksl",
+        lineComments = ["//"],
+        blockComments = [BlockComment { open = "/*", close = "*/", nests = true }],
+        docComments = ["///"],
+        strings = [StringForm { open = "\"", close = "\"", escape = .Some("\\\\."), multiline = false,
+            raw = false, interpolation = .None, class = .String }],
+        numbers = ["0[xX][0-9A-Fa-f]+", "\\d+\\.\\d+", "\\d+"],
+        identifier = "[A-Za-z_][A-Za-z0-9_]*",
+        keywords = [
+            KeywordGroup { class = .Keyword, modifiers = [.Control],
+                words = ["if", "else", "while", "return"] },
+            KeywordGroup { class = .Boolean, modifiers = [],
+                words = ["true", "false"] },
+            KeywordGroup { class = .Keyword, modifiers = [],
+                words = ["import", "as", "type", "const", "enum", "function", "shader", "group",
+                    "option", "let"] },
+            KeywordGroup { class = .Keyword, modifiers = [.Contextual],
+                words = ["uniform", "storage", "texture", "sampler", "read", "write", "read_write",
+                    "vertex", "fragment", "compute", "input", "output", "threads", "entry"] },
+            KeywordGroup { class = .Builtin, modifiers = [],
+                words = ["Float", "Float2", "Float3", "Float4", "Half", "Half2", "Half3", "Half4", "Float2x2", "Float3x3", "Float4x4",
+                    "Int", "Int2", "Int3", "Int4", "UInt", "UInt2", "UInt3", "UInt4", "Bool",
+                    "Bool2", "Bool3", "Bool4", "Array", "Sampler", "Texture1d", "Texture2d",
+                    "Texture3d", "TextureCube", "Texture2dArray", "Depth2d", "DepthCube",
+                    "mul", "sample", "load", "store", "atomicAdd", "abs", "min", "max", "clamp",
+                    "mix", "fma", "dot", "length", "normalize", "pow", "sqrt", "floor", "ceil", "round",
+                    "sin", "cos", "tan", "exp", "exp2", "log", "log2", "select", "all", "any", "transpose", "pack2x16float", "unpack2x16float"] }
+        ],
+        operators = ["->", "==", "!=", "<=", ">=", "&&", "||", "<<", ">>", "=", "+", "-", "*", "/",
+            "%", "<", ">", "!", "&", "|", "^", "~", ".", ",", ":", "@"],
+        brackets = [BracketPair { open = "{", close = "}" }, BracketPair { open = "(", close = ")" },
+            BracketPair { open = "[", close = "]" }],
+        autoClose = [AutoClosePair { open = "{", close = "}", notIn = [] },
+            AutoClosePair { open = "(", close = ")", notIn = [] },
+            AutoClosePair { open = "[", close = "]", notIn = [] },
+            AutoClosePair { open = "\"", close = "\"", notIn = [.String, .Comment] }],
+        indent = IndentRules { unit = "    ", increase = .Some("[{(\\[]\\s*$"),
+            decrease = .Some("^\\s*[})\\]]") },
+        annotation = .Some("@[a-z_][a-z_0-9]*")
+    }
+    let keys: [DiagnosticKey] = [
+        DiagnosticKey { key = "shader.uniformity", code = 2019 },
+        DiagnosticKey { key = "shader.const-not-finite", code = 2017 },
+        DiagnosticKey { key = "shader.const-index", code = 2020 },
+        DiagnosticKey { key = "shader.interface-mismatch", code = 2009 },
+        DiagnosticKey { key = "shader.override-missing", code = 2010 },
+        DiagnosticKey { key = "shader.override-unsupported", code = 2021 },
+        DiagnosticKey { key = "shader.target-unsupported", code = 2016 },
+        DiagnosticKey { key = "shader.capability", code = 2016 },
+        DiagnosticKey { key = "shader.slot-collision", code = 2018 }
+    ]
+
+    function units(session: Session, inputs: [SourceFile]) -> [Unit] {
+        var units: [Unit] = []
+        for input in inputs { units.append(definition_unit(session, input)) }
+        return units
+    }
+
+    function parse(session: Session, unit: Unit, program: [SourceFile]) -> Tree {
+        match loadShader(session) {
+            Ok(tree) -> { return definition_tree(session, unit, artifactHandle(tree)) }
+            Error(failure) -> {
+                failure.report()
+                return definition_tree(session, unit, 0)
+            }
+        }
+    }
+
+    function elaborate(session: Session, unit: Unit, tree: Tree) -> Program {
+        let parsed: SyntaxTree = artifactValue(definition_tree_payload(session, tree))
+        return definition_program(session, unit, artifactHandle(check(parsed)))
+    }
+
+    function lower(session: Session, unit: Unit, program: Program) -> ShaderModule {
+        let checked: CheckedProgram = artifactValue(definition_program_payload(session, program))
+        return lowerShader(session, unit, program, checked)
+    }
+
+    function emit(unit: ShaderUnit) -> Bool {
+        return writeKsl(unit)
+    }
+
+    function format(session: Session, unit: Unit, tree: Tree) -> Bool {
+        let file = readFile(session, sourceName())
+        let source = fileText(session, file as SourceFile)
+        var starts: [Int] = []
+        var ends: [Int] = []
+        for token in lex(source, file) {
+            if token.kind != .End {
+                starts.append(token.span.start)
+                ends.append(token.span.end)
+            }
+        }
+        return layoutTokens(source, starts, ends, LayoutRules {
+            spacedCalls = ["if", "while", "return"],
+            keywords = ["return", "if", "while", "let", "const", "else"],
+            ambiguous = [],
+            spacedArrow = true,
+            labels = [],
+            semicolons = false,
+            literals = false,
+            headers = [],
+            inlineBlocks = false
+        })
+    }
+}

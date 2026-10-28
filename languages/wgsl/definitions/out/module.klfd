@@ -1,0 +1,278 @@
+// The module: the extensions it enables, structs, constants, overrides and
+// globals, then each function and each entry point.
+
+extend TextOut {
+    function writeWgslModule(borrow mut self) {
+        prepareNames(wgslReserved(), false)
+        prepareVarying()
+        var capabilities: [String] = []
+        let capabilityCount = textCount("unit", -1, 0, "capabilities")
+        for at in 0..capabilityCount {
+            capabilities.append(textItem("unit", -1, 0, "capabilities", at))
+        }
+        if hasText(capabilities, "float16") { write("enable f16;\n") }
+        if hasText(capabilities, "dual-source-blending") { write("enable dual_source_blending;\n") }
+        if hasText(capabilities, "clip-distances") { write("enable clip_distances;\n") }
+        for refused in ["float64", "int64", "int64-atomics"] {
+            if hasText(capabilities, refused) { refuse(joinText(["the ", refused, " capability"])) }
+        }
+        writeStructs()
+        writeConstants()
+        writeGlobals()
+        let functions = count("functions", -1)
+        for which in 0..functions {
+            if !isEntry(which) { writeFunction(which, joinText(["fn ", functionNames[which]])) }
+        }
+        for which in 0..functions {
+            if isEntry(which) { writeEntry(which) }
+        }
+    }
+
+    // Marks the types that pass between stages: vertex results and fragment
+    // arguments.
+    function prepareVarying(borrow mut self) {
+        let types = count("types", -1)
+        for typeIndex in 0..types {
+            dialect.varying.append(false)
+        }
+        let functions = count("functions", -1)
+        for which in 0..functions {
+            let stage = text("functions", -1, which, "stage")
+            let result = field("functions", -1, which, "result")
+            if isEntry(which) && stage == "vertex" && result >= 0 { dialect.varying[result] = true }
+            if isEntry(which) && stage == "fragment" {
+                let arguments = count("arguments", which)
+                for argument in 0..arguments {
+                    dialect.varying[field("arguments", which, argument, "type")] = true
+                }
+            }
+        }
+    }
+
+    // The attributes of an interface binding, read from the record `index`
+    // of `table` with fields after `prefix`. Integer values that pass
+    // between stages are flat, as WGSL requires.
+    function bindingText(borrow self, table: String, owner: Int, index: Int, prefix: String, typeIndex: Int,
+        varying: Bool) -> String {
+        let builtin = text(table, owner, index, joinText([prefix, "builtin"]))
+        if utf8Count(builtin) > 0 { return joinText(["@builtin(", builtin, ") "]) }
+        var location = field(table, owner, index, joinText([prefix, "location"]))
+        if location < 0 { location = 0 }
+        var pieces: [String] = [joinText(["@location(", decimalText(location), ") "])]
+        let source = field(table, owner, index, joinText([prefix, "blend_src"]))
+        if source >= 0 { pieces.append(joinText(["@blend_src(", decimalText(source), ") "])) }
+        let interpolation = text(table, owner, index, joinText([prefix, "interpolation"]))
+        let sampling = text(table, owner, index, joinText([prefix, "sampling"]))
+        if utf8Count(interpolation) > 0 && utf8Count(sampling) > 0 {
+            pieces.append(joinText(["@interpolate(", interpolation, ", ", sampling, ") "]))
+        } else if utf8Count(interpolation) > 0 {
+            pieces.append(joinText(["@interpolate(", interpolation, ") "]))
+        } else if varying && integerScalar(typeText(typeIndex, "scalar")) {
+            pieces.append("@interpolate(flat) ")
+        }
+        return joinText(pieces)
+    }
+
+    // Whether a record carries an interface binding.
+    function hasBinding(borrow self, table: String, owner: Int, index: Int, prefix: String) -> Bool {
+        return utf8Count(text(table, owner, index, joinText([prefix, "builtin"]))) > 0
+            || textCount(table, owner, index, joinText([prefix, "interpolation"])) > 0
+            || textCount(table, owner, index, joinText([prefix, "sampling"])) > 0
+            || field(table, owner, index, joinText([prefix, "location"])) >= 0
+            || field(table, owner, index, joinText([prefix, "blend_src"])) >= 0
+    }
+
+    function writeStructs(borrow self) {
+        let types = count("types", -1)
+        for typeIndex in 0..types {
+            if typeKind(typeIndex) == "struct" {
+                var sizes: [Int] = []
+                if flag("types", -1, typeIndex, "host_shared") { sizes = memberSizes(typeIndex) }
+                var pieces: [String] = [joinText(["struct ", structName(typeIndex), " {\n"])]
+                let members = count("members", typeIndex)
+                for member in 0..members {
+                    var attributes = ""
+                    if member < sizes.count && sizes[member] > 0 {
+                        attributes = joinText(["@size(", decimalText(sizes[member]), ") "])
+                    }
+                    let memberType = field("members", typeIndex, member, "type")
+                    if hasBinding("members", typeIndex, member, "") {
+                        attributes = joinText([attributes, bindingText("members", typeIndex, member, "", memberType,
+                            dialect.varying[typeIndex])])
+                    }
+                    let written = typeName(memberType)
+                    pieces.append(joinText(["    ", attributes, memberName(typeIndex, member), ": ", written, ",\n"]))
+                }
+                pieces.append("}\n\n")
+                write(joinText(pieces))
+            }
+        }
+    }
+
+    // A module-scope value: what the validator evaluated it to when it
+    // could and the type is known, else the expression itself.
+    function globalValue(borrow self, value: Int, expression: Int) -> String {
+        if value >= 0 { return constText(value) }
+        return globalExpression(expression)
+    }
+
+    function globalExpression(borrow self, expression: Int) -> String {
+        let which = kind("expressions", -1, expression)
+        match which {
+            "literal" -> return dialectLiteral("expressions", -1, expression)
+            "constant" -> return constantNames[field("expressions", -1, expression, "constant")]
+            "override" -> return overrideNames[field("expressions", -1, expression, "override")]
+            "zero" -> return joinText([typeName(field("expressions", -1, expression, "type")), "()"])
+            "compose" -> {
+                var parts: [String] = []
+                let items = fieldCount("expressions", -1, expression, "items")
+                for at in 0..items {
+                    parts.append(globalExpression(fieldItem("expressions", -1, expression, "items", at)))
+                }
+                let written = typeName(field("expressions", -1, expression, "type"))
+                return joinText([written, "(", joinWith(parts, ", "), ")"])
+            }
+            "unary" -> return joinText(["(", unaryOperator(text("expressions", -1, expression, "op")),
+                globalExpression(field("expressions", -1, expression, "expr")), ")"])
+            "binary" -> {
+                let left = globalExpression(field("expressions", -1, expression, "left"))
+                let right = globalExpression(field("expressions", -1, expression, "right"))
+                return joinText(["(", left, " ", wgslBinary(text("expressions", -1, expression, "op")), " ", right,
+                    ")"])
+            }
+            else -> {
+                refuseAt(joinText(["a module-scope expression ", which]), "expressions", -1, expression)
+                return ""
+            }
+        }
+    }
+
+    function writeConstants(borrow self) {
+        var any = false
+        let constants = count("constants", -1)
+        for constant in 0..constants {
+            let written = typeName(field("constants", -1, constant, "type"))
+            let value = globalValue(field("constants", -1, constant, "value"), field("constants", -1, constant, "init"))
+            write(joinText(["const ", constantNames[constant], ": ", written, " = ", value, ";\n"]))
+            any = true
+        }
+        let overrides = count("overrides", -1)
+        for item in 0..overrides {
+            let written = typeName(field("overrides", -1, item, "type"))
+            var id = ""
+            let number = field("overrides", -1, item, "id")
+            if number >= 0 { id = joinText(["@id(", decimalText(number), ") "]) }
+            var init = ""
+            let initial = field("overrides", -1, item, "init")
+            if initial >= 0 {
+                init = joinText([" = ", globalValue(field("overrides", -1, item, "value"), initial)])
+            }
+            write(joinText([id, "override ", overrideNames[item], ": ", written, init, ";\n"]))
+            any = true
+        }
+        if any { write("\n") }
+    }
+
+    function writeGlobals(borrow self) {
+        var any = false
+        let globals = count("globals", -1)
+        for global in 0..globals {
+            let written = typeName(field("globals", -1, global, "type"))
+            var binding = ""
+            let group = field("globals", -1, global, "group")
+            if group >= 0 {
+                binding = joinText(["@group(", decimalText(group), ") @binding(",
+                    decimalText(field("globals", -1, global, "binding")), ") "])
+            }
+            let space = text("globals", -1, global, "space")
+            var held = ""
+            if space == "storage" {
+                held = joinText(["<storage, ", storageAccess(text("globals", -1, global, "access")), ">"])
+            } else if space == "uniform" || space == "private" || space == "workgroup" {
+                held = joinText(["<", space, ">"])
+            }
+            if space == "function" || space == "immediate" {
+                refuseAt("a global in the immediate space", "globals", -1, global)
+            } else {
+                var init = ""
+                let initial = field("globals", -1, global, "init")
+                if initial >= 0 { init = joinText([" = ", globalValue(field("globals", -1, global, "value"), initial)]) }
+                write(joinText([binding, "var", held, " ", globalNames[global], ": ", written, init, ";\n"]))
+                any = true
+            }
+        }
+        if any { write("\n") }
+    }
+
+    function writeEntry(borrow mut self, which: Int) {
+        let stage = text("functions", -1, which, "stage")
+        var head = "@compute @workgroup_size("
+        if stage == "vertex" {
+            head = "@vertex\n"
+        } else if stage == "fragment" {
+            head = "@fragment\n"
+        } else {
+            var sizes: [String] = []
+            for axis in 0..3 {
+                var size = 1
+                var sized = -1
+                if fieldCount("functions", -1, which, "workgroup") == 3 {
+                    size = fieldItem("functions", -1, which, "workgroup", axis)
+                    sized = fieldItem("functions", -1, which, "workgroup_override", axis)
+                }
+                if size >= 0 {
+                    sizes.append(decimalText(size))
+                } else {
+                    sizes.append(globalExpression(sized))
+                }
+            }
+            head = joinText([head, joinWith(sizes, ", "), ")\n"])
+        }
+        if textCount("functions", -1, which, "early_depth_test") > 0 {
+            refuseAt("an early depth test", "functions", -1, which)
+        }
+        write(head)
+        writeFunction(which, joinText(["fn ", entryNames[entryIndex(which)]]))
+    }
+
+    function writeFunction(borrow mut self, which: Int, name: String) {
+        prepareBody(which)
+        let entry = isEntry(which)
+        let stage = text("functions", -1, which, "stage")
+        var parameters: [String] = []
+        let arguments = count("arguments", which)
+        for argument in 0..arguments {
+            let argumentType = field("arguments", which, argument, "type")
+            var attributes = ""
+            if hasBinding("arguments", which, argument, "") {
+                attributes = bindingText("arguments", which, argument, "", argumentType, entry && stage == "fragment")
+            }
+            let written = typeName(argumentType)
+            parameters.append(joinText([attributes, argumentNames[argument], ": ", written]))
+        }
+        var result = ""
+        let resultIndex = field("functions", -1, which, "result")
+        if resultIndex >= 0 {
+            var attributes = ""
+            if hasBinding("functions", -1, which, "result_") {
+                attributes = bindingText("functions", -1, which, "result_", resultIndex, entry && stage == "vertex")
+            }
+            result = joinText([" -> ", attributes, typeName(resultIndex)])
+        }
+        write(joinText([name, "(", joinWith(parameters, ", "), ")", result, " {\n"]))
+        let locals = count("locals", which)
+        for local in 0..locals {
+            let written = typeName(field("locals", which, local, "type"))
+            let init = field("locals", which, local, "init")
+            var value = ""
+            if init >= 0 && !flag("expressions", which, init, "emits") {
+                value = joinText([" = ", operand(init)])
+            } else if init >= 0 {
+                refuseAt("a local initialized by a runtime expression", "locals", which, local)
+            }
+            write(joinText(["    var ", localNames[local], ": ", written, value, ";\n"]))
+        }
+        writeBlock(field("functions", -1, which, "body"), 1)
+        write("}\n\n")
+    }
+}

@@ -1,0 +1,247 @@
+import Foundation
+
+// HTTP/1.1 messages on links (RFC 9112): a client sends one request at a
+// time and the next when its response ends, a server answers in chunks with
+// HTTP/3 advertised beside it. Persistent connections, no pipelining
+// (DESIGN.md section 7.4).
+
+namespace LinkStream {
+    // HTTP/1.1 has one message at a time; served requests on a link use
+    // this stream.
+    let only: QuicStreamNumber = QuicStreamNumber(0)
+}
+
+extend Network {
+    // The next request waiting for link `index`, when it is free.
+    function startLink(borrow mut self, index: Number) {
+        if links[index].closed || links[index].current.isSome() || !linkOpen(index) { return }
+        let key = links[index].id
+        var next: RequestId? = .None
+        for request in requests {
+            if request.session == .Some(key) && request.pending.isSome() {
+                next = .Some(request.id)
+                break
+            }
+        }
+        let id = match next {
+            Some(value) -> value
+            None -> return
+        }
+        let position = match requestIndex(id) {
+            Some(value) -> value
+            None -> return
+        }
+        let request = match requests[position].pending {
+            Some(value) -> value
+            None -> return
+        }
+        requests[position].pending = .None
+        let bytes: [UN8] = match request.body {
+            Empty -> []
+            Bytes(value) -> copy value
+        }
+        let framing: BodyFraming = bytes.count > 0 || carriesBody(request.method) ? .Length(
+            bytes.count
+        ) : .Empty
+        let head = RequestHead {
+            method: request.method,
+            target: copy request.target,
+            fields: copy request.fields
+        }
+        var wire = match http1RequestHead(head, move framing) {
+            Ok(value) -> value
+            Error(failure) -> {
+                endRequest(position, Fields {}, .Some(http1Failure(failure)))
+                return startLink(index)
+            }
+        }
+        wire.appendAll(bytes)
+        links[index].reader.answersHead = request.method == .Head
+        links[index].current = .Some(id)
+        match sendOnLink(index, wire) {
+            Ok -> {}
+            Error(failure) -> closeLink(index, move failure)
+        }
+    }
+
+    function takeHttp1(borrow mut self, index: Number) {
+        while !links[index].closed {
+            let next = links[index].reader.event()
+            let event = match next {
+                Some(value) -> value
+                None -> return
+            }
+            match links[index].server {
+                Some(server) -> serverMessage(index, server, event)
+                None -> clientMessage(index, event)
+            }
+        }
+    }
+
+    function clientMessage(borrow mut self, index: Number, event: borrow Http1Event) {
+        let id = match links[index].current {
+            Some(value) -> value
+            // A response nobody asked for.
+            None -> return closeLink(index, .Protocol(code(Http3Error.MessageError)))
+        }
+        match event {
+            Head(head) -> {
+                let response = match head {
+                    ResponseHead(value) -> value
+                    RequestHead(_) -> return closeLink(
+                        index,
+                        .Protocol(code(Http3Error.MessageError))
+                    )
+                }
+                if closesConnection(response.fields) { links[index].closeAfter = true }
+                // Informational responses are the protocol's business.
+                if code(response.status) < StatusRange.informationalEnd { return }
+                events.append(
+                    .ResponseHead(
+                        ResponseHeadEvent {
+                            request: id,
+                            status: response.status,
+                            fields: copy response.fields,
+                            version: .Http1
+                        }
+                    )
+                )
+            }
+            Body(bytes) -> events.append(
+                .ResponseBody(BodyChunk { request: id, bytes: copy bytes })
+            )
+            Ended(trailers) -> {
+                links[index].current = .None
+                links[index].answered = true
+                match requestIndex(id) {
+                    Some(position) -> endRequest(position, copy trailers, .None)
+                    None -> {}
+                }
+                if links[index].closeAfter {
+                    links[index].finishing = true
+                } else {
+                    startLink(index)
+                }
+            }
+        }
+    }
+
+    function serverMessage(
+        borrow mut self,
+        index: Number,
+        server: ServerId,
+        event: borrow Http1Event
+    ) {
+        let key = links[index].id
+        match event {
+            Head(head) -> {
+                let request = match head {
+                    RequestHead(value) -> value
+                    ResponseHead(_) -> return closeLink(
+                        index,
+                        .Protocol(code(Http3Error.MessageError))
+                    )
+                }
+                if closesConnection(request.fields) { links[index].closeAfter = true }
+                served.append(
+                    ServerRequest {
+                        id: takeRequestId(),
+                        session: key,
+                        stream: LinkStream.only,
+                        head: .Some(copy request)
+                    }
+                )
+            }
+            Body(bytes) -> {
+                let position = match receivingIndex(key, LinkStream.only) {
+                    Some(value) -> value
+                    None -> return
+                }
+                if served[position].body.count + bytes.count > options.requestBodyLimit {
+                    return closeLink(index, .TooLarge(options.requestBodyLimit))
+                }
+                served[position].body.appendAll(bytes)
+            }
+            Ended(_) -> {
+                match receivingIndex(key, LinkStream.only) {
+                    Some(position) -> deliverIncoming(position, server, links[index].peer)
+                    None -> {}
+                }
+            }
+        }
+    }
+
+    // A response head on link `link` for served request `index`, chunked
+    // unless it can have no body.
+    function respondOnLink(
+        borrow mut self,
+        link: Number,
+        index: Number,
+        head: borrow ResponseHead
+    ) -> Result<Void, HttpFailure> {
+        let status = code(head.status)
+        let informational = status < StatusRange.informationalEnd
+        let bodiless = served[index].bodiless || head.status == .NoContent || head.status == .NotModified
+        if !informational { served[index].bodiless = bodiless }
+        var fields = copy head.fields
+        match links[link].server {
+            Some(server) -> {
+                match altServiceFor(server) {
+                    Some(value) -> fields.add("alt-svc", value)
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+        if links[link].closeAfter && !informational { fields.add("connection", "close") }
+        let framing: BodyFraming = informational || bodiless ? .Empty : .Chunked
+        let wire = match http1ResponseHead(
+            ResponseHead { status: head.status, fields: fields },
+            move framing
+        ) {
+            Ok(value) -> value
+            Error(failure) -> return .Error(http1Failure(failure))
+        }
+        return sendOnLink(link, wire)
+    }
+
+    function finishOnLink(
+        borrow mut self,
+        link: Number,
+        index: Number,
+        trailers: borrow Fields
+    ) -> Result<Void, HttpFailure> {
+        if !served[index].bodiless {
+            let last = match http1LastChunk(trailers) {
+                Ok(value) -> value
+                Error(failure) -> return .Error(http1Failure(failure))
+            }
+            try sendOnLink(link, last)
+        }
+        if links[link].closeAfter { links[link].finishing = true }
+        return .Ok
+    }
+
+    function altServiceFor(borrow self, server: ServerId) -> String? {
+        for listener in listeners {
+            if listener.server == server { return copy listener.altService }
+        }
+        return .None
+    }
+}
+
+// Methods whose requests say their length even when it is zero.
+function carriesBody(method: Method) -> Bool {
+    return method == .Post || method == .Put || method == .Patch
+}
+
+// `Connection: close` among the fields (RFC 9112 section 9.6).
+function closesConnection(fields: borrow Fields) -> Bool {
+    for field in fields.entries {
+        if field.name != "connection" { continue }
+        for option in field.value.split(",") {
+            if option.trim().lowercased() == "close" { return true }
+        }
+    }
+    return false
+}

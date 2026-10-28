@@ -1,0 +1,98 @@
+// Loading: the compiled file and the files it imports, parsed into one tree.
+//
+// `import A.B` names `A/B.ksl` beside the importing file, then under the
+// toolchain's library root, each segment matched ignoring ASCII case as in
+// the oracle: repositories spell one directory `Common` and `common`. Imports are one level deep, as in the oracle: an
+// imported file's own imports are not loaded. An import that resolves
+// nowhere is left out here and reported by the checker, which knows the
+// alias it was written under.
+
+function loadShader(session: Session) -> Result<SyntaxTree, Failure> {
+    let entry = sourceName()
+    let file = readFile(session, entry)
+    var tree = try parseFile(SyntaxTree.empty(), fileText(session, file as SourceFile), file, "")
+    var loaded: [String] = []
+    for declared in tree.files[0].imports {
+        if contains(loaded, declared.alias) { continue }
+        loaded.append(declared.alias)
+        match resolveImport(session, directoryOf(entry), declared.path) {
+            Some(imported) -> {
+                tree = try parseFile(tree, fileText(session, imported as SourceFile), imported, declared.alias)
+            }
+            None -> {}
+        }
+    }
+    return .Ok(tree)
+}
+
+// The file `import A.B` reads, as a source file id.
+function resolveImport(session: Session, directory: String, path: [Identifier]) -> Optional<Int> {
+    var relative = ""
+    for segment in path {
+        if utf8Count(relative) > 0 { relative = joinText([relative, "/"]) }
+        relative = joinText([relative, segment.text])
+    }
+    relative = joinText([relative, ".ksl"])
+    match importUnder(session, directory, relative) {
+        Some(file) -> return .Some(file)
+        None -> {}
+    }
+    let library = stdRoot(session)
+    if utf8Count(library) > 0 { return importUnder(session, library, relative) }
+    let none: Optional<Int> = .None
+    return none
+}
+
+function importUnder(session: Session, root: String, relative: String) -> Optional<Int> {
+    let none: Optional<Int> = .None
+    let exact = joinPath(root, relative)
+    if pathExists(session, exact) { return .Some(readFile(session, exact)) }
+    // A listing names each file under the directory as written, `./` too.
+    var listed = exact
+    if root == "." { listed = joinText(["./", relative]) }
+    let count = readDirectory(session, root, "ksl")
+    for index in 0..count {
+        let file = source_directory_file(session, index)
+        if sameIgnoringCase(fileName(session, file as SourceFile), listed) { return .Some(file) }
+    }
+    return none
+}
+
+function sameIgnoringCase(left: String, right: String) -> Bool {
+    if utf8Count(left) != utf8Count(right) { return false }
+    for index in 0..utf8Count(left) {
+        if lowerAscii(utf8Byte(left, index)) != lowerAscii(utf8Byte(right, index)) { return false }
+    }
+    return true
+}
+
+function lowerAscii(byte: Int) -> Int {
+    if byte >= 65 && byte <= 90 { return byte + 32 }
+    return byte
+}
+
+function contains(names: [String], name: String) -> Bool {
+    for known in names {
+        if known == name { return true }
+    }
+    return false
+}
+
+function directoryOf(path: String) -> String {
+    var slash = -1
+    for index in 0..utf8Count(path) {
+        if utf8Byte(path, index) == asciiSlash { slash = index }
+    }
+    if slash < 0 { return "." }
+    if slash == 0 { return "/" }
+    return utf8Slice(path, 0, slash)
+}
+
+function joinPath(directory: String, relative: String) -> String {
+    if utf8Count(relative) > 0 && utf8Byte(relative, 0) == asciiSlash { return relative }
+    match directory {
+        "." -> return relative
+        "/" -> return joinText(["/", relative])
+        else -> return joinText([directory, "/", relative])
+    }
+}

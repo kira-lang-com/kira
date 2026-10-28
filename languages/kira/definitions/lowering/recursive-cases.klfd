@@ -1,0 +1,38 @@
+// The payload of an enum case, in the enum value or, for a recursive case,
+// in the heap cell the value points to. A copy allocates a cell of its own,
+// a move hands the pointer over with the value's bytes, and destroying the
+// value frees the cell.
+
+extend FunctionLowering {
+    function payloadType(borrow self, enumType: Type, variant: Int) -> Type {
+        match program.enums[enumType.declaration].variants[variant].payload {
+            Some(payload) -> return payload
+            None -> return Type.void()
+        }
+    }
+
+    function payloadPlace(borrow mut self, address: KirAddress, enumType: Type, variant: Int) -> KirAddress {
+        let payload = types.of(payloadType(enumType, variant))
+        if !isRecursiveCase(program, enumType.declaration, variant) { return kir.payload(address, variant, payload) }
+        return kir.typedMemory(kir.load(kir.payload(address, variant, types.pointer)), payload)
+    }
+
+    // The place to write a new payload of `variant` into the enum at
+    // `address`, allocating its cell when the case is recursive.
+    function newPayloadPlace(borrow mut self, address: KirAddress, enumType: Type, variant: Int) -> KirAddress {
+        let payload = types.of(payloadType(enumType, variant))
+        if !isRecursiveCase(program, enumType.declaration, variant) { return kir.payload(address, variant, payload) }
+        let size = kir.integer(types.integer64, types.cellSizes[enumType.declaration][variant])
+        let alignment = kir.integer(types.integer64, types.cellAlignments[enumType.declaration][variant])
+        let cell = kir.allocateRaw(size, alignment)
+        kir.store(cell, kir.payload(address, variant, types.pointer))
+        return kir.typedMemory(cell, payload)
+    }
+
+    function destroyPayload(borrow mut self, address: KirAddress, enumType: Type, variant: Int) {
+        destroyValue(payloadPlace(address, enumType, variant), payloadType(enumType, variant))
+        if isRecursiveCase(program, enumType.declaration, variant) {
+            kir.freeRaw(kir.load(kir.payload(address, variant, types.pointer)))
+        }
+    }
+}

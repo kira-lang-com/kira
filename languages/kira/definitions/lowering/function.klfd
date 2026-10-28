@@ -1,0 +1,547 @@
+// Lowering one function: its locals, its statements and its control flow.
+//
+// Every local has one storage address. A scalar or struct binding gets a
+// stack slot, allocated in the entry block so it dominates every use; a
+// struct or enum parameter and anything passed `borrow mut` use the caller's
+// storage. Reading a local is a load from its address, so a `borrow mut`
+// parameter needs no special case once it is bound.
+
+struct FunctionLowering {
+    let program: CheckedProgram
+    let types: KirTypes
+    let functions: [KirFunctionBuilder]
+    let checked: CheckedFunction
+    let kir: KirFunctionBuilder
+    let entry: KirBlockBuilder
+    // The block being filled, and whether it still needs a terminator.
+    var current: KirBlockBuilder
+    var open: Bool
+    var storage: [KirAddress]
+    // Where a struct or enum result is written, when the function has one.
+    var result: Optional<KirAddress>
+    var breaks: [KirBlockBuilder]
+    var continues: [KirBlockBuilder]
+    var lifetimes: [TrackedValue]
+    // For each address from `trackedBase` on, the index in `lifetimes` of the
+    // newest value tracked at it, or -1. Addresses are numbered across the
+    // whole module, so the table starts at the lowest one this function has
+    // tracked rather than at zero.
+    var trackedAt: [Int]
+    var trackedBase: Int
+    // Temporaries whose lifetimes have ended, kept for reuse.
+    var spareTemporaries: [TrackedValue]
+    var lifetimeScopes: [LifetimeScope]
+    var loopScopeDepths: [Int]
+    var cells: [TrackedCell]
+    var cellFlags: [Optional<KirAddress>]
+    // The storage an array alias holds once it is rebound to a value of its own.
+    var aliasStorage: [Optional<KirAddress>]
+    var functionIndex: Optional<Int>
+    var handlers: [LoweredErrorHandler]
+    // Buffers made for the arguments of the C call being lowered, given back
+    // once it returns.
+    var callStorage: [KirValue]
+    var cachingConstruction: Bool
+    var constructionLoads: [ConstructionLoad]
+    // An async function's resume function (lowering/async.klfd): its frame,
+    // the frame field of each local and of its drop flag (-1 off the frame
+    // or untracked), and the blocks its
+    // entry dispatches to.
+    var frameBase: Optional<KirAddress>
+    var frameRecord: Optional<KirType>
+    var frameFields: Int
+    var frameLocals: [Int]
+    var frameFlags: [Int]
+    var resumePoints: [KirBlockBuilder]
+    var cancelPoints: [KirBlockBuilder]
+
+    function start(program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder], index: Int) -> FunctionLowering {
+        var lowering = FunctionLowering.startChecked(program, types, functions, program.functions[index], functions[index])
+        lowering.functionIndex = .Some(index)
+        return lowering
+    }
+
+    function startChecked(program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder], checked: CheckedFunction, kir: KirFunctionBuilder) -> FunctionLowering {
+        kir_function_body(kir)
+        let entry = kir.entryBlock()
+        return FunctionLowering {
+            program = program,
+            types = types,
+            functions = functions,
+            checked = checked,
+            kir = kir,
+            entry = entry,
+            current = entry,
+            open = true,
+            storage = [],
+            result = .None,
+            breaks = [],
+            continues = [],
+            lifetimes = [], trackedAt = [], trackedBase = 0, spareTemporaries = [], lifetimeScopes = [], loopScopeDepths = [], cells = [], cellFlags = [], aliasStorage = [], functionIndex = .None, handlers = [], callStorage = [], cachingConstruction = false, constructionLoads = [],
+            frameBase = .None, frameRecord = .None, frameFields = 0, frameLocals = [], frameFlags = [], resumePoints = [], cancelPoints = []
+        }
+    }
+
+    function lowerBody(borrow mut self) {
+        kir.at(program.named(checked.name))
+        bindLocals()
+        let body = kir.block()
+        enter(body)
+        if framed() { asyncPrologue() }
+        if checked.entry {
+            match types.exitRegistration {
+                Some(registration) -> kir.callVoid(registration)
+                None -> {}
+            }
+        }
+        if !lowerZeroArrayBody() && !lowerArrayBuilderBody() { statements(checked.body) }
+        if open && framed() && resumeSpec().returnsNothing { asyncReturn(.None) }
+        if open {
+            if checked.result.equals(Type.void()) {
+                cleanupValues()
+                kir.returnVoid()
+            } else {
+                kir.unreachable()
+            }
+        }
+        kir.switchTo(entry)
+        if framed() { asyncDispatch(body) } else { kir.branch(body) }
+    }
+
+    // Parameters take their incoming values; every other local gets a slot.
+    function bindLocals(borrow mut self) {
+        var incoming = 0
+        if checked.lambda { incoming = 1 }
+        if checked.result.isAggregate() {
+            result = .Some(kir.memory(kir.parameter(incoming), types.of(checked.result)))
+            incoming += 1
+        }
+        for index in 0..checked.locals.count {
+            if index == checked.parameterCount { openFrame() }
+            let local = checked.locals[index]
+            let storageType = types.of(local.valueType)
+            let absent: Optional<KirAddress> = .None
+            cellFlags.append(absent)
+            aliasStorage.append(absent)
+            frameLocals.append(-1)
+            frameFlags.append(-1)
+            if local.captured {
+                let target = currentFunctionIndex()
+                let payloadType = types.capturePayloadType(target)
+                let boxType = types.captureBoxType(target)
+                let box = kir.typedMemory(kir.parameter(0), boxType)
+                let payload = kir.field(box, 2, payloadType)
+                var fieldType = storageType
+                if local.cell { fieldType = types.pointer }
+                storage.append(kir.field(payload, index, fieldType))
+                continue
+            }
+            if local.cell {
+                let slot = storageSlot(types.pointer)
+                if !framed() { kir.store(kir_value_null(kir, types.pointer), slot) }
+                storage.append(slot)
+                cellFlags[index] = .Some(trackCell(slot, local.valueType))
+                continue
+            }
+            if index >= checked.parameterCount && local.byReference {
+                let slot = storageSlot(types.pointer)
+                storage.append(slot)
+                let own = storageSlot(storageType)
+                trackValue(own, local.valueType)
+                aliasStorage[index] = .Some(own)
+                continue
+            }
+            if index >= checked.parameterCount {
+                let slot = storageSlot(storageType)
+                if framed() { frameLocals[index] = frameFields - 1 }
+                storage.append(slot)
+                if local.passingMode == .Owned { trackValue(slot, local.valueType) }
+                if framed() && frameFields > frameLocals[index] + 1 { frameFlags[index] = frameFields - 1 }
+            } else if local.byReference || local.valueType.isAggregate() {
+                let slot = kir.memory(kir.parameter(incoming + index - checked.captures.count), storageType)
+                storage.append(slot)
+                if local.passingMode == .Owned {
+                    trackValue(slot, local.valueType)
+                    markInitialized(slot)
+                }
+            } else {
+                let slot = kir.slot(storageType)
+                kir.store(kir.parameter(incoming + index - checked.captures.count), slot)
+                storage.append(slot)
+            }
+        }
+        openFrame()
+    }
+
+    function enter(borrow mut self, block: KirBlockBuilder) {
+        kir.switchTo(block)
+        current = block
+        open = true
+    }
+
+    // Ends the current block with a branch to `target`, if it is still open.
+    function flowInto(borrow mut self, target: KirBlockBuilder) {
+        if open { kir.branch(target) }
+        open = false
+    }
+
+    // Unnamed storage for a struct or enum value, allocated in the entry block
+    // like every other slot, or a retired one of the same type.
+    function temporary(borrow mut self, valueType: Type) -> KirAddress {
+        match recycledTemporary(valueType) {
+            Some(slot) -> {
+                releaseTracked(slot)
+                return slot
+            }
+            None -> {}
+        }
+        kir.switchTo(entry)
+        let slot = storageSlot(types.of(valueType))
+        trackValue(slot, valueType)
+        kir.switchTo(current)
+        releaseTracked(slot)
+        return slot
+    }
+
+    // Statements after a return, `break` or `continue` never run and are not
+    // lowered.
+    function statements(borrow mut self, indices: [Int]) {
+        let scope = lifetimeScopes.count
+        lifetimeScopes.append(LifetimeScope { locals = [], firstTemporary = lifetimes.count })
+        for position in 0..indices.count {
+            let index = indices[position]
+            if !open { break }
+            match program.statements[index].declaredLocal() {
+                Some(local) -> lifetimeScopes[scope].locals.append(local)
+                None -> {}
+            }
+            let mark = lifetimes.count
+            if !lowerRawArrayCopy(indices, position) { statement(program.statements[index]) }
+            endStatement(mark)
+        }
+        if open { cleanupLifetimeScope(lifetimeScopes[scope]) }
+        popLifetimeScope(scope)
+    }
+
+    // A statement's temporaries end with it: once it completes they are
+    // destroyed, and retired from the tracked values so that no later exit
+    // cleans them again and a later temporary can take their slots. A
+    // statement that left the block already cleaned them on its way out.
+    function endStatement(borrow mut self, mark: Int) {
+        if open {
+            for offset in 0..(lifetimes.count - mark) {
+                destroyTracked(lifetimes[lifetimes.count - offset - 1])
+            }
+        }
+        retireTracked(mark)
+    }
+
+    // The statements of a block expression. Its result may read the locals
+    // they declare, so those join the scope around the block and are
+    // released with it.
+    function blockStatements(borrow mut self, indices: [Int]) {
+        if lifetimeScopes.count == 0 {
+            statements(indices)
+            return
+        }
+        let scope = lifetimeScopes.count - 1
+        for position in 0..indices.count {
+            let index = indices[position]
+            if !open { break }
+            match program.statements[index].declaredLocal() {
+                Some(local) -> lifetimeScopes[scope].locals.append(local)
+                None -> {}
+            }
+            let mark = lifetimes.count
+            if !lowerRawArrayCopy(indices, position) { statement(program.statements[index]) }
+            endStatement(mark)
+        }
+    }
+
+    function statement(borrow mut self, lowered: CheckedStatement) {
+        match lowered {
+            InitializeGlobal(index, value) -> initializeGlobal(index, value)
+            Declare(local, value) -> {
+                if checked.locals[local].cell {
+                    initializeCell(local, value)
+                    return
+                }
+                if isAlias(local) {
+                    kir.store(kir.convert(convertBitcast, kir.pointer(address(value)), types.pointer), storage[local])
+                    return
+                }
+                releaseTracked(storage[local])
+                write(value, storage[local])
+            }
+            Assign(place, value) -> {
+                match program.expressions[place].operation.readLocal() {
+                    Some(local) -> {
+                        if isAlias(local) {
+                            rebindAlias(local, value)
+                            return
+                        }
+                    }
+                    None -> {}
+                }
+                let valueType = program.typeOf(place)
+                if valueType.isAggregate() {
+                    let saved = temporary(valueType)
+                    write(value, saved)
+                    prepareArrayPlace(place)
+                    let destination = address(place)
+                    if isTracked(destination) {
+                        releaseTracked(destination)
+                    } else if !program.refills(place) {
+                        destroyValue(destination, valueType)
+                    }
+                    moveValue(saved, destination, valueType)
+                    forgetTracked(saved)
+                    markInitialized(destination)
+                    return
+                }
+                let stored = self.value(value)
+                prepareArrayPlace(place)
+                let destination = address(place)
+                kir.store(stored, destination)
+            }
+            Evaluate(value) -> evaluate(value)
+            Branch(condition, whenTrue, whenFalse) -> branch(condition, whenTrue, whenFalse)
+            Loop(condition, body) -> loop(condition, body)
+            Count(counter, low, high, body) -> count(counter, low, high, body)
+            Iterate(element, array, body) -> arrayIteration(element, array, body)
+            Dispatch(subject, arms) -> dispatch(subject, arms, .None)
+            Attempt(body, local, subject, arms) -> lowerAttempt(body, local, subject, arms)
+            Return(value) -> returnStatement(value)
+            Break -> { cleanupLoopScopes() jump(breaks[breaks.count - 1]) }
+            Continue -> { cleanupLoopScopes() jump(continues[continues.count - 1]) }
+        }
+    }
+
+    function branch(borrow mut self, condition: Int, whenTrue: [Int], whenFalse: [Int]) {
+        let test = value(condition)
+        let thenBlock = kir.block()
+        let elseBlock = kir.block()
+        let join = kir.block()
+        kir.branchIf(test, thenBlock, elseBlock)
+        enter(thenBlock)
+        statements(whenTrue)
+        var joined = open
+        flowInto(join)
+        enter(elseBlock)
+        statements(whenFalse)
+        joined = joined || open
+        flowInto(join)
+        enter(join)
+        if !joined {
+            kir.unreachable()
+            open = false
+        }
+    }
+
+    function loop(borrow mut self, condition: Int, body: [Int]) {
+        let test = kir.block()
+        let bodyBlock = kir.block()
+        let after = kir.block()
+        flowInto(test)
+        enter(test)
+        kir.branchIf(value(condition), bodyBlock, after)
+        loopBody(bodyBlock, body, after, test)
+        enter(after)
+    }
+
+    // `for counter in low..high`: both bounds are evaluated once, and the
+    // counter steps by one while it is below `high`.
+    function count(borrow mut self, counter: Int, low: Int, high: Int, body: [Int]) {
+        let counterType = program.typeOf(low)
+        kir.store(value(low), storage[counter])
+        let limit = value(high)
+        // A framed body may suspend in the loop, so the bound is kept in the
+        // frame rather than in a value of the block before it.
+        var spilled: Optional<KirAddress> = .None
+        if framed() {
+            kir.switchTo(entry)
+            let slot = storageSlot(types.of(counterType))
+            kir.switchTo(current)
+            kir.store(limit, slot)
+            spilled = .Some(slot)
+        }
+        let test = kir.block()
+        let bodyBlock = kir.block()
+        let step = kir.block()
+        let after = kir.block()
+        flowInto(test)
+        enter(test)
+        var bound = limit
+        match spilled {
+            Some(slot) -> bound = kir.load(slot)
+            None -> {}
+        }
+        let below = kir.compare(kirPredicate(.Less, counterType.signed), kir.load(storage[counter]), bound)
+        kir.branchIf(below, bodyBlock, after)
+        loopBody(bodyBlock, body, after, step)
+        enter(step)
+        let one = kir.integer(types.of(counterType), 1)
+        let next = kir.binary(kirOperator(.Add, counterType.signed), false, counterType.signed, kir.load(storage[counter]), one)
+        kir.store(next, storage[counter])
+        kir.branch(test)
+        open = false
+        enter(after)
+    }
+
+    function loopBody(borrow mut self, block: KirBlockBuilder, body: [Int], after: KirBlockBuilder, next: KirBlockBuilder) {
+        breaks.append(after)
+        continues.append(next)
+        loopScopeDepths.append(lifetimeScopes.count)
+        enter(block)
+        statements(body)
+        flowInto(next)
+        breaks = withoutLast(breaks)
+        continues = withoutLast(continues)
+        popLoopScope()
+    }
+
+    // A match is one `switch.enum` over its arms. Each arm copies the
+    // variant's payload into its binding before its statements run.
+    // Each arm runs in a block of its own, entered by switching on an enum's
+    // variant or by testing an integer or a Bool against each literal in
+    // turn. The arms of a `match` used as a value write it to `destination`.
+    function dispatch(borrow mut self, subject: Int, arms: [CheckedArm], destination: Optional<KirAddress>) {
+        let subjectType = program.typeOf(subject)
+        // Subject evaluation can create blocks (bounds checks, calls, or
+        // another match). Emit those before the arms that read its value.
+        var scrutinee: Optional<KirAddress> = .None
+        var tested: Optional<KirValue> = .None
+        var text: Optional<KirAddress> = .None
+        var number: Optional<KirAddress> = .None
+        if subjectType.kind == .Enumeration {
+            scrutinee = .Some(address(subject))
+        } else if isStringType(program, subjectType) {
+            text = .Some(address(subject))
+        } else if program.isNumberWords(subjectType) {
+            // A `Number` is its two words by the time it gets here, and those
+            // are ordered by value and not compared word against word.
+            number = .Some(address(subject))
+        } else {
+            tested = .Some(value(subject))
+        }
+        let join = kir.block()
+        var blocks: [KirBlockBuilder] = []
+        for arm in arms { blocks.append(kir.block()) }
+        match scrutinee {
+            Some(place) -> {
+                if program.enums[subjectType.declaration].open {
+                    testOpenArms(kir.tag(place), program.enums[subjectType.declaration], arms, blocks)
+                } else {
+                    switchArms(subjectType, arms, blocks)
+                    kir.switchEnum(place)
+                }
+            }
+            None -> {
+                match tested {
+                    Some(subjectValue) -> testArms(subjectValue, subjectType, arms, blocks)
+                    None -> {}
+                }
+                match text {
+                    Some(place) -> testTextArms(place, subjectType, arms, blocks)
+                    None -> {}
+                }
+                match number {
+                    Some(place) -> testNumberArms(place, arms, blocks)
+                    None -> {}
+                }
+            }
+        }
+        open = false
+        var joined = false
+        for index in 0..arms.count {
+            let arm = arms[index]
+            enter(blocks[index])
+            // The binding belongs to its arm: it ends where the arm does,
+            // after the arm's value has been written from it. So do the
+            // locals the arm's body declares, since the value may be one of
+            // them: closing the body first would free what the value moves.
+            let scope = lifetimeScopes.count
+            lifetimeScopes.append(LifetimeScope { locals = [], firstTemporary = lifetimes.count })
+            match arm.binding {
+                Some(binding) -> {
+                    lifetimeScopes[scope].locals.append(binding)
+                    bindPayload(subject, scrutinee, subjectType, arm.variant, binding)
+                }
+                None -> {}
+            }
+            blockStatements(arm.body)
+            if open {
+                match arm.value {
+                    Some(value) -> {
+                        match destination {
+                            Some(place) -> write(value, place)
+                            // A `match` whose value is Void runs each arm's
+                            // value for what it does.
+                            None -> evaluate(value)
+                        }
+                    }
+                    None -> {}
+                }
+            }
+            if open { cleanupLifetimeScope(lifetimeScopes[scope]) }
+            // No other arm runs after this one, so its temporaries end here.
+            retireTracked(lifetimeScopes[scope].firstTemporary)
+            popLifetimeScope(scope)
+            joined = joined || open
+            flowInto(join)
+        }
+        enter(join)
+        if !joined {
+            kir.unreachable()
+            open = false
+        }
+    }
+
+    function returnStatement(borrow mut self, returned: Optional<Int>) {
+        if framed() {
+            asyncReturn(returned)
+            return
+        }
+        match returned {
+            Some(expression) -> {
+                if program.typeOf(expression).equals(Type.void()) {
+                    evaluate(expression)
+                    cleanupValues()
+                    kir.returnVoid()
+                    open = false
+                    return
+                }
+                match result {
+                    Some(destination) -> {
+                        write(expression, destination)
+                        cleanupValues()
+                        kir.returnVoid()
+                    }
+                    None -> {
+                        let returnedValue = value(expression)
+                        cleanupValues()
+                        kir.returnValue(returnedValue)
+                    }
+                }
+            }
+            None -> {
+                cleanupValues()
+                kir.returnVoid()
+            }
+        }
+        open = false
+    }
+
+    function jump(borrow mut self, target: KirBlockBuilder) {
+        kir.branch(target)
+        open = false
+    }
+}
+
+function withoutLast(blocks: [KirBlockBuilder]) -> [KirBlockBuilder] {
+    var kept: [KirBlockBuilder] = []
+    for index in 0..blocks.count - 1 {
+        kept.append(blocks[index])
+    }
+    return kept
+}

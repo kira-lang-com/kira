@@ -1,0 +1,30 @@
+// `@FFI.Variadic`: arguments past the fixed parameters cross as C promotes
+// them, so a byte or a `Bool` arrives as an `int`, an `F32` as a double and
+// a `String` as a `CString`.
+
+distinct Count = I32
+
+enum Mode {
+    First
+    Second
+    Third
+}
+
+@FFI.Extern { library: klfseam, symbol: seam_tally, abi: c }
+@FFI.Variadic
+function tally(kinds: CString): Int
+
+@Main
+function main() {
+    print(tally(""))
+    let small: I8 = -3
+    let wide: U16 = 60000
+    print(tally("ii", small, wide))
+    print(tally("lil", 5000000000, 7, -1))
+    let half: F32 = 0.5
+    print(tally("dd", half, 2.25))
+    print(tally("ss", "four", "seven!!"))
+    print(tally("ii", true, false))
+    print(tally("ii", Count(I32(41)), Mode.Third))
+    print(tally("ilids", 1, 2, 3, 4.5, "x"))
+}

@@ -1,0 +1,32 @@
+// A stock count kept in a struct: methods, `borrow mut` parameters and a
+// field with a default.
+
+struct Stock {
+    var count: Int
+    let limit: Int = 100
+
+    function room(borrow self) -> Int {
+        return limit - count
+    }
+
+    function add(borrow mut self, amount: Int) -> Bool {
+        if amount > room() { return false }
+        count = count + amount
+        return true
+    }
+}
+
+function restock(stock: borrow mut Stock, rounds: Int) -> Int {
+    var refused = 0
+    for round in 0..rounds {
+        if !stock.add(round * 10) { refused = refused + 1 }
+    }
+    return refused
+}
+
+@Main
+function main() -> Int {
+    var stock = Stock { count = 5 }
+    let refused = restock(stock, 6)
+    return stock.count * 10 + refused
+}

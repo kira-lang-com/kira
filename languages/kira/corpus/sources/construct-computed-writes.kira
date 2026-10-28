@@ -1,0 +1,61 @@
+// A computed member is written in part as a whole: writing a field of its
+// value, or appending to it, reads the member, changes the copy and hands it
+// to the setter. Its getter reads, so a method that only reads it borrows
+// self, even when the setter writes self.
+
+import Foundation
+
+struct Pair {
+    var a: Int = 1
+    var b: Int = 2
+}
+
+construct Base {
+}
+
+construct Holder() extends Base {
+    var store: Pair = Pair {}
+    var items: [Int] = []
+
+    var pair: Pair {
+        get {
+            return store
+        }
+        set(value) {
+            store = value
+        }
+    }
+
+    var list: [Int] {
+        get {
+            return items
+        }
+        set(value) {
+            items = value
+        }
+    }
+
+    function sum() -> Int {
+        return pair.a + pair.b + list.count
+    }
+
+    function change() {
+        pair.a = 7
+        pair.b += 3
+        list.append(9)
+        list[0] = 4
+    }
+}
+
+@Main
+function main() -> Int {
+    var holder = Holder()
+    if holder.sum() != 3 { return 1 }
+    holder.change()
+    if holder.store.a != 7 { return 2 }
+    if holder.store.b != 5 { return 3 }
+    if holder.items.count != 1 { return 4 }
+    if holder.items[0] != 4 { return 5 }
+    if holder.sum() != 13 { return 6 }
+    return 42
+}

@@ -1,0 +1,94 @@
+import Foundation
+
+// Splitting an executable into the image that runs and the image that keeps the
+// debug information.
+
+// The loaded bytes of `.text`, as the stripped image holds them.
+function sameLoadedText(stripped: borrow [UN8], original: borrow [UN8]) -> Bool {
+    for index in 64..128 {
+        if stripped[index] != original[index] { return false }
+    }
+    return true
+}
+
+// A stripped image keeps the loaded bytes of `.text` and drops the debug
+// sections: the sections listed are the header, `.text` and `.shstrtab`.
+@Test
+function strippingDropsTheDebugSectionsAndKeepsWhatRuns() {
+    let original = sampleElf(2)
+    let stripped = match stripDebugInformation(original) {
+        Ok(split) -> split
+        Error(failure) -> {
+            expect!((elfFailureText(failure)) == "")
+            return
+        }
+    }
+    expect!((sectionListing(stripped)) == ":0 .text:1 .shstrtab:3")
+    expect!((sameLoadedText(stripped, original)) == (true))
+}
+
+// The stripped image is itself a readable ELF file of the same machine.
+@Test
+function theStrippedImageReadsAsTheSameMachine() {
+    let stripped = match stripDebugInformation(sampleElf(2)) {
+        Ok(split) -> split
+        Error(failure) -> {
+            expect!((elfFailureText(failure)) == "")
+            return
+        }
+    }
+    let machine = match elfMachine(stripped) {
+        Ok(found) -> found
+        Error(failure) -> {
+            expect!((elfFailureText(failure)) == "")
+            return
+        }
+    }
+    expect!((machine) == (62))
+}
+
+// The debug image keeps every header and the `dbg!` bytes of `.debug_info`.
+@Test
+function debugInformationKeepsEveryHeader() {
+    let debug = match debugInformation(sampleElf(3)) {
+        Ok(split) -> split
+        Error(failure) -> {
+            expect!((elfFailureText(failure)) == "")
+            return
+        }
+    }
+    expect!((sectionListing(debug)) == ":0 .text:8 .debug_info:1 .symtab:2 .strtab:3 .shstrtab:3")
+}
+
+@Test
+function debugInformationKeepsTheDebugBytes() {
+    let debug = match debugInformation(sampleElf(3)) {
+        Ok(split) -> split
+        Error(failure) -> {
+            expect!((elfFailureText(failure)) == "")
+            return
+        }
+    }
+    let image = match readElf(debug) {
+        Ok(read) -> read
+        Error(failure) -> {
+            expect!((elfFailureText(failure)) == "")
+            return
+        }
+    }
+    let at = image.sections[2].offset
+    var held: [UN8] = []
+    for index in at..(at + 4) { held.append(debug[index]) }
+    expect!((textFromBytes(held).or("?")) == "dbg!")
+}
+
+// A relocatable object is neither an executable nor a shared library, so it is
+// not split.
+@Test
+function aRelocatableObjectIsNotSplit() {
+    let text = match stripDebugInformation(sampleElf(1)) {
+        Ok(split) -> "split"
+        Error(failure) -> elfFailureText(failure)
+    }
+    expect!((text) == "unsupported ELF: only an executable or a shared library is split")
+}

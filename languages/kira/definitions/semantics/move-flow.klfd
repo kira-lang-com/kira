@@ -1,0 +1,86 @@
+// Which bindings a move may have consumed at each point of a body.
+//
+// A move ends its binding on the paths through it and no others: after
+// `if ready { return .Array(move items) }` the later code runs only when the
+// branch did not, so `items` is still there. Each branch of an `if` or a
+// `match` starts from the state before it, and the state after is the union
+// of the branches that reach the end. A `break` or `continue` carries its
+// state to the loop's exit instead.
+
+extend Checker {
+    function movedNow(borrow self) -> [Bool] {
+        var state: [Bool] = []
+        for local in locals { state.append(local.moved) }
+        return state
+    }
+
+    function restoreMoved(borrow mut self, state: [Bool]) {
+        for index in 0..state.count { locals[index].moved = state[index] }
+    }
+
+    // The union of `paths`, the states of the ways that reach the end of a
+    // statement. When none reaches it the code after is unreachable, and it
+    // keeps the state from before the statement.
+    function joinMoved(borrow mut self, paths: [[Bool]], before: [Bool]) {
+        restoreMoved(before)
+        if paths.count == 0 { return }
+        for index in 0..before.count {
+            var moved = false
+            for path in paths {
+                if path[index] { moved = true }
+            }
+            locals[index].moved = moved
+        }
+    }
+
+    // Records the state at a `break` or `continue` for its loop's exit.
+    function jumpMoved(borrow mut self) {
+        if loopMoves.count == 0 { return }
+        let top = loopMoves.count - 1
+        let now = movedNow()
+        var exit: [Bool] = []
+        for index in 0..loopMoves[top].count {
+            exit.append(loopMoves[top][index] || now[index])
+        }
+        loopMoves[top] = exit
+    }
+
+    // Whether control cannot reach the end of `statements`: every way
+    // through returns, breaks or continues.
+    function leaves(borrow self, statements: [Int]) -> Bool {
+        for index in statements {
+            match program.statements[index] {
+                Return -> return true
+                Break -> return true
+                Continue -> return true
+                Branch(condition, thenBody, elseBody) -> {
+                    if leaves(thenBody) && leaves(elseBody) { return true }
+                }
+                Dispatch(subject, arms) -> {
+                    if arms.count > 0 {
+                        var all = true
+                        for arm in arms {
+                            if !leaves(arm.body) { all = false }
+                        }
+                        if all { return true }
+                    }
+                }
+                Attempt(body, error, subject, arms) -> {
+                    var all = leaves(body)
+                    for arm in arms {
+                        if !leaves(arm.body) { all = false }
+                    }
+                    if all { return true }
+                }
+                Declare -> {}
+                InitializeGlobal -> {}
+                Assign -> {}
+                Evaluate -> {}
+                Loop -> {}
+                Count -> {}
+                Iterate -> {}
+            }
+        }
+        return false
+    }
+}

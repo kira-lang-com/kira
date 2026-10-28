@@ -1,0 +1,70 @@
+import Foundation
+
+// Frame release of scalar-only structs.
+//
+// A struct whose fields are all scalars is inline storage on the native frame
+// and a heap object on the VM, so its release is the one place the engines'
+// release plans legitimately differ. These shapes are the ones a wrong plan
+// leaked in a real application, and they churn enough copies that an unreleased
+// slot is caught by the VM's exit accounting.
+
+struct RlxColor {
+    var r: Float = 0.0
+    var g: Float = 0.0
+    var b: Float = 0.0
+    var a: Float = 0.0
+}
+
+struct RlxResolution {
+    var color: RlxColor = RlxColor {}
+    var found: Bool = false
+}
+
+// A `var` local that is field-written and then returned: the return copies,
+// so the frame still holds the original and the plan must release it.
+function rlxResolve(tag: Number) -> RlxResolution {
+    var resolution = RlxResolution()
+    resolution.color = RlxColor { r: Float(tag), g: 2.0, b: 3.0, a: 4.0 }
+    resolution.found = tag > 0
+    return resolution
+}
+
+// A chained field read off a call result: the temporary and its field both
+// die in this frame.
+function rlxResolveColor(tag: Number) -> RlxColor {
+    return rlxResolve(tag).color
+}
+
+// A scalar-only struct borrowed by a callee. The VM passes a copy the callee
+// owns, so the parameter slot must be in the callee's plan.
+function rlxRead(resolution: borrow RlxResolution) -> Number {
+    return Number(resolution.color.r)
+}
+
+let rlxModuleResolution = rlxResolve(7)
+
+@Test
+function resolvedColorRedIsReleasedEachIteration() {
+    var total: Number = 0
+    for index in 0..2000 {
+        let resolved = rlxResolveColor(index)
+        total = total + Number(resolved.r)
+    }
+    expect!((total) == (1999000))
+}
+
+@Test
+function borrowedModuleConstantReadsItsRed() {
+    var total: Number = 0
+    for index in 0..2000 {
+        total = total + rlxRead(rlxModuleResolution)
+    }
+    expect!((total) == (14000))
+    expect!((rlxRead(rlxModuleResolution)) == (7))
+}
+
+@Test
+function foundFlagFollowsTheTag() {
+    expect!(rlxResolve(7).found)
+    expect!(!rlxResolve(0).found)
+}

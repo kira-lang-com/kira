@@ -1,0 +1,47 @@
+import Foundation
+
+// A `match` whose arms call functions that return nothing, used where a
+// value goes: as a `return` in a function that returns nothing.
+
+struct VoidMatchLog {
+    var notes: [String] = []
+
+    function noteNumber(borrow mut self, value: Number) {
+        notes.append("number \(value)")
+    }
+
+    function noteText(borrow mut self, text: borrow String) {
+        notes.append("text \(text)")
+    }
+
+    function take(borrow mut self, outcome: Result<Number, String>) {
+        return match outcome {
+            Ok(value) -> noteNumber(value)
+            Error(text) -> noteText(text)
+        }
+    }
+}
+
+@Test
+function voidMatchRunsTheTakenArm() {
+    var log = VoidMatchLog {}
+    log.take(.Ok(7))
+    log.take(.Error("no"))
+    expect!((joined(log.notes, ", ")) == ("number 7, text no"))
+}
+
+@Test
+function voidMatchRunsOnlyOneArmPerCall() {
+    var log = VoidMatchLog {}
+    log.take(.Ok(3))
+    expect!(log.notes.count == 1)
+    expect!((log.notes[0]) == ("number 3"))
+}
+
+@Test
+function voidMatchKeepsErrorTextVerbatim() {
+    var log = VoidMatchLog {}
+    log.take(.Error("disk full"))
+    expect!(log.notes.count == 1)
+    expect!((log.notes[0]) == ("text disk full"))
+}

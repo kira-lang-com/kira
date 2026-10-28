@@ -1,0 +1,87 @@
+import Foundation
+import Build
+import Kten
+
+@Main
+function main() -> Number {
+    if environmentValue("FIXTURE_COMPILER") == "yes" { return compilerProbe() }
+    var graph = Graph {
+        project: "relocation",
+        root: environmentValue("FIXTURE_ROOT"),
+        request: BuildRequest { arguments: ["all"], jobs: 1 }
+    }
+    if environmentValue("FIXTURE_FORCE_SWEEP") == "yes" {
+        let path = environmentValue("KIRA_BUILD_CACHE") + "/unswept"
+        match writeFileBytes(path, ktenObject("Unswept", [ktenField("bytes", .Number(268435456))]).encoded()) {
+            Ok -> {}
+            Error(failure) -> return 2
+        }
+    }
+    let imported = environmentValue("FIXTURE_SNAPSHOT")
+    if imported.count > 0 {
+        let snapshot = match loadBuildSnapshot(imported) {
+            Ok(found) -> found
+            Error(failure) -> return 2
+        }
+        var artifacts: [Artifact] = []
+        for reference in snapshot.artifacts { artifacts.append(graph.reference(copy reference)) }
+        let shared = environmentValue("FIXTURE_SHARED") == "yes"
+        graph.step(Step {
+            name: "all", summary: "import snapshot", produces: artifacts, materialize: !shared,
+            run: .Some({ run in
+                if !shared { return 0 }
+                for reference in run.artifacts {
+                    match resolveBuildArtifact(reference) {
+                        Ok(path) -> print("shared " + path)
+                        Error(failure) -> return 2
+                    }
+                }
+                return 0
+            })
+        })
+        return graph.run()
+    }
+    let library = graph.source("library.txt")
+    let unrelated = graph.source("unrelated.txt")
+    let built = graph.command(CommandAction {
+        label: "compile library",
+        tool: "/bin/cp",
+        arguments: [.Input(library), .Output("library")],
+        reads: [library],
+        sourceRoot: ".",
+        outputs: [Output { name: "library" }]
+    })[0]
+    let dependent = graph.command(CommandAction {
+        label: "compile dependent",
+        tool: "/bin/cp",
+        arguments: [.Input(built), .Output("dependent")],
+        outputs: [Output { name: "dependent" }]
+    })[0]
+    let other = graph.command(CommandAction {
+        label: "compile unrelated",
+        tool: "/bin/cp",
+        arguments: [.Input(unrelated), .Output("unrelated")],
+        reads: [unrelated],
+        sourceRoot: ".",
+        outputs: [Output { name: "unrelated" }]
+    })[0]
+    let anchor = graph.source("anchor.txt")
+    let discovered = graph.command(CommandAction {
+        label: "compile discovered",
+        tool: "/bin/sh",
+        arguments: [
+            .Text("-c"),
+            .Text("dep=\"${1%/*}/discovered.txt\"\n/bin/cat \"$dep\" > \"$2\"\nprintf '%s: %s\\n' \"$2\" \"$dep\" > dependencies.d"),
+            .Text("probe"), .Input(anchor), .Output("discovered")
+        ],
+        reads: [anchor], sourceRoot: ".", depfile: "dependencies.d",
+        outputs: [Output { name: "discovered" }]
+    })[0]
+    let capture = environmentValue("FIXTURE_CAPTURE") == "yes"
+    let metadata: Kten? = capture ? .Some(.Text("relocation probe")) : .None
+    graph.step(Step {
+        name: "all", summary: "relocation probe", produces: [built, dependent, other, discovered],
+        snapshot: metadata, materialize: !capture
+    })
+    return graph.run()
+}

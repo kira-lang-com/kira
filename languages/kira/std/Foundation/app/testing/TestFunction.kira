@@ -1,0 +1,185 @@
+// `@Test` on a top-level function makes it a test, and `expect!` checks
+// something inside one. `kira test` runs every test function in a child of
+// its own, and the test passes when it returns with every expectation it
+// reached held.
+//
+//   @Test
+//   function sumsRange() {
+//       var sum = 0
+//       for value in 0..5 { sum += value }
+//       expect!(sum == 10)
+//   }
+//
+// A failed expectation does not stop the test: the rest of it still runs, so
+// one run reports every expectation that failed.
+
+// What `@Test` leaves beside a test function in a test build, for
+// `TestRunner` to find: a member of this family named after the function,
+// whose `run` calls it.
+construct TestFunction {
+    @Required function run()
+    // The fragment the message of a trap must contain for the test to pass,
+    // none for a test that passes by returning.
+    @Required function expectedTrap() -> String?
+}
+
+namespace TestFunctionMarker {
+    let prefix: String = "__kira_test_function_"
+}
+
+// `@Test` makes a passing test. A test whose body states `expectTrap!("fragment")`
+// must end in a runtime trap whose message contains `fragment`: its body runs
+// in a child that traps, and the test passes when the trap's text has it.
+// Attributes take no arguments in Kira, so the marker is in the body.
+macro expectTrap(message: expr) {
+    expand { }
+}
+
+comptime macro Test {
+    kind { attribute }
+    appliesTo { function }
+    expand(target: Declaration) -> Syntax {
+        if !Build.testing() { return quote {} }
+        var expected = Syntax { text = ".None" }
+        match trapFragment(target.syntax.asString()) {
+            Some(fragment) -> expected = Syntax { text = ".Some(\"" + fragment + "\")" }
+            None -> {}
+        }
+        return quote {
+            TestFunction __kira_test_function_#{target.name} {
+                function run() { #{target.name}() }
+                function expectedTrap() -> String? { return #{expected} }
+            }
+        }
+    }
+}
+
+// The fragment of the first `expectTrap!("...")` in a declaration's text, none
+// when the declaration states none.
+comptime function trapFragment(text: borrow String) -> Optional<String> {
+    let marker = "expectTrap!(\""
+    match text.indexOf(marker) {
+        None -> return .None
+        Some(start) -> {
+            let rest = text.substring(start + marker.count, text.count)
+            match rest.indexOf("\"") {
+                None -> return .None
+                Some(close) -> return .Some(rest.substring(0, close))
+            }
+        }
+    }
+}
+
+// The test function a `TestFunction` member was left for.
+comptime function testFunctionName(marker: borrow Identifier) -> Identifier {
+    let text = marker.asString()
+    return Identifier { text = text.substring(TestFunctionMarker.prefix.count, text.count) }
+}
+
+// `expect!(condition)`. A condition comparing two values with `==` at its top
+// level reports both values when it fails, so the failure says what each side
+// was and not only that they differed.
+comptime macro expect {
+    kind { function }
+    expand(input: Syntax) -> Syntax {
+        let source = input.asString().trim()
+        match comparedSides(source) {
+            Some(sides) -> {
+                let (left, right) = sides
+                return quote {
+                    expectEqual!(
+                        #{Syntax { text = left }},
+                        #{Syntax { text = right }},
+                        #{left},
+                        #{right}
+                    )
+                }
+            }
+            None -> return quote { expectTrue(#{input}, #{source}) }
+        }
+    }
+}
+
+// The two sides of the `==` that `source` compares with, when it is outside
+// every bracket and string literal. `!=`, `<=` and `>=` never start with
+// `==`, so the first such pair is the comparison.
+comptime function comparedSides(source: borrow String) -> (String, String)? {
+    var depth = 0
+    var quoted = false
+    var escaped = false
+    for index in 0..source.count {
+        let character = source.substring(index, index + 1)
+        if quoted {
+            if escaped {
+                escaped = false
+            } else {
+                match character {
+                    "\\" -> escaped = true
+                    "\"" -> quoted = false
+                    // Any other character is part of the literal.
+                    else -> {}
+                }
+            }
+            continue
+        }
+        match character {
+            "\"" -> quoted = true
+            "(", "[", "{" -> depth++
+            ")", "]", "}" -> depth--
+            "=" -> {
+                if depth == 0 && index + 2 <= source.count && source.substring(
+                    index,
+                    index + 2
+                ) == "==" {
+                    return .Some(
+                        (
+                            source.substring(0, index).trim(),
+                            source.substring(index + 2, source.count).trim()
+                        )
+                    )
+                }
+            }
+            // Any other character leaves the nesting as it is.
+            else -> {}
+        }
+    }
+    return .None
+}
+
+function expectTrue(condition: Bool, source: borrow String) {
+    if !condition { recordTestIssue("expectation failed: " + source) }
+}
+
+// `left` and `right` are the sides as written. Each value is shown where it
+// is compared, as its own type shows it.
+macro expectEqual(got: expr, expected: expr, left: expr, right: expr) {
+    expand {
+        if !(got == expected) {
+            recordTestIssue(
+                "expectation failed: " + shownSide(left, traceText(got)) + " == " + shownSide(
+                    right,
+                    traceText(expected)
+                )
+            )
+        }
+    }
+}
+
+// A side whose value reads the same as its source, a literal, is shown once.
+function shownSide(source: borrow String, shown: borrow String) -> String {
+    if shown == source { return copy source }
+    return "(" + source + " → " + shown + ")"
+}
+
+// A failed expectation: written where the driver shows a failing test's
+// account, and counted so the test ends failed.
+function recordTestIssue(message: borrow String) {
+    printError(message)
+    runtimeContext.testIssues++
+}
+
+// How a test function that returned went.
+function testFunctionAnswer() -> TestAnswer {
+    if runtimeContext.testIssues == 0 { return .Passed }
+    return .Failed
+}

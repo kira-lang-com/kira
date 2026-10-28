@@ -1,0 +1,113 @@
+// The fields of a foreign block, read before its signature is checked.
+struct ForeignFields {
+    let clean: Bool
+    let called: Optional<Identifier>
+    let library: Optional<Identifier>
+    let symbol: Optional<Identifier>
+    let abi: Optional<Identifier>
+    let retains: [Identifier]
+}
+
+extend Checker {
+    function foreignFields(borrow mut self, mark: ForeignMark, syscall: Bool) -> ForeignFields {
+        var clean = true
+        var called: Optional<Identifier> = .None
+        var library: Optional<Identifier> = .None
+        var symbol: Optional<Identifier> = .None
+        var abi: Optional<Identifier> = .None
+        var retains: [Identifier] = []
+        for field in mark.fields {
+            match field.value {
+                Word(word) -> {
+                    if syscall {
+                        if field.key.text != "name" || called.isSome() {
+                            report(.ForeignUnknownField, field.key.span)
+                            clean = false
+                        }
+                        called = .Some(word)
+                        continue
+                    }
+                    match field.key.text {
+                        "library" -> {
+                            if library.isSome() { report(.ForeignFieldTwice, field.key.span) clean = false }
+                            library = .Some(word)
+                        }
+                        "symbol" -> {
+                            if symbol.isSome() { report(.ForeignFieldTwice, field.key.span) clean = false }
+                            symbol = .Some(word)
+                        }
+                        "abi" -> {
+                            if abi.isSome() { report(.ForeignFieldTwice, field.key.span) clean = false }
+                            abi = .Some(word)
+                        }
+                        "retains" -> retains.append(word)
+                        else -> {
+                            report(.ForeignUnknownField, field.key.span)
+                            clean = false
+                        }
+                    }
+                }
+                Count -> {
+                    report(.ForeignUnknownField, field.key.span)
+                    clean = false
+                }
+                Named -> {
+                    report(.ForeignUnknownField, field.key.span)
+                    clean = false
+                }
+                Listed -> {
+                    report(.ForeignUnknownField, field.key.span)
+                    clean = false
+                }
+            }
+        }
+        return ForeignFields { clean = clean, called = called, library = library, symbol = symbol, abi = abi, retains = retains }
+    }
+
+    // The library a block calls into, `-1` for a system call, or none when a
+    // field it needs is missing or wrong.
+    function foreignTarget(borrow mut self, fields: borrow ForeignFields, mark: ForeignMark, syscall: Bool, address: Bool) -> Optional<Int> {
+        if syscall {
+            if fields.called.isNone() {
+                report(.ForeignMissingField, mark.block)
+                return .None
+            }
+            return .Some(0 - 1)
+        }
+        var clean = true
+        var libraryIndex = 0 - 1
+        match fields.library {
+            Some(named) -> {
+                libraryIndex = nativeLibraryIndex(named.text)
+                if libraryIndex < 0 {
+                    report(.UnknownNativeLibrary, named.span)
+                    clean = false
+                }
+            }
+            None -> {
+                report(.ForeignMissingField, mark.block)
+                clean = false
+            }
+        }
+        if fields.symbol.isNone() {
+            report(.ForeignMissingField, mark.block)
+            clean = false
+        }
+        match fields.abi {
+            Some(named) -> {
+                if named.text != "c" {
+                    report(.ForeignAbi, named.span)
+                    clean = false
+                }
+            }
+            None -> {
+                if !address {
+                    report(.ForeignMissingField, mark.block)
+                    clean = false
+                }
+            }
+        }
+        if !clean { return .None }
+        return .Some(libraryIndex)
+    }
+}

@@ -1,0 +1,31 @@
+import Foundation
+
+// A string is written as itself, as `print` writes it; other values as a
+// trail shows them. The interpolated string stays usable afterwards.
+
+struct Named {
+    let name: String
+    let size: Number
+}
+
+function described(named: borrow Named) -> String {
+    let label = "item"
+    let text = "\(label) \(named.name) \(named.size) \(true)"
+    return text + " " + label
+}
+
+@Test
+function interpolationWritesStringsAndValues() {
+    expect!((described(Named { name: "box", size: 4 })) == ("item box 4 true item"))
+    expect!((described(Named { name: "", size: 0 })) == ("item  0 true item"))
+    expect!((described(Named { name: "a b", size: 12 })) == ("item a b 12 true item"))
+}
+
+@Test
+function interpolationLeavesTheSourceStringUnchanged() {
+    let named = Named { name: "box", size: 4 }
+    let first = described(named)
+    let second = described(named)
+    expect!((first) == (second))
+    expect!((named.name) == ("box"))
+}

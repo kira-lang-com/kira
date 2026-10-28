@@ -1,0 +1,269 @@
+// `async function`: a body that runs as a future.
+//
+// KLF has no coroutine instructions (D-019); the definition writes the state
+// machine. An `async function F(parameters) -> Output` is checked as two
+// functions:
+//
+//   * F itself, whose result the parser made `Async<Output>`. Its body is
+//     one step, `Start`: allocate the frame of F's resume function, move the
+//     parameters into it, and return the `Async` that owns it.
+//   * `__async#F`, the resume function, `(frame: RawPtr, context: borrow
+//     Context) -> Poll<Output>`. It holds F's checked body. F's parameters
+//     and every binding the body makes live in the frame, so they keep their
+//     values across a suspension; lowering (lowering/async.klfd) gives each
+//     await a resume point and jumps to it from the frame's first word.
+//
+// `future.await` inside an async body suspends. It is the whole value of the
+// statement that writes it -- a binding, an assignment, an evaluation or a
+// return -- so nothing an expression computed is held across the
+// suspension; the awaited future is moved into a binding of its own first.
+// An await written deeper in a statement is taken out into a binding before
+// it (semantics/await-hoist.klfd), which makes it the whole value of that
+// binding.
+// Outside an async body `future.await` drives the future with `blockOn`.
+
+enum AsyncStep {
+    // F's body: the resume function whose frame it allocates.
+    Start(Int)
+    // `future.await`: the binding holding the future, and its `poll`.
+    Suspend(Int, Int)
+
+    function namedFunction(borrow self) -> Optional<Int> {
+        match self {
+            Start(resume) -> return .Some(resume)
+            Suspend(future, poll) -> return .Some(poll)
+        }
+    }
+
+    // A function made into a value: the resume function an `Async` holds.
+    function referencedFunction(borrow self) -> Optional<Int> {
+        match self {
+            Start(resume) -> return .Some(resume)
+            Suspend -> return .None
+        }
+    }
+}
+
+// What lowering needs of a resume function.
+struct AsyncResume {
+    // What `Poll.Ready` carries.
+    let output: Type
+    // Written to return nothing: every way out finishes with `Int` 0.
+    let returnsNothing: Bool
+    // F's parameters are the resume function's locals from 2 on.
+    let parameters: Int
+}
+
+// While an async body is checked: what its `return` takes, and the one
+// expression a suspension may be, the whole value of the statement being
+// checked.
+struct AsyncBody {
+    let output: Type
+    var awaitAt: Optional<Span>
+}
+
+// Whether the signature is an `async function`'s own.
+function isAsyncSignature(signature: Signature) -> Bool {
+    return signature.owner.isNone() && hasAttribute(signature.declaration.annotations, .Async)
+}
+
+// The parser gives an `async function` written without a result `Int` named
+// where the function is, so the output it was written with is nothing.
+function asyncWroteNothing(declaration: FunctionDeclaration) -> Bool {
+    match declaration.result {
+        Some(wrapped) -> {
+            if wrapped.arguments.count != 1 { return false }
+            let output = wrapped.arguments[0]
+            return output.name.text == "Int" && output.name.span.start == declaration.name.span.start && output.name.span.file == declaration.name.span.file
+        }
+        None -> return false
+    }
+}
+
+extend Checker {
+    // The type a `return` in the body being checked gives back.
+    function returnType(borrow self) -> Type {
+        match asyncBody {
+            Some(body) -> return body.output
+            None -> return signature().result
+        }
+    }
+
+    function checkAsyncFunction(borrow mut self, index: Int) {
+        let signature = declarations.signatures[index]
+        let span = signature.name.span
+        let wrapped = signature.result
+        if wrapped.isInvalid() || wrapped.kind != .Structure {
+            checkPlainFunction(index)
+            return
+        }
+        let output = program.structs[wrapped.declaration].typeArguments[0]
+        let nothing = asyncWroteNothing(signature.declaration)
+        var bodyOutput = output
+        if nothing { bodyOutput = Type.void() }
+        var contextType = Type.invalid()
+        match declarations.typeNamed("Context") {
+            Some(found) -> contextType = found
+            None -> report(.UnknownType, span)
+        }
+        let pollType = handleTypeFor("Poll", output, span)
+
+        // The resume function: frame and context first, then F's parameters
+        // and the body's bindings, all of which lowering keeps in the frame.
+        current = index
+        locals = []
+        visible = []
+        scopes = []
+        loops = 0
+        checkingInitializer = false
+        sourceOverride = .None
+        handlers = []
+        propagated = []
+        tryAllowed = false
+        let frame = declareLocal("__frame", Type.pointer(), false, false)
+        let context = declareLocal("__context", contextType, false, false)
+        locals[context].passingMode = .Borrowed
+        for parameter in signature.parameters {
+            if parameter.mode != .Owned { report(.TaskBorrowedTarget, parameter.name.span) }
+            let local = declareLocal(parameter.name.text, parameter.valueType, false, false)
+            locals[local].passingMode = .Owned
+        }
+        asyncBody = .Some(AsyncBody { output = bodyOutput, awaitAt = .None })
+        let body = block(signature.declaration.body)
+        asyncBody = .None
+        if !bodyOutput.equals(Type.void()) && !alwaysReturns(body) { report(.MissingReturn, span) }
+
+        let resume = declarations.signatures.count
+        let symbol = joinText(["__async#", signature.symbol])
+        let name = Identifier { text = symbol, span = span }
+        let syntax = FunctionDeclaration {
+            name = name, annotations = [], receiver = .Free, parameters = [], result = .None, body = [], span = signature.declaration.span,
+            typeParameters = [], scope = signature.declaration.scope
+        }
+        declarations.addSignature(Signature {
+            name = name, symbol = symbol, member = "", owner = .None, receiver = .Free,
+            parameters = [
+                ParameterSignature { name = Identifier { text = "__frame", span = span }, valueType = Type.pointer(), mode = .Owned },
+                ParameterSignature { name = Identifier { text = "__context", span = span }, valueType = contextType, mode = .Borrowed }
+            ],
+            result = pollType, entry = false, declaration = syntax
+        })
+        program.functions.append(CheckedFunction {
+            symbol = symbol, name = span, result = pollType, parameterCount = 2,
+            locals = locals, body = body, entry = false, lambda = false, captures = [], globalInitializer = false,
+            service = false, foreign = .None, memberName = "",
+            asyncResume = .Some(AsyncResume { output = output, returnsNothing = nothing, parameters = signature.parameters.count })
+        })
+
+        // F itself: allocate the frame, move the parameters in, hand it back.
+        locals = []
+        visible = []
+        scopes = []
+        for parameter in signature.parameters {
+            let local = declareLocal(parameter.name.text, parameter.valueType, false, false)
+            locals[local].passingMode = .Owned
+        }
+        let started = add(.Async(.Start(resume)), wrapped, span)
+        program.functions[index] = CheckedFunction {
+            symbol = signature.symbol, name = span, result = wrapped, parameterCount = signature.parameters.count,
+            locals = locals, body = [program.addStatement(.Return(.Some(started)))], entry = false, lambda = false,
+            captures = [], globalInitializer = false, service = false, foreign = .None, memberName = signature.member,
+            exported = isPublic(signature), owner = .None, ridlName = signature.name.text
+        }
+    }
+
+    // Remembers the statement's whole value as the one place a suspension
+    // may be written, when it is a `.await`.
+    function allowAwait(borrow mut self, value: Int) -> Optional<Span> {
+        match asyncBody {
+            Some(body) -> {
+                let saved = body.awaitAt
+                var allowed: Optional<Span> = .None
+                if value >= 0 && isAwaitSyntax(value) { allowed = .Some(tree.expressions[value].span) }
+                asyncBody = .Some(AsyncBody { output = body.output, awaitAt = allowed })
+                return saved
+            }
+            None -> return .None
+        }
+    }
+
+    function restoreAwait(borrow mut self, saved: Optional<Span>) {
+        match asyncBody {
+            Some(body) -> asyncBody = .Some(AsyncBody { output = body.output, awaitAt = saved })
+            None -> {}
+        }
+    }
+
+    function isAwaitSyntax(borrow self, value: Int) -> Bool {
+        match tree.expressions[value].kind.memberName() {
+            Some(name) -> return name.text == "await"
+            None -> return false
+        }
+    }
+
+    // `total += future.await` in an async body: the suspension is the whole
+    // value of a binding of its own, and the operator reads that binding, so
+    // nothing the target computes is held across the suspension.
+    function awaitThenCompound(borrow mut self, operator: BinaryOperator, target: Int, value: Int, span: Span) -> Int {
+        let saved = allowAwait(value)
+        let awaited = expression(value, .None)
+        restoreAwait(saved)
+        let name = "__awaitedOperand"
+        let held = declareLocal(name, typeOf(awaited), false, false)
+        let hold = program.addStatement(.Declare(held, awaited))
+        let operand = tree.addExpression(.Name(Identifier { text = name, span = span }), span)
+        let combined = program.addStatement(checkCompoundAssignment(operator, target, operand, span))
+        let done = add(.Integer(0), Type.int(), span)
+        return program.addStatement(.Evaluate(add(.Sequence([hold, combined], done), Type.void(), span)))
+    }
+
+    // `future.await` for a value of a `Future` type: a suspension in an async
+    // body, `blockOn(future)` anywhere else.
+    function checkFutureAwait(borrow mut self, future: Int, claimed: [TypeReference], span: Span) -> Int {
+        let futureType = typeOf(future)
+        let output = resolveType(claimed[0])
+        match asyncBody {
+            Some(body) -> {
+                var allowed = false
+                match body.awaitAt {
+                    Some(at) -> allowed = at.start == span.start && at.end == span.end && at.file == span.file
+                    None -> {}
+                }
+                if !allowed {
+                    report(.OutsideSubset, span)
+                    return add(.Integer(0), Type.invalid(), span)
+                }
+                match declarations.findFunction(.Some(futureType), "poll") {
+                    Some(poll) -> {
+                        let held = declareLocal("__awaited", futureType, true, false)
+                        let hold = program.addStatement(.Declare(held, future))
+                        let suspended = add(.Async(.Suspend(held, poll)), output, span)
+                        return add(.Sequence([hold], suspended), output, span)
+                    }
+                    None -> {
+                        report(.UndefinedFunction, span)
+                        return add(.Integer(0), Type.invalid(), span)
+                    }
+                }
+            }
+            None -> return blockOnCall(future, output, span)
+        }
+    }
+
+    // `blockOn(future)`, the instance for the future's type and output.
+    function blockOnCall(borrow mut self, future: Int, output: Type, span: Span) -> Int {
+        match genericFunctionNamed("blockOn") {
+            Some(template) -> {
+                let references = [declarations.reference(typeOf(future), span), declarations.reference(output, span)]
+                match mintFunction(template, references, span) {
+                    Some(target) -> return callChecked(target, .None, [future], span)
+                    None -> return add(.Integer(0), Type.invalid(), span)
+                }
+            }
+            None -> {
+                report(.UndefinedFunction, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+}

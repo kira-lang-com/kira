@@ -1,0 +1,181 @@
+// The adapters C calls through an `@FFI.Callback` (KLF section 26.4). Each
+// takes the callback's C signature with the platform convention, converts
+// what C passed to what the Kira function takes, calls it, and converts its
+// result back: a C struct arrives as the address of its image, which a
+// pointer parameter takes as it is and any other reads into a Kira value;
+// a `CString` a `String` parameter takes is copied while C still owns it.
+
+// An adapter is named after its function, past every image's suffix, plus
+// a hash of the function's symbol.
+let foreignEntrySuffixBase = 3298534883328
+
+extend KirTypes {
+    function declareForeignEntries(borrow mut self, builder: KirModuleBuilder, program: CheckedProgram, reached: [Bool]) {
+        for index in 0..program.foreignCallbacks.count {
+            let callback = program.foreignCallbacks[index]
+            if !reached[callback.callee] {
+                let absent: Optional<KirFunctionBuilder> = .None
+                foreignEntries.append(absent)
+                continue
+            }
+            let name = program.named(program.functions[callback.callee].name)
+            var result = unit
+            let image = cCode(program, fieldScalar(program, callback.result)) == cValue
+            if !image { result = cCarrierScalar(program, callback.result) }
+            let signature = kir_signature_new_named(builder, name.start, name.end, result, foreignEntrySuffixBase + stableHash(foreignEntryKey(program, callback)))
+            if image { kir_signature_parameter(signature, pointer) }
+            for parameter in callback.parameters {
+                kir_signature_parameter(signature, cCarrierScalar(program, parameter))
+                cParameter(signature, program, parameter)
+            }
+            cResult(signature, program, callback.result)
+            let adapter: Optional<KirFunctionBuilder> = .Some(kir_signature_define(signature))
+            foreignEntries.append(adapter)
+        }
+    }
+
+    // How KIR carries a C value: a struct by value as its image's address.
+    function cCarrierScalar(borrow self, program: CheckedProgram, valueType: Type) -> KirType {
+        let scalar = fieldScalar(program, valueType)
+        let code = cCode(program, scalar)
+        if code == cVoid { return unit }
+        if code == cValue { return pointer }
+        return cCarrier(program, scalar)
+    }
+}
+
+// What names a C entry: its function and the shape C calls it with, since
+// one function may be handed to C as callbacks of several shapes, each
+// with an entry of its own, and every unit names each alike.
+function foreignEntryKey(program: CheckedProgram, callback: ForeignCallback) -> String {
+    var parts = [program.functions[callback.callee].symbol, "("]
+    for parameter in callback.parameters {
+        parts.append(typeKey(program, parameter))
+        parts.append(",")
+    }
+    parts.append(")")
+    parts.append(typeKey(program, callback.result))
+    if callback.context >= 0 { parts.append(joinText(["@", hexadecimalWord(callback.context)])) }
+    return joinText(parts)
+}
+
+function lowerForeignEntries(program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder]) {
+    for index in 0..program.foreignCallbacks.count {
+        match types.foreignEntries[index] {
+            Some(adapter) -> lowerForeignEntry(program, types, functions, program.foreignCallbacks[index], adapter)
+            None -> {}
+        }
+    }
+}
+
+function lowerForeignEntry(program: CheckedProgram, types: KirTypes, functions: [KirFunctionBuilder], callback: ForeignCallback, adapter: KirFunctionBuilder) {
+    let callee = program.functions[callback.callee]
+    var entry = FunctionLowering.startChecked(program, types, functions, helperChecked(callee.name, Type.void()), adapter)
+    let body = entry.kir.block()
+    entry.enter(body)
+    entry.enterFromC(callback, callee)
+    entry.kir.switchTo(entry.entry)
+    entry.kir.branch(body)
+}
+
+extend FunctionLowering {
+    function enterFromC(borrow mut self, callback: ForeignCallback, callee: CheckedFunction) {
+        let span = callee.name
+        let image = cCode(program, fieldScalar(program, callback.result)) == cValue
+        var incoming = 0
+        if image { incoming = 1 }
+        var values: [KirValue] = []
+        if callback.closure {
+            if callback.context >= 0 {
+                values.append(kir.parameter(incoming + callback.context))
+            } else {
+                values.append(kir_value_null(kir, types.pointer))
+            }
+        }
+        var returned: Optional<KirAddress> = .None
+        if callee.result.isAggregate() {
+            let place = temporary(callee.result)
+            returned = .Some(place)
+            values.append(kir.pointer(place))
+        }
+        var local = callee.captures.count
+        for index in 0..callback.parameters.count {
+            if index == callback.context { continue }
+            values.append(fromC(kir.parameter(incoming + index), callback.parameters[index], callee.locals[local], span))
+            local += 1
+        }
+        for argument in values { kir.argument(argument) }
+        let calleeFunction = functions[callback.callee]
+        match returned {
+            Some(place) -> {
+                kir.callVoid(calleeFunction)
+                markInitialized(place)
+                if image {
+                    let out = kir.typedMemory(kir.parameter(0), types.imageType(program, callback.result))
+                    writeImage(place, callback.result, out, false)
+                    cleanupValues()
+                    kir.returnVoid()
+                    return
+                }
+                let word = toC(place, callback.result)
+                cleanupValues()
+                kir.returnValue(word)
+            }
+            None -> {
+                if callback.result.equals(Type.void()) {
+                    kir.callVoid(calleeFunction)
+                    cleanupValues()
+                    kir.returnVoid()
+                    return
+                }
+                let word = kir.call(calleeFunction, types.of(callee.result))
+                cleanupValues()
+                kir.returnValue(word)
+            }
+        }
+    }
+
+    // A value C passed as the Kira parameter `local` takes it.
+    function fromC(borrow mut self, word: KirValue, given: Type, local: Local, span: Span) -> KirValue {
+        let taken = local.valueType
+        if !taken.isAggregate() && !local.byReference { return word }
+        if given.kind == .Structure && isCStringType(program, given) && !isCStringType(program, taken) {
+            let text = temporary(given)
+            kir.store(word, kir.field(text, 0, types.pointer))
+            markInitialized(text)
+            let read = temporary(taken)
+            kir.argument(kir.pointer(read))
+            kir.argument(kir.pointer(text))
+            kir.callVoid(functions[program.foreignHelpers[0]])
+            markInitialized(read)
+            return handedOver(read, local)
+        }
+        let place = temporary(taken)
+        if given.equals(taken) {
+            if cCode(program, fieldScalar(program, given)) == cValue {
+                readImage(kir.typedMemory(word, types.imageType(program, given)), given, place, span)
+            } else if given.kind == .Enumeration {
+                enumFromNumber(word, given, place, span)
+            } else {
+                storeSeamWord(word, given, place)
+            }
+        } else {
+            kir.store(word, kir.field(place, 0, types.pointer))
+        }
+        markInitialized(place)
+        return handedOver(place, local)
+    }
+
+    // A temporary passed on: one the callee owns is no longer this one's
+    // to drop.
+    function handedOver(borrow mut self, place: KirAddress, local: Local) -> KirValue {
+        if local.passingMode == .Owned { forgetTracked(place) }
+        return kir.pointer(place)
+    }
+
+    // A Kira result as the word C reads.
+    function toC(borrow mut self, place: KirAddress, valueType: Type) -> KirValue {
+        if valueType.kind == .Enumeration { return kir.convert(convertTruncate, kir.tag(place), types.integer32) }
+        return seamWord(place, valueType)
+    }
+}

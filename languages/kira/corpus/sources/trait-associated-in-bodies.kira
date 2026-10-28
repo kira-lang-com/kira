@@ -1,0 +1,29 @@
+// An associated type of a type parameter, `Value.ID`, names the type the
+// instance's argument binds in a method's body too: in a local's annotation
+// and in a generic type's arguments.
+
+import Foundation
+
+struct Row: Identifiable {
+    let id: String
+}
+
+struct Holder<Value: Identifiable> {
+    let rows: [Value]
+
+    function ids(borrow self) -> Set<Value.ID> {
+        var ids = Set<Value.ID>()
+        var list: [Value.ID] = []
+        for row in rows {
+            ids.insert(row.id)
+            list.append(row.id)
+        }
+        return ids
+    }
+}
+
+@Main
+function main() -> Int {
+    let holder = Holder<Row> { rows: [Row { id: "a" }, Row { id: "b" }] }
+    return holder.ids().count()
+}

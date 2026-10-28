@@ -1,0 +1,353 @@
+import Foundation
+import Heap
+
+// SHA-256, and the sidecar file a published artifact is verified against.
+//
+// The algorithm is here rather than reached for because it is fixed, published
+// and pinned by its test vectors: `Tests` checks the three NIST cases and the
+// block boundaries a streaming hasher gets wrong.
+//
+// What a checksum is worth: the transport is HTTPS, so TLS is what stands
+// between a user and a hostile network. What this catches is a truncated or
+// corrupted transfer, a mirror serving stale bytes, and an artifact repackaged
+// after publication. That is worth a hard refusal — which is why a *mismatch*
+// fails an install while an *absent* sidecar only downgrades it to unverified: a
+// release published before sidecars existed must stay installable.
+
+// The round constants: the first 32 bits of the fractional parts of the cube
+// roots of the first 64 primes (FIPS 180-4, section 4.2.2).
+let roundConstants: [UN32] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+]
+
+// The initial hash value: the first 32 bits of the fractional parts of the
+// square roots of the first 8 primes (FIPS 180-4, section 5.3.3).
+let initialState: [UN32] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+]
+
+// A SHA-256 block is 64 bytes, its length is 64 bits, and a digest is 32.
+public let blockBytes: Number = 64
+public let digestBytes: Number = 32
+public let lengthBytes: Number = 8
+
+// The bytes read per call while hashing a file. A release archive is tens of
+// megabytes: hashing it must not read it into memory whole, and must not pay a
+// syscall per kilobyte either.
+public let readChunkBytes: Number = 65536
+
+// A SHA-256 digest, kept as the eight words the algorithm ends with so two
+// digests are compared by value and never as text.
+public struct Digest {
+    var words: [UN32] = []
+}
+
+// A hasher that has seen nothing.
+public function newHasher() -> Hasher {
+    var hasher = Hasher {}
+    hasher.state = filledWords(8, UN32(0))
+    for index in 0..8 {
+        hasher.state[index] = initialState[index]
+    }
+    hasher.block = filled(blockBytes, UN8(0))
+    return hasher
+}
+
+// The digest of `bytes`.
+public function digestOf(bytes: borrow [UN8]) -> Digest {
+    var hasher = newHasher()
+    hasher.absorb(bytes)
+    return hasher.finish()
+}
+
+// The digest of a file, read in chunks rather than into memory whole, or
+// nothing when the file cannot be read.
+public function digestOfFile(path: borrow String) -> Digest? {
+    // A file whose size cannot be read is no file, not an empty one.
+    let size = match fileSize(path) {
+        Ok(found) -> found
+        Error(failure) -> return .None
+    }
+    var hasher = newHasher()
+    var offset: Number = 0
+    while offset < size {
+        let chunk = bytesOf(path, offset, readChunkBytes)
+        if chunk.count == 0 { return .None }
+        hasher.absorb(chunk)
+        offset = offset + chunk.count
+    }
+    return .Some(hasher.finish())
+}
+
+// The streaming hasher: the eight state words, the block being filled, and how
+// many bytes have gone through it.
+public struct Hasher {
+    var state: [UN32] = []
+    var block: [UN8] = []
+    var filled: Number = 0
+    // The bytes absorbed so far: a message is far shorter than 2^61 bytes, so
+    // its length in bits is held as a number, never wrapped.
+    var length: UNumber = 0
+
+    // `bytes` through the hasher, a block at a time.
+    function absorb(borrow mut self, bytes: borrow [UN8]) {
+        var index: Number = 0
+        while index < bytes.count {
+            let taking = smaller(blockBytes - self.filled, bytes.count - index)
+            for offset in 0..taking {
+                self.block[self.filled + offset] = bytes[index + offset]
+            }
+            self.filled = self.filled + taking
+            self.length = self.length + UNumber(taking)
+            index = index + taking
+            if self.filled == blockBytes {
+                self.compress()
+                self.filled = 0
+            }
+        }
+    }
+
+    // One 64-byte block folded into the state.
+    function compress(borrow mut self) {
+        var schedule: [UN32] = filledWords(64, UN32(0))
+        for index in 0..16 {
+            schedule[index] = blockWord(self.block, index)
+        }
+        for index in 16..64 {
+            let recent = schedule[index - 15]
+            let older = schedule[index - 2]
+            let first = rotatedRight(recent, UN32(7)) ^ rotatedRight(recent, UN32(18)) ^ (
+                recent >> UN32(3)
+            )
+            let second = rotatedRight(older, UN32(17)) ^ rotatedRight(older, UN32(19)) ^ (
+                older >> UN32(10)
+            )
+            schedule[index] = wrappingAdd(
+                wrappingAdd(schedule[index - 16], first),
+                wrappingAdd(schedule[index - 7], second)
+            )
+        }
+
+        var a = self.state[0]
+        var b = self.state[1]
+        var c = self.state[2]
+        var d = self.state[3]
+        var e = self.state[4]
+        var f = self.state[5]
+        var g = self.state[6]
+        var h = self.state[7]
+
+        for index in 0..64 {
+            let big = rotatedRight(e, UN32(6)) ^ rotatedRight(e, UN32(11)) ^ rotatedRight(
+                e,
+                UN32(25)
+            )
+            let choose = (e & f) ^ (notWord(e) & g)
+            let first = wrappingAdd(
+                wrappingAdd(wrappingAdd(h, big), wrappingAdd(choose, roundConstants[index])),
+                schedule[index]
+            )
+            let large = rotatedRight(a, UN32(2)) ^ rotatedRight(a, UN32(13)) ^ rotatedRight(
+                a,
+                UN32(22)
+            )
+            let majority = (a & b) ^ (a & c) ^ (b & c)
+            let second = wrappingAdd(large, majority)
+
+            h = g
+            g = f
+            f = e
+            e = wrappingAdd(d, first)
+            d = c
+            c = b
+            b = a
+            a = wrappingAdd(first, second)
+        }
+
+        self.state[0] = wrappingAdd(self.state[0], a)
+        self.state[1] = wrappingAdd(self.state[1], b)
+        self.state[2] = wrappingAdd(self.state[2], c)
+        self.state[3] = wrappingAdd(self.state[3], d)
+        self.state[4] = wrappingAdd(self.state[4], e)
+        self.state[5] = wrappingAdd(self.state[5], f)
+        self.state[6] = wrappingAdd(self.state[6], g)
+        self.state[7] = wrappingAdd(self.state[7], h)
+    }
+
+    // The digest of everything absorbed so far.
+    function finish(borrow self) -> Digest {
+        var padded: Hasher = copy self
+        padded.padInPlace()
+        return Digest { words: padded.state }
+    }
+
+    // The message's 1 bit, its zeros, and its length in bits (FIPS 180-4,
+    // section 5.1.1).
+    function padInPlace(borrow mut self) {
+        self.block[self.filled] = UN8(128)
+        self.filled = self.filled + 1
+        if self.filled > blockBytes - lengthBytes {
+            while self.filled < blockBytes {
+                self.block[self.filled] = UN8(0)
+                self.filled = self.filled + 1
+            }
+            self.compress()
+            self.filled = 0
+        }
+        while self.filled < blockBytes - lengthBytes {
+            self.block[self.filled] = UN8(0)
+            self.filled = self.filled + 1
+        }
+        let bits = self.length * 8
+        for offset in 0..lengthBytes {
+            self.block[self.filled] = UN8((bits >> (56 - offset * 8)) & 255)
+            self.filled = self.filled + 1
+        }
+        self.compress()
+    }
+}
+
+// Word `index` of a block, big-endian as the specification reads it.
+public function blockWord(block: borrow [UN8], index: Number) -> UN32 {
+    let at = index * 4
+    return (UN32(block[at]) << UN32(24))
+        | (UN32(block[at + 1]) << UN32(16))
+        | (UN32(block[at + 2]) << UN32(8))
+        | UN32(block[at + 3])
+}
+
+// One word's complement, over the thirty-two bits of the word.
+//
+// Kira's `~` complements the sixty-four bits of the representation and answers
+// `Number` (`checkUnary`, the M4 subset), so `~e` of a `UN32` word is negative and
+// narrowing it back to a word is a trap rather than a wrong answer. SHA-256's
+// complement is over the word, so it is written here rather than spelled `~`.
+public function notWord(word: UN32) -> UN32 {
+    return UN32((~word) & 4294967295)
+}
+
+// A 32-bit rotation, which the algorithm needs in nine places and integer
+// division cannot express.
+public function rotatedRight(value: UN32, count: UN32) -> UN32 {
+    return (value >> count) | (value << (UN32(32) - count))
+}
+
+public function filledWords(count: Number, value: UN32) -> [UN32] {
+    var words: [UN32] = []
+    for index in 0..count {
+        words.append(value)
+    }
+    return words
+}
+
+public function smaller(left: Number, right: Number) -> Number {
+    if left < right { return left }
+    return right
+}
+
+// The digest's lowercase hex spelling, the form a sidecar carries.
+public function digestHex(digest: borrow Digest) -> String {
+    let digits: [String] = [
+        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"
+    ]
+    var text = ""
+    for index in 0..8 {
+        let word = digest.words[index]
+        for offset in 0..8 {
+            let shift = UN32(28 - offset * 4)
+            let nibble = Number((word >> shift) & UN32(15))
+            text = text + digits[nibble]
+        }
+    }
+    return text
+}
+
+// A digest read from its hex spelling, in either case, or nothing when the text
+// is not exactly 64 hex digits: a truncated or annotated field is a refusal
+// rather than a partial parse.
+public function parseDigestHex(text: borrow String) -> Digest? {
+    if text.count != digestBytes * 2 { return .None }
+    var digest = Digest {}
+    digest.words = filledWords(8, UN32(0))
+    for index in 0..digestBytes * 2 {
+        match hexDigitValue(text.byteAt(index)) {
+            None -> { return .None }
+            Some(nibble) -> {
+                // Eight hex digits make a word, two of them a byte, and the
+                // first of each pair its high nibble — which is the byte's own
+                // position in the word that says how far to shift it.
+                digest.words[trunc(index / 8)] = digest.words[trunc(index / 8)] | (
+                    UN32(nibble) << nibbleShift(index)
+                )
+            }
+        }
+    }
+    return .Some(digest)
+}
+
+// Where the hex digit at `index` sits in its word.
+//
+// A word is four bytes, most significant first, so the first byte's high nibble
+// is the top of the word and each later digit is eight bits lower. This is the
+// mirror of `digestHex`, which walks the same word from its top down.
+public function nibbleShift(index: Number) -> UN32 {
+    let byte = trunc((index % 8) / 2)
+    if index % 2 == 0 { return UN32(24 - byte * 8 + 4) }
+    return UN32(24 - byte * 8)
+}
+
+// Whether two digests are the same bytes, which is how a verification reads: a
+// value comparison, never a string one whose case or padding could decide it.
+public function sameDigest(left: borrow Digest, right: borrow Digest) -> Bool {
+    for index in 0..8 {
+        if left.words[index] != right.words[index] { return false }
+    }
+    return true
+}
+
+// The name of the sidecar file carrying an artifact's published digest.
+public function checksumFileName(artifact: borrow String) -> String {
+    return artifact + ".sha256"
+}
+
+// The digest out of a sidecar's contents.
+//
+// Accepts a bare digest and the `<digest>  <name>` line `shasum -a 256` and
+// `sha256sum` write, and refuses anything else: a sidecar is a claim about the
+// artifact beside it, and one that cannot be read is a publishing failure to
+// report rather than a verification to skip.
+public function parseChecksumFile(text: borrow String) -> Digest? {
+    let lines = text.split("\n")
+    if lines.count == 0 { return .None }
+    return parseDigestHex(lines[0].trim().before(" *").before(" "))
+}
+
+// The digest the sidecar beside `artifact` publishes, read from `directory`, or
+// nothing when the release published no sidecar.
+public function publishedChecksumIn(
+    directory: borrow String,
+    artifact: borrow String
+) -> Result<Digest?, SourceFailure> {
+    let sidecar = joinPath(directory, checksumFileName(artifact))
+    if !fileExists(sidecar) { return .Ok(.None) }
+    match textOf(sidecar) {
+        Some(text) -> return checksumIn(text, sidecar)
+        None -> return .Error(.TransportFailed(sidecar))
+    }
+}
+
+// The digest a sidecar's text holds, or a refusal naming the sidecar.
+public function checksumIn(text: borrow String, sidecar: borrow String) -> Result<Digest?, SourceFailure> {
+    match parseChecksumFile(text) {
+        Some(digest) -> return .Ok(.Some(digest))
+        None -> return .Error(.MalformedFeed("`" + sidecar + "` is not a SHA-256 checksum"))
+    }
+}

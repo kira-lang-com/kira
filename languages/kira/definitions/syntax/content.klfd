@@ -1,0 +1,182 @@
+// Child content: the `{ ... }` after a construction or a call.
+//
+// `HStack(spacing: 8) { Text("a") For(x in xs) { Text(x) } }` passes the
+// block's items as children, while `doThing { print("a") }` passes the same
+// brace as a closure taking no parameters. The parser cannot tell which the
+// callee wants, so it keeps every reading that parses and analysis takes the
+// one the callee's parameter asks for. `name: value` fills written after the
+// block become labelled arguments; a fill's own bare `{ ... }` is carried the
+// same two ways.
+
+// `call` is the construction or call the block follows, or nothing for a
+// fill's block. `items` index `SyntaxTree.contentItems` and are absent when
+// the block does not read as content; `closure` is the block as a lambda,
+// absent when it does not read as statements.
+struct ContentSyntax {
+    let call: Optional<Int>
+    let items: Optional<[Int]>
+    let closure: Optional<Int>
+    let fills: [Int]
+}
+
+// One item of a content block: a child, `For(name in source) { items }` with
+// `high` set for a range `low..high`, or `if condition { items } else { items }`.
+enum ContentItem {
+    Child(Int)
+    For(Identifier, Int, Optional<Int>, [Int])
+    If(Int, [Int], [Int])
+}
+
+extend SyntaxTree {
+    function addContentItem(borrow mut self, item: ContentItem) -> Int {
+        contentItems.append(item)
+        return contentItems.count - 1
+    }
+}
+
+extend Parser {
+    // Whether the `{` at the cursor opens a struct literal: empty, or a first
+    // field bound with `=` or `:`.
+    function structLiteralAhead(borrow self) -> Bool {
+        return structLiteralAheadAt(0)
+    }
+
+    // Whether a struct literal's `{` is `offset` tokens ahead.
+    function structLiteralAheadAt(borrow self, offset: Int) -> Bool {
+        if peek(offset).kind != .LeftBrace { return false }
+        let first = peek(offset + 1).kind
+        if first == .RightBrace { return true }
+        if first == .Let || first == .Var { return true }
+        let second = peek(offset + 2).kind
+        return (first == .Identifier || first == .Type) && (second == .Equals || second == .Colon)
+    }
+
+    // `node { ... }` and the named fills after it.
+    function trailingContent(borrow mut self, node: Int) -> Result<Int, Failure> {
+        let start = tree.expressions[node].span
+        let reading = try deferredBrace()
+        let fills = try namedFills()
+        let content = ContentSyntax { call = .Some(node), items = reading.items, closure = reading.closure, fills = fills }
+        return .Ok(tree.addExpression(.Content(content), spanFrom(start)))
+    }
+
+    // The `{ ... }` at the cursor read as content and as a closure body,
+    // keeping the readings that parse. When neither does, the content
+    // reading's failure stands.
+    function deferredBrace(borrow mut self) -> Result<ContentSyntax, Failure> {
+        let start = position
+        let opening = current().span
+        var closure: Optional<Int> = .None
+        match block() {
+            Ok(body) -> {
+                let span = spanFrom(opening)
+                closure = .Some(tree.addExpression(.Lambda(LambdaDeclaration {
+                    parameters = [], annotations = [], body = body, span = span
+                }), span))
+            }
+            Error -> {}
+        }
+        let afterBlock = position
+        position = start
+        match contentBlock() {
+            Ok(items) -> return .Ok(ContentSyntax { call = .None, items = .Some(items), closure = closure, fills = [] })
+            Error(failed) -> {
+                if closure.isNone() { return .Error(failed) }
+                position = afterBlock
+                return .Ok(ContentSyntax { call = .None, items = .None, closure = closure, fills = [] })
+            }
+        }
+    }
+
+    function namedFills(borrow mut self) -> Result<[Int], Failure> {
+        var fills: [Int] = []
+        while structLiterals && at(.Identifier) && peek(1).kind == .Colon {
+            let label = try identifier(.ExpectedParameterName)
+            advance()
+            var value = 0
+            if at(.LeftBrace) && !lambdaAhead() {
+                let opening = current().span
+                let reading = try deferredBrace()
+                value = tree.addExpression(.Content(reading), spanFrom(opening))
+            } else {
+                value = try expression()
+            }
+            fills.append(tree.addExpression(.Labelled(label, value), spanFrom(label.span)))
+        }
+        return .Ok(fills)
+    }
+
+    function contentBlock(borrow mut self) -> Result<[Int], Failure> {
+        try expect(.LeftBrace)
+        let saved = structLiterals
+        structLiterals = true
+        var items: [Int] = []
+        while !at(.RightBrace) && !at(.End) {
+            items.append(try contentItem())
+            eat(.Comma)
+        }
+        structLiterals = saved
+        try expect(.RightBrace)
+        return .Ok(items)
+    }
+
+    function contentItem(borrow mut self) -> Result<Int, Failure> {
+        if atWord("For") && peek(1).kind == .LeftParen {
+            advance()
+            advance()
+            let name = macroName(try identifier(.ExpectedLoopVariable))
+            try expect(.In)
+            let low = try expressionWith(false)
+            var high: Optional<Int> = .None
+            if eat(.DotDot) { high = .Some(try expressionWith(false)) }
+            try expect(.RightParen)
+            if !at(.LeftBrace) { return .Error(failure(.ExpectedBuilderBody)) }
+            let body = try contentBlock()
+            return .Ok(tree.addContentItem(.For(name, low, high, body)))
+        }
+        if eat(.If) {
+            let condition = try expressionWith(false)
+            let whenTrue = try contentBlock()
+            var whenFalse: [Int] = []
+            if eat(.Else) {
+                if at(.If) {
+                    whenFalse = [try contentItem()]
+                } else {
+                    whenFalse = try contentBlock()
+                }
+            }
+            return .Ok(tree.addContentItem(.If(condition, whenTrue, whenFalse)))
+        }
+        return .Ok(tree.addContentItem(.Child(try expression())))
+    }
+}
+
+// Whether `reference` is written `some Family` or `[some Family]`, the types
+// of a child slot.
+function isContentReference(reference: TypeReference) -> Bool {
+    if isSomeReference(reference) { return true }
+    return reference.name.text == "Array" && reference.arguments.count == 1 && isSomeReference(reference.arguments[0])
+}
+
+function isSomeReference(reference: TypeReference) -> Bool {
+    return utf8Count(reference.name.text) > 5 && utf8Slice(reference.name.text, 0, 5) == "some "
+}
+
+// `@Content let children: [Any Family]`, the older spelling of a slot, as
+// the `[some Family]` it means.
+function contentSpelling(reference: TypeReference) -> TypeReference {
+    if reference.name.text == "Array" && reference.arguments.count == 1 {
+        return TypeReference {
+            qualifier = reference.qualifier, name = reference.name, arguments = [contentSpelling(reference.arguments[0])],
+            modes = reference.modes, instanceName = reference.instanceName
+        }
+    }
+    if utf8Count(reference.name.text) > 4 && utf8Slice(reference.name.text, 0, 4) == "Any " {
+        let family = utf8Slice(reference.name.text, 4, utf8Count(reference.name.text))
+        return TypeReference {
+            qualifier = reference.qualifier, name = Identifier { text = joinText(["some ", family]), span = reference.name.span },
+            arguments = [], modes = reference.modes, instanceName = reference.instanceName
+        }
+    }
+    return reference
+}

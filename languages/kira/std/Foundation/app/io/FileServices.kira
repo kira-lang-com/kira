@@ -1,0 +1,231 @@
+import Heap
+
+// The file-system operations `FileSystem.kira` is written over, on the
+// kernel's `klf.fs` services. The platform's KLF runtime implements those, so
+// a program reads and writes files on every platform KLF runs on without
+// naming a platform library.
+//
+// A service takes machine words, so a path or a byte array crosses as its
+// address and count. Reads and writes move at most `FileService.chunk` bytes
+// per call.
+
+@Service("klfsvc_fs_read")
+function kernelFileRead(
+    path: RawPtr,
+    pathCount: Int,
+    offset: Int,
+    destination: RawPtr,
+    count: Int
+) -> Int
+
+@Service("klfsvc_fs_write")
+function kernelFileWrite(path: RawPtr, pathCount: Int, data: RawPtr, count: Int, append: Int) -> Int
+
+@Service("klfsvc_fs_list")
+function kernelDirectoryList(
+    path: RawPtr,
+    pathCount: Int,
+    destination: RawPtr,
+    capacity: Int
+) -> Int
+
+@Service("klfsvc_fs_file_exists")
+function kernelFileExists(path: RawPtr, pathCount: Int) -> Int
+
+@Service("klfsvc_fs_path_exists")
+function kernelPathExists(path: RawPtr, pathCount: Int) -> Int
+
+@Service("klfsvc_fs_is_directory")
+function kernelIsDirectory(path: RawPtr, pathCount: Int) -> Int
+
+@Service("klfsvc_fs_file_size")
+function kernelFileSize(path: RawPtr, pathCount: Int) -> Int
+
+@Service("klfsvc_fs_make_directory")
+function kernelMakeDirectory(path: RawPtr, pathCount: Int) -> Int
+
+@Service("klfsvc_fs_remove_path")
+function kernelRemovePath(path: RawPtr, pathCount: Int) -> Int
+
+@Service("klfsvc_fs_rename")
+function kernelRenamePath(from: RawPtr, fromCount: Int, to: RawPtr, toCount: Int) -> Int
+
+namespace FileService {
+    // The most a service buffer carries at once.
+    let chunk: Number = 1048576
+}
+
+// At most `count` bytes of the file from `offset`: fewer when the file ends
+// first, none for a negative offset, a count below one or a missing file.
+function fileBytes(path: borrow String, offset: Number, count: Number) -> [UN8] {
+    let empty: [UN8] = []
+    if offset < 0 || count <= 0 {
+        return empty
+    }
+    // Room for what the file holds past `offset` and one byte more, which
+    // finds its end, so its bytes land in one allocation; a file that grew
+    // since is read on in more chunks.
+    let size = kernelFileSize(path.data, path.count)
+    var reserved = count
+    if size - offset < reserved {
+        reserved = size > offset ? size - offset + 1 : 1
+    }
+    var data = makeArrayData(reserved)
+    var filled: Number = 0
+    while filled < count {
+        if filled == reserved {
+            reserved = filled + FileService.chunk
+            if reserved > count {
+                reserved = count
+            }
+            data = resizeArrayData(data, reserved)
+        }
+        var asking = reserved - filled
+        if asking > FileService.chunk {
+            asking = FileService.chunk
+        }
+        let read = kernelFileRead(
+            path.data,
+            path.count,
+            offset + filled,
+            heapOffset(data, filled),
+            asking
+        )
+        filled = filled + read
+        if read < asking {
+            break
+        }
+    }
+    return Array { data = data, count = filled, capacity = filled, ops = empty.ops }
+}
+
+// The whole file as text. Text is UTF-8 or it is not text, so a file that is
+// not valid UTF-8 reads as nothing, as an unreadable one does.
+function fileText(path: borrow String) -> String {
+    let empty = ""
+    // Room for the file and one byte more, which finds its end.
+    let size = kernelFileSize(path.data, path.count)
+    var reserved: Number = size > 0 ? size + 1 : 1
+    var data = makeArrayData(reserved)
+    var filled: Number = 0
+    while true {
+        if filled == reserved {
+            reserved = filled + FileService.chunk
+            data = resizeArrayData(data, reserved)
+        }
+        var asking = reserved - filled
+        if asking > FileService.chunk {
+            asking = FileService.chunk
+        }
+        let read = kernelFileRead(path.data, path.count, filled, heapOffset(data, filled), asking)
+        filled = filled + read
+        if read < asking { break }
+    }
+    let text = String { data = data, count = filled, capacity = reserved, ops = empty.ops }
+    if !isUtf8Text(text) {
+        return empty
+    }
+    return text
+}
+
+// `count` bytes at `data` over the file's contents, a chunk at a time: the
+// first chunk replaces the contents and each later one appends.
+function writeChunks(path: borrow String, data: RawPtr, count: Number) -> Bool {
+    var written: Number = 0
+    var append: Number = 0
+    while true {
+        var chunk = count - written
+        if chunk > FileService.chunk {
+            chunk = FileService.chunk
+        }
+        if kernelFileWrite(path.data, path.count, heapOffset(data, written), chunk, append) == 0 {
+            return false
+        }
+        written = written + chunk
+        append = 1
+        if written >= count { break }
+    }
+    return true
+}
+
+// The entry names directly inside a directory, in the host's order; nothing
+// for a path that is not a readable directory.
+function directoryEntries(path: borrow String) -> [String] {
+    var names: [String] = []
+    var capacity: Number = 0
+    var buffer = makeArrayData(0)
+    var needed = kernelDirectoryList(path.data, path.count, buffer, capacity)
+    while needed > capacity {
+        capacity = needed
+        buffer = resizeArrayData(buffer, capacity)
+        needed = kernelDirectoryList(path.data, path.count, buffer, capacity)
+    }
+    let listing = String { data = buffer, count = needed, capacity = capacity, ops = "".ops }
+    var start: Number = 0
+    for index in 0..needed {
+        if storedByte(listing, index) == UN8(0) {
+            names.append(slice(listing, start, index))
+            start = index + 1
+        }
+    }
+    return names
+}
+
+function regularFileExists(path: borrow String) -> Bool {
+    return kernelFileExists(path.data, path.count) != 0
+}
+
+function sizeOfFile(path: borrow String) -> Number {
+    return Number(kernelFileSize(path.data, path.count))
+}
+
+// Whether `text` is well-formed UTF-8: no stray continuation byte, no
+// truncated sequence, no overlong form, no surrogate, nothing past U+10FFFF.
+function isUtf8Text(text: borrow String) -> Bool {
+    var index: Number = 0
+    while index < text.count {
+        match utf8Sequence(Number(storedByte(text, index))) {
+            Some(sequence) -> {
+                if !sequence.follows(text, index) { return false }
+                index = index + sequence.length
+            }
+            None -> return false
+        }
+    }
+    return true
+}
+
+// The bytes a UTF-8 sequence takes and the range its first continuation byte
+// must fall in; the later ones are any continuation byte.
+struct Utf8Sequence {
+    let length: Number
+    let low: Number
+    let high: Number
+
+    function follows(borrow self, text: borrow String, lead: Number) -> Bool {
+        if lead + length > text.count { return false }
+        for offset in 1..length {
+            let byte = Number(storedByte(text, lead + offset))
+            if offset == 1 && (byte < low || byte > high) { return false }
+            if offset > 1 && (byte < 0x80 || byte > 0xBF) { return false }
+        }
+        return true
+    }
+}
+
+// The sequence a lead byte opens, with the narrower first continuation that
+// rules out overlong forms (after 0xE0 and 0xF0), surrogates (after 0xED) and
+// code points past U+10FFFF (after 0xF4).
+function utf8Sequence(lead: Number) -> Utf8Sequence? {
+    match lead {
+        0x00..0x80 -> return .Some(Utf8Sequence { length = 1, low = 0x80, high = 0xBF })
+        0xC2..0xE0 -> return .Some(Utf8Sequence { length = 2, low = 0x80, high = 0xBF })
+        0xE0 -> return .Some(Utf8Sequence { length = 3, low = 0xA0, high = 0xBF })
+        0xE1..0xED, 0xEE..0xF0 -> return .Some(Utf8Sequence { length = 3, low = 0x80, high = 0xBF })
+        0xED -> return .Some(Utf8Sequence { length = 3, low = 0x80, high = 0x9F })
+        0xF0 -> return .Some(Utf8Sequence { length = 4, low = 0x90, high = 0xBF })
+        0xF4 -> return .Some(Utf8Sequence { length = 4, low = 0x80, high = 0x8F })
+        0xF1..0xF4 -> return .Some(Utf8Sequence { length = 4, low = 0x80, high = 0xBF })
+        else -> return .None
+    }
+}

@@ -1,0 +1,57 @@
+import Foundation
+
+// Match compiler depfiles that canonicalize /var to /private/var, and source
+// workspaces reached through any other symlink. Missing suffixes are kept so
+// absent discovered inputs still participate in invalidation.
+function physicalPath(path: borrow String) -> Result<String, BuildFailure> {
+    var absolute = copy path
+    if !absolute.startsWith("/") {
+        let current = match currentDirectory() {
+            Ok(directory) -> directory
+            Error(failure) -> return .Error(.Files("cannot locate source root: \(traceText(failure))"))
+        }
+        absolute = joinPath(current, absolute)
+    }
+    var parts = absolute.split("/")
+    var position = 0
+    var resolved = "/"
+    var links = 0
+    let maximumLinks: Number = 40
+    while position < parts.count {
+        let part = parts[position]
+        position += 1
+        if part.count == 0 || part == "." { continue }
+        if part == ".." {
+            resolved = parentPath(resolved)
+            continue
+        }
+        let candidate = joinPath(resolved, part)
+        let status = match linkStatus(candidate) {
+            Ok(found) -> found
+            Error(failure) -> {
+                if !missing(failure) {
+                    return .Error(.Files("cannot resolve \(candidate): \(traceText(failure))"))
+                }
+                var suffix = copy candidate
+                for index in position..parts.count { suffix = joinPath(suffix, parts[index]) }
+                return .Ok(plainPath(suffix))
+            }
+        }
+        if status.kind != .Link {
+            resolved = candidate
+            continue
+        }
+        links += 1
+        if links > maximumLinks { return .Error(.Files("too many source path links: \(path)")) }
+        let target = match readSymbolicLink(candidate) {
+            Ok(found) -> found
+            Error(failure) -> return .Error(.Files("cannot resolve \(candidate): \(traceText(failure))"))
+        }
+        if target.startsWith("/") { resolved = "/" }
+        var expanded = target.split("/")
+        for index in position..parts.count { expanded.append(copy parts[index]) }
+        parts = expanded
+        position = 0
+    }
+    return .Ok(resolved)
+}

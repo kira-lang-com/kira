@@ -1,0 +1,46 @@
+// A `Number`'s 65-bit mantissa holds every `U64` and its negation; `&`, `|`,
+// `^`, `~`, `<<` and `>>` act on whole numbers as on 65-bit two's complement
+// integers, and `%` keeps the dividend's sign.
+
+import Foundation
+
+@Main
+function main() -> Int {
+    var failures = 0
+    let max: U64 = 0xffffffffffffffff
+    let big = Number(max)
+    if String(big) != "18446744073709551615" { failures += 1 }
+    if U64(big) != max { failures += 1 }
+    let lowest = Number(0) - big - Number(1)
+    if String(lowest) != "-18446744073709551616" { failures += 1 }
+    if Number(String(lowest)) != lowest { failures += 1 }
+    if (big & Number(255)) != Number(255) { failures += 1 }
+    if (big >> Number(60)) != Number(15) { failures += 1 }
+    if (Number(1) << Number(63)) != Number("9223372036854775808") { failures += 1 }
+    if ~Number(0) != Number(-1) { failures += 1 }
+    if ~big != lowest { failures += 1 }
+    if (big ^ Number(1)) != Number("18446744073709551614") { failures += 1 }
+    if (Number(-8) | Number(3)) != Number(-5) { failures += 1 }
+    if Number(-7) % Number(3) != Number(-1) { failures += 1 }
+    let bits: Number = 0xffffffffffffffff
+    if bits != big { failures += 1 }
+    let written: Number = 18446744073709551615
+    if written != big { failures += 1 }
+    let lowestWritten: Number = -18446744073709551616
+    if lowestWritten != lowest { failures += 1 }
+    let half: Number = 1844674407370955161.5
+    if half * 10 != big { failures += 1 }
+    let widest: U64 = 18446744073709551615
+    if widest != max { failures += 1 }
+    if Number("1844674407370955161.5") * Number(10) != big { failures += 1 }
+    if !(big > Number(1)) || !(lowest < Number(-1)) { failures += 1 }
+    if Int(Number("-9223372036854775808")) != 0 - 9223372036854775807 - 1 { failures += 1 }
+    // The nearest float is 2^64, one past the mantissa.
+    if Float(big) != 18446744073709551616.0 { failures += 1 }
+    if Number(Float(Number("9007199254740993"))) != Number("9007199254740992") { failures += 1 }
+    // A `U64` past `Int`'s largest widens where a `Number` is wanted, not
+    // only through `Number(x)`.
+    let widened: UNumber = max
+    if widened != big { failures += 1 }
+    return 42 + failures
+}

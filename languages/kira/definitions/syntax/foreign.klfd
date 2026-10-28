@@ -1,0 +1,357 @@
+// `@FFI.*` annotations: the C boundary, written as a `.klffi` file writes it
+// (KLF section 26), inline in a Kira file.
+//
+// `@FFI.Extern`, `@FFI.Address`, `@FFI.Syscall` and `@FFI.Variadic` ride a
+// bodyless function; `@FFI.Struct`, `@FFI.Union`, `@FFI.Pointer`,
+// `@FFI.Array`, `@FFI.Callback` and `@FFI.Alias` ride a struct and declare a
+// C type. Each is parsed into a `ForeignMark` kept beside the tree at the
+// span of its annotation, which the declaration carries as a `Foreign`
+// attribute. What a form requires, and what its values mean, is the
+// checker's.
+
+enum ForeignForm {
+    Extern
+    Address
+    Syscall
+    Variadic
+    Struct
+    Union
+    Pointer
+    Array
+    Callback
+    Alias
+}
+
+// A field's value: a bare word (`c`, `borrowed`, a symbol), an element
+// count, a type, or a bracketed type list.
+enum ForeignValue {
+    Word(Identifier)
+    Count(Int)
+    Named(TypeReference)
+    Listed([TypeReference])
+}
+
+struct ForeignField {
+    let key: Identifier
+    let value: ForeignValue
+    let span: Span
+    // A callback's parameter names, one per listed type, empty where the
+    // list does not name one.
+    let names: [Identifier]
+}
+
+struct ForeignMark {
+    let form: ForeignForm
+    // `FFI.Extern` as written, or the name of a function an `extern library`
+    // block declares.
+    let span: Span
+    // The `{ ... }` block, or the name when the block is absent.
+    let block: Span
+    let fields: [ForeignField]
+}
+
+function foreignFormNamed(member: String) -> Optional<ForeignForm> {
+    match member {
+        "Extern" -> return .Some(.Extern)
+        "Address" -> return .Some(.Address)
+        "Syscall" -> return .Some(.Syscall)
+        "Variadic" -> return .Some(.Variadic)
+        "Struct" -> return .Some(.Struct)
+        "Union" -> return .Some(.Union)
+        "Pointer" -> return .Some(.Pointer)
+        "Array" -> return .Some(.Array)
+        "Callback" -> return .Some(.Callback)
+        "Alias" -> return .Some(.Alias)
+        else -> return .None
+    }
+}
+
+// Whether a form rides a function rather than declaring a type.
+function isCallableForm(form: ForeignForm) -> Bool {
+    match form {
+        Extern -> return true
+        Address -> return true
+        Syscall -> return true
+        Variadic -> return true
+        Struct -> return false
+        Union -> return false
+        Pointer -> return false
+        Array -> return false
+        Callback -> return false
+        Alias -> return false
+    }
+}
+
+// A type declaration an `@FFI.*` mark rides.
+struct ForeignTypeMark {
+    let name: Identifier
+    let mark: Int
+}
+
+// `let flags: U32 @Bits(3)`: a C bit-field, `width` bits of the member
+// named at `field`.
+struct FieldBits {
+    let field: Span
+    let width: Int
+    let span: Span
+}
+
+// The mark an annotation list names, by its index beside the tree.
+function foreignMarkIndex(tree: SyntaxTree, annotations: [Annotation]) -> Optional<Int> {
+    for annotation in annotations {
+        match foreignMarkOf(tree, annotation) {
+            Some(index) -> return .Some(index)
+            None -> {}
+        }
+    }
+    return .None
+}
+
+// Every mark an annotation list names: `@FFI.Variadic` rides beside the
+// `@FFI.Extern` it marks.
+function foreignMarkIndices(tree: SyntaxTree, annotations: [Annotation]) -> [Int] {
+    var marks: [Int] = []
+    for annotation in annotations {
+        match foreignMarkOf(tree, annotation) {
+            Some(index) -> marks.append(index)
+            None -> {}
+        }
+    }
+    return marks
+}
+
+// The mark `annotation` names. A mark is read with its annotation, most often
+// just before it is asked for, so the search starts from the latest.
+function foreignMarkOf(tree: SyntaxTree, annotation: Annotation) -> Optional<Int> {
+    if !isAttribute(annotation, .Foreign) { return .None }
+    var index = tree.foreignMarks.count
+    while index > 0 {
+        index -= 1
+        if tree.foreignMarks[index].span.same(annotation.name.span) { return .Some(index) }
+    }
+    return .None
+}
+
+function markField(mark: ForeignMark, key: String) -> Optional<ForeignField> {
+    for field in mark.fields {
+        if field.key.text == key { return .Some(field) }
+    }
+    return .None
+}
+
+// The storage a C array, function pointer or pointer is reached through, as
+// kira names it: `elements`, an array of the element type, `pointer`, the
+// address C calls, and `address`, the address a pointer holds. A body that declares fields of its own is kept as
+// written, for the checker to refuse. The field's span is the type's name:
+// KIR names a record field by its source text, which these do not have, and
+// the type's name is a valid one its single field cannot collide with.
+function foreignStorage(mark: ForeignMark, owner: Identifier, fields: [FieldDeclaration]) -> [FieldDeclaration] {
+    if fields.count > 0 { return fields }
+    match mark.form {
+        Array -> {
+            match markField(mark, "element") {
+                Some(field) -> {
+                    match field.value {
+                        Named(element) -> {
+                            let arguments: [TypeReference] = [element]
+                            let annotation = TypeReference {
+                                qualifier = .None, name = Identifier { text = "Array", span = field.span },
+                                arguments = arguments, modes = [], instanceName = genericInstanceName("Array", arguments)
+                            }
+                            return [storageField("elements", annotation, owner.span)]
+                        }
+                        Word -> return fields
+                        Count -> return fields
+                        Listed -> return fields
+                    }
+                }
+                None -> return fields
+            }
+        }
+        Callback -> {
+            var storage = [storageField("pointer", rawPointerReference(mark.block), owner.span)]
+            match markField(mark, "context") {
+                Some(field) -> storage.append(storageField("context", rawPointerReference(mark.block), field.key.span))
+                None -> {}
+            }
+            return storage
+        }
+        Pointer -> return [storageField("address", rawPointerReference(mark.block), owner.span)]
+        Extern -> return fields
+        Address -> return fields
+        Syscall -> return fields
+        Variadic -> return fields
+        Struct -> return fields
+        Union -> return fields
+        Alias -> return fields
+    }
+}
+
+// The type an `@FFI.Alias` names: the declaration is a type alias to it,
+// as `type Name = Target` is.
+function foreignAliasTarget(mark: ForeignMark) -> Optional<TypeReference> {
+    if mark.form != .Alias { return .None }
+    match markField(mark, "target") {
+        Some(field) -> {
+            match field.value {
+                Named(target) -> return .Some(target)
+                Word -> return .None
+                Count -> return .None
+                Listed -> return .None
+            }
+        }
+        None -> return .None
+    }
+}
+
+function rawPointerReference(span: Span) -> TypeReference {
+    return TypeReference {
+        qualifier = .None, name = Identifier { text = "RawPtr", span = span },
+        arguments = [], modes = [], instanceName = "RawPtr"
+    }
+}
+
+function storageField(name: String, annotation: TypeReference, span: Span) -> FieldDeclaration {
+    return FieldDeclaration {
+        name = Identifier { text = name, span = span }, mutable = true, annotation = annotation, initial = .None, annotations = [], inferred = false,
+        span = span
+    }
+}
+
+extend Parser {
+    // `@FFI.<Member> { key: value, ... }`, with the `FFI` already read.
+    function foreignAnnotation(borrow mut self, root: Identifier) -> Result<Annotation, Failure> {
+        try expect(.Dot)
+        let member = try identifier(.ExpectedAnnotationName)
+        let span = root.span.to(member.span)
+        if root.text != "FFI" { return .Error(Failure { diagnostic = .UnknownQualifiedAnnotation, span = span }) }
+        var form: ForeignForm = .Extern
+        match foreignFormNamed(member.text) {
+            Some(named) -> form = named
+            None -> return .Error(Failure { diagnostic = .UnknownQualifiedAnnotation, span = span })
+        }
+        var fields: [ForeignField] = []
+        var block = span
+        if at(.LeftBrace) {
+            let open = advance()
+            while !at(.RightBrace) {
+                fields.append(try foreignField(form))
+                if !eat(.Comma) && !at(.RightBrace) {
+                    return .Error(failure(.ExpectedForeignSeparator))
+                }
+            }
+            try expect(.RightBrace)
+            block = spanFrom(open.span)
+        } else {
+            match form {
+                Variadic -> {}
+                Extern -> return .Error(failure(.ExpectedForeignBlock))
+                Address -> return .Error(failure(.ExpectedForeignBlock))
+                Syscall -> return .Error(failure(.ExpectedForeignBlock))
+                Struct -> return .Error(failure(.ExpectedForeignBlock))
+                Union -> return .Error(failure(.ExpectedForeignBlock))
+                Pointer -> return .Error(failure(.ExpectedForeignBlock))
+                Array -> return .Error(failure(.ExpectedForeignBlock))
+                Callback -> return .Error(failure(.ExpectedForeignBlock))
+                Alias -> return .Error(failure(.ExpectedForeignBlock))
+            }
+        }
+        tree.foreignMarks.append(ForeignMark { form = form, span = span, block = block, fields = fields })
+        return .Ok(Annotation { name = Identifier { text = root.text, span = span }, attribute = .Some(.Foreign), arguments = [] })
+    }
+
+    // One `key: value`. A callable form's values are words throughout; a
+    // type form reads a type, a count or a type list by its key.
+    function foreignField(borrow mut self, form: ForeignForm) -> Result<ForeignField, Failure> {
+        let key = try identifier(.ExpectedForeignFieldName)
+        try expectAs(.Colon, .ExpectedForeignColon)
+        let start = current().span
+        if isCallableForm(form) {
+            let word = try identifier(.ExpectedForeignValue)
+            return .Ok(ForeignField { key = key, value = .Word(word), span = word.span, names = [] })
+        }
+        match key.text {
+            "target", "element", "result" -> {
+                let named = try foreignType()
+                return .Ok(ForeignField { key = key, value = .Named(named), span = spanFrom(start), names = [] })
+            }
+            "count" -> {
+                if !at(.IntegerLiteral) { return .Error(failure(.ExpectedForeignValue)) }
+                let token = advance()
+                let count = try integerValue(token.span)
+                return .Ok(ForeignField { key = key, value = .Count(count), span = token.span, names = [] })
+            }
+            "params" -> {
+                try expectAs(.LeftBracket, .ExpectedForeignValue)
+                var listed: [TypeReference] = []
+                var names: [Identifier] = []
+                while !at(.RightBracket) {
+                    var name = Identifier { text = "", span = current().span }
+                    if at(.Identifier) && peek(1).kind == .Colon {
+                        name = try identifier(.ExpectedForeignValue)
+                        try expectAs(.Colon, .ExpectedForeignColon)
+                    }
+                    names.append(name)
+                    listed.append(try foreignType())
+                    if !eat(.Comma) { break }
+                }
+                try expect(.RightBracket)
+                return .Ok(ForeignField { key = key, value = .Listed(listed), span = spanFrom(start), names = names })
+            }
+            "layout", "ownership", "abi", "free", "context" -> {
+                let word = try identifier(.ExpectedForeignValue)
+                return .Ok(ForeignField { key = key, value = .Word(word), span = word.span, names = [] })
+            }
+            else -> {
+                // A key no form reads: its value is passed over up to the
+                // separator, so one unknown field does not derail the block.
+                var depth = 0
+                while !at(.End) {
+                    if depth == 0 && (at(.Comma) || at(.RightBrace)) { break }
+                    if at(.LeftBracket) { depth += 1 }
+                    if at(.RightBracket) { depth -= 1 }
+                    advance()
+                }
+                return .Ok(ForeignField { key = key, value = .Listed([]), span = spanFrom(start), names = [] })
+            }
+        }
+    }
+
+    // A type value. A generated `union Name` carries C's aggregate tag, which
+    // names no Kira type, so the tag is read past.
+    function foreignType(borrow mut self) -> Result<TypeReference, Failure> {
+        if atWord("union") && peek(1).kind == .Identifier { advance() }
+        return typeReference()
+    }
+}
+
+extend Parser {
+    // `extern library ffimath { function add(a: I32, b: I32) -> I32 }`: each
+    // bodyless function is an `@FFI.Extern { library: ffimath, symbol: add,
+    // abi: c }`.
+    function externLibraryBlock(borrow mut self) -> Result<Span, Failure> {
+        let start = advance().span
+        advance()
+        let library = try identifier(.ExpectedForeignValue)
+        try expect(.LeftBrace)
+        while !at(.RightBrace) {
+            if !at(.Function) || peek(1).kind != .Identifier { return .Error(failure(.ExpectedDeclaration)) }
+            let symbol = Identifier { text = text(peek(1).span), span = peek(1).span }
+            let fields: [ForeignField] = [
+                externField("library", library),
+                externField("symbol", symbol),
+                externField("abi", Identifier { text = "c", span = library.span })
+            ]
+            tree.foreignMarks.append(ForeignMark { form = .Extern, span = symbol.span, block = library.span, fields = fields })
+            let declared = try functionDeclaration([implicitAnnotation(.Foreign, symbol.span)])
+            tree.functions.append(declared)
+            tree.declarationSites.append(DeclarationSite { name = declared.name, kind = "function", span = declared.span, family = "" })
+        }
+        try expect(.RightBrace)
+        return .Ok(spanFrom(start))
+    }
+}
+
+function externField(key: String, value: Identifier) -> ForeignField {
+    return ForeignField { key = Identifier { text = key, span = value.span }, value = .Word(value), span = value.span, names = [] }
+}

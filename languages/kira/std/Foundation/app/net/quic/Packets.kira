@@ -1,0 +1,307 @@
+// QUIC version 1 packets (RFC 9000 section 17) and their protection (RFC
+// 9001 section 5): long headers for Initial and Handshake, the short header
+// for 1-RTT, packet numbers, AEAD and header protection. Each encryption
+// level is also its packet number space; 0-RTT is not sent.
+
+namespace QuicPacketLimit {
+    // A long header's Length is always written in two bytes, so it can be
+    // reserved before the payload is sealed; every packet is far smaller
+    // than the 16383 bytes two bytes hold.
+    let lengthBytes: Number = 2
+    let twoByteVarint: Number = 16384
+    let largestNumberBytes: Number = 4
+    let versionBytes: Number = 4
+}
+
+// A packet's header before protection, as a sender knows it.
+struct QuicPacketHeader {
+    let level: TlsEncryptionLevel
+    let destination: [UN8]
+    let source: [UN8] = []
+    // An Initial's token, from a Retry or NEW_TOKEN.
+    let token: [UN8] = []
+    let keyPhase: Bool = false
+}
+
+struct QuicOutgoingPacket {
+    let header: QuicPacketHeader
+    let number: Number
+    // The largest number the peer acknowledged in this space, which sets
+    // how few bytes the number may take (RFC 9000 section 17.1).
+    let largestAcknowledged: Number?
+    let payload: [UN8]
+}
+
+// The fewest bytes that let the peer recover `number` (RFC 9000 appendix
+// A.2).
+function quicNumberLength(number: Number, largestAcknowledged: Number?) -> Number {
+    let unacknowledged = match largestAcknowledged {
+        Some(largest) -> number - largest
+        None -> number + 1
+    }
+    var length = 1
+    while length < QuicPacketLimit.largestNumberBytes && 2 * unacknowledged >= 1 << (
+        Wire.byteBits * length
+    ) {
+        length += 1
+    }
+    return length
+}
+
+function quicLevelType(level: TlsEncryptionLevel) -> QuicLongPacketType {
+    return match level {
+        Initial -> .Initial
+        Handshake -> .Handshake
+        Application -> .ZeroRtt
+    }
+}
+
+// The header through the packet number, unprotected, and where the
+// number starts.
+function quicHeaderBytes(
+    packet: borrow QuicOutgoingPacket,
+    numberBytes: Number,
+    sealedBytes: Number
+) -> ([UN8], Number) {
+    var writer = WireWriter {}
+    let header = packet.header
+    if header.level == .Application {
+        let phase = header.keyPhase ? Quic.keyPhaseBit : 0
+        writer.writeByte(Quic.fixedBit | phase | numberBytes - 1)
+        writer.writeBytes(header.destination)
+    } else {
+        let kind = code(quicLevelType(header.level)) << Quic.longTypeShift
+        writer.writeByte(Quic.longHeader | Quic.fixedBit | kind | numberBytes - 1)
+        writer.writeInteger(Quic.version1, QuicPacketLimit.versionBytes)
+        writer.writeVector(header.destination, Tls.shortVector)
+        writer.writeVector(header.source, Tls.shortVector)
+        if header.level == .Initial {
+            writer.writeVarint(header.token.count)
+            writer.writeBytes(header.token)
+        }
+        writer.writeInteger(
+            QuicPacketLimit.twoByteVarint | numberBytes + sealedBytes,
+            QuicPacketLimit.lengthBytes
+        )
+    }
+    let numberAt = writer.count()
+    writer.writeInteger(packet.number % (1 << (Wire.byteBits * numberBytes)), numberBytes)
+    return (writer.bytes, numberAt)
+}
+
+// `packet` sealed and its header protected.
+function quicSealPacket(
+    packet: borrow QuicOutgoingPacket,
+    keys: borrow TlsTrafficKeys
+) -> Result<[UN8], CryptoFailure> {
+    let numberBytes = quicNumberLength(packet.number, packet.largestAcknowledged)
+    var plain = copy packet.payload
+    // The header protection sample needs 16 bytes past the number's first
+    // four; PADDING frames make up the shortfall.
+    while numberBytes + plain.count < Quic.sampleOffset { plain.append(0) }
+    let sealedBytes = plain.count + CryptoService.tagBytes
+    let (header, numberAt) = quicHeaderBytes(packet, numberBytes, sealedBytes)
+    let nonce = tlsSequenceNonce(keys.iv, packet.number)
+    let sealed = try sealAead(keys.key, nonce, header, plain)
+    var whole = joinedBytes(header, sealed)
+    try quicProtectHeader(whole, numberAt, numberBytes, keys)
+    return .Ok(whole)
+}
+
+// Header protection (RFC 9001 section 5.4.1): the low bits of the first
+// byte and the packet number masked with the sample's mask.
+function quicProtectHeader(
+    packet: borrow mut [UN8],
+    numberAt: Number,
+    numberBytes: Number,
+    keys: borrow TlsTrafficKeys
+) -> Result<Void, CryptoFailure> {
+    let sampleAt = numberAt + Quic.sampleOffset
+    let sample = byteRun(packet, sampleAt, sampleAt + Quic.sampleBytes)
+    let mask = try headerMask(keys.key.suite, keys.header, sample)
+    let long = (Number(packet[0]) & Quic.longHeader) != 0
+    let bits = long ? Quic.longProtectedBits : Quic.shortProtectedBits
+    packet[0] = UN8(Number(packet[0]) ^ (Number(mask[0]) & bits))
+    for index in 0..numberBytes {
+        packet[numberAt + index] = UN8(Number(packet[numberAt + index]) ^ Number(mask[1 + index]))
+    }
+    return .Ok
+}
+
+// Why a packet is dropped rather than read; none of these closes the
+// connection (RFC 9000 section 12.2).
+enum QuicPacketDrop {
+    Malformed
+    UnknownVersion
+    // No keys yet, or the AEAD refused it.
+    Undecryptable
+}
+
+// What a packet's header says before it is unprotected.
+struct QuicRawHeader {
+    let level: TlsEncryptionLevel
+    let retry: Bool
+    let version: Number
+    let destination: [UN8]
+    let source: [UN8]
+    let token: [UN8]
+    let start: Number
+    let numberAt: Number
+    // Where the packet ends in its datagram: coalesced packets follow it.
+    let end: Number
+}
+
+// The header of the packet at `start` of `datagram`; a short header's
+// destination ID has the length this endpoint issues.
+function quicReadHeader(
+    datagram: borrow [UN8],
+    start: Number,
+    shortIdBytes: Number
+) -> Result<QuicRawHeader, QuicPacketDrop> {
+    var reader = WireReader { bytes: copy datagram, at: start }
+    let first = try reader.readByte() otherwise return .Error(.Malformed)
+    if (first & Quic.fixedBit) == 0 { return .Error(.Malformed) }
+    if (first & Quic.longHeader) == 0 {
+        let destination = try reader.readBytes(shortIdBytes) otherwise return .Error(.Malformed)
+        return .Ok(
+            QuicRawHeader {
+                level: .Application,
+                retry: false,
+                version: Quic.version1,
+                destination: destination,
+                source: [],
+                token: [],
+                start: start,
+                numberAt: reader.at,
+                end: datagram.count
+            }
+        )
+    }
+    return quicReadLongHeader(reader, first, start)
+}
+
+function quicReadLongHeader(
+    reader: borrow mut WireReader,
+    first: Number,
+    start: Number
+) -> Result<QuicRawHeader, QuicPacketDrop> {
+    let version = try reader.readInteger(QuicPacketLimit.versionBytes) otherwise return .Error(
+        .Malformed
+    )
+    let destination = try reader.readVector(Tls.shortVector) otherwise return .Error(.Malformed)
+    let source = try reader.readVector(Tls.shortVector) otherwise return .Error(.Malformed)
+    if version != Quic.version1 { return .Error(.UnknownVersion) }
+    if destination.count > Quic.maximumConnectionId || source.count > Quic.maximumConnectionId {
+        return .Error(.Malformed)
+    }
+    let kind: QuicLongPacketType = fromCode<QuicLongPacketType>(
+        (first >> Quic.longTypeShift) & Quic.packetNumberLengthMask
+    )
+    var token: [UN8] = []
+    if kind == .Initial {
+        let length = try reader.readVarint() otherwise return .Error(.Malformed)
+        token = try reader.readBytes(length) otherwise return .Error(.Malformed)
+    }
+    if kind == .Retry {
+        // A Retry is its token and integrity tag, to the datagram's end.
+        return .Ok(
+            QuicRawHeader {
+                level: .Initial,
+                retry: true,
+                version: version,
+                destination: destination,
+                source: source,
+                token: reader.readRest(),
+                start: start,
+                numberAt: reader.at,
+                end: reader.bytes.count
+            }
+        )
+    }
+    if kind == .ZeroRtt { return .Error(.Undecryptable) }
+    let length = try reader.readVarint() otherwise return .Error(.Malformed)
+    if length > reader.remaining() { return .Error(.Malformed) }
+    return .Ok(
+        QuicRawHeader {
+            level: kind == .Initial ? TlsEncryptionLevel.Initial : TlsEncryptionLevel.Handshake,
+            retry: false,
+            version: version,
+            destination: destination,
+            source: source,
+            token: token,
+            start: start,
+            numberAt: reader.at,
+            end: reader.at + length
+        }
+    )
+}
+
+struct QuicIncomingPacket {
+    let level: TlsEncryptionLevel
+    let number: Number
+    let payload: [UN8]
+    let keyPhase: Bool
+    // Reserved header bits that were not zero, which is a protocol
+    // violation once the packet has authenticated (RFC 9000 section 17.2).
+    let reservedSet: Bool
+}
+
+// The full packet number nearest the next one expected (RFC 9000 appendix
+// A.3).
+function quicFullNumber(truncated: Number, numberBytes: Number, largest: Number?) -> Number {
+    let expected = match largest {
+        Some(value) -> value + 1
+        None -> 0
+    }
+    let window = 1 << (Wire.byteBits * numberBytes)
+    let half = trunc(window / 2)
+    let candidate = expected - expected % window + truncated
+    if candidate + half <= expected && candidate < Wire.varintMaximum - window {
+        return candidate + window
+    }
+    if candidate > expected + half && candidate >= window { return candidate - window }
+    return candidate
+}
+
+// The packet `raw` describes, unprotected and opened.
+function quicOpenPacket(
+    datagram: borrow [UN8],
+    raw: borrow QuicRawHeader,
+    keys: borrow TlsTrafficKeys,
+    largest: Number?
+) -> Result<QuicIncomingPacket, QuicPacketDrop> {
+    let sampleAt = raw.numberAt + Quic.sampleOffset
+    if sampleAt + Quic.sampleBytes > raw.end { return .Error(.Malformed) }
+    let sample = byteRun(datagram, sampleAt, sampleAt + Quic.sampleBytes)
+    let mask = try headerMask(keys.key.suite, keys.header, sample) otherwise return .Error(
+        .Undecryptable
+    )
+    let long = raw.level != .Application
+    let bits = long ? Quic.longProtectedBits : Quic.shortProtectedBits
+    let first = Number(datagram[raw.start]) ^ (Number(mask[0]) & bits)
+    let numberBytes = (first & Quic.packetNumberLengthMask) + 1
+    var header = byteRun(datagram, raw.start, raw.numberAt + numberBytes)
+    header[0] = UN8(first)
+    var truncated = 0
+    for index in 0..numberBytes {
+        let byte = Number(datagram[raw.numberAt + index]) ^ Number(mask[1 + index])
+        header[header.count - numberBytes + index] = UN8(byte)
+        truncated = truncated * Wire.byteValues + byte
+    }
+    let number = quicFullNumber(truncated, numberBytes, move largest)
+    let sealed = byteRun(datagram, raw.numberAt + numberBytes, raw.end)
+    let nonce = tlsSequenceNonce(keys.iv, number)
+    let payload = try openAead(keys.key, nonce, header, sealed) otherwise return .Error(
+        .Undecryptable
+    )
+    let reserved = first & (long ? Quic.longReservedBits : Quic.shortReservedBits)
+    return .Ok(
+        QuicIncomingPacket {
+            level: raw.level,
+            number: number,
+            payload: payload,
+            keyPhase: !long && (first & Quic.keyPhaseBit) != 0,
+            reservedSet: reserved != 0
+        }
+    )
+}

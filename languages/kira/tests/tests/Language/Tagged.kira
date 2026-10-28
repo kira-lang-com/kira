@@ -1,0 +1,38 @@
+import Foundation
+
+// An enum's declaration order is a stable zero-based code, and payload-less
+// variants reconstruct from it. The compiler owns both directions natively,
+// `code(...)` and `fromCode<E>(...)`, with no `@Derive`.
+
+enum HxMaterial {
+    Flat
+    Frosted
+    Metallic
+}
+
+@Test
+function codeFollowsDeclarationOrder() {
+    expect!((code(HxMaterial.Flat)) == (0))
+    expect!((code(HxMaterial.Frosted)) == (1))
+    expect!((code(HxMaterial.Metallic)) == (2))
+}
+
+@Test
+function fromCodeRoundTripsAnInRangeCode() {
+    expect!((code(fromCode<HxMaterial>(2))) == (2))
+    expect!((code(fromCode<HxMaterial>(1))) == (1))
+}
+
+@Test
+function fromCodeClampsAnOutOfRangeCodeToTheFirstVariant() {
+    expect!((code(fromCode<HxMaterial>(99))) == (0))
+    expect!((code(fromCode<HxMaterial>(0 - 5))) == (0))
+}
+
+@Test
+function nativeCodesFoldToADistinctTotal() {
+    let total = code(HxMaterial.Flat) + code(HxMaterial.Frosted) * 10 + code(
+        HxMaterial.Metallic
+    ) * 100
+    expect!((total) == (210))
+}

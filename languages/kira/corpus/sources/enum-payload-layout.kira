@@ -1,0 +1,32 @@
+// An enum's payload area holds its largest variant at its most aligned
+// variant's alignment, which need not be the same variant: `Five` is the
+// larger (20 bytes on 4), `Failure` the more aligned (16 bytes on 8). Laid
+// out by the more aligned alone, `Five`'s last field fell outside the enum.
+
+import Foundation
+
+struct Five {
+    var a: U32
+    var b: U32
+    var c: U32
+    var d: U32
+    var e: U32
+}
+
+struct Failure {
+    var code: U32
+    var detail: U64
+}
+
+function made(seed: U32) -> Result<Five, Failure> {
+    return .Ok(Five { a: seed, b: U32(1), c: U32(2), d: U32(3), e: seed + U32(4) })
+}
+
+@Main
+function main() -> Int {
+    let last = match made(U32(38)) {
+        Ok(five) -> Int(five.e)
+        Error(failed) -> Int(failed.code)
+    }
+    return last
+}

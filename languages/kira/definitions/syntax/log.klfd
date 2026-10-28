@@ -1,0 +1,342 @@
+// `log`: an event on the program's trail.
+//
+//     log("frame decoded", width, bytes: data.count)
+//     log warn("cache entry rejected", key)
+//
+// The parser writes it out as calls into Foundation's trail, so nothing past
+// parsing knows it was ever more than ordinary Kira:
+//
+//     if trailOpen(level) {
+//         if trailUnknown(site) { trailSite(site, level, trail, path, line, column, message, [names]) }
+//         if trailBegin(site) { trailField(width) trailField(data.count) trailEnd() }
+//     }
+//
+// A disabled level costs one call, the site's description is built the first
+// time it is enabled, and the fields are evaluated only when it records. A
+// field is named by its label or by its source text. The trail and path are
+// known only once the loader knows the file's package, so the parser leaves
+// them empty and `placeTrailSites` fills them in.
+
+struct TrailSiteSyntax {
+    let span: Span
+    let trail: Int
+    let path: Int
+    // 1 once the loader finds the site in a library.
+    let library: Int
+    // Every literal naming the site; the loader gives them the site's key.
+    var numbers: [Int]
+    // The category's path, `trail` then the category's written name, or -1 for
+    // a site in the module's implicit category. The loader fills it in.
+    var categoryPath: Int = -1
+    var categoryName: String = ""
+}
+
+let defaultLogLevel = 2
+
+struct PlacedSite {
+    let index: Int
+    let trail: Int
+    let path: Int
+    let library: Int
+    // The category path expression, or -1 for the implicit category.
+    let categoryPath: Int
+}
+
+struct LoggedFields {
+    let message: Optional<Int>
+    let names: [Int]
+    let fields: [Int]
+}
+
+// The `category:` argument of a log: its value expression, and the category's
+// written name, `Enum.Case`, which the loader prefixes with the module's name.
+struct LoggedCategory {
+    let value: Int
+    let name: String
+}
+
+struct CategorySplit {
+    let category: Optional<LoggedCategory>
+    let fields: [Int]
+}
+
+enum LogArgument {
+    Labelled(Identifier, Int)
+    Message
+    Literal
+    Value
+}
+
+extend Parser {
+    // At the start of a statement: `log(` or `log <word>(`.
+    function atLog(borrow self) -> Bool {
+        if !atWord("log") { return false }
+        if peek(1).kind == .LeftParen { return true }
+        return peek(1).kind == .Identifier && peek(2).kind == .LeftParen
+    }
+
+    function logStatement(borrow mut self) -> Result<Int, Failure> {
+        let start = advance().span
+        var level = defaultLogLevel
+        if at(.Identifier) {
+            let word = advance()
+            level = logLevelNamed(text(word.span))
+            if level < 0 { return .Error(Failure { diagnostic = .UnknownLogLevel, span = word.span }) }
+        }
+        let arguments = try self.arguments()
+        let span = spanFrom(start)
+        let split = try categoryArgument(arguments)
+        let logged = try loggedFields(split.fields)
+        if logged.message.isNone() && level <= 1 { return .Error(Failure { diagnostic = .LogMessage, span = span }) }
+        return .Ok(logDesugared(span, level, trailKindLog, logged.message, logged.names, logged.fields, split.category))
+    }
+
+    // Takes the labelled `category:` argument out of a log's arguments. Its
+    // value must be written `Enum.Case`, the case of a `LogCategory` enum; the
+    // enum is checked where the value is typed, as any argument is.
+    function categoryArgument(borrow mut self, arguments: [Int]) -> Result<CategorySplit, Failure> {
+        var category: Optional<LoggedCategory> = .None
+        var fields: [Int] = []
+        for argument in arguments {
+            let expression = tree.expressions[argument]
+            match expression.kind.logArgument() {
+                Labelled(label, value) -> {
+                    if label.text != "category" {
+                        fields.append(argument)
+                        continue
+                    }
+                    if category.isSome() || !categoryPathExpression(value) {
+                        return .Error(Failure { diagnostic = .LogCategoryPath, span = expression.span })
+                    }
+                    category = .Some(LoggedCategory { value = value, name = text(tree.expressions[value].span) })
+                }
+                Message -> fields.append(argument)
+                Literal -> fields.append(argument)
+                Value -> fields.append(argument)
+            }
+        }
+        return .Ok(CategorySplit { category = category, fields = fields })
+    }
+
+    // Whether `value` is written `Name.Name`: an enum case named through its
+    // enum, with nothing else in the expression.
+    function categoryPathExpression(borrow self, value: Int) -> Bool {
+        let written = text(tree.expressions[value].span)
+        let length = utf8Count(written)
+        var dots = 0
+        var dot = 0
+        for index in 0..length {
+            if utf8Byte(written, index) == 46 {
+                dots = dots + 1
+                dot = index
+            }
+        }
+        if dots != 1 { return false }
+        return identifierBytes(written, 0, dot) && identifierBytes(written, dot + 1, length)
+    }
+
+    // A leading string literal is the message; every other argument is a
+    // field, named by its label or its source text, and traced when recorded.
+    function loggedFields(borrow mut self, arguments: [Int]) -> Result<LoggedFields, Failure> {
+        var message: Optional<Int> = .None
+        var first = 0
+        if arguments.count > 0 {
+            match tree.expressions[arguments[0]].kind.logArgument() {
+                Message -> {
+                    message = .Some(arguments[0])
+                    first = 1
+                }
+                Labelled -> {}
+                Literal -> {}
+                Value -> {}
+            }
+        }
+        var names: [Int] = []
+        var fields: [Int] = []
+        for index in first..arguments.count {
+            let argument = tree.expressions[arguments[index]]
+            match argument.kind.logArgument() {
+                Labelled(label, value) -> {
+                    names.append(generatedText(label.text, label.span))
+                    fields.append(generatedCall("traceText", [value], argument.span))
+                }
+                Message -> return .Error(Failure { diagnostic = .LogFieldName, span = argument.span })
+                Literal -> return .Error(Failure { diagnostic = .LogFieldName, span = argument.span })
+                Value -> {
+                    names.append(generatedText(text(argument.span), argument.span))
+                    fields.append(generatedCall("traceText", [arguments[index]], argument.span))
+                }
+            }
+        }
+        return .Ok(LoggedFields { message = message, names = names, fields = fields })
+    }
+
+    // `Trace(note, fields...)` in a `traced()` body, as Foundation's
+    // `traceOf(note, [names], [texts])`.
+    function traceCall(borrow mut self, name: Identifier, arguments: [Int]) -> Result<Int, Failure> {
+        let span = spanFrom(name.span)
+        let logged = try loggedFields(arguments)
+        var note = generatedText("", span)
+        match logged.message {
+            Some(literal) -> note = literal
+            None -> {}
+        }
+        let names = tree.addExpression(.ArrayLiteral(logged.names), span)
+        let values = tree.addExpression(.ArrayLiteral(logged.fields), span)
+        return .Ok(generatedCall("traceOf", [note, names, values], span))
+    }
+
+    function logDesugared(borrow mut self, span: Span, level: Int, kind: Int, message: Optional<Int>, names: [Int], fields: [Int], category: Optional<LoggedCategory>) -> Int {
+        let site = logTrailSite(span, category)
+        var written = generatedText("", span)
+        match message {
+            Some(literal) -> written = literal
+            None -> {}
+        }
+        let describe = tree.addStatement(.Evaluation(describeSite(site, span, level, kind, written, names, category)), span)
+        let unknown = tree.addStatement(.If(generatedCall("trailUnknown", [siteNumber(site, span)], span), [describe], []), span)
+        var recording: [Int] = []
+        for field in fields { recording.append(generatedStatement("trailField", [field], span)) }
+        recording.append(generatedStatement("trailEnd", [], span))
+        let record = tree.addStatement(.If(generatedCall("trailBegin", [siteNumber(site, span)], span), recording, []), span)
+        let open = generatedCall("trailOpen", [generatedInteger(level, span), siteNumber(site, span)], span)
+        return tree.addStatement(.If(open, [unknown, record], []), span)
+    }
+
+    // A site whose trail and path the loader fills in.
+    function newTrailSite(borrow mut self, span: Span) -> PlacedSite {
+        return addTrailSite(span, -1, "")
+    }
+
+    // The site of a `log`: in its category when it names one, the implicit
+    // category otherwise. The loader fills in the category's path.
+    function logTrailSite(borrow mut self, span: Span, category: Optional<LoggedCategory>) -> PlacedSite {
+        match category {
+            Some(logged) -> return addTrailSite(span, generatedText("", span), logged.name)
+            None -> return newTrailSite(span)
+        }
+    }
+
+    function addTrailSite(borrow mut self, span: Span, categoryPath: Int, categoryName: String) -> PlacedSite {
+        let index = tree.trailSites.count
+        let trail = generatedText("", span)
+        let path = generatedText("", span)
+        let library = generatedInteger(0, span)
+        tree.trailSites.append(TrailSiteSyntax {
+            span = span, trail = trail, path = path, library = library, numbers = [],
+            categoryPath = categoryPath, categoryName = categoryName
+        })
+        return PlacedSite { index = index, trail = trail, path = path, library = library, categoryPath = categoryPath }
+    }
+
+    // A literal naming `site`, 0 until the loader gives it the site's key.
+    function siteNumber(borrow mut self, site: PlacedSite, span: Span) -> Int {
+        let number = generatedInteger(0, span)
+        tree.trailSites[site.index].numbers.append(number)
+        return number
+    }
+
+    // `trailSite(site, level, kind, trail, path, library, line, column,
+    // message, [names], line text, width)`: the site as a report shows it, with the
+    // line it is written on and how much of the line it spans.
+    function siteDescription(borrow mut self, site: PlacedSite, span: Span, level: Int, kind: Int, message: Int, names: [Int]) -> Int {
+        return generatedCall("trailSite", siteArguments(site, span, level, kind, message, names), span)
+    }
+
+    // `trailSite` for a site in the implicit category, or
+    // `trailCategorySite` with the category's path and value after the rest.
+    function describeSite(borrow mut self, site: PlacedSite, span: Span, level: Int, kind: Int, message: Int, names: [Int], category: Optional<LoggedCategory>) -> Int {
+        var arguments = siteArguments(site, span, level, kind, message, names)
+        match category {
+            Some(logged) -> {
+                arguments.append(site.categoryPath)
+                arguments.append(categoryThreshold(logged.value, span))
+                return generatedCall("trailCategorySite", arguments, span)
+            }
+            None -> return generatedCall("trailSite", arguments, span)
+        }
+    }
+
+    // The arguments both site descriptions share, in the order Foundation takes them.
+    function siteArguments(borrow mut self, site: PlacedSite, span: Span, level: Int, kind: Int, message: Int, names: [Int]) -> [Int] {
+        let position = lineAndColumn(span.start)
+        let bounds = lineBounds(span.start)
+        var end = span.end
+        if end > bounds[1] { end = bounds[1] }
+        var width = end - span.start
+        if width < 1 { width = 1 }
+        return [
+            siteNumber(site, span), generatedInteger(level, span), generatedInteger(kind, span), site.trail, site.path, site.library,
+            generatedInteger(position[0], span), generatedInteger(position[1], span), message,
+            tree.addExpression(.ArrayLiteral(names), span),
+            generatedText(utf8Slice(source, bounds[0], bounds[1]), span), generatedInteger(width, span)
+        ]
+    }
+
+    // The first byte of the line holding `offset`, and the byte past its end.
+    function lineBounds(borrow self, offset: Int) -> [Int] {
+        var start = offset
+        while start > 0 && utf8Byte(source, start - 1) != 10 { start = start - 1 }
+        var end = offset
+        let count = utf8Count(source)
+        while end < count && utf8Byte(source, end) != 10 && utf8Byte(source, end) != 13 { end = end + 1 }
+        return [start, end]
+    }
+
+    // A call to one of Foundation's trail functions.
+    function generatedCall(borrow mut self, name: String, arguments: [Int], span: Span) -> Int {
+        return tree.addExpression(.Call(Identifier { text = name, span = span }, arguments), span)
+    }
+
+    // The category's declared threshold: `Enum.Case.threshold()`.
+    function categoryThreshold(borrow mut self, value: Int, span: Span) -> Int {
+        return tree.addExpression(.MethodCall(value, Identifier { text = "threshold", span = span }, []), span)
+    }
+
+    function generatedStatement(borrow mut self, name: String, arguments: [Int], span: Span) -> Int {
+        return tree.addStatement(.Evaluation(generatedCall(name, arguments, span)), span)
+    }
+
+    function generatedInteger(borrow mut self, value: Int, span: Span) -> Int {
+        return tree.addExpression(.IntegerLiteral(value, false), span)
+    }
+
+    function generatedText(borrow mut self, value: String, span: Span) -> Int {
+        return tree.addExpression(.StringLiteral(.Some(value)), span)
+    }
+
+    // The 1-based line and column of byte `offset` in this file.
+    function lineAndColumn(borrow self, offset: Int) -> [Int] {
+        var line = 1
+        var lineStart = 0
+        for index in 0..offset {
+            if utf8Byte(source, index) == 10 {
+                line += 1
+                lineStart = index + 1
+            }
+        }
+        return [line, offset - lineStart + 1]
+    }
+}
+
+// Whether the bytes of `text` from `from` up to `to` form an identifier: letters,
+// digits and underscores, not starting with a digit.
+function identifierBytes(text: String, from: Int, to: Int) -> Bool {
+    if to <= from { return false }
+    for index in from..to {
+        let byte = utf8Byte(text, index)
+        let letter = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+        let digit = byte >= 48 && byte <= 57
+        if !letter && !(digit && index > from) { return false }
+    }
+    return true
+}
+
+function logLevelNamed(word: String) -> Int {
+    if word == "fault" { return 0 }
+    if word == "warn" { return 1 }
+    if word == "info" { return 2 }
+    if word == "debug" { return 3 }
+    if word == "trace" { return 4 }
+    return 0 - 1
+}

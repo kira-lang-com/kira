@@ -1,0 +1,219 @@
+// The tokens of Kira source.
+//
+// Kira has no statement terminator and the lexer emits no newline token: the
+// grammar ends a statement where its form ends. A token is its kind and the
+// byte range it covers; its text is read back from the source when the parser
+// needs it.
+
+enum TokenKind {
+    Identifier
+    IntegerLiteral
+    FloatLiteral
+    StringLiteral
+
+    Function
+    Let
+    Var
+    Return
+    If
+    Else
+    While
+    True
+    False
+    Import
+    As
+    Is
+    Struct
+    Enum
+    Class
+    Construct
+    Trait
+    Extends
+    Override
+    Match
+    Attempt
+    Try
+    For
+    In
+    Break
+    Continue
+    Type
+    Distinct
+
+    LeftParen
+    RightParen
+    LeftBrace
+    RightBrace
+    LeftBracket
+    RightBracket
+    Comma
+    Colon
+    Dot
+    DotDot
+    At
+    Backslash
+    Hash
+    Question
+    Arrow
+    Equals
+    Plus
+    Minus
+    Star
+    Slash
+    Percent
+    EqualEqual
+    BangEqual
+    Less
+    LessEqual
+    Greater
+    GreaterEqual
+    AmpersandAmpersand
+    PipePipe
+    Ampersand
+    Pipe
+    Caret
+    Tilde
+    LessLess
+    GreaterGreater
+    Bang
+
+    End
+}
+
+struct Token {
+    let kind: TokenKind
+    let span: Span
+}
+
+// A byte range in one source file, named by its session file id.
+struct Span {
+    let file: Int
+    let start: Int
+    let end: Int
+
+    function to(borrow self, other: Span) -> Span {
+        return Span { file = file, start = start, end = other.end }
+    }
+
+    function same(borrow self, other: Span) -> Bool {
+        return file == other.file && start == other.start && end == other.end
+    }
+
+    function holds(borrow self, other: Span) -> Bool {
+        return file == other.file && start <= other.start && other.end <= end
+    }
+}
+
+// The reserved word an identifier spells, if it spells one. `handle`, `borrow`,
+// `mut`, `move`, `copy` and `self` are contextual and stay identifiers.
+function keyword(word: String) -> Optional<TokenKind> {
+    match word {
+        "function" -> return .Some(.Function)
+        "let" -> return .Some(.Let)
+        "var" -> return .Some(.Var)
+        "return" -> return .Some(.Return)
+        "if" -> return .Some(.If)
+        "else" -> return .Some(.Else)
+        "while" -> return .Some(.While)
+        "true" -> return .Some(.True)
+        "false" -> return .Some(.False)
+        "import" -> return .Some(.Import)
+        "as" -> return .Some(.As)
+        "is" -> return .Some(.Is)
+        "struct" -> return .Some(.Struct)
+        "enum" -> return .Some(.Enum)
+        "class" -> return .Some(.Class)
+        "construct" -> return .Some(.Construct)
+        "trait" -> return .Some(.Trait)
+        "extends" -> return .Some(.Extends)
+        "override" -> return .Some(.Override)
+        "match" -> return .Some(.Match)
+        "attempt" -> return .Some(.Attempt)
+        "try" -> return .Some(.Try)
+        "for" -> return .Some(.For)
+        "in" -> return .Some(.In)
+        "break" -> return .Some(.Break)
+        "continue" -> return .Some(.Continue)
+        "type" -> return .Some(.Type)
+        "distinct" -> return .Some(.Distinct)
+        else -> return .None
+    }
+}
+
+enum TokenDelimiter { Open Close Hole End Other }
+
+extend TokenKind {
+    function delimiter(borrow self) -> TokenDelimiter {
+        match self {
+            Identifier -> return .Other
+            IntegerLiteral -> return .Other
+            FloatLiteral -> return .Other
+            StringLiteral -> return .Other
+            Function -> return .Other
+            Let -> return .Other
+            Var -> return .Other
+            Return -> return .Other
+            If -> return .Other
+            Else -> return .Other
+            While -> return .Other
+            True -> return .Other
+            False -> return .Other
+            Import -> return .Other
+            As -> return .Other
+            Is -> return .Other
+            Struct -> return .Other
+            Enum -> return .Other
+            Class -> return .Other
+            Construct -> return .Other
+            Trait -> return .Other
+            Extends -> return .Other
+            Override -> return .Other
+            Match -> return .Other
+            Attempt -> return .Other
+            Try -> return .Other
+            For -> return .Other
+            In -> return .Other
+            Break -> return .Other
+            Continue -> return .Other
+            Type -> return .Other
+            Distinct -> return .Other
+            LeftParen -> return .Other
+            RightParen -> return .Other
+            LeftBrace -> return .Open
+            RightBrace -> return .Close
+            LeftBracket -> return .Other
+            RightBracket -> return .Other
+            Comma -> return .Other
+            Colon -> return .Other
+            Dot -> return .Other
+            DotDot -> return .Other
+            At -> return .Other
+            Backslash -> return .Other
+            Hash -> return .Hole
+            Question -> return .Other
+            Arrow -> return .Other
+            Equals -> return .Other
+            Plus -> return .Other
+            Minus -> return .Other
+            Star -> return .Other
+            Slash -> return .Other
+            Percent -> return .Other
+            EqualEqual -> return .Other
+            BangEqual -> return .Other
+            Less -> return .Other
+            LessEqual -> return .Other
+            Greater -> return .Other
+            GreaterEqual -> return .Other
+            AmpersandAmpersand -> return .Other
+            PipePipe -> return .Other
+            Ampersand -> return .Other
+            Pipe -> return .Other
+            Caret -> return .Other
+            Tilde -> return .Other
+            LessLess -> return .Other
+            GreaterGreater -> return .Other
+            Bang -> return .Other
+            End -> return .End
+        }
+    }
+}

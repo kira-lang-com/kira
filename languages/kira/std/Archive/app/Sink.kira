@@ -1,0 +1,131 @@
+import Foundation
+
+// Bytes written to a new file in order. They gather in memory and go to the
+// file a run at a time.
+
+namespace SinkSize {
+    // How many bytes gather before `spill` writes them.
+    let run: Number = 1048576
+    // The shortest run `appendRange` copies whole.
+    let wholeRun: Number = 4096
+}
+
+/// Bytes written to a new file in order.
+///
+/// They gather in memory and go to the file a run at a time. Call `finish` once everything is appended, which writes what is left and closes the file.
+public struct ArchiveSink {
+    /// The file's path.
+    let path: String
+    /// The open file the bytes are written to.
+    let file: FileHandle
+    /// How many bytes are in the file already, not counting those still pending.
+    var written: UNumber = 0
+    /// Bytes appended but not yet written to the file.
+    var pending: [UN8] = []
+
+    /// Appends one byte.
+    function appendByte(borrow mut self, byte: UN8) {
+        pending.append(byte)
+    }
+
+    /// Appends `bytes`. A long run is copied whole with what is pending; a short one is appended a byte at a time.
+    function append(borrow mut self, bytes: borrow [UN8]) {
+        if bytes.count >= SinkSize.wholeRun {
+            pending = joinedBytes(pending, bytes)
+            return
+        }
+        pending.appendAll(bytes)
+    }
+
+    /// Writes what gathered, then `bytes` straight from their storage, without copying them in memory.
+    ///
+    /// # Errors
+    /// `.Files` when the file cannot be written.
+    function write(borrow mut self, bytes: borrow [UN8]) -> Result<Void, ArchiveFailure> {
+        match flush() {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        match file.write(written, bytes) {
+            Ok -> {}
+            Error(failure) -> return .Error(.Files("cannot write \(path): \(traceText(failure))"))
+        }
+        written += bytes.count
+        return .Ok
+    }
+
+    /// Appends the bytes of `bytes` from `from` up to, not including, `to`. A long run is copied whole with what is pending; a short one a byte at a time.
+    function appendRange(borrow mut self, bytes: borrow [UN8], from: Number, to: Number) {
+        if to - from >= SinkSize.wholeRun {
+            pending = joinedBytes(pending, byteRun(bytes, from, to))
+            return
+        }
+        for index in from..to { pending.append(bytes[index]) }
+    }
+
+    /// How many bytes were appended, whether written yet or not.
+    function count(borrow self) -> UNumber {
+        return written + pending.count
+    }
+
+    /// Writes what gathered once it reaches a run of bytes. Does nothing before that.
+    ///
+    /// # Errors
+    /// `.Files` when the file cannot be written.
+    function spill(borrow mut self) -> Result<Void, ArchiveFailure> {
+        if pending.count < SinkSize.run { return .Ok }
+        return flush()
+    }
+
+    /// Writes every pending byte to the file, and clears them.
+    ///
+    /// # Errors
+    /// `.Files` when the file cannot be written.
+    function flush(borrow mut self) -> Result<Void, ArchiveFailure> {
+        if pending.count == 0 { return .Ok }
+        match file.write(written, pending) {
+            Ok -> {}
+            Error(failure) -> return .Error(.Files("cannot write \(path): \(traceText(failure))"))
+        }
+        written += pending.count
+        pending = []
+        return .Ok
+    }
+
+    /// Writes what is left and closes the file, answering its length in bytes.
+    ///
+    /// # Errors
+    /// `.Files` when the file cannot be written or closed.
+    function finish(borrow mut self) -> Result<UNumber, ArchiveFailure> {
+        match flush() {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+        return match file.close() {
+            Ok -> .Ok(written)
+            Error(failure) -> .Error(.Files("cannot close \(path): \(traceText(failure))"))
+        }
+    }
+}
+
+/// A sink writing to the new file at `path`. The file must not exist yet.
+///
+/// # Errors
+/// `.Files` when the file cannot be created, for example because it already exists.
+public function createArchiveSink(path: borrow String) -> Result<ArchiveSink, ArchiveFailure> {
+    return match openFileHandle(path, .CreateNew) {
+        Ok(file) -> .Ok(ArchiveSink { path: copy path, file: file })
+        Error(failure) -> .Error(.Files("cannot create \(path): \(traceText(failure))"))
+    }
+}
+
+/// The whole file at `path`.
+///
+/// # Errors
+/// - `.Files` when the file cannot be read, with its path and the reason.
+public function readArchiveFile(path: borrow String) -> Result<[UN8], ArchiveFailure> {
+    return match readFileBytes(path) {
+        Ok(bytes) -> .Ok(bytes)
+        Error(failure) -> .Error(.Files("cannot read \(path): \(traceText(failure))"))
+    }
+}

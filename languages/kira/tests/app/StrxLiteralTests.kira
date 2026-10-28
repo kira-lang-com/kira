@@ -1,0 +1,71 @@
+import Foundation
+
+// StrxLiteralTests.kira — what a string LITERAL means: the escapes the lexer
+// resolves, and the line continuation a backslash before a newline writes.
+// PREFIX: strx / Strx  (all top-level names use this prefix).
+
+// --- escapes ---------------------------------------------------------------
+
+@Test
+function strxLiteralNewlineEscape() {
+    let got = "a\nb".count
+    expect!(got == 3)
+}
+
+@Test
+function strxLiteralTabAndQuote() {
+    let got = "\t\"".count
+    expect!(got == 2)
+}
+
+// One character, not the two that were written.
+@Test
+function strxLiteralBackslashIsOneCharacter() {
+    let got = "\\".count
+    expect!(got == 1)
+}
+
+// --- line continuation -----------------------------------------------------
+
+// A message too long for one line, written across two. The newline and the
+// indentation lining the second line up under the first are layout: neither
+// reaches the string, so this is the same value as the single-line spelling.
+@Test
+function strxLiteralContinuationJoinsTheLines() {
+    let split = "the compositor offers no wl_compositor or no \
+                 xdg_wm_base, and a window needs both"
+    let got = split
+    expect!(got == "the compositor offers no wl_compositor or no xdg_wm_base, and a window needs both")
+}
+
+// The space belongs to the text BEFORE the backslash, so a continuation
+// written without one joins the halves with nothing between them. This is the
+// case that says the indentation is dropped rather than collapsed to a space.
+@Test
+function strxLiteralContinuationJoinsWithNoSpace() {
+    let joined = "un\
+                  split"
+    let got = joined
+    expect!(got == "unsplit")
+}
+
+// Three lines is two continuations, and a continued literal is still one
+// token: it measures like any other string.
+@Test
+function strxLiteralContinuationSpansThreeLines() {
+    let long = "one \
+                two \
+                three"
+    let got = long.count
+    expect!(got == 13)
+}
+
+// A continuation inside a literal that also carries ordinary escapes: the two
+// resolve independently.
+@Test
+function strxLiteralContinuationBesideAnEscape() {
+    let mixed = "a\nb \
+                 c"
+    let got = mixed.count
+    expect!(got == 5)
+}

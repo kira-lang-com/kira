@@ -1,0 +1,196 @@
+// A struct method's omitted receiver borrows mutably when its body writes
+// through self. Explicit borrow modes remain the caller's contract, and a
+// class's methods keep theirs: its `self` is a reference.
+//
+// A computed member's getter and setter share its name, so each method is
+// judged on its own body: a setter that writes self leaves its getter a
+// reader. Assigning the member calls that setter, so it writes self as
+// assigning a field does; calling a method of the name calls neither.
+function inferredReceivers(tree: SyntaxTree, methods: [FunctionDeclaration], names: [String]) -> [FunctionDeclaration] {
+    var mutates: [Bool] = []
+    var called: [String] = []
+    var places = names
+    for method in methods {
+        let explicit = method.receiver == .MutablyBorrowed
+        mutates.append(explicit)
+        if explicit { noteMutating(method, called, places) }
+    }
+    for pass in 0..methods.count {
+        for index in 0..methods.count {
+            let method = methods[index]
+            if method.receiver != .Free || mutates[index] { continue }
+            var reached = places
+            for parameter in method.parameters { reached = withoutName(reached, parameter.name.text) }
+            if bodyMutatesReceiver(tree, method.body, reached, called) {
+                mutates[index] = true
+                noteMutating(method, called, places)
+            }
+        }
+    }
+    var result: [FunctionDeclaration] = []
+    for index in 0..methods.count {
+        let method = methods[index]
+        var receiver = method.receiver
+        if receiver == .Free && mutates[index] { receiver = .MutablyBorrowed }
+        result.append(FunctionDeclaration {
+            name = method.name, annotations = method.annotations, receiver = receiver,
+            parameters = method.parameters, result = method.result, body = method.body,
+            span = method.span, typeParameters = method.typeParameters, scope = method.scope
+        })
+    }
+    return result
+}
+
+// What makes a body that reaches `method` write self: assigning the member
+// a mutating setter sets, or calling a mutating method of its name.
+function noteMutating(method: FunctionDeclaration, called: borrow mut [String], places: borrow mut [String]) {
+    if hasAttribute(method.annotations, .ComputedSetter) {
+        places.append(method.name.text)
+        return
+    }
+    if hasAttribute(method.annotations, .Computed) { return }
+    called.append(method.name.text)
+}
+
+// The names of a struct's fields, which a method body reaches as bare members
+// and writes through its receiver.
+function fieldNames(fields: [FieldDeclaration]) -> [String] {
+    var names: [String] = []
+    for field in fields { names.append(field.name.text) }
+    return names
+}
+
+// The names of the fields `owner` has, for a block that writes through a
+// receiver of `owner` without the declaration that gave them a body.
+function typeFieldNames(declarations: Declarations, owner: Type) -> [String] {
+    var names: [String] = []
+    if owner.kind == .Structure {
+        for field in declarations.structs[owner.declaration].fields { names.append(field.name.text) }
+    }
+    return names
+}
+
+function receiverPlace(tree: SyntaxTree, expression: Int, names: [String]) -> Bool {
+    match tree.expressions[expression].kind {
+        Name(name) -> {
+            if name.text == "self" { return true }
+            for field in names { if field == name.text { return true } }
+            return false
+        }
+        Member(base, field) -> return receiverPlace(tree, base, names)
+        Index(base, index) -> return receiverPlace(tree, base, names)
+        Quote -> return false
+        IntegerLiteral -> return false
+        FloatLiteral -> return false
+        BooleanLiteral -> return false
+        StringLiteral -> return false
+        ArrayLiteral -> return false
+        Transfer -> return false
+        Labelled -> return false
+        TypeQuery -> return false
+        ExpandedMacro -> return false
+        MacroCall -> return false
+        Call -> return false
+        GenericCall -> return false
+        MethodCall -> return false
+        IndirectCall -> return false
+        Lambda -> return false
+        KeyPath -> return false
+        Task -> return false
+        Try -> return false
+        Variant -> return false
+        StructLiteral -> return false
+        Unary -> return false
+        Binary -> return false
+        Conditional -> return false
+        MatchValue -> return false
+        Content -> return false
+    }
+}
+
+function receiverMutationCall(tree: SyntaxTree, expression: Int, names: [String], mutating: [String]) -> Bool {
+    match tree.expressions[expression].kind {
+        Call(name, arguments) -> return hasText(mutating, name.text)
+        MethodCall(base, method, arguments) -> {
+            if !receiverPlace(tree, base, names) { return false }
+            if hasText(mutating, method.text) { return true }
+            for name in ["append", "remove", "insert", "clear", "reserve", "pop"] {
+                if method.text == name { return true }
+            }
+            return false
+        }
+        Quote -> return false
+        IntegerLiteral -> return false
+        FloatLiteral -> return false
+        BooleanLiteral -> return false
+        StringLiteral -> return false
+        ArrayLiteral -> return false
+        Index -> return false
+        Transfer -> return false
+        Labelled -> return false
+        TypeQuery -> return false
+        Name -> return false
+        Member -> return false
+        ExpandedMacro -> return false
+        MacroCall -> return false
+        GenericCall -> return false
+        IndirectCall -> return false
+        Lambda -> return false
+        KeyPath -> return false
+        Task -> return false
+        Try -> return false
+        Variant -> return false
+        StructLiteral -> return false
+        Unary -> return false
+        Binary -> return false
+        Conditional -> return false
+        MatchValue -> return false
+        Content -> return false
+    }
+}
+
+// A local, loop variable or parameter named as a field is that name from where
+// it is declared to the end of its block, so a write to it writes no member.
+function withoutName(names: [String], hidden: String) -> [String] {
+    var kept: [String] = []
+    for name in names { if name != hidden { kept.append(name) } }
+    return kept
+}
+
+function bodyMutatesReceiver(tree: SyntaxTree, statements: [Int], names: [String], mutating: [String]) -> Bool {
+    var visible = names
+    for index in statements {
+        let names = visible
+        match tree.statements[index].kind {
+            Assignment(target, value) -> { if receiverPlace(tree, target, names) { return true } }
+            CompoundAssignment(operator, target, value) -> { if receiverPlace(tree, target, names) { return true } }
+            Evaluation(value) -> { if receiverMutationCall(tree, value, names, mutating) { return true } }
+            If(condition, whenTrue, whenFalse) -> {
+                if bodyMutatesReceiver(tree, whenTrue, names, mutating) || bodyMutatesReceiver(tree, whenFalse, names, mutating) { return true }
+            }
+            While(condition, body) -> { if bodyMutatesReceiver(tree, body, names, mutating) { return true } }
+            For(name, start, end, body) -> { if bodyMutatesReceiver(tree, body, withoutName(names, name.text), mutating) { return true } }
+            ForEach(name, source, body) -> { if bodyMutatesReceiver(tree, body, withoutName(names, name.text), mutating) { return true } }
+            Match(subject, arms) -> {
+                for arm in arms { if bodyMutatesReceiver(tree, arm.body, names, mutating) { return true } }
+            }
+            Attempt(body, arms) -> {
+                if bodyMutatesReceiver(tree, body, names, mutating) { return true }
+                for arm in arms { if bodyMutatesReceiver(tree, arm.body, names, mutating) { return true } }
+            }
+            Binding(binding) -> {
+                if receiverMutationCall(tree, binding.value, names, mutating) { return true }
+                visible = withoutName(names, binding.name.text)
+            }
+            Return(value) -> {
+                match value {
+                    Some(returned) -> { if receiverMutationCall(tree, returned, names, mutating) { return true } }
+                    None -> {}
+                }
+            }
+            Break -> {}
+            Continue -> {}
+        }
+    }
+    return false
+}

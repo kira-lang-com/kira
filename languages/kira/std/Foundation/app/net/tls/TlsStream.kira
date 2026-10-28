@@ -1,0 +1,302 @@
+// TLS 1.3 over a byte stream (DESIGN.md section 5): the handshake engine on
+// the record carrier, then application data both ways. Sans-I/O like the
+// engine: TCP bytes in through `receive`, TCP bytes out through `transmit`.
+
+enum TlsStreamState {
+    Handshaking
+    Open
+    Failed(TlsAlert)
+}
+
+struct TlsStream {
+    var handshake: TlsHandshake
+    var state: TlsStreamState = .Handshaking
+    // Each direction closes on its own (RFC 8446 section 6.1): after its
+    // close_notify a side writes nothing, and what arrives after the peer's
+    // is ignored.
+    var sentClose: Bool = false
+    var peerClosed: Bool = false
+    var incoming: [UN8] = []
+    var outgoing: [UN8] = []
+    var received: [UN8] = []
+    var agreement: TlsAgreement? = .None
+    var handshakeRead: TlsRecordKeys? = .None
+    var handshakeWrite: TlsRecordKeys? = .None
+    var applicationRead: TlsRecordKeys? = .None
+    var applicationWrite: TlsRecordKeys? = .None
+
+    function isOpen(borrow self) -> Bool {
+        return state == .Open
+    }
+
+    // Bytes for the socket, all that is queued.
+    function transmit(borrow mut self) -> [UN8] {
+        let out = outgoing
+        outgoing = []
+        return out
+    }
+
+    // Application bytes that arrived, all of them.
+    function read(borrow mut self) -> [UN8] {
+        let out = received
+        received = []
+        return out
+    }
+
+    function write(borrow mut self, data: borrow [UN8]) -> Result<Void, TlsAlert> {
+        if state != .Open || sentClose { return .Error(.UnexpectedMessage) }
+        var start = 0
+        while start < data.count {
+            let end = min(start + Tls.recordPlaintextMaximum, data.count)
+            try sealOut(.Application, .ApplicationData, byteRun(data, start, end))
+            start = end
+        }
+        return .Ok
+    }
+
+    // Sends close_notify; the socket may be shut for writing after it.
+    function close(borrow mut self) {
+        if state == .Open && !sentClose {
+            match sealOut(.Application, .Alert, tlsAlertBody(.CloseNotify)) {
+                Ok -> {}
+                Error(failure) -> absorb failure
+            }
+        }
+        sentClose = true
+    }
+
+    // TCP bytes from the peer. A failure of ours has already queued the
+    // alert to send; transmit it, then close the socket. A failure is also
+    // the alert the peer sent, which is answered with nothing.
+    function receive(borrow mut self, bytes: borrow [UN8]) -> Result<Void, TlsAlert> {
+        match state {
+            Failed(alert) -> return .Error(alert)
+            Handshaking -> {}
+            Open -> {}
+        }
+        if peerClosed { return .Ok }
+        incoming.appendAll(bytes)
+        match takeRecords() {
+            Ok -> {}
+            Error(alert) -> fail(alert)
+        }
+        // The peer's alert ends the stream as one of ours does.
+        return match state {
+            Failed(alert) -> .Error(alert)
+            Handshaking, Open -> .Ok
+        }
+    }
+
+    // The alert goes under the newest keys the peer can open: plain before
+    // the handshake keys, handshake keys until the engine has connected.
+    function fail(borrow mut self, alert: TlsAlert) {
+        let body = tlsAlertBody(alert)
+        if handshake.isConnected() && applicationWrite.isSome() {
+            match sealOut(.Application, .Alert, body) {
+                Ok -> {}
+                Error(failure) -> absorb failure
+            }
+        } else if handshakeWrite.isSome() {
+            match sealOut(.Handshake, .Alert, body) {
+                Ok -> {}
+                Error(failure) -> absorb failure
+            }
+        } else {
+            outgoing.appendAll(tlsPlainRecords(.Alert, body))
+        }
+        state = .Failed(alert)
+    }
+
+    function takeRecords(borrow mut self) -> Result<Void, TlsAlert> {
+        while true {
+            let next = try tlsNextRecord(incoming)
+            let frame = match next {
+                Some(value) -> value
+                None -> return .Ok
+            }
+            incoming = byteRun(incoming, frame.header.count + frame.body.count, incoming.count)
+            try takeRecord(frame)
+            try pump()
+            if peerClosed {
+                incoming = []
+                return .Ok
+            }
+        }
+        return .Ok
+    }
+
+    function takeRecord(borrow mut self, frame: borrow TlsRecordFrame) -> Result<Void, TlsAlert> {
+        let level = handshake.expectedLevel()
+        // A middlebox-compatibility ChangeCipherSpec is dropped during the
+        // handshake (RFC 8446 section 5).
+        if frame.kind == .ChangeCipherSpec && state == .Handshaking && frame.body == [1] {
+            return .Ok
+        }
+        if level == .Initial {
+            if frame.kind == .Handshake { return handshake.receive(.Initial, frame.body) }
+            if frame.kind == .Alert { return takeAlert(frame.body) }
+            return .Error(.UnexpectedMessage)
+        }
+        if frame.kind != .ApplicationData { return .Error(.UnexpectedMessage) }
+        let inner = try openIn(level, frame)
+        return match inner.kind {
+            Handshake -> handshake.receive(level, inner.content)
+            Alert -> takeAlert(inner.content)
+            ApplicationData -> takeData(level, inner.content)
+            else -> .Error(.UnexpectedMessage)
+        }
+    }
+
+    function takeData(
+        borrow mut self,
+        level: TlsEncryptionLevel,
+        content: borrow [UN8]
+    ) -> Result<Void, TlsAlert> {
+        if level != .Application || state != .Open { return .Error(.UnexpectedMessage) }
+        received.appendAll(content)
+        return .Ok
+    }
+
+    function takeAlert(borrow mut self, body: borrow [UN8]) -> Result<Void, TlsAlert> {
+        if body.count != TlsRecordLimit.alertBytes { return .Error(.DecodeError) }
+        let alert: TlsAlert = fromCode<TlsAlert>(Number(body[1]))
+        if alert == .CloseNotify {
+            peerClosed = true
+            return .Ok
+        }
+        // The peer's own failure: answered with nothing, the stream is over.
+        state = .Failed(alert)
+        return .Ok
+    }
+
+    function openIn(
+        borrow mut self,
+        level: TlsEncryptionLevel,
+        frame: borrow TlsRecordFrame
+    ) -> Result<TlsInnerRecord, TlsAlert> {
+        match level {
+            Application -> {
+                var keys = match applicationRead {
+                    Some(value) -> value
+                    None -> return .Error(.UnexpectedMessage)
+                }
+                let inner = try keys.open(frame.header, frame.body)
+                applicationRead = .Some(keys)
+                return .Ok(inner)
+            }
+            Handshake -> {
+                var keys = match handshakeRead {
+                    Some(value) -> value
+                    None -> return .Error(.UnexpectedMessage)
+                }
+                let inner = try keys.open(frame.header, frame.body)
+                handshakeRead = .Some(keys)
+                return .Ok(inner)
+            }
+            Initial -> return .Error(.UnexpectedMessage)
+        }
+    }
+
+    function sealOut(
+        borrow mut self,
+        level: TlsEncryptionLevel,
+        kind: TlsContentType,
+        content: borrow [UN8]
+    ) -> Result<Void, TlsAlert> {
+        match level {
+            Initial -> outgoing.appendAll(tlsPlainRecords(kind, content))
+            Handshake -> {
+                var keys = match handshakeWrite {
+                    Some(value) -> value
+                    None -> return .Error(.InternalError)
+                }
+                outgoing.appendAll(try keys.seal(kind, content))
+                handshakeWrite = .Some(keys)
+            }
+            Application -> {
+                var keys = match applicationWrite {
+                    Some(value) -> value
+                    None -> return .Error(.InternalError)
+                }
+                outgoing.appendAll(try keys.seal(kind, content))
+                applicationWrite = .Some(keys)
+            }
+        }
+        return .Ok
+    }
+
+    // The engine's events: its bytes become records, its secrets keys.
+    function pump(borrow mut self) -> Result<Void, TlsAlert> {
+        while true {
+            let next = handshake.event()
+            let event = match next {
+                Some(value) -> value
+                None -> return .Ok
+            }
+            match event {
+                Send(bytes) -> try sealOut(bytes.level, .Handshake, bytes.bytes)
+                Secrets(secrets) -> try install(secrets)
+                Complete(value) -> {
+                    agreement = .Some(value)
+                    state = .Open
+                }
+                PeerUpdatedKeys(requested) -> try followUpdate(requested)
+            }
+        }
+        return .Ok
+    }
+
+    function install(borrow mut self, secrets: borrow TlsLevelSecrets) -> Result<Void, TlsAlert> {
+        let client = try tlsRecordKeys(secrets.parameters, secrets.client)
+        let server = try tlsRecordKeys(secrets.parameters, secrets.server)
+        let (read, write) = handshake.role == .Client ? (server, client) : (client, server)
+        match secrets.level {
+            Handshake -> {
+                handshakeRead = .Some(read)
+                handshakeWrite = .Some(write)
+            }
+            Application -> {
+                applicationRead = .Some(read)
+                applicationWrite = .Some(write)
+            }
+            Initial -> return .Error(.InternalError)
+        }
+        return .Ok
+    }
+
+    // The peer's next keys, and ours too when it asks: a KeyUpdate sent
+    // under the old keys, then the new ones (RFC 8446 section 4.6.3).
+    function followUpdate(borrow mut self, requested: Bool) -> Result<Void, TlsAlert> {
+        let read = match applicationRead {
+            Some(value) -> try value.updated()
+            None -> return .Error(.UnexpectedMessage)
+        }
+        applicationRead = .Some(read)
+        if !requested { return .Ok }
+        return updateKeys(false)
+    }
+
+    // Moves this side to new sending keys; `ask` has the peer move too.
+    function updateKeys(borrow mut self, ask: Bool) -> Result<Void, TlsAlert> {
+        let flag = ask ? TlsRecordLimit.updateRequested : TlsRecordLimit.updateNotRequested
+        let message = tlsHandshakeMessage(.KeyUpdate, [UN8(flag)])
+        try sealOut(.Application, .Handshake, message.encoded)
+        let write = match applicationWrite {
+            Some(value) -> try value.updated()
+            None -> return .Error(.UnexpectedMessage)
+        }
+        applicationWrite = .Some(write)
+        return .Ok
+    }
+}
+
+function tlsClient(settings: TlsClientSettings) -> Result<TlsStream, TlsAlert> {
+    let handshake = try tlsStartClient(move settings)
+    var stream = TlsStream { handshake: move handshake }
+    try stream.pump()
+    return .Ok(stream)
+}
+
+function tlsServer(settings: TlsServerSettings) -> TlsStream {
+    return TlsStream { handshake: tlsStartServer(move settings) }
+}

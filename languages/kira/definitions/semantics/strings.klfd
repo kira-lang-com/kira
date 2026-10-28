@@ -1,0 +1,137 @@
+function isStringType(program: CheckedProgram, valueType: Type) -> Bool {
+    if valueType.kind != .Structure { return false }
+    return program.structs[valueType.declaration].name.text == "String"
+}
+
+function stringRuntimeFunctions(declarations: Declarations) -> [Int] {
+    match declarations.typeNamed("String") {
+        Some(stringType) -> {
+            var functions: [Int] = []
+            let names: [String] = ["concatStrings", "equalStrings", "stringFromInteger", "stringFromBoolean", "stringFromUnsigned", "stringFromFloat", "orderStrings", "hashStringBytes"]
+            for name in names {
+                match declarations.findFunction(.None, name) {
+                    Some(target) -> functions.append(target)
+                    None -> report(.UndefinedFunction, declarations.structs[stringType.declaration].name.span)
+                }
+            }
+            return functions
+        }
+        None -> return []
+    }
+}
+
+extend Checker {
+    // A literal written with an escape or a continuation carries its text;
+    // any other is its source. `String` comes from Foundation, so a program
+    // without it has no strings.
+    function checkStringLiteral(borrow mut self, decoded: Optional<String>, span: Span) -> Int {
+        match declarations.typeNamed("String") {
+            Some(stringType) -> {
+                match decoded {
+                    Some(text) -> return add(.StringText(text), stringType, span)
+                    None -> return add(.StringLiteral, stringType, span)
+                }
+            }
+            None -> {
+                report(.MissingFoundation, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+
+    function checkPrint(borrow mut self, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 1 {
+            report(.BuiltinArguments, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let checked = expression(arguments[0], .None)
+        let valueType = typeOf(checked)
+        if valueType.isInvalid() { return add(.Integer(0), Type.invalid(), span) }
+        var text = checked
+        if !isStringType(program, valueType) {
+            if !valueType.isInteger() && valueType.kind != .Floating && valueType.kind != .Decimal && valueType.kind != .Boolean {
+                text = tracedText(checked, span)
+            } else {
+                text = renderedString(checked, span)
+            }
+        }
+        return add(.Print(text), Type.void(), span)
+    }
+
+    function stringConversion(borrow mut self, operand: Int, span: Span) -> Int {
+        let checked = expression(operand, .None)
+        let sourceType = typeOf(checked)
+        if isStringType(program, sourceType) { return checked }
+        return renderedString(checked, span)
+    }
+
+    // A checked value as the `String` that `String(x)` and `print` render.
+    function renderedString(borrow mut self, checked: Int, span: Span) -> Int {
+        let sourceType = typeOf(checked)
+        if sourceType.kind == .Structure {
+            let owner = program.structs[sourceType.declaration]
+            match owner.name.text {
+                "Syntax", "Identifier" -> {
+                    match owner.field("text") {
+                        Some(field) -> return add(.Member(checked, field), owner.fields[field].valueType, span)
+                        None -> {}
+                    }
+                }
+                else -> {}
+            }
+        }
+        match declarations.typeNamed("String") {
+            Some(stringType) -> {
+                if sourceType.kind == .Decimal { return numberText(checked, stringType, span) }
+                if sourceType.isInteger() && sourceType.bits == 64 && !sourceType.signed {
+                    return add(.Call(program.stringFunctions[4], [checked]), stringType, span)
+                }
+                if sourceType.isInteger() {
+                    let integer = coerce(checked, Type.int(), .ArgumentTypeMismatch)
+                    return add(.Call(program.stringFunctions[2], [integer]), stringType, span)
+                }
+                if sourceType.kind == .Boolean {
+                    return add(.Call(program.stringFunctions[3], [checked]), stringType, span)
+                }
+                if sourceType.kind == .Floating {
+                    let float = coerce(checked, Type.floating(64), .ArgumentTypeMismatch)
+                    return add(.Call(program.stringFunctions[5], [float]), stringType, span)
+                }
+                report(.ConversionArguments, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+            None -> {
+                report(.UnknownType, span)
+                return add(.Integer(0), Type.invalid(), span)
+            }
+        }
+    }
+}
+
+// Foundation's `Syntax` and `Identifier`, which carry source text in their
+// `text` field.
+function isReflectionText(program: CheckedProgram, valueType: Type) -> Bool {
+    if valueType.kind != .Structure { return false }
+    let declared = program.structs[valueType.declaration]
+    if declared.name.text != "Syntax" && declared.name.text != "Identifier" { return false }
+    return declared.fields.count > 0 && declared.fields[0].name.text == "text" && isStringType(program, declared.fields[0].valueType)
+}
+
+// `==` and `!=` between source text values compare what they read, whichever
+// of `Syntax`, `Identifier` and `String` each side is.
+extend Checker {
+    function compareTexts(borrow mut self, comparison: Comparison, left: Int, right: Int, span: Span) -> Int {
+        return add(.Compare(comparison, sourceText(left), sourceText(right)), Type.boolean(), span)
+    }
+
+    function sourceText(borrow mut self, value: Int) -> Int {
+        let valueType = typeOf(value)
+        if isReflectionText(program, valueType) {
+            return add(.Member(value, 0), program.structs[valueType.declaration].fields[0].valueType, program.expressions[value].span)
+        }
+        if !isStringType(program, valueType) && !valueType.isInvalid() {
+            report(.OperatorOperands, program.expressions[value].span)
+        }
+        return value
+    }
+}

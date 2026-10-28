@@ -1,0 +1,105 @@
+// Congestion control (RFC 9002 section 7). `QuicCongestionController` is the
+// seam CUBIC plugs into later; NewReno is the first.
+
+namespace QuicCongestion {
+    // RFC 9002 section 7.2: ten datagrams, within 14720 bytes and at least
+    // two datagrams.
+    let initialDatagrams: Number = 10
+    let initialCeiling: Number = 14720
+    let minimumDatagrams: Number = 2
+    // Persistent congestion spans this many probe timeouts (section 7.6).
+    let persistentPeriods: Number = 3
+}
+
+trait QuicCongestionController {
+    function window(borrow self) -> Number
+    function inFlight(borrow self) -> Number
+    function onSent(borrow mut self, bytes: Number)
+    function onAcked(borrow mut self, packet: borrow QuicSentPacket)
+    // `bytes` lost in one detection, the newest sent at `newestSentAt`.
+    function onLost(borrow mut self, bytes: Number, newestSentAt: QuicInstant, now: QuicInstant)
+    function onPersistentCongestion(borrow mut self)
+    // Bytes that leave flight without a verdict, as when keys are dropped.
+    function onDiscarded(borrow mut self, bytes: Number)
+}
+
+struct QuicNewReno: QuicCongestionController {
+    let datagram: Number
+    var congestionWindow: Number
+    var bytesInFlight: Number = 0
+    var slowStartThreshold: Number? = .None
+    var recoveryStart: QuicInstant? = .None
+    var acknowledgedInAvoidance: Number = 0
+
+    function window(borrow self) -> Number {
+        return congestionWindow
+    }
+
+    function inFlight(borrow self) -> Number {
+        return bytesInFlight
+    }
+
+    function onSent(borrow mut self, bytes: Number) {
+        bytesInFlight += bytes
+    }
+
+    function minimumWindow(borrow self) -> Number {
+        return QuicCongestion.minimumDatagrams * datagram
+    }
+
+    function inRecovery(borrow self, sentAt: QuicInstant) -> Bool {
+        return match recoveryStart {
+            Some(start) -> sentAt.raw <= start.raw
+            None -> false
+        }
+    }
+
+    function onAcked(borrow mut self, packet: borrow QuicSentPacket) {
+        if !packet.inFlight { return }
+        bytesInFlight = max(bytesInFlight - packet.size, 0)
+        // Packets sent before recovery began do not grow the window.
+        if inRecovery(packet.sentAt) { return }
+        let threshold = match slowStartThreshold {
+            Some(value) -> value
+            None -> congestionWindow + packet.size
+        }
+        if congestionWindow < threshold {
+            congestionWindow += packet.size
+            return
+        }
+        // Congestion avoidance: one datagram per window acknowledged.
+        acknowledgedInAvoidance += packet.size
+        if acknowledgedInAvoidance >= congestionWindow {
+            acknowledgedInAvoidance -= congestionWindow
+            congestionWindow += datagram
+        }
+    }
+
+    function onLost(borrow mut self, bytes: Number, newestSentAt: QuicInstant, now: QuicInstant) {
+        bytesInFlight = max(bytesInFlight - bytes, 0)
+        if inRecovery(newestSentAt) { return }
+        recoveryStart = .Some(now)
+        // The loss reduction factor is one half (RFC 9002 section 7.3.2).
+        congestionWindow = max(trunc(congestionWindow / 2), minimumWindow())
+        slowStartThreshold = .Some(congestionWindow)
+        acknowledgedInAvoidance = 0
+    }
+
+    function onPersistentCongestion(borrow mut self) {
+        congestionWindow = minimumWindow()
+        recoveryStart = .None
+        acknowledgedInAvoidance = 0
+    }
+
+    function onDiscarded(borrow mut self, bytes: Number) {
+        bytesInFlight = max(bytesInFlight - bytes, 0)
+    }
+}
+
+function quicNewReno(datagram: Number) -> QuicNewReno {
+    let initial = min(
+        QuicCongestion.initialDatagrams * datagram,
+        max(QuicCongestion.initialCeiling, QuicCongestion.minimumDatagrams * datagram)
+    )
+    return QuicNewReno { datagram: datagram, congestionWindow: initial }
+}

@@ -1,0 +1,75 @@
+// The compiler-known traits a type keeps by its shape rather than by a claim.
+//
+// A type is `Copyable` when every member is: a member owning storage (a
+// `String`, an array, a function value, an `Any`, a class handle, a channel
+// end) or a user `Drop` body makes it move instead. It is `Send` and `Sync`
+// unless a member is a function value or a task, whose captures and joins
+// belong to the thread that made them; owning storage does not stop a value
+// crossing, since a move leaves the receiving thread its only holder.
+
+function keepsMarker(declarations: Declarations, tree: SyntaxTree, valueType: Type, marker: String) -> Bool {
+    return markerHolds(declarations, tree, valueType, marker, 0)
+}
+
+function markerHolds(declarations: Declarations, tree: SyntaxTree, valueType: Type, marker: String, depth: Int) -> Bool {
+    if depth > declarations.structs.count + declarations.enums.count { return true }
+    match valueType.kind {
+        Integer -> return true
+        Decimal -> return true
+        Floating -> return true
+        Boolean -> return true
+        Pointer -> return true
+        Void -> return true
+        Invalid -> return true
+        Structure -> {
+            let declared = declarations.structs[valueType.declaration]
+            let base = declared.genericBase
+            match base {
+                "Closure", "Task", "MainThreadTask" -> return false
+                else -> {}
+            }
+            if marker == "Copyable" && ownsStorage(declared, tree) { return false }
+            if base == "Array" {
+                return markerHolds(declarations, tree, declared.typeArguments[0], marker, depth + 1)
+            }
+            for field in declared.fields {
+                if !markerHolds(declarations, tree, field.valueType, marker, depth + 1) { return false }
+            }
+            return true
+        }
+        Enumeration -> {
+            for variant in declarations.enums[valueType.declaration].variants {
+                match variant.payload {
+                    Some(payload) -> {
+                        if !markerHolds(declarations, tree, payload, marker, depth + 1) { return false }
+                    }
+                    None -> {}
+                }
+            }
+            return true
+        }
+    }
+}
+
+// Whether copying a value of `declared` would have to clone storage it owns or
+// run its release twice.
+function ownsStorage(declared: StructType, tree: SyntaxTree) -> Bool {
+    let base = declared.genericBase
+    match base {
+        "Array", "Class", "Sender", "Receiver" -> return true
+        else -> {}
+    }
+    match declared.name.text {
+        "String", "Any" -> return true
+        else -> {}
+    }
+    for conformance in tree.conformances {
+        if conformance.owner.instanceName == declared.name.text && conformance.traitName.name.text == "Drop" { return true }
+    }
+    for marked in tree.foreignTypes {
+        if !marked.name.span.same(declared.name.span) { continue }
+        let mark = tree.foreignMarks[marked.mark]
+        if mark.form == .Pointer && pointerOwnership(mark) == "owned" { return true }
+    }
+    return false
+}

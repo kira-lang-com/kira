@@ -1,0 +1,410 @@
+// The deserializer half of `@Derive(Serializable)`. DeriveSerde.kira holds the
+// macro, the wire format and the limitations; the helpers both halves call
+// live in SerdeText.kira, beside them in this folder.
+
+// The deserializer for one declaration, shared by the `Serializable` macro in
+// DeriveSerde.kira: `Serializable` generates both directions, so this lives in one
+// place rather than in two macros.
+comptime function __kira_serde_deserialize_fn(target: borrow Declaration) -> Syntax {
+
+    // The exact inverse of the distinct writer: validate `Name(`, read the
+    // representation as the value it is — tag, digits, and range check
+    // included — validate `)`, and build the type by calling it, which is
+    // the one way into a distinct type.
+    if target.kind == .Distinct {
+        // One body for every representation: the inner read differs and
+        // the call around it does not.
+        var rep: String = "Int"
+        for field in target.fields {
+            let scalarNames: [String] = ["Int", "I8", "U8", "I16", "U16", "I32", "U32", "U64", "Float", "F32", "Bool", "String"]
+            for sname in scalarNames {
+                if field.type == sname {
+                    rep = sname
+                }
+            }
+            if field.type == "RawPtr" {
+                deriveUnsupported(
+                    "Derive(Serializable): a distinct type over `RawPtr` cannot be read back — an opaque foreign word is an address, and it means nothing in another process or another run",
+                    at: target.syntax
+                )
+            }
+        }
+        // The opener: `Name(` must lead, and the value must close.
+        var open: Syntax = quote {
+            var __open: Int = __kira_deser_find(s, "(")
+            if s.substring(0, __open) != #{target.name.asString()} {
+                __open = __kira_deser_trap(s)
+            }
+            if s.charAt(s.count - 1) != 41 {
+                __open = __kira_deser_trap(s)
+            }
+            let __inner: String = s.substring(__open + 1, s.count - 1)
+        }
+        // One body for every representation: the inner read differs and
+        // the call around it does not, because a splice in argument
+        // position renders inline like any other splice.
+        var readInner: Syntax = quote { __kira_deser_tagged_int(__inner, "Int") }
+        if rep == "I8" {
+            readInner = quote { I8(__kira_deser_tagged_int(__inner, "I8")) }
+        }
+        if rep == "U8" {
+            readInner = quote { U8(__kira_deser_tagged_int(__inner, "U8")) }
+        }
+        if rep == "I16" {
+            readInner = quote { I16(__kira_deser_tagged_int(__inner, "I16")) }
+        }
+        if rep == "U16" {
+            readInner = quote { U16(__kira_deser_tagged_int(__inner, "U16")) }
+        }
+        if rep == "I32" {
+            readInner = quote { I32(__kira_deser_tagged_int(__inner, "I32")) }
+        }
+        if rep == "U32" {
+            readInner = quote { U32(__kira_deser_tagged_int(__inner, "U32")) }
+        }
+        if rep == "U64" {
+            readInner = quote { U64(__kira_deser_tagged_uint(__inner, "U64")) }
+        }
+        if rep == "Float" {
+            readInner = quote { __kira_deser_float(__inner) }
+        }
+        if rep == "F32" {
+            readInner = quote { __kira_deser_float32(__inner) }
+        }
+        if rep == "Bool" {
+            readInner = quote { __kira_deser_bool(__inner) }
+        }
+        if rep == "String" {
+            readInner = quote { __kira_deser_unquote(__inner) }
+        }
+        return quote {
+            function deserialize_#{target.name}(s: borrow String) -> #{target.name} {
+                #{open}
+                return #{target.name}(#{readInner})
+            }
+        }
+    }
+    // The inverse of the enum writer: validate `TypeName.`, read the variant
+    // name up to `(` or the end, and rebuild that variant — carving the
+    // payload out of the parentheses when there is one. An unknown name is a
+    // structural violation and traps, exactly as a wrong struct name does.
+    if target.kind == .Enum {
+        var arms: [Syntax] = []
+        // The name matched nothing, which is malformed input: every arm
+        // above returned, so this trap is the only way out. It is written
+        // as a payload-free variant when the enum has one, and otherwise as
+        // the first variant carrying a payload that traps before it is
+        // built — an enum has no value that means "no value", and returning
+        // one anyway would answer with a variant nothing wrote.
+        var fallback: Syntax = quote {}
+        var haveFallback: Bool = false
+        for variant in target.fields {
+            if variant.type == "" {
+                if haveFallback == false {
+                    fallback = quote { return .#{variant.name} }
+                    haveFallback = true
+                }
+            }
+        }
+        if haveFallback == false {
+            for variant in target.fields {
+                if haveFallback == false {
+                    if variant.type == "Int" {
+                        fallback = quote { return .#{variant.name}(__kira_deser_trap(s)) }
+                    } else {
+                        if variant.type == "Bool" {
+                            fallback = quote {
+                                return .#{variant.name}(__kira_deser_bool(__kira_deser_trap_str(s)))
+                            }
+                        } else {
+                            if variant.type == "String" {
+                                fallback = quote {
+                                    return .#{variant.name}(__kira_deser_trap_str(s))
+                                }
+                            } else {
+                                if variant.type == "Float" {
+                                    fallback = quote {
+                                        return .#{variant.name}(
+                                            __kira_deser_float(__kira_deser_trap_str(s))
+                                        )
+                                    }
+                                } else {
+                                    fallback = quote {
+                                        return .#{variant.name}(
+                                            deserialize_#{variant.type.asSyntax()}(
+                                                __kira_deser_trap_str(s)
+                                            )
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    haveFallback = true
+                }
+            }
+        }
+        var seen: Int = 0
+        for variant in target.fields {
+            seen = seen + 1
+            if variant.type == "" {
+                arms.append(
+                    quote {
+                        if __name == #{variant.name.asString()} {
+                            return .#{variant.name}
+                        }
+                    }
+                )
+            } else {
+                // One arm shape for every payload: only the conversion
+                // differs, and a splice in argument position renders inline
+                // like any other splice. An array payload parses through
+                // statements first, so its arm holds those too.
+                var payloadText: String = variant.type.trim()
+                var isArrayPayload: Bool = payloadText.startsWith("[") && payloadText.endsWith("]")
+                if isArrayPayload {
+                    if __kira_serde_ok(payloadText) == false {
+                        deriveUnsupported(
+                            "Derive(Serializable): variant `" + variant.name.asString() + "` has payload type `" + payloadText + "`, which Serde cannot generate: array elements are an integer width, a decimal, Float, F32, Bool, String, a nested array thereof, or a named type with its own `deserialize_` function",
+                            at: variant.syntax
+                        )
+                    } else {
+                        var stem: String = "p" + variant.name.asString()
+                        arms.append(
+                            quote {
+                                if __name == #{variant.name.asString()} {
+                                    #{__kira_serde_read_value(payloadText, quote { __inner }, "__v" + stem, stem)}
+                                    return .#{variant.name}(#{Identifier { text = "__v" + stem }})
+                                }
+                            }
+                        )
+                    }
+                }
+                else {
+                    var intTag: String = ""
+                    let scalarNames: [String] = ["Int", "I8", "U8", "I16", "U16", "I32", "U32"]
+                    for sname in scalarNames {
+                        if variant.type == sname {
+                            intTag = sname
+                        }
+                    }
+                    var conv: Syntax = quote { deserialize_#{variant.type.asSyntax()}(__inner) }
+                    if intTag != "" {
+                        conv = quote {
+                            #{variant.type.asSyntax()}(__kira_deser_tagged_int(__inner, #{intTag}))
+                        }
+                    // The top half of the `U64` range is past what a signed
+                    // accumulation can hold, so it parses unsigned.
+                    } else {
+                        match variant.type {
+                            "U64" -> {
+                                conv = quote { U64(__kira_deser_tagged_uint(__inner, "U64")) }
+                            }
+                            "Bool" -> { conv = quote { __kira_deser_bool(__inner) } }
+                            "String" -> { conv = quote { __kira_deser_unquote(__inner) } }
+                            "Float" -> { conv = quote { __kira_deser_float(__inner) } }
+                            "F32" -> { conv = quote { __kira_deser_float32(__inner) } }
+                            else -> {}
+                        }
+                    }
+                    arms.append(
+                        quote {
+                            if __name == #{variant.name.asString()} {
+                                return .#{variant.name}(#{conv})
+                            }
+                        }
+                    )
+                }
+            }
+        }
+        return quote {
+            function deserialize_#{target.name}(s: borrow String) -> #{target.name} {
+                let __dot: Int = __kira_deser_find(s, ".")
+                var __head: String = s.substring(0, __dot)
+                if __head != #{target.name.asString()} {
+                    __head = __kira_deser_trap_str(s)
+                }
+                let __rest: String = s.substring(__dot + 1, s.count)
+                var __name: String = __rest
+                var __inner: String = ""
+                match __rest.indexOf("(") {
+                    Some(__open) -> {
+                        __name = __rest.substring(0, __open)
+                        if __rest.charAt(__rest.count - 1) != 41 {
+                            __name = __kira_deser_trap_str(s)
+                        }
+                        __inner = __rest.substring(__open + 1, __rest.count - 1)
+                    }
+                    // A case with no payload.
+                    None -> {}
+                }
+                #{arms}
+                let __unknown: Int = __kira_deser_trap(s)
+                #{fallback}
+            }
+        }
+    }
+    var total: Int = 0
+    for field in target.fields {
+        total = total + 1
+    }
+
+    var stmts: [Syntax] = []
+    // The leading `TypeName` up to the first `{`. A missing `{` or a
+    // wrong name traps.
+    stmts.append(quote { let __brace: Int = __kira_deser_find(s, "{") })
+    stmts.append(quote { var pos: Int = __brace + 1 })
+    stmts.append(
+        quote {
+            if s.substring(0, __brace) != #{target.name.asString()} {
+                pos = __kira_deser_trap(s)
+            }
+        }
+    )
+
+    var inits: [Syntax] = []
+    var idx: Int = 0
+    for field in target.fields {
+        var joined: String = ""
+        for id in field.type.asSyntax().identifiers() {
+            joined = joined + id.asString()
+        }
+        if joined != field.type {
+            var asArray: String = field.type.trim()
+            if asArray.startsWith("[") == false || asArray.endsWith("]") == false {
+                deriveUnsupported(
+                    "Derive(Serializable): field has an unsupported generic type; only an integer width, a decimal, Float, F32, Bool, String, an array thereof, or a nested @Derive(Serializable) struct field are supported",
+                    at: target.syntax
+                )
+            }
+        }
+
+        var fieldText: String = field.type.trim()
+        var isArrayField: Bool = fieldText.startsWith("[") && fieldText.endsWith("]")
+        if isArrayField {
+            if __kira_serde_ok(fieldText) == false {
+                deriveUnsupported(
+                    "Derive(Serializable): field `" + field.name.asString() + "` has type `" + fieldText + "`, which Serde cannot generate: array elements are an integer width, a decimal, Float, F32, Bool, String, a nested array thereof, or a named type with its own `deserialize_` function",
+                    at: field.syntax
+                )
+            } else {
+                stmts.append(
+                    quote {
+                        let __rest#{idx}: String = s.substring(pos, s.count)
+                        let __eq#{idx}: Int = __kira_deser_find(__rest#{idx}, ":")
+                        let __eqAt#{idx}: Int = pos + __eq#{idx}
+                        if s.substring(pos, __eqAt#{idx}) != #{field.name.asString()} {
+                            pos = __kira_deser_trap(s)
+                        }
+                        pos = __eqAt#{idx} + 1
+                        let __end#{idx}: Int = __kira_deser_scan(s, pos)
+                        let __val#{idx}: String = s.substring(pos, __end#{idx})
+                        pos = __end#{idx}
+                    }
+                )
+                stmts.append(
+                    __kira_serde_read_value(
+                        fieldText,
+                        quote { __val#{idx} },
+                        field.name.asString(),
+                        "f" + field.name.asString()
+                    )
+                )
+            }
+        } else {
+
+            // The tag the writer wrote, checked exactly before the digits are
+            // read, and the narrowing conversion that range-checks them: a
+            // `U8` field reading `U8(300)` traps rather than wrapping, and one
+            // reading `Int(5)` is refused a value of another type.
+            var intTag: String = ""
+            let scalarNames: [String] = ["Int", "I8", "U8", "I16", "U16", "I32", "U32", "U64"]
+            for sname in scalarNames {
+                if field.type == sname {
+                    intTag = sname
+                }
+            }
+            var conv: Syntax = quote { deserialize_#{field.type.asSyntax()}(__val#{idx}) }
+            if intTag != "" {
+                conv = quote {
+                    #{field.type.asSyntax()}(__kira_deser_tagged_int(__val#{idx}, #{intTag}))
+                }
+            }
+            // A decimal reads its decimal text, then its conversion range-checks
+            // a sized decimal for its width.
+            var decimalTag: String = __kira_serde_number_tag(field.type)
+            if decimalTag != "" {
+                conv = quote {
+                    #{field.type.asSyntax()}(__kira_deser_tagged_number(__val#{idx}, #{decimalTag}))
+                }
+            }
+            // The top half of the `U64` range is past what a signed
+            // accumulation can hold, so it parses unsigned.
+            if field.type == "U64" {
+                conv = quote { U64(__kira_deser_tagged_uint(__val#{idx}, "U64")) }
+            }
+            if field.type == "Bool" {
+                conv = quote { __kira_deser_bool(__val#{idx}) }
+            }
+            if field.type == "String" {
+                conv = quote { __kira_deser_unquote(__val#{idx}) }
+            }
+            if field.type == "Float" {
+                conv = quote { __kira_deser_float(__val#{idx}) }
+            }
+            if field.type == "F32" {
+                conv = quote { __kira_deser_float32(__val#{idx}) }
+            }
+
+            stmts.append(
+                quote {
+                    let __rest#{idx}: String = s.substring(pos, s.count)
+                    let __eq#{idx}: Int = __kira_deser_find(__rest#{idx}, ":")
+                    let __eqAt#{idx}: Int = pos + __eq#{idx}
+                    if s.substring(pos, __eqAt#{idx}) != #{field.name.asString()} {
+                        pos = __kira_deser_trap(s)
+                    }
+                    pos = __eqAt#{idx} + 1
+                    let __end#{idx}: Int = __kira_deser_scan(s, pos)
+                    let __val#{idx}: String = s.substring(pos, __end#{idx})
+                    let #{field.name}: #{field.type.asSyntax()} = #{conv}
+                    pos = __end#{idx}
+                }
+            )
+        }
+
+        if idx < total - 1 {
+            stmts.append(
+                quote {
+                    if s.charAt(pos) != 44 {
+                        pos = __kira_deser_trap(s)
+                    }
+                    pos = pos + 1
+                }
+            )
+        }
+
+        inits.append(quote { #{field.name}: #{field.name} })
+        idx = idx + 1
+    }
+
+    stmts.append(
+        quote {
+            if s.charAt(pos) != 125 {
+                pos = __kira_deser_trap(s)
+            }
+            if pos + 1 != s.count {
+                pos = __kira_deser_trap(s)
+            }
+        }
+    )
+
+    return quote {
+        function deserialize_#{target.name}(s: borrow String) -> #{target.name} {
+            #{stmts}
+            return #{target.name} {
+                #{joinSyntax(inits, ", ")}
+            }
+        }
+    }
+}

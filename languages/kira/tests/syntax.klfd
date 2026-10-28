@@ -1,0 +1,87 @@
+import Testing
+
+// The programs of `corpus/syntax.klfd`: each is rejected with the diagnostic
+// its comment names, at the line the corpus gave.
+
+@Test
+function rejectsSemicolons() {
+    expect!(!compiles("function main() -> Int { return 1; }"))
+    expect!(diagnosed(1005, 1, 0))
+}
+
+@Test
+function rejectsUnterminatedStrings() {
+    expect!(!compiles("""
+        function main() -> Int { return "open }
+        """))
+    expect!(diagnosed(1002, 1, 0))
+}
+
+@Test
+function rejectsUnterminatedComments() {
+    expect!(!compiles("""
+        function main() -> Int { return 1 } /* never closed
+        """))
+    expect!(diagnosed(1004, 1, 0))
+}
+
+@Test
+function rejectsMissingInitializers() {
+    expect!(!compiles("function main() -> Int { let x return x }"))
+    expect!(diagnosed(2011, 1, 0))
+}
+
+@Test
+function rejectsUnexpectedExpressions() {
+    expect!(!compiles("function main() -> Int { return ) }"))
+    expect!(diagnosed(2020, 1, 0))
+}
+
+@Test
+function rejectsIntegerLiteralOverflow() {
+    expect!(!compiles("function main() -> Int { return 99999999999999999999 }"))
+    expect!(diagnosed(2021, 1, 0))
+}
+
+@Test
+function rejectsStructsWithoutNames() {
+    expect!(!compiles("struct { }"))
+    expect!(diagnosed(2007, 1, 0))
+}
+
+@Test
+function rejectsTextWithoutFoundation() {
+    expect!(!compiles("""
+        @Main
+        function main() -> Int {
+            let text = "kira"
+            return 0
+        }
+        """))
+    expect!(diagnosed(3400, 3, 0))
+}
+
+@Test
+function rejectsPublicOnExtensions() {
+    expect!(!compiles("""
+        // `public` exports a declaration; an extension takes no visibility.
+        struct Point { let x: Int }
+
+        public extend Point {
+            function twice(borrow self) -> Int { return x * 2 }
+        }
+        """))
+    expect!(diagnosed(2092, 4, 0))
+}
+
+@Test
+function rejectsPublicWithoutDeclaration() {
+    expect!(!compiles("""
+        // `public` must front the declaration it exports.
+        @Main
+        function main() -> Int { return 0 }
+
+        public
+        """))
+    expect!(diagnosed(2093, 5, 0))
+}

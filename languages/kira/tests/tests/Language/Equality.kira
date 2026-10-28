@@ -1,0 +1,149 @@
+// Structural equality: `==` / `!=` on structs, arrays, and payload-carrying
+// enums. The compiler auto-conforms a type to `Equatable` when every leaf is
+// comparable, and `==` walks it: a struct field by field, an array by length then
+// element, an enum by tag then payload.
+
+import Foundation
+
+struct EqxPoint {
+    let x: Number
+    let y: Number
+}
+
+struct EqxSeg {
+    let from: EqxPoint
+    let to: EqxPoint
+    let label: String
+}
+
+distinct EqxId = Number
+
+struct EqxTagged {
+    let id: EqxId
+    let at: EqxPoint
+}
+
+enum EqxShape {
+    Empty
+    Dot(EqxPoint)
+    Named(String)
+    Count(Number)
+}
+
+struct EqxMoney {
+    let amount: Number
+    let label: String
+}
+
+enum EqxMeasure {
+    Empty
+    Exact(Float)
+}
+
+@Test
+function structsAreEqualByEveryField() {
+    let a = EqxPoint { x: 1, y: 2 }
+    let b = EqxPoint { x: 1, y: 2 }
+    let c = EqxPoint { x: 1, y: 3 }
+    expect!(a == b)
+    expect!(a != c)
+}
+
+@Test
+function nestedStructsAndStringsCompareStructurally() {
+    let a = EqxPoint { x: 1, y: 2 }
+    let c = EqxPoint { x: 1, y: 3 }
+    let l1 = EqxSeg { from: a, to: c, label: "ac" }
+    let l2 = EqxSeg { from: EqxPoint { x: 1, y: 2 }, to: EqxPoint { x: 1, y: 3 }, label: "ac" }
+    let l3 = EqxSeg { from: a, to: c, label: "other" }
+    expect!(l1 == l2)
+    expect!(l1 != l3)
+}
+
+@Test
+function distinctFieldParticipatesInEquality() {
+    let a = EqxTagged { id: EqxId(7), at: EqxPoint { x: 4, y: 5 } }
+    let b = EqxTagged { id: EqxId(7), at: EqxPoint { x: 4, y: 5 } }
+    let c = EqxTagged { id: EqxId(8), at: EqxPoint { x: 4, y: 5 } }
+    expect!(a == b)
+    expect!(a != c)
+}
+
+@Test
+function numberFieldsCompareAsDecimals() {
+    let a = EqxMoney { amount: Number("1.50"), label: "usd" }
+    let b = EqxMoney { amount: Number("1.50"), label: "usd" }
+    let c = EqxMoney { amount: Number("1.75"), label: "usd" }
+    expect!(a == b)
+    expect!(a != c)
+}
+
+@Test
+function arraysCompareByLengthThenElement() {
+    let xs = [1, 2, 3]
+    let ys = [1, 2, 3]
+    let zs = [1, 2, 4]
+    let short = [1, 2]
+    expect!(xs == ys)
+    expect!(xs != zs)
+    expect!(xs != short)
+}
+
+@Test
+function arraysOfStructsCompareElementwise() {
+    let ps = [EqxPoint { x: 1, y: 2 }, EqxPoint { x: 1, y: 3 }]
+    let qs = [EqxPoint { x: 1, y: 2 }, EqxPoint { x: 1, y: 3 }]
+    expect!(ps == qs)
+    expect!(ps.contains(EqxPoint { x: 1, y: 3 }))
+    expect!(!ps.contains(EqxPoint { x: 9, y: 9 }))
+}
+
+@Test
+function enumPayloadComparesByPayload() {
+    expect!(EqxShape.Dot(EqxPoint { x: 5, y: 6 }) == EqxShape.Dot(EqxPoint { x: 5, y: 6 }))
+    expect!(EqxShape.Dot(EqxPoint { x: 5, y: 6 }) != EqxShape.Dot(EqxPoint { x: 5, y: 7 }))
+}
+
+@Test
+function enumStringAndIntPayloadsCompare() {
+    expect!(EqxShape.Named("k") == EqxShape.Named("k"))
+    expect!(EqxShape.Named("k") != EqxShape.Named("j"))
+    expect!(EqxShape.Count(3) == EqxShape.Count(3))
+    expect!(EqxShape.Count(3) != EqxShape.Count(4))
+}
+
+@Test
+function enumVariantsWithDifferentTagsDiffer() {
+    expect!(EqxShape.Dot(EqxPoint { x: 0, y: 0 }) != EqxShape.Named("x"))
+    expect!(EqxShape.Empty == EqxShape.Empty)
+}
+
+@Test
+function enumComparesAgainstAVariantLiteral() {
+    let s = EqxShape.Count(9)
+    expect!(s == EqxShape.Count(9))
+    expect!(s != EqxShape.Empty)
+}
+
+@Test
+function genericEquatableBoundUsesStructuralEquality() {
+    let hit = eqxSame(EqxPoint { x: 1, y: 2 }, EqxPoint { x: 1, y: 2 })
+    let miss = eqxSame(EqxPoint { x: 1, y: 2 }, EqxPoint { x: 3, y: 2 })
+    expect!(hit)
+    expect!(!miss)
+    expect!(eqxSame(7, 7))
+}
+
+function eqxSame<T: Equatable>(a: T, b: T) -> Bool {
+    return a == b
+}
+
+@Test
+function floatPayloadComparesAsAFloat() {
+    let zero: Float = 0.0
+    let nan = zero / zero
+    expect!(EqxMeasure.Exact(1.5) == EqxMeasure.Exact(1.5))
+    expect!(EqxMeasure.Exact(1.5) != EqxMeasure.Exact(2.5))
+    expect!(EqxMeasure.Exact(nan) != EqxMeasure.Exact(nan))
+    expect!(EqxMeasure.Empty != EqxMeasure.Exact(1.5))
+}

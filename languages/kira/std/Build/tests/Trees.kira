@@ -1,0 +1,27 @@
+import Foundation
+
+// Tree listings: a list of entries encodes to Kten and reads back as the
+// same entries, in order.
+
+@Test
+function listingEntriesRoundTrip() {
+    let expected: String = "bin:directory:493: bin/tool:file:493:ab lib:link:511:bin"
+    let entries = [
+        TreeEntry { path: "bin", kind: .Directory, mode: 493, content: "" },
+        TreeEntry { path: "bin/tool", kind: .File, mode: 493, content: "ab" },
+        TreeEntry { path: "lib", kind: .Link, mode: 511, content: "bin" }
+    ]
+    let outcome = match listingOf(listingKten(entries).encoded()) {
+        Ok(back) -> {
+            var parts: [String] = []
+            for entry in back {
+                parts.append(
+                    "\(entry.path):\(entryKindName(entry.kind)):\(entry.mode):\(entry.content)"
+                )
+            }
+            joined(parts, " ")
+        }
+        Error(failure) -> failureText(failure)
+    }
+    expect!((outcome) == expected)
+}

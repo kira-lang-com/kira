@@ -1,0 +1,23 @@
+import Foundation
+
+// The Network library's log categories exist, and each one takes a path form
+// that `Log` and `KIRA_LOG` read. A category that did not exist would fail to
+// compile here, so this checks the names the library promises to users.
+
+function accepted(result: Result<Void, LogConfigFailure>) -> Bool {
+    match result {
+        Ok -> return true
+        Error(failure) -> {
+            absorb failure
+            return false
+        }
+    }
+}
+
+@Test
+function networkCategoriesAcceptPaths() {
+    expect!(accepted(Log.enable("Network.NetworkLog.Request", .Warn)))
+    expect!(accepted(Log.enable("Network.NetworkLog.Connection", .Debug)))
+    expect!(accepted(Log.disable("Network.NetworkLog.Session")))
+    expect!(accepted(Log.reset("Network.NetworkLog.Session")))
+}

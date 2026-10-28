@@ -1,0 +1,98 @@
+// `move self.value` takes a field's value out of storage that stays alive,
+// and the idiom that follows it puts one back: `self.value = .None`. Lowering
+// destroys what a field held before an assignment replaces it, which here is
+// the value just moved away, so it would run `drop` twice. The checker keeps
+// the fields moved out of each binding's value, by their path from the
+// binding, and an assignment to one of them refills it: lowering writes the
+// new value without destroying the old.
+//
+// The path is followed in the order the body is written, so a field moved
+// on one branch and refilled after the branches join counts as moved on
+// every way there.
+
+struct MovedField {
+    let owner: Int
+    let local: Int
+    let names: [String]
+
+    function same(borrow self, other: borrow MovedField) -> Bool {
+        if owner != other.owner || local != other.local || names.count != other.names.count { return false }
+        for index in 0..names.count {
+            if names[index] != other.names[index] { return false }
+        }
+        return true
+    }
+}
+
+extend Checker {
+    // `local.field.field`: a member chain rooted at a binding of the
+    // function being checked.
+    function movedFieldPath(borrow self, expression: Int) -> Optional<MovedField> {
+        match placeStep(tree.expressions[expression].kind) {
+            Field(base, name) -> {
+                match tree.expressions[base].kind.name() {
+                    Some(root) -> {
+                        match lookup(root.text) {
+                            Some(local) -> return .Some(MovedField { owner = current, local = local, names = [name.text] })
+                            None -> return .None
+                        }
+                    }
+                    None -> {}
+                }
+                match movedFieldPath(base) {
+                    Some(prefix) -> {
+                        var names = prefix.names
+                        names.append(name.text)
+                        return .Some(MovedField { owner = prefix.owner, local = prefix.local, names = names })
+                    }
+                    None -> return .None
+                }
+            }
+            Indexed -> return .None
+            Plain -> return .None
+            Other -> return .None
+        }
+    }
+
+    // `move` out of a field whose value runs `drop`.
+    function noteFieldMove(borrow mut self, operand: Int, valueType: Type) {
+        var drops = DropsMemo {}
+        for _ in 0..program.structs.count { drops.structs.append(0) }
+        for _ in 0..program.enums.count { drops.enums.append(0) }
+        if !dropsOnce(valueType, drops) { return }
+        match movedFieldPath(operand) {
+            Some(path) -> {
+                for moved in movedFields { if moved.same(path) { return } }
+                movedFields.append(path)
+            }
+            None -> {}
+        }
+    }
+
+    // An assignment to `target`, checked as `written`: when it refills a
+    // moved field, lowering is told so.
+    function noteFieldRefill(borrow mut self, target: Int, written: Int) {
+        if movedFields.count == 0 { return }
+        match movedFieldPath(target) {
+            Some(path) -> {
+                var kept: [MovedField] = []
+                var refilled = false
+                for moved in movedFields {
+                    if moved.same(path) { refilled = true } else { kept.append(moved) }
+                }
+                movedFields = kept
+                if refilled { program.refilledPlaces.append(written) }
+            }
+            None -> {}
+        }
+    }
+}
+
+extend CheckedProgram {
+    function refills(borrow self, place: Int) -> Bool {
+        for refilled in refilledPlaces {
+            if refilled == place { return true }
+        }
+        return false
+    }
+}

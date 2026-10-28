@@ -1,0 +1,49 @@
+import Foundation
+
+// An `@Open` enum with raw values keeps each case's raw value as its tag, so
+// a code no case names survives, even one equal to a case's position.
+
+@Open
+enum OpenKey: U32 {
+    Escape = 41
+    F12 = 69
+}
+
+function openKeyName(key: OpenKey) -> String {
+    return match key {
+        Escape -> "escape"
+        F12 -> "f12"
+        else -> "unknown"
+    }
+}
+
+@Test
+function knownRawCodesMatchTheirCases() {
+    expect!((openKeyName(key: fromCode<OpenKey>(69))) == ("f12"))
+    expect!((openKeyName(key: .Escape)) == ("escape"))
+}
+
+@Test
+function unknownRawCodeSurvivesWithItsValue() {
+    let unknown = fromCode<OpenKey>(1)
+    expect!((openKeyName(key: unknown)) == ("unknown"))
+    expect!((String(code(unknown))) == ("1"))
+}
+
+@Test
+function caseCodeIsItsRawValue() {
+    let raw: U32 = code(OpenKey.F12)
+    expect!((Number(raw)) == (69))
+}
+
+@Test
+function enumComparesByCode() {
+    expect!(fromCode<OpenKey>(69) == OpenKey.F12)
+    expect!(fromCode<OpenKey>(1) != OpenKey.F12)
+}
+
+@Test
+function traceNamesKnownCasesAndCodesUnknownOnes() {
+    expect!((traceText(OpenKey.F12)) == ("OpenKey.F12"))
+    expect!((traceText(fromCode<OpenKey>(7))) == ("OpenKey(7)"))
+}
