@@ -70,29 +70,38 @@ jobs:
 
       - name: Install klf
         run: |
+          temp="$RUNNER_TEMP"
+          if [ "$RUNNER_OS" = Windows ]; then temp=$(cygpath -u "$temp"); fi
           klf_home="$HOME/.klf"
           tag=$(gh release view -R kira-lang-com/kira-language-framework --json tagName --jq .tagName)
           tree="$klf_home/toolchains/klf/release/${tag#v}"
           mkdir -p "$tree"
           gh release download "$tag" -R kira-lang-com/kira-language-framework \
-            --pattern "klf-${tag#v}-${{ matrix.host }}.tar.gz" --dir "$RUNNER_TEMP"
-          tar -xzf "$RUNNER_TEMP/klf-${tag#v}-${{ matrix.host }}.tar.gz" -C "$tree"
+            --pattern "klf-${tag#v}-${{ matrix.host }}.tar.gz" --dir "$temp"
+          tar -xzf "$temp/klf-${tag#v}-${{ matrix.host }}.tar.gz" -C "$tree"
           "$tree/bin/klf" setup
           echo "$klf_home/bin" >> "$GITHUB_PATH"
 
       - name: Bootstrap kira and knvm
         run: |
-          mkdir -p "$RUNNER_TEMP/bootstrap"
-          klf build languages/kira -o "$RUNNER_TEMP/bootstrap/kira"
-          "$RUNNER_TEMP/bootstrap/kira" build tools/knvm -o "$RUNNER_TEMP/bootstrap/knvm"
+          temp="$RUNNER_TEMP"
+          if [ "$RUNNER_OS" = Windows ]; then temp=$(cygpath -u "$temp"); fi
+          mkdir -p "$temp/bootstrap"
+          klf build languages/kira -o "$temp/bootstrap/kira"
+          "$temp/bootstrap/kira" build tools/knvm -o "$temp/bootstrap/knvm"
 
       - name: Build every language
-        run: '"$RUNNER_TEMP/bootstrap/knvm" binstall'
+        run: |
+          temp="$RUNNER_TEMP"
+          if [ "$RUNNER_OS" = Windows ]; then temp=$(cygpath -u "$temp"); fi
+          "$temp/bootstrap/knvm" binstall
 
       - name: Pack
         run: |
+          temp="$RUNNER_TEMP"
+          if [ "$RUNNER_OS" = Windows ]; then temp=$(cygpath -u "$temp"); fi
           version="${TAG#v}"
-          out="$RUNNER_TEMP/out"
+          out="$temp/out"
           mkdir -p "$out"
           pack() { # <name> <tree>
             local file="$1-$version-${{ matrix.host }}.tar.gz"
@@ -103,14 +112,14 @@ jobs:
             language=$(basename "$(dirname "$(dirname "$root")")")
             pack "$language" "$root"
           done
-          tools="$RUNNER_TEMP/tools/bin"
+          tools="$temp/tools/bin"
           mkdir -p "$tools"
-          kira="$RUNNER_TEMP/bootstrap/kira"
+          kira="$temp/bootstrap/kira"
           "$kira" build tools/knvm -o "$tools/knvm"
           for name in klf $(sed -n 's/^ *binary = "\(.*\)",*$/\1/p' toolchain.klfd); do
             "$kira" build tools/launcher -o "$tools/$name"
           done
-          pack knvm "$RUNNER_TEMP/tools"
+          pack knvm "$temp/tools"
           ls -la "$out"
 
       - uses: actions/upload-artifact@v4
