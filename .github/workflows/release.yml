@@ -145,7 +145,13 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --target "$GITHUB_SHA" --title "Kira ${TAG#v}" \
-              --notes "Install with \`curl -fsSL https://github.com/kira-lang-com/kira/releases/latest/download/install.sh | sh\`, or on Windows \`irm https://github.com/kira-lang-com/kira/releases/latest/download/install.ps1 | iex\`."
+            if gh api "repos/$GH_REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then
+              test "$(gh api "repos/$GH_REPO/commits/$TAG" --jq '.sha')" = "$GITHUB_SHA"
+              gh release create "$TAG" --verify-tag --title "Kira ${TAG#v}" \
+                --notes "Install with \`curl -fsSL https://github.com/kira-lang-com/kira/releases/latest/download/install.sh | sh\`, or on Windows \`irm https://github.com/kira-lang-com/kira/releases/latest/download/install.ps1 | iex\`."
+            else
+              gh release create "$TAG" --target "$GITHUB_SHA" --title "Kira ${TAG#v}" \
+                --notes "Install with \`curl -fsSL https://github.com/kira-lang-com/kira/releases/latest/download/install.sh | sh\`, or on Windows \`irm https://github.com/kira-lang-com/kira/releases/latest/download/install.ps1 | iex\`."
+            fi
           fi
           gh release upload "$TAG" dist/* --clobber
