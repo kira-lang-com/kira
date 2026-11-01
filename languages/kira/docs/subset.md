@@ -994,3 +994,15 @@ for literals or tracing reports 3400:
 
 The generated [diagnostic reference](diagnostics.md) is the source for current
 codes. [Idiomatic Kira](idiomatic-kira.md) describes the intended style.
+
+
+## Unsafe language parity (pending)
+
+The reference Kira compiler has added `unsafe function` and `unsafe { ... }`
+with `KSEM400` enforcement for raw pointers, FFI and callback-state handles.
+**This KLFD-hosted frontend has not implemented those constructs yet.** Do not
+accept or silently strip `unsafe` in the parser: parsing must be accompanied
+by safety-qualified callable types, effect checking on direct/indirect/FFI
+calls, lexical permission boundaries (including closures), and matching tests.
+Updated downstream packages use this syntax and require that port before they
+can build with this frontend.
