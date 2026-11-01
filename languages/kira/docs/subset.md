@@ -529,7 +529,10 @@ package root, not to the file writing the call**, so from `app/main.kira` the
 shader at `app/Shaders/Basic.ksl` is named `app/Shaders/Basic.ksl`. A rejected
 shader is 4038, after ksl's own diagnostics. Without `ksl` on the path, an
 earlier build's files are read from `generated/shaders/`, and none at all is
-4039. A path that is not a `.ksl` file with a stem is 9001.
+4039. The invocation requests `spirv,msl,hlsl,wgsl` explicitly: the KSL
+compiler's default emits SPIR-V only, whereas `KslArtifact` also needs source
+artifacts on a clean build. A path that is not a `.ksl` file with a stem is
+9001.
 
 ### `klist!`
 

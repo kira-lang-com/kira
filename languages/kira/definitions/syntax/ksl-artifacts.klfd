@@ -91,11 +91,13 @@ function kslArtifactSource(session: Session, root: String, stem: String, origin:
     return .Ok(joinText(parts))
 }
 
-// Runs `ksl build` over the shader at `path` in the package at `root`. Its
-// diagnostics go to the driver's error output, as its own would.
+// Runs `ksl build` over the shader at `path` in the package at `root`. The
+// default target produces SPIR-V only, but KslArtifact also embeds text for
+// the supported backends. Request them explicitly so a clean build has all
+// the outputs the macro reads.
 function buildKslShader(root: String, path: String, origin: Span) -> Result<Bool, Failure> {
     let output = joinPath(root, "generated/shaders")
-    let status = runCommand(["ksl", "build", joinPath(root, path), "--out", output])
+    let status = runCommand(["ksl", "build", joinPath(root, path), "--target", "spirv,msl,hlsl,wgsl", "--out", output])
     if status == -2 { return .Ok(false) }
     if status == 0 { return .Ok(true) }
     writeDriverError(commandOutput(2))
