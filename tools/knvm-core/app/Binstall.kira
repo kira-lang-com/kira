@@ -30,7 +30,7 @@ public enum BinstallFailure {
     // already names the path and the reason, and wrapping a rendered sentence in
     // another one is how a diagnostic ends up quoted inside itself.
     Install(InstallFailure)
-    // No directory above the one `binstall` ran in holds a `toolchain.klfd`.
+    // No directory above the one `binstall` ran in holds a `toolchain.kcore`.
     NoManifest(String)
     // The manifest is there and cannot be read or does not parse.
     ManifestUnreadable(String)
@@ -51,7 +51,7 @@ public enum BinstallOutcome {
 // dev toolchain.
 //
 // `start` is where the search begins: the working directory, for the binary.
-// A language is found through the `toolchain.klfd` that lists it. The build's output is
+// A language is found through the `toolchain.kcore` that lists it. The build's output is
 // left on this process's own streams, so a compile error lands in front of the
 // user rather than in a captured buffer.
 public function binstallToolchain(
@@ -76,7 +76,7 @@ public function binstallListed(name: borrow String, start: borrow String) -> Bin
             for language in manifest.languages {
                 if language.name == name { return binstallLanguage(manifest.root, language) }
             }
-            return .Failed(.NotListed(joinPath(manifest.root, manifestFileName)))
+            return .Failed(.NotListed(manifest.path))
         }
     }
     return .Failed(.NoManifest(start))
@@ -134,15 +134,22 @@ public function holdsEveryMarker(compiler: borrow Compiler, directory: borrow St
 
 // The version the checkout states.
 //
-// `definitions/language.klfd` declares `let version: String = "0.1.0"` and the
+// `definitions/language.kcore` declares `let version: String = "0.1.0"` and the
 // framework declares `version = "0.1.0"` in its manifest; either is the one place
 // a checkout says what it is. A dev toolchain is named after it, so two
 // checkouts of different versions do not overwrite one another on the `dev`
 // channel.
 public function checkoutVersion(compiler: borrow Compiler, root: borrow String) -> Optional<String> {
-    match textOf(joinPath(root, compiler.versionFile)) {
+    let path = joinPath(root, compiler.versionFile)
+    match textOf(path) {
         Some(text) -> return versionFromManifest(text)
-        None -> return .None
+        None -> {
+            if !compiler.versionFile.endsWith(languageDefinitionName) { return .None }
+            match textOf(joinPath(directoryOfPath(path), "language.klfd")) {
+                Some(text) -> return versionFromManifest(text)
+                None -> return .None
+            }
+        }
     }
 }
 

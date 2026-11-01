@@ -3,7 +3,7 @@
 The kernel carries a diagnostic as one integer, so each KSL family is a
 thousands band. The low digits are KSL's own number: `KSLP001` is 1001 and
 `KSLS004` is 2004. The titles and explanations are the `DiagnosticSpec` list
-in `definitions/language.klfd`.
+in `definitions/language.kcore`.
 
 ## Parser (KSLP, 1xxx)
 

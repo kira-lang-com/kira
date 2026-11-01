@@ -12,7 +12,7 @@ The reference for Kira's syntax and meaning is the Rust implementation in
 ## What's here
 
 This repository defines two languages, each a definition package under
-`languages/<name>/`, listed in the root `toolchain.klfd`:
+`languages/<name>/`, listed in the root `toolchain.kcore`:
 
 - `languages/kira/` is Kira.
   - `definitions/` holds the definition: `language.klfd` (the `Kira` construct,
@@ -32,7 +32,7 @@ This repository defines two languages, each a definition package under
   - `docs/` has `subset.md` (what kira accepts) and `diagnostics.md`.
 - `languages/ksl/` is KSL, Kira's shading language, with its `definitions/`,
   `library/`, `corpus/`, `tests/` and `docs/`.
-- `toolchain.klfd` lists both languages and what an installed toolchain of each
+- `toolchain.kcore` lists both languages and what an installed toolchain of each
   carries. `knvm binstall` reads it.
 - `tools/` holds `knvm`, the version manager, and `launcher`, the one binary
   installed on PATH under each compiler's name. `tools/knvm/README.md` has the

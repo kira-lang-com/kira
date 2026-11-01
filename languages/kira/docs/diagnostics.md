@@ -1,6 +1,6 @@
 # Diagnostic codes
 
-Generated from `definitions/language.klfd` by `tools/generate-diagnostics.py`.
+Generated from `definitions/language.kcore` by `tools/generate-diagnostics.py`.
 Do not edit this table by hand.
 
 The compiler reports a numeric code and a source range. The thousands
@@ -325,7 +325,7 @@ Every diagnostic has:
 
 1. **A stable code.** `KLF-` plus a name for framework codes; a number from the
    table above for Kira codes. A code is never reused for another meaning, and
-   a new code goes through the table procedure (`definitions/language.klfd`,
+   a new code goes through the table procedure (`definitions/language.kcore`,
    then `tools/generate-diagnostics.py`).
 2. **A headline in plain words that names the user's symbols.** The name is the
    source name, fully qualified when two units could mean different things. A

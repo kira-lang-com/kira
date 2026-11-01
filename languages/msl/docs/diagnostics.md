@@ -7,7 +7,7 @@ is 5000 plus its number. A message is the title, a colon, and the meaning.
 With `--diagnostics json`, N is the `code` field.
 
 Codes 230 to 237 and 5001 come from the shader kernel (KLF spec §23, §16.6).
-kmsl maps each kernel key to its code in `definitions/language.klfd`.
+kmsl maps each kernel key to its code in `definitions/language.kcore`.
 
 ## Preprocessing and parsing
 

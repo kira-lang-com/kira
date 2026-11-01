@@ -25,7 +25,7 @@ tools/launcher/        the launcher on PATH for every compiler: resolve the sele
 | `unpin` | Remove this directory tree's pin |
 | `uninstall <version> [--channel]` | Remove an installed version |
 | `setup` | Install the newest release of `klf` (then run its `klf setup`), of every language, and of `knvm` with its launchers, onto PATH; on an existing install, bring each up to date |
-| `binstall` | Build every language the enclosing `toolchain.klfd` lists, register it, and install it as its dev toolchain |
+| `binstall` | Build every language the enclosing `toolchain.kcore` lists, register it, and install it as its dev toolchain |
 | `sinstall` | Build `knvm` and a launcher per compiler from this checkout and put them on PATH |
 | `valgrind install --target <triple> --sysroot <dir>` | Build the pinned Valgrind release for a Linux target with the selected `klf` toolchain's clang against that sysroot, and keep it at `~/.klf/tools/valgrind/<version>/<target>/`, a root whose `usr/lib/valgrind` is the prefix it was built for |
 
@@ -104,14 +104,16 @@ from `klf.host` — `x86_64-linux-gnu`, `aarch64-macos`, and so on.
 ## binstall and sinstall
 
 `binstall` is the developer route. Run bare, anywhere in a repository of
-languages, it reads the `toolchain.klfd` at that repository's root and, for every
+languages, it reads the `toolchain.kcore` at that repository's root (or the
+legacy `toolchain.klfd` if no `.kcore` manifest exists there) and, for every
 language listed there, runs `klf build <path> -o <staging>/bin/<binary>`, copies
 each `files` entry from the language package into the toolchain, lands the result
 on the `dev` channel through the same staging, validate and rename pipeline a
 release install uses, and records the language in
 `$KLFD_HOME/toolchains/<name>/language.toml`. That record is the registry: every
 later `knvm` invocation and every launcher knows the language from it. The
-toolchain is named after the version `<path>/definitions/language.klfd` declares.
+toolchain is named after the version `<path>/definitions/language.kcore` declares;
+the legacy `.klfd` definition name is also accepted.
 `knvm <name> binstall` builds one listed language. A second run replaces the
 tree: a dev toolchain names a moving target, so "already installed" would mean
 "silently stale".

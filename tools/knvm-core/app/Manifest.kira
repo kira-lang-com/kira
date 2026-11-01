@@ -1,15 +1,16 @@
 import Foundation
 
-// `toolchain.klfd`: the languages a repository defines.
+// `toolchain.kcore`: the languages a repository defines.
 //
-// The file is KLFD, the same notation as the definitions beside it, so a
+// The file uses KCore, the same notation as the definitions beside it, so a
 // repository says what it ships in the language it is written in. knvm reads it
 // as text rather than running it: it holds nothing but literals, and a version
 // manager that needed a compiler to learn which compilers to build would need
 // one before it could install one.
 
 // The file at a repository's root that lists its languages.
-public let manifestFileName: String = "toolchain.klfd"
+public let manifestFileName: String = "toolchain.kcore"
+public let legacyManifestFileName: String = "toolchain.klfd"
 
 // One file or tree copied from a language package into its installed toolchain.
 public struct ToolchainFile {
@@ -269,6 +270,7 @@ public function isNameByte(byte: UN8) -> Bool {
 public struct EnclosingManifest {
     // The repository root: the directory holding the manifest.
     var root: String = ""
+    var path: String = ""
     var languages: [ToolchainLanguage] = []
 }
 
@@ -282,7 +284,8 @@ public function enclosingManifest(start: borrow String) -> ManifestLookup {
     var current = start
     if current.isEmpty() { return .Missing }
     while true {
-        let path = joinPath(current, manifestFileName)
+        var path = joinPath(current, manifestFileName)
+        if !fileExists(path) { path = joinPath(current, legacyManifestFileName) }
         if fileExists(path) {
             let text = match textOf(path) {
                 Some(read) -> read
@@ -290,7 +293,7 @@ public function enclosingManifest(start: borrow String) -> ManifestLookup {
             }
             match parseToolchainManifest(path, text) {
                 Read(languages) -> {
-                    return .Found(EnclosingManifest { root: current, languages: copy languages })
+                    return .Found(EnclosingManifest { root: current, path: path, languages: copy languages })
                 }
                 Failed(detail) -> { return .Failed(detail) }
             }

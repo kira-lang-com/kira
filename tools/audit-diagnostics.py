@@ -33,15 +33,15 @@ def specifications(language):
 
 def report_sites(definitions):
     sites = {}
-    for path in definitions.rglob("*.klfd"):
-        for case, args in re.findall(r"report\(\.(\w+),\s*([^)]*?)\)", path.read_text()):
+    for path in definitions.rglob("*.kcore"):
+        for case, args in re.findall(r"report\(\.(\w+),\s*([^)]*?)\)", path.read_text(encoding="utf-8")):
             sites.setdefault(case, []).append(args.strip())
     return sites
 
 
 def main():
-    language = (ROOT / "definitions/language.klfd").read_text()
-    table = json.loads((ROOT / "definitions/diagnostic-registry.json").read_text())
+    language = (ROOT / "definitions/language.kcore").read_text(encoding="utf-8")
+    table = json.loads((ROOT / "definitions/diagnostic-registry.json").read_text(encoding="utf-8"))
     name_of_code = {str(row["code"]): row["name"] for row in table}
     sites = report_sites(ROOT / "definitions")
     # String-aware: explanations may contain braces, so scan each whole literal.

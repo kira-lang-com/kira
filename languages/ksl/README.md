@@ -28,11 +28,11 @@ The binary also holds every other bundled shader definition, so `kmsl` and
 
 ## Layout
 
-- `definitions/language.klfd`: the `Ksl` construct, its diagnostic specs and
+- `definitions/language.kcore`: the `Ksl` construct, its diagnostic specs and
   kernel keys, and the four phases.
 - `definitions/syntax/`: the lexer, the syntax tree, and a parser that stops
   at the first error.
-- `definitions/package/loader.klfd`: reads the compiled file and every file it
+- `definitions/package/loader.kcore`: reads the compiled file and every file it
   imports.
 - `definitions/semantics/`: the checker. It reports every independent error,
   and a failed expression takes `Void` so that it is not reported again.
