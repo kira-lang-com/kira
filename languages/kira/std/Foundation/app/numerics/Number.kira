@@ -449,7 +449,8 @@ function numberNegate(value: Number) -> Number {
 function numberNegative(value: Number) -> Bool {
     let words = numberWords(value)
     let extended = (words.scale & NumberWord.extended) != 0
-    return (words.mantissa < 0) != extended
+    if extended { return words.mantissa >= 0 }
+    return words.mantissa < 0
 }
 
 function numberOrder(left: Number, right: Number) -> Int {
@@ -469,6 +470,10 @@ function numberFromInt(value: Int) -> Number {
 
 function numberToInt(value: Number) -> Int {
     let words = numberWords(value)
+    let minimum = numberFromInt(-9223372036854775807 - 1)
+    let maximum = numberFromInt(9223372036854775807)
+    if numberOrder(value, minimum) < 0 { return -9223372036854775807 - 1 }
+    if numberOrder(value, maximum) > 0 { return 9223372036854775807 }
     // An index or a count is whole, so that case is tested first.
     if words.scale == 0 { return words.mantissa }
     if words.scale > NumberWord.scale {
@@ -483,16 +488,14 @@ function numberToInt(value: Number) -> Int {
     return words.mantissa / divisor
 }
 
-// A `U64`'s bits as an `Int`'s, and back. A conversion traps outside the
-// target's range, so the top bit moves by hand.
+// Number's checked conversion runtime needs the raw equal-width bit pattern
+// after it has already established the value or deliberately preserved it.
 function numberWordOfBits(bits: U64) -> Int {
-    if bits < U64(9223372036854775807) + U64(1) { return Int(bits) }
-    return Int(bits - U64(9223372036854775807) - U64(1)) - 9223372036854775807 - 1
+    return rawNumberSignedWord(bits)
 }
 
 function numberBitsOfWord(word: Int) -> U64 {
-    if word >= 0 { return U64(word) }
-    return U64(word + 9223372036854775807 + 1) + U64(9223372036854775807) + U64(1)
+    return rawNumberUnsignedWord(word)
 }
 
 function numberFromUnsigned(value: U64) -> Number {
@@ -501,36 +504,39 @@ function numberFromUnsigned(value: U64) -> Number {
     return numberFromWords(NumberWords(word, 0))
 }
 
-// The integer part, truncated toward zero; a negative one traps.
+// The integer part, truncated toward zero and clamped to the unsigned range.
 function numberToUnsigned(value: Number) -> U64 {
     let words = numberWords(value)
-    if words.scale == 0 && words.mantissa >= 0 { return U64(words.mantissa) }
+    let extended = (words.scale & NumberWord.extended) != 0
+    if words.mantissa < 0 && !extended { return U64(0) }
+    if words.scale == 0 && words.mantissa >= 0 { return rawNumberUnsignedWord(words.mantissa) }
     if words.scale == NumberWord.extended && words.mantissa < 0 {
         return numberBitsOfWord(words.mantissa)
     }
+    if numberNegative(value) { return U64(0) }
+    let maximumBits = rawNumberUnsignedWord(-1)
+    let maximum = numberFromUnsigned(maximumBits)
+    if numberOrder(value, maximum) > 0 { return maximumBits }
     let bits = serviceWord(.ToUnsigned, words, NumberWords(0, 0))
     if kernelNumberSecond() != 0 {
-        numberFailedOn(
-            .OutsideDomain,
-            "\(numberWordsShown(words)) is no unsigned integer: it is negative or too large"
-        )
+        return maximumBits
     }
     return numberBitsOfWord(bits)
 }
 
 namespace NumberRange {
-    // Past this a float's integer part leaves the extended mantissa.
-    let float: Float = 10000000000000000000.0
+    // Number covers every Int and every U64.
+    let signedMinimum: Float = -9223372036854775808.0
+    let unsignedLimit: Float = 18446744073709551616.0
+    let unsignedMaximum: U64 = rawNumberUnsignedWord(-1)
 }
 
 // The nearest decimal to the float's binary value. The service reads the
 // float's magnitude, whose bits fit an `Int`.
 function numberFromFloat(value: Float) -> Number {
-    // Infinity and NaN have no decimal, and neither has a float past the
-    // mantissa's range; the failure says which float it was.
-    if value != value || abs(value) > NumberRange.float {
-        numberFailedOn(.Overflow, "the Float \(value) is no Number")
-    }
+    if value != value { return numberFromInt(0) }
+    if value < NumberRange.signedMinimum { return numberFromInt(-9223372036854775807 - 1) }
+    if value >= NumberRange.unsignedLimit { return numberFromUnsigned(NumberRange.unsignedMaximum) }
     let magnitude = numberAnswer(
         serviceWord(.FromFloat, NumberWords(Int(floatToBits(abs(value))), 0), NumberWords(0, 0))
     )

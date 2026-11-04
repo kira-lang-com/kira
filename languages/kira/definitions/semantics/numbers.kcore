@@ -270,23 +270,67 @@ extend Checker {
         return add(.Integer(0), Type.invalid(), span)
     }
 
-    // `Int(n)` truncates toward zero and `Float(n)` takes the nearest float.
-    // A sized value is already an integer, and converts as one.
+    // `UNumber(x)` uses the same representation as Number but clamps into its
+    // unsigned range before returning it.
+    function unsignedNumberConversion(borrow mut self, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 1 {
+            report(.ConversionArguments, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let value = toNumber(arguments[0], span)
+        if typeOf(value).isInvalid() { return value }
+        let unsigned = numberCall(11, [value], Type.integer(64, false), span)
+        return numberCall(10, [unsigned], Type.number(), span)
+    }
+
+    // An integer widened exactly to Number before any destination clamp.
+    function numberFromInteger(borrow mut self, value: Int, source: Type, span: Span) -> Int {
+        if source.isSizedNumber() { return numberFromSized(value, span) }
+        if !source.signed && source.bits == 64 {
+            return numberCall(10, [value], Type.number(), span)
+        }
+        return numberCall(2, [add(.Convert(value), Type.int(), span)], Type.number(), span)
+    }
+
+    // A Number converted to an integer of any width truncates toward zero and
+    // clamps before the final representation change. The 64-bit conversions
+    // already clamp in the Number runtime.
+    function clampedInteger(borrow mut self, value: Int, target: Type, span: Span) -> Int {
+        if target.isInt() { return numberCall(3, [value], target, span) }
+        if !target.signed && target.bits == 64 {
+            return numberCall(11, [value], target, span)
+        }
+
+        var minimum = 0
+        if target.signed { minimum = target.minimum() }
+        let lower = numberValue(minimum, 0, span)
+        let lowerCondition = numberComparison(.Less, Operands { left = value, right = lower }, span)
+        let boundedLow = add(.Select(lowerCondition, lower, value), Type.number(), span)
+        let upper = numberValue(target.maximum(), 0, span)
+        let upperCondition = numberComparison(.Greater, Operands { left = boundedLow, right = upper }, span)
+        let bounded = add(.Select(upperCondition, upper, boundedLow), Type.number(), span)
+
+        if !target.signed {
+            let unsigned = numberCall(11, [bounded], Type.integer(64, false), span)
+            return add(.Convert(unsigned), target, span)
+        }
+        let integer = numberCall(3, [bounded], Type.int(), span)
+        return add(.Convert(integer), target, span)
+    }
+
+    // `Int(n)` and every narrower integer conversion truncate toward zero and
+    // clamp to the destination range. Sized numbers widen through Number so
+    // negative-to-unsigned and out-of-range conversions use the same path.
     function fromNumber(borrow mut self, value: Int, target: Type, span: Span) -> Int {
-        if typeOf(value).isSizedNumber() { return add(.Convert(value), target, span) }
+        var number = value
+        if typeOf(value).isSizedNumber() { number = numberFromSized(value, span) }
         if target.kind == .Floating {
-            let float = numberCall(5, [value], Type.floating(64), span)
+            let float = numberCall(5, [number], Type.floating(64), span)
             if target.bits == 64 { return float }
             return add(.Convert(float), target, span)
         }
-        if target.isInteger() && !target.signed && target.bits == 64 {
-            let unsigned = numberCall(11, [value], Type.integer(64, false), span)
-            if target.equals(Type.integer(64, false)) { return unsigned }
-            return add(.Convert(unsigned), target, span)
-        }
-        let integer = numberCall(3, [value], Type.int(), span)
-        if target.isInt() { return integer }
-        return add(.Convert(integer), target, span)
+        if target.isInteger() { return clampedInteger(number, target, span) }
+        return add(.Convert(value), target, span)
     }
 
     function numberText(borrow mut self, value: Int, stringType: Type, span: Span) -> Int {

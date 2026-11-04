@@ -15,7 +15,7 @@ extend Parser {
         var overrides: [ClassFieldOverride] = []
         while !at(.RightBrace) {
             if eat(.Override) {
-                if at(.Function) {
+                if at(.Function) || at(.Unsafe) && peek(1).kind == .Function {
                     methods.append(try memberFunction([]))
                 } else if at(.Let) || at(.Var) {
                     advance()
@@ -27,7 +27,7 @@ extend Parser {
                 } else {
                     return .Error(failure(.ExpectedMember))
                 }
-            } else if at(.Let) || at(.Var) || at(.Function) || at(.At) || atPrivate() {
+            } else if at(.Let) || at(.Var) || at(.Function) || at(.Unsafe) && peek(1).kind == .Function || at(.At) || atPrivate() {
                 let memberStart = current().span
                 let prefix = try memberPrefix()
                 if at(.Let) || at(.Var) {

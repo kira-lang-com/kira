@@ -35,7 +35,7 @@ function inferredReceivers(tree: SyntaxTree, methods: [FunctionDeclaration], nam
         result.append(FunctionDeclaration {
             name = method.name, annotations = method.annotations, receiver = receiver,
             parameters = method.parameters, result = method.result, body = method.body,
-            span = method.span, typeParameters = method.typeParameters, scope = method.scope
+            span = method.span, typeParameters = method.typeParameters, scope = method.scope, isUnsafe = method.isUnsafe
         })
     }
     return result
@@ -178,6 +178,7 @@ function bodyMutatesReceiver(tree: SyntaxTree, statements: [Int], names: [String
                 if bodyMutatesReceiver(tree, body, names, mutating) { return true }
                 for arm in arms { if bodyMutatesReceiver(tree, arm.body, names, mutating) { return true } }
             }
+            Unsafe(body) -> { if bodyMutatesReceiver(tree, body, names, mutating) { return true } }
             Binding(binding) -> {
                 if receiverMutationCall(tree, binding.value, names, mutating) { return true }
                 visible = withoutName(names, binding.name.text)

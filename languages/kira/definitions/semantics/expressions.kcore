@@ -180,6 +180,10 @@ extend Checker {
             Some(target) -> {
                 let signature = declarations.signatures[target]
                 declarations.requireVisible(file(), signature.name.span.file, name.span)
+                if signature.declaration.isUnsafe {
+                    report(.UnsafeRequired, name.span)
+                    return add(.Integer(0), Type.invalid(), name.span)
+                }
                 let reference = canonicalAliasReference(declarations.aliases, functionReferenceType(signature.declaration), 0)
                 match declarations.typeNamedAt(reference.instanceName, reference.name.span.file) {
                     Some(callable) -> return add(.FunctionReference(target), callable, name.span)

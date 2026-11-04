@@ -6,8 +6,8 @@ Kira, hosted on the Kira Language Framework (KLF-RIDL section 27: `name =
 `.klfd` definitions in KLF Kira; the framework in `../kira-language-framework`
 loads them and builds the native `kira` driver from them.
 
-The reference for Kira's syntax and meaning is the Rust implementation in
-`../kira`. kira compiles a subset of it, listed in `docs/subset.md`.
+The reference for Kira's syntax and meaning is the deprecated Rust implementation in
+`../deprecated-kira-rust`. kira compiles a subset of it, listed in `docs/subset.md`.
 
 ## What's here
 
@@ -28,7 +28,7 @@ This repository defines two languages, each a definition package under
     against their diagnostic codes, `packages` builds packages with libraries
     from `corpus/packages/`, and `ffi` and `ffi-diagnostics` call C through the
     `.klffi` forms.
-  - `tests/` and `tests-ffi/` hold the harness ported from `../kira`.
+  - `tests/` and `tests-ffi/` hold the harness ported from `../deprecated-kira-rust`.
   - `docs/` has `subset.md` (what kira accepts) and `diagnostics.md`.
 - `languages/ksl/` is KSL, Kira's shading language, with its `definitions/`,
   `library/`, `corpus/`, `tests/` and `docs/`.

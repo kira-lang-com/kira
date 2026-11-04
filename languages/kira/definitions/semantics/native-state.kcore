@@ -25,6 +25,9 @@ function nativeStateErasure(program: CheckedProgram, declarations: Declarations,
 
 extend Checker {
     function checkNativeStateCall(borrow mut self, name: String, types: [TypeReference], arguments: [Int], span: Span) -> Int {
+        if unsafeDepth == 0 && (name == "nativeRecover" || name == "nativeUserDataRetain" || name == "nativeUserDataRelease" || name == "nativeStateFree") {
+            report(.UnsafeRequired, span)
+        }
         if name == "nativeRecover" { return nativeRecover(types, arguments, span) }
         if types.count > 0 { report(.IntrinsicTypeArguments, span) }
         if arguments.count != 1 {

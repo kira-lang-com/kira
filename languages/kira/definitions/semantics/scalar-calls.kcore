@@ -29,9 +29,9 @@ extend Checker {
         return add(.HeapFreeRaw(pointer), Type.void(), span)
     }
 
-    // `I32(value)`: the value at another integer type, range-checked when the
-    // target cannot hold every value of the source. A distinct value converts
-    // from its representation.
+    // `I32(value)`: the value at another integer type, clamped when the target
+    // cannot hold every value of the source. A distinct value converts from
+    // its representation.
     function conversion(borrow mut self, target: Type, arguments: [Int], span: Span) -> Int {
         if target.isSizedNumber() && arguments.count == 1 { return sizedConversion(target, arguments[0], span) }
         if target.kind == .Decimal && arguments.count == 1 {
@@ -47,17 +47,16 @@ extend Checker {
             let word = whole(expression(arguments[0], .None), Type.int(), .ArgumentTypeMismatch)
             if typeOf(word).isInvalid() { return word }
             requireOperand(word, typeOf(word).isInteger())
+            if unsafeDepth == 0 { report(.UnsafeRequired, span) }
             return add(.Convert(word), target, span)
         }
         if target.isInteger() {
             match numberConstantSyntax(tree, arguments[0]) {
-                Some(whole) -> {
-                    if lookup("Number").isNone() { return integerLiteral(whole, false, .Some(target), span) }
-                }
+                Some(whole) -> return clampedIntegerLiteral(whole, false, target, span)
                 None -> {}
             }
         }
-        var value = expression(arguments[0], .Some(target))
+        var value = expression(arguments[0], .None)
         var source = typeOf(value)
         if isDistinctType(program, source) {
             source = program.structs[source.declaration].fields[0].valueType
@@ -66,7 +65,31 @@ extend Checker {
         if source.isInvalid() || source.equals(target) { return value }
         if source.kind == .Decimal { return fromNumber(value, target, span) }
         requireOperand(value, source.isInteger() || source.kind == .Floating)
+        if target.isInteger() && source.isInteger() {
+            return clampedInteger(numberFromInteger(value, source, span), target, span)
+        }
+        if target.isInteger() && source.kind == .Floating {
+            let float = add(.Convert(value), Type.floating(64), span)
+            let number = numberCall(4, [float], Type.number(), span)
+            return clampedInteger(number, target, span)
+        }
         return add(.Convert(value), target, span)
+    }
+
+    // A literal integer conversion is a compile-time saturation when the
+    // Number runtime is unavailable (for example, in a freestanding build).
+    function clampedIntegerLiteral(borrow mut self, value: Int, hexadecimal: Bool, target: Type, span: Span) -> Int {
+        if hexadecimal && !target.signed && target.bits == 64 {
+            return integerLiteral(value, true, .Some(target), span)
+        }
+        var minimum = 0
+        if target.signed { minimum = target.minimum() }
+        var maximum = target.maximum()
+        if !target.signed && target.bits == 64 { maximum = value }
+        var bounded = value
+        if bounded < minimum { bounded = minimum }
+        if bounded > maximum { bounded = maximum }
+        return add(.Integer(bounded), target, span)
     }
 
     // `rawPointerWord(pointer)`: the word an opaque pointer holds, as `U64`.
@@ -79,6 +102,30 @@ extend Checker {
         if typeOf(pointer).isInvalid() { return pointer }
         requireOperand(pointer, typeOf(pointer).kind == .Pointer)
         return add(.Convert(pointer), Type.integer(64, false), span)
+    }
+
+    // Raw equal-width bitcasts used only by Number's conversion runtime after
+    // it has already checked or deliberately preserved the sign bit.
+    function rawNumberUnsignedWord(borrow mut self, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 1 {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let word = expression(arguments[0], .Some(Type.int()))
+        if typeOf(word).isInvalid() { return word }
+        requireOperand(word, typeOf(word).isInteger())
+        return add(.Bitcast(word), Type.integer(64, false), span)
+    }
+
+    function rawNumberSignedWord(borrow mut self, arguments: [Int], span: Span) -> Int {
+        if arguments.count != 1 {
+            report(.ArgumentCount, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
+        let bits = expression(arguments[0], .Some(Type.integer(64, false)))
+        if typeOf(bits).isInvalid() { return bits }
+        requireOperand(bits, typeOf(bits).isInteger())
+        return add(.Bitcast(bits), Type.int(), span)
     }
 
     // `wrappingAdd(a, b)` and its siblings wrap at the operands' width

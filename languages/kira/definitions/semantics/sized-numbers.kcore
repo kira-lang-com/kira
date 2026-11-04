@@ -34,34 +34,58 @@ extend Checker {
         return add(.Convert(value), target, span)
     }
 
-    // `UN32(n)` of a `Number`: truncated toward zero and trapping outside the
-    // range, as `U32(n)` is.
+    // `UN32(n)` of a `Number`: truncated toward zero and clamped to its range.
     function sizedFromNumber(borrow mut self, value: Int, target: Type, span: Span) -> Int {
         match wholeLiteralWord(value) {
             Some(word) -> {
-                if target.holdsLiteral(word, false) { return sizedWord(word, target, span) }
-                report(.LiteralOutOfRange, span)
-                return add(.Integer(word), Type.invalid(), span)
+                var minimum = 0
+                var maximum = 0
+                if target.signed {
+                    if target.bits == 8 {
+                        minimum = -128
+                        maximum = 127
+                    }
+                    if target.bits == 16 {
+                        minimum = -32768
+                        maximum = 32767
+                    }
+                    if target.bits == 32 {
+                        minimum = -2147483648
+                        maximum = 2147483647
+                    }
+                } else {
+                    if target.bits == 8 { maximum = 255 }
+                    if target.bits == 16 { maximum = 65535 }
+                    if target.bits == 32 { maximum = 4294967295 }
+                }
+                if word < minimum { return sizedWord(minimum, target, span) }
+                if word > maximum { return sizedWord(maximum, target, span) }
+                return sizedWord(word, target, span)
             }
             None -> {}
         }
         return add(.Convert(fromNumber(value, target.storage(), span)), target, span)
     }
 
-    // `UN8(x)`: an integer or sized value converts at its width, a `Number`
-    // through `sizedFromNumber`, a float by truncation and a string through
-    // the `Number` it spells.
+    // `UN8(x)` and its peers convert through Number, then clamp to the target.
     function sizedConversion(borrow mut self, target: Type, argument: Int, span: Span) -> Int {
-        var value = expression(argument, .Some(target))
+        var value = expression(argument, .None)
         var source = typeOf(value)
         if isDistinctType(program, source) {
             source = program.structs[source.declaration].fields[0].valueType
             value = add(.Member(value, 0), source, span)
         }
         if source.isInvalid() || source.equals(target) { return value }
-        if source.isInteger() || source.isSizedNumber() { return add(.Convert(value), target, span) }
         if source.isNumber() { return sizedFromNumber(value, target, span) }
-        if source.kind == .Floating { return add(.Convert(add(.Convert(value), target.storage(), span)), target, span) }
+        if source.isInteger() || source.isSizedNumber() {
+            let number = numberFromInteger(value, source, span)
+            return add(.Convert(fromNumber(number, target.storage(), span)), target, span)
+        }
+        if source.kind == .Floating {
+            let float = add(.Convert(value), Type.floating(64), span)
+            let number = numberCall(4, [float], Type.number(), span)
+            return add(.Convert(fromNumber(number, target.storage(), span)), target, span)
+        }
         if isStringType(program, source) { return sizedFromNumber(numberCall(6, [value], Type.number(), span), target, span) }
         report(.ConversionArguments, span)
         return add(.Integer(0), Type.invalid(), span)

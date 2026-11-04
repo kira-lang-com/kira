@@ -114,7 +114,7 @@ extend Parser {
             annotations.append(implicitAnnotation(.Async, token.span))
             isAsync = true
         }
-        if at(.Function) {
+        if at(.Function) || at(.Unsafe) && peek(1).kind == .Function {
             quotes = comptime
             skipsBody = bodiesElsewhere
             let parsed = functionDeclaration(builtInAnnotations(annotations))
@@ -179,7 +179,7 @@ extend Parser {
         return FunctionDeclaration {
             name = declared.name, annotations = declared.annotations, receiver = declared.receiver,
             parameters = declared.parameters, result = .Some(wrapped), body = declared.body, span = declared.span,
-            typeParameters = declared.typeParameters, scope = declared.scope
+            typeParameters = declared.typeParameters, scope = declared.scope, isUnsafe = declared.isUnsafe
         }
     }
 
@@ -325,7 +325,9 @@ extend Parser {
     }
 
     function functionDeclaration(borrow mut self, annotations: [Annotation]) -> Result<FunctionDeclaration, Failure> {
-        let start = try expect(.Function)
+        let start = current().span
+        let isUnsafe = eat(.Unsafe)
+        try expect(.Function)
         let name = try identifier(.ExpectedFunctionName)
         // A function, method or foreign declaration with a builtin's name
         // would take its calls over without a word.
@@ -333,7 +335,7 @@ extend Parser {
             "code", "compare", "hash", "print", "traceText" -> return .Error(Failure { diagnostic = .BuiltinShadow, span = name.span })
             else -> {}
         }
-        return functionDefinition(name, annotations, start.span)
+        return functionDefinition(name, annotations, start, isUnsafe)
     }
 
     // A function inside a type, trait or extension, which declares no type
@@ -353,7 +355,7 @@ extend Parser {
     function atPrivate(borrow self) -> Bool {
         if !atWord("private") { return false }
         let next = peek(1).kind
-        return next == .Let || next == .Var || next == .Function || next == .At
+        return next == .Let || next == .Var || next == .Function || next == .Unsafe || next == .At
     }
 
     function eatPrivate(borrow mut self) -> Bool {
@@ -384,13 +386,14 @@ extend Parser {
             return .Ok(FunctionDeclaration {
                 name = declared.name, annotations = declared.annotations, receiver = .Static,
                 parameters = declared.parameters, result = declared.result, body = declared.body,
-                span = declared.span, typeParameters = declared.typeParameters, scope = declared.scope
+                span = declared.span, typeParameters = declared.typeParameters, scope = declared.scope,
+                isUnsafe = declared.isUnsafe
             })
         }
         return .Ok(declared)
     }
 
-    function functionDefinition(borrow mut self, name: Identifier, annotations: [Annotation], start: Span) -> Result<FunctionDeclaration, Failure> {
+    function functionDefinition(borrow mut self, name: Identifier, annotations: [Annotation], start: Span, isUnsafe: Bool) -> Result<FunctionDeclaration, Failure> {
         if hasAttribute(annotations, .Native) {
             return .Error(Failure { diagnostic = .NativeOnFunction, span = start })
         }
@@ -432,7 +435,8 @@ extend Parser {
             body = body,
             span = spanFrom(start),
             typeParameters = typeParameters,
-            scope = GenericScope.none()
+            scope = GenericScope.none(),
+            isUnsafe = isUnsafe
         })
     }
 
@@ -628,7 +632,7 @@ extend Parser {
                 keepPrivate(prefix, field.name)
                 recordDocs(memberDocs, "field", field.name.text, name.text)
                 fields.append(field)
-            } else if at(.Function) {
+            } else if at(.Function) || at(.Unsafe) && peek(1).kind == .Function {
                 skipsBody = bodiesElsewhere && genericParameters.count == 0
                 let method = memberFunction(prefix.annotations)
                 skipsBody = false
@@ -775,7 +779,7 @@ extend Parser {
         var rawValues: [Int] = []
         while !at(.RightBrace) {
             let memberDocs = try claimDocs()
-            if at(.Function) || at(.At) || atPrivate() {
+            if at(.Function) || at(.Unsafe) && peek(1).kind == .Function || at(.At) || atPrivate() {
                 skipsBody = bodiesElsewhere && genericParameters.count == 0
                 let method = prefixedMethod()
                 skipsBody = false
@@ -899,12 +903,14 @@ extend Parser {
                 try namespaceDeclaration(path)
                 continue
             }
-            if at(.Function) {
-                let functionStart = advance().span
+            if at(.Function) || at(.Unsafe) && peek(1).kind == .Function {
+                let functionStart = current().span
+                let isUnsafe = eat(.Unsafe)
+                try expect(.Function)
                 let written = try identifier(.ExpectedFunctionName)
                 let name = Identifier { text = joinText([path, ".", written.text]), span = written.span }
                 recordDocs(memberDocs, "function", name.text, "")
-                let declared = try functionDefinition(name, [], functionStart)
+                let declared = try functionDefinition(name, [], functionStart, isUnsafe)
                 if declared.typeParameters.count > 0 {
                     tree.genericFunctions.append(declared)
                 } else {

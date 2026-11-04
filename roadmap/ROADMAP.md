@@ -1,7 +1,7 @@
 # Kira in KLFD: status and roadmap
 
 This roadmap tracks the Kira reimplementation in this repository. The reference
-is `../kira`; the controlling KLF design is section 27 of
+is `../deprecated-kira-rust`; the controlling KLF design is section 27 of
 `../kira-language-framework/roadmap/KLF-RIDL.md`. The KLF milestone exit test
 for Kira is M7: parity with `tests-kik` and successful Kira ecosystem builds.
 
@@ -84,7 +84,7 @@ from section 27.3, not permission to add language-specific backend shortcuts.
 - `tools/` holds the version manager: `knvm` installs a toolchain into
   `~/.klf/toolchains/<channel>/<version>/`, selects it, pins one per directory
   tree, and the launcher dispatches the `kira` on PATH to the selected
-  toolchain's driver. It is `../kira/crates/kira-knvm` ported to Kira and pointed
+  toolchain's driver. It is `../deprecated-kira-rust/crates/kira-knvm` ported to Kira and pointed
   at this compiler; `tools/knvm/README.md` has the layout, the verbs and where it
   stops. `languages/kira/corpus/packages/knvm` checks the decisions it rests on, and the install,
   `binstall` and `sinstall` paths have been run end to end against a fixture feed
@@ -162,7 +162,7 @@ from section 27.3, not permission to add language-specific backend shortcuts.
 
 ### 5. Reach the Kira M7 exit test
 
-- Use `../kira/tests-kik` as the conformance oracle. Compare acceptance,
+- Use `../deprecated-kira-rust/tests-kik` as the conformance oracle. Compare acceptance,
   diagnostics, output and exit status on the supported backends.
 - Build the Kira ecosystem packages against this compiler and its bundled std.
 - Update this roadmap and the sibling KLF `roadmap/IMPLEMENTED.md` whenever a
@@ -171,7 +171,7 @@ from section 27.3, not permission to add language-specific backend shortcuts.
 
 ## The `tests-kik` oracle
 
-`kira test ../kira/tests-kik/harness` is **1544 passed, 0 failed**.
+`kira test ../deprecated-kira-rust/tests-kik/harness` is **1544 passed, 0 failed**.
 
 Two adjustments were made to the oracle, both the kind this repository has
 already made to it (the colon result headers became arrows when the harness

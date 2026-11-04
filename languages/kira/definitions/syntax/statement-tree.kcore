@@ -109,6 +109,7 @@ enum StatementKind {
     ForEach(Identifier, Int, [Int])
     Match(Int, [MatchArm])
     Attempt([Int], [MatchArm])
+    Unsafe([Int])
     Return(Optional<Int>)
     Break
     Continue
@@ -120,6 +121,25 @@ struct Statement {
 }
 
 extend StatementKind {
+    function unsafeBody(borrow self) -> Optional<[Int]> {
+        match self {
+            Unsafe(body) -> return .Some(body)
+            Binding -> return .None
+            Assignment -> return .None
+            CompoundAssignment -> return .None
+            Evaluation -> return .None
+            If -> return .None
+            While -> return .None
+            For -> return .None
+            ForEach -> return .None
+            Match -> return .None
+            Attempt -> return .None
+            Return -> return .None
+            Break -> return .None
+            Continue -> return .None
+        }
+    }
+
     function evaluatedExpression(borrow self) -> Optional<Int> {
         match self {
             Evaluation(value) -> return .Some(value)
@@ -132,6 +152,7 @@ extend StatementKind {
             ForEach -> return .None
             Match -> return .None
             Attempt -> return .None
+            Unsafe -> return .None
             Return -> return .None
             Break -> return .None
             Continue -> return .None
@@ -151,6 +172,7 @@ extend StatementKind {
             ForEach -> return .None
             Match -> return .None
             Attempt -> return .None
+            Unsafe -> return .None
             Return(value) -> return value
             Break -> return .None
             Continue -> return .None

@@ -118,7 +118,7 @@ extend Parser {
         let memberStart = current().span
         let prefix = try memberPrefix()
         let annotations = prefix.annotations
-        if at(.Function) {
+        if at(.Function) || at(.Unsafe) && peek(1).kind == .Function {
             let method = try memberFunction(annotations)
             keepPrivate(prefix, method.name)
             recordDocs(memberDocs, "method", method.name.text, owner)
@@ -202,7 +202,7 @@ extend Parser {
             let start = current().span
             let name = try identifier(.ExpectedMemberName)
             recordDocs(memberDocs, "init", name.text, owner)
-            members.inits.append(try functionDefinition(name, [], start))
+            members.inits.append(try functionDefinition(name, [], start, false))
             return .Ok(true)
         }
         if at(.Identifier) && annotations.count == 0 {

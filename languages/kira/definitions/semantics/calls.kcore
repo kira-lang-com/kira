@@ -68,6 +68,8 @@ extend Checker {
         match callee.text {
             "String" -> { if arguments.count == 1 { return stringConversion(arguments[0], span) } }
             "rawPointerWord" -> { if declarations.findFunction(.None, callee.text).isNone() { return pointerWord(arguments, span) } }
+            "rawNumberUnsignedWord" -> { if declarations.findFunction(.None, callee.text).isNone() { return rawNumberUnsignedWord(arguments, span) } }
+            "rawNumberSignedWord" -> { if declarations.findFunction(.None, callee.text).isNone() { return rawNumberSignedWord(arguments, span) } }
             "heapAllocateRaw" -> return allocateRawCall(arguments, span)
             "heapFreeRaw" -> return freeRawCall(arguments, span)
             else -> {}
@@ -85,7 +87,10 @@ extend Checker {
             None -> {}
         }
         match builtinType(callee.text) {
-            Some(target) -> return conversion(target, arguments, span)
+            Some(target) -> {
+                if callee.text == "UNumber" { return unsignedNumberConversion(arguments, span) }
+                return conversion(target, arguments, span)
+            }
             None -> {}
         }
         match wrappingOperator(callee.text) {
@@ -631,10 +636,14 @@ extend Checker {
     // of its parameter's type.
     function callChecked(borrow mut self, target: Int, receiver: Optional<Int>, arguments: [Int], span: Span) -> Int {
         match program.functions[target].foreign {
-            Some(foreign) -> return foreignCall(target, program.foreignFunctions[foreign], arguments, span)
+            Some(foreign) -> {
+                if unsafeDepth == 0 { report(.UnsafeRequired, span) }
+                return foreignCall(target, program.foreignFunctions[foreign], arguments, span)
+            }
             None -> {}
         }
         let callee = declarations.signatures[target]
+        if callee.declaration.isUnsafe && unsafeDepth == 0 { report(.UnsafeRequired, span) }
         if hasAttribute(callee.declaration.annotations, .MainThread) && !requestedCall(span) {
             report(.MainThreadDirectCall, span)
         }

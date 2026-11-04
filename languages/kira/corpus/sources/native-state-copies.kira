@@ -19,9 +19,11 @@ function main() -> Int {
     let sorted = holders.sorted({ a, b in return a.rank < b.rank })
     let named: Optional<NativeState<Int>> = .Some(nativeState(Int(0)))
     var extra = 0
-    match named {
-        Some(state) -> extra = nativeRecover<Int>(state)
-        None -> {}
+    unsafe {
+        match named {
+            Some(state) -> extra = nativeRecover<Int>(state)
+            None -> {}
+        }
+        return nativeRecover<Int>(reversed[1].state) + nativeRecover<Int>(sorted[0].state) + extra
     }
-    return nativeRecover<Int>(reversed[1].state) + nativeRecover<Int>(sorted[0].state) + extra
 }

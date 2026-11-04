@@ -34,6 +34,36 @@ public struct KiraSettings {
     let excluding: [String] = []
     /// The relocatable source hierarchy, relative to the build project.
     let sourceRoot: String = ""
+    /// Whether the compile prints every phase with the milliseconds it took
+    /// (`--timings`), into the compile's `.out` log.
+    let timings: Bool = false
+    /// Functions a library keeps exported (`--export`, once each).
+    let exports: [String] = []
+    /// Whether an emitted contract marks each declaration with the place it
+    /// is written (`--ridl-source`).
+    let ridlSource: Bool = false
+    /// Checkouts a dependency with a `url` is taken from instead of fetching
+    /// it (`--dependency Name=<directory>;...`).
+    let dependencies: [KiraDependency] = []
+    /// Whether the package is checked and built as the framework it ships as
+    /// (`--framework`).
+    let framework: Bool = false
+    /// Whether the compile also writes the package's documentation, into its
+    /// `.out` log (`--doc`), in `docFormat`.
+    let documentation: Bool = false
+    /// Whether an undocumented public declaration fails the compile
+    /// (`--doc-check`).
+    let documentationCheck: Bool = false
+    /// The documentation's format, `markdown` or `json` (`--doc-format`).
+    let documentationFormat: String = "markdown"
+}
+
+/// A dependency's checkout given to a compile in place of fetching it.
+public struct KiraDependency {
+    /// The dependency's name, as the manifest's `Dependency` names it.
+    let name: String
+    /// The checkout's tree.
+    let checkout: Artifact
 }
 
 /// A library a compile made: its shared binary and its contract.
@@ -165,11 +195,13 @@ extend KiraToolchain {
         if settings.release { detail += ", release" }
         if settings.optimize { detail += ", optimized" }
         if settings.sdk.isSome() { detail += ", with an SDK" }
+        if settings.timings { detail += ", timed" }
         var reads = [tree]
         match graph.packageTree(package, settings.excluding) {
             Some(found) -> reads.append(found)
             None -> {}
         }
+        for dependency in settings.dependencies { reads.append(dependency.checkout) }
         for artifact in [settings.sdk, settings.sysroot] {
             match artifact {
                 Some(given) -> {
@@ -231,6 +263,29 @@ extend KiraToolchain {
         }
         if settings.release { arguments.append(.Text("--release")) }
         if settings.optimize { arguments.append(.Text("--optimize")) }
+        if settings.timings { arguments.append(.Text("--timings")) }
+        for export in settings.exports {
+            arguments.append(.Text("--export"))
+            arguments.append(.Text(copy export))
+        }
+        if settings.ridlSource { arguments.append(.Text("--ridl-source")) }
+        if settings.dependencies.count > 0 {
+            var joined: [Argument] = []
+            for (index, dependency) in settings.dependencies.enumerated() {
+                let separator = index > 0 ? ";" : ""
+                joined.append(.Text("\(separator)\(dependency.name)="))
+                joined.append(.Input(dependency.checkout))
+            }
+            arguments.append(.Text("--dependency"))
+            arguments.append(.Joined(joined))
+        }
+        if settings.framework { arguments.append(.Text("--framework")) }
+        if settings.documentation { arguments.append(.Text("--doc")) }
+        if settings.documentationCheck { arguments.append(.Text("--doc-check")) }
+        if settings.documentationFormat != "markdown" {
+            arguments.append(.Text("--doc-format"))
+            arguments.append(.Text(copy settings.documentationFormat))
+        }
         match settings.sdk {
             Some(given) -> {
                 arguments.append(.Text("--sdk"))

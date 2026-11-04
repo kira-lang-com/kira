@@ -25,7 +25,9 @@ struct NativeState<Boxed>: Drop {
 function nativeStateBox(value: Any) -> Int {
     if runtimeContext.nativeStateIdentity == 9223372036854775807 { runtimeTrap() }
     let identity = runtimeContext.nativeStateIdentity + 1
-    if rawPointerWord(RawPtr(identity)) != U64(identity) { runtimeTrap() }
+    var pointer = RawPtr.null
+    unsafe { pointer = RawPtr(identity) }
+    if rawPointerWord(pointer) != U64(identity) { runtimeTrap() }
     runtimeContext.nativeStateIdentity = identity
     var index = runtimeContext.nativeStateFree
     if index < 0 {
@@ -61,12 +63,16 @@ function nativeStateSlotOf(token: RawPtr) -> Int {
 
 function nativeStateExport(slot: Int) -> RawPtr {
     nativeStateRetain(slot)
-    return RawPtr(slot)
+    var token = RawPtr.null
+    unsafe { token = RawPtr(slot) }
+    return token
 }
 
 function nativeStateBorrow(slot: Int) -> RawPtr {
     nativeStateLive(slot)
-    return RawPtr(slot)
+    var token = RawPtr.null
+    unsafe { token = RawPtr(slot) }
+    return token
 }
 
 function nativeStateRetain(slot: Int) {

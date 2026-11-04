@@ -25,15 +25,17 @@ struct FrameCounter {
 // What C calls. It recovers the state its userdata names, writes through it,
 // and reads a field back — all inside the nested run.
 function onFrame(userdata: U64, n: I32) -> I32 {
-    var state = nativeRecover<FrameCounter>(RawPtr(userdata))
-    state.hits = state.hits + 1
-    state.marks.append(Int(n))
-    // Read back through the same view: what this run wrote has to be readable
-    // by this run, and the string boxed by the *outer* run has to still be here.
-    if state.label != "kept" {
-        return 0 - 1
+    unsafe {
+        var state = nativeRecover<FrameCounter>(RawPtr(userdata))
+        state.hits = state.hits + 1
+        state.marks.append(Int(n))
+        // Read back through the same view: what this run wrote has to be readable
+        // by this run, and the string boxed by the *outer* run has to still be here.
+        if state.label != "kept" {
+            return 0 - 1
+        }
+        return Int32(state.hits * 100 + Int(n))
     }
-    return Int32(state.hits * 100 + Int(n))
 }
 
 @Main function main() {
@@ -42,15 +44,19 @@ function onFrame(userdata: U64, n: I32) -> I32 {
 
     let taker: UserdataTaker = onFrame
     // 1 * 100 + 7 = 107 on the first crossing, then 2 * 100 + 107 = 307.
-    print(callUserdataTwice(taker, U64(rawPointerWord(handle)), 7))
+    var callbackResult: I32 = 0
+    unsafe { callbackResult = callUserdataTwice(taker, U64(rawPointerWord(handle)), 7) }
+    print(callbackResult)
 
     // Back in the outer run: both crossings' writes are here.
-    var after = nativeRecover<FrameCounter>(handle)
-    print(after.hits)
-    print(after.label)
-    print(after.marks.count)
-    print(after.marks[0])
-    print(after.marks[1])
-    nativeUserDataRelease(handle)
+    unsafe {
+        var after = nativeRecover<FrameCounter>(handle)
+        print(after.hits)
+        print(after.label)
+        print(after.marks.count)
+        print(after.marks[0])
+        print(after.marks[1])
+        nativeUserDataRelease(handle)
+    }
     return
 }

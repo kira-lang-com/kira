@@ -11,6 +11,7 @@ extend Parser {
         if at(.While) { return whileStatement() }
         if at(.For) { return forStatement() }
         if at(.Match) { return matchStatement() }
+        if at(.Unsafe) { return unsafeStatement() }
         if eat(.Return) {
             var value: Optional<Int> = .None
             if startsExpression() && onSameLine(start, current().span) {
@@ -57,6 +58,12 @@ extend Parser {
             None -> {}
         }
         return .Ok(tree.addStatement(.Evaluation(target), spanFrom(start)))
+    }
+
+    function unsafeStatement(borrow mut self) -> Result<Int, Failure> {
+        let start = try expect(.Unsafe)
+        let body = try block()
+        return .Ok(tree.addStatement(.Unsafe(body), spanFrom(start.span)))
     }
 
     // `let` and `var` need an initializer: definite initialization begins at

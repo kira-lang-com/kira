@@ -33,9 +33,22 @@ extend Checker {
     // need first, then the statement.
     function checkStatementInto(borrow mut self, index: Int, into: borrow mut [Int]) {
         var hoisting = AwaitHoisting { statements = [], replaced = [], originals = [] }
+        let unsafeStatements = tree.statements[index].kind.unsafeBody()
+        let savedUnsafe = unsafeDepth
+        if unsafeStatements.isSome() { unsafeDepth += 1 }
         if asyncBody.isSome() { hoistStatement(index, hoisting) }
-        for statement in hoisting.statements { into.append(statement) }
-        into.append(checkStatement(index))
+        match unsafeStatements {
+            Some(body) -> {
+                for statement in hoisting.statements { into.append(statement) }
+                let checked = block(body)
+                for statement in checked { into.append(statement) }
+            }
+            None -> {
+                for statement in hoisting.statements { into.append(statement) }
+                into.append(checkStatement(index))
+            }
+        }
+        unsafeDepth = savedUnsafe
         for position in 0..hoisting.replaced.count {
             tree.expressions[hoisting.replaced[position]] = hoisting.originals[position]
         }
@@ -57,6 +70,9 @@ extend Checker {
             CompoundAssignment(operator, target, value) -> hoistWithin(value, true, hoisting)
             If(condition, whenTrue, whenFalse) -> hoistWithin(condition, false, hoisting)
             Match(subject, arms) -> hoistWithin(subject, false, hoisting)
+            Unsafe(body) -> {
+                for statement in body { hoistStatement(statement, hoisting) }
+            }
             For(name, low, high, body) -> hoistSiblings([low, high], false, hoisting)
             ForEach(name, array, body) -> hoistWithin(array, false, hoisting)
             While -> {}

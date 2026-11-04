@@ -27,6 +27,10 @@ extend Checker {
 
     function foreignCallback(borrow mut self, callee: Int, callback: Int, span: Span) -> Int {
         let signature = declarations.signatures[callee]
+        if signature.declaration.isUnsafe {
+            report(.UnsafeRequired, span)
+            return add(.Integer(0), Type.invalid(), span)
+        }
         declarations.requireVisible(file(), signature.name.span.file, span)
         let callbackType = Type.structure(callback)
         match callbackMark(callback) {

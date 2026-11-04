@@ -183,6 +183,8 @@ struct Checker {
     var constructIndices: [Int]
     // While an `async function`'s body is checked (async.klfd).
     var asyncBody: Optional<AsyncBody> = .None
+    // Lexical permission for operations whose safety cannot be proved here.
+    var unsafeDepth: Int = 0
 
     function checkFunction(borrow mut self, index: Int) {
         if isAsyncSignature(declarations.signatures[index]) {
@@ -204,6 +206,8 @@ struct Checker {
         handlers = []
         propagated = []
         tryAllowed = false
+        unsafeDepth = 0
+        if signature.declaration.isUnsafe { unsafeDepth = 1 }
         for parameter in signature.parameters {
             let reference = parameter.mode == .MutablyBorrowed
             let local = declareLocal(parameter.name.text, parameter.valueType, reference, reference)

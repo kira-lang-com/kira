@@ -11,9 +11,13 @@ function runCollectors(session: Session, unit: Unit, tree: SyntaxTree) -> Result
     for declared in tree.proceduralMacros {
         match declared.kind {
             MacroCollector -> {
-                if declarations == "" { declarations = collectedDeclarations(session, tree) }
-                let file = try evaluateSourceMacroArguments(session, unit, collected, declared, [declarations], declared.name.span)
-                collected = try parseCollected(session, collected, file, declared)
+                // The test runner contributes an entrypoint only to test
+                // builds; normal library builds must not evaluate its macro.
+                if tree.testing || declared.name.text != "TestRunner" {
+                    if declarations == "" { declarations = collectedDeclarations(session, tree) }
+                    let file = try evaluateSourceMacroArguments(session, unit, collected, declared, [declarations], declared.name.span)
+                    collected = try parseCollected(session, collected, file, declared)
+                }
             }
             MacroFunction -> {}
             MacroDerive -> {}
