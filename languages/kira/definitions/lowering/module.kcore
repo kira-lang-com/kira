@@ -53,7 +53,12 @@ function programRoots(program: CheckedProgram) -> [Int] {
 // is then declared by name alone, and its body is the reaching unit's. One
 // another unit defines is declared with its signature when reached.
 function lowerCheckedProgram(builder: KirModuleBuilder, program: CheckedProgram, roots: [Int], markComptime: Bool) -> [KirFunctionBuilder] {
-    let reached = reachableFunctions(program, roots)
+    var effectiveRoots = roots
+    match program.typeNames {
+        Some(table) -> effectiveRoots.append(table)
+        None -> {}
+    }
+    let reached = reachableFunctions(program, effectiveRoots)
     var types = KirTypes.declare(builder, program)
     types.declareForeignImages(builder, program)
     types.declareNativeLibraries(builder, program)
