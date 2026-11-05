@@ -1,49 +1,447 @@
 // A manifest makes dependencies available. Only imports from files active on
 // this target make them build units; an excluded file cannot pull in its OS.
 
-function sourcesImportDependency(session: Session, root: String, tree: borrow SyntaxTree, first: Int, last: Int, dependency: Dependency) -> Bool {
-    var imported: [String] = []
+function packageSourceImports(tree: borrow SyntaxTree, first: Int, last: Int) -> DependencyNameSet {
+    var imported = emptyDependencyNameSet()
     for index in first..last {
-        for item in tree.sources[index].imports { imported.append(item.name.text) }
+        for item in tree.sources[index].imports { imported.insert(item.name.text) }
     }
-    return importsDependency(session, root, imported, dependency)
+    return imported
 }
 
-function importsDependency(session: Session, root: String, imported: [String], dependency: Dependency) -> Bool {
-    if listsText(imported, dependency.name.text) { return true }
+function importsDependency(session: Session, root: String, imported: DependencyNameSet, dependency: Dependency, borrow mut sources: PackageSourceIndex) -> Bool {
+    if imported.contains(dependency.name.text) { return true }
     // The manifest's entry name and the package's exported moduleRoot can
     // differ. Inspecting an available manifest must not turn an unavailable,
     // excluded dependency into an error or a build unit.
     let fetched = dependencyOverride(session, dependency.name.text)
     if dependency.source != .Path && utf8Count(fetched) == 0 { return false }
     let named = utf8Count(fetched) > 0 ? fetched : joinPath(root, dependency.path)
-    let file = readFile(session, joinPath(named, "package.kira"))
-    if file < 0 { return false }
-    match readManifest(fileText(session, file as SourceFile), file) {
-        Ok(manifest) -> return listsText(imported, manifest.moduleRoot)
-        Error(_) -> return false
+    match resolvePackagePath(session, normalizedPath(named), sources) {
+        Some(package) -> match readCachedManifest(session, package.manifest, sources) {
+            Ok(manifest) -> return imported.contains(manifest.moduleRoot)
+            Error(_) -> return false
+        }
+        None -> return false
     }
 }
 
-function packageImports(session: Session, directory: String) -> Optional<[String]> {
-    var files: [Int] = []
-    let count = readDirectory(session, joinPath(directory, "app"), "kira")
-    for index in 0..count { files.append(source_directory_file(session, index)) }
-    var tree = SyntaxTree.empty()
-    tree.buildTarget = targetTriple(session)
-    var imported: [String] = []
-    for file in files {
-        match parseFile(move tree, fileText(session, file as SourceFile), file, 0) {
-            Ok(parsed) -> tree = parsed
-            // Discovery must not hide the sources whose ordinary parse will
-            // report the failure. Keep the graph conservative in that case.
-            Error(_) -> return .None
+function packageBundleManifestFile(session: Session, name: String, directory: String, borrow mut sources: PackageSourceIndex) -> Optional<Int> {
+    match sources.bundledFile(name) {
+        Some(cached) -> return cached.file
+        None -> {}
+    }
+    let file = readFile(session, joinPath(directory, "package.kira"))
+    if file < 0 {
+        sources.insertBundledFile(name, .None)
+        return .None
+    }
+    sources.insertBundledFile(name, .Some(file))
+    return .Some(file)
+}
+
+struct PackageSourceEntry {
+    let file: Int
+    let source: String
+    let imports: [String]
+    let lexed: Optional<Lexed>
+}
+
+struct PackageSourceDirectory {
+    let root: String
+    let files: [Int]
+}
+
+struct PackageManifestEntry {
+    let file: Int
+    let manifest: Manifest
+}
+
+struct PackageBundleEntry {
+    let name: String
+    let file: Optional<Int>
+}
+
+struct PackageManifestPathEntry {
+    let named: String
+    let package: Optional<PackageRoot>
+}
+
+struct PackageSourceIndex {
+    var buckets: [[PackageSourceEntry]]
+    var directories: [[PackageSourceDirectory]]
+    var manifests: [[PackageManifestEntry]]
+    var bundled: [[PackageBundleEntry]]
+    var packagePaths: [[PackageManifestPathEntry]]
+    var sourceBucketCount: Int
+    var sourceCount: Int
+    var directoryBucketCount: Int
+    var directoryCount: Int
+    var manifestBucketCount: Int
+    var manifestCount: Int
+    var bundleBucketCount: Int
+    var bundleCount: Int
+    var packagePathBucketCount: Int
+    var packagePathCount: Int
+
+    function value(borrow self, file: Int) -> Optional<PackageSourceEntry> {
+        let bucket = file % sourceBucketCount
+        for entry in buckets[bucket] {
+            if entry.file == file { return .Some(entry) }
+        }
+        return .None
+    }
+
+    function insert(borrow mut self, entry: PackageSourceEntry) {
+        let bucket = entry.file % sourceBucketCount
+        for index in 0..buckets[bucket].count {
+            if buckets[bucket][index].file == entry.file {
+                buckets[bucket][index] = entry
+                return
+            }
+        }
+        buckets[bucket].append(entry)
+        sourceCount += 1
+        if sourceCount > sourceBucketCount * 4 { resizeSources(sourceBucketCount * 2) }
+    }
+
+    function resizeSources(borrow mut self, size: Int) {
+        var grown: [[PackageSourceEntry]] = []
+        for bucket in 0..size {
+            let empty: [PackageSourceEntry] = []
+            grown.append(empty)
+        }
+        for bucket in buckets {
+            for entry in bucket { grown[entry.file % size].append(entry) }
+        }
+        buckets = grown
+        sourceBucketCount = size
+    }
+
+    function directoryFiles(borrow self, root: String) -> Optional<[Int]> {
+        let normalized = normalizedPath(root)
+        let bucket = nameHash(normalized) % directoryBucketCount
+        for directory in directories[bucket] {
+            if directory.root == normalized { return .Some(directory.files) }
+        }
+        return .None
+    }
+
+    function insertDirectory(borrow mut self, root: String, files: [Int]) {
+        let normalized = normalizedPath(root)
+        let bucket = nameHash(normalized) % directoryBucketCount
+        for index in 0..directories[bucket].count {
+            if directories[bucket][index].root == normalized {
+                directories[bucket][index] = PackageSourceDirectory { root = normalized, files = files }
+                return
+            }
+        }
+        directories[bucket].append(PackageSourceDirectory { root = normalized, files = files })
+        directoryCount += 1
+        if directoryCount > directoryBucketCount * 4 {
+            resizeDirectories(directoryBucketCount * 2)
         }
     }
+
+    function resizeDirectories(borrow mut self, size: Int) {
+        var grown: [[PackageSourceDirectory]] = []
+        for bucket in 0..size {
+            let empty: [PackageSourceDirectory] = []
+            grown.append(empty)
+        }
+        for bucket in directories {
+            for entry in bucket { grown[nameHash(entry.root) % size].append(entry) }
+        }
+        directories = grown
+        directoryBucketCount = size
+    }
+
+    function manifest(borrow self, file: Int) -> Optional<Manifest> {
+        let bucket = file % manifestBucketCount
+        for entry in manifests[bucket] {
+            if entry.file == file { return .Some(entry.manifest) }
+        }
+        return .None
+    }
+
+    function insertManifest(borrow mut self, file: Int, manifest: Manifest) {
+        let bucket = file % manifestBucketCount
+        for index in 0..manifests[bucket].count {
+            if manifests[bucket][index].file == file {
+                manifests[bucket][index] = PackageManifestEntry { file = file, manifest = manifest }
+                return
+            }
+        }
+        manifests[bucket].append(PackageManifestEntry { file = file, manifest = manifest })
+        manifestCount += 1
+        if manifestCount > manifestBucketCount * 4 {
+            resizeManifests(manifestBucketCount * 2)
+        }
+    }
+
+    function removeManifest(borrow mut self, file: Int) {
+        let bucket = file % manifestBucketCount
+        var retained: [PackageManifestEntry] = []
+        var removed = false
+        for entry in manifests[bucket] {
+            if entry.file != file { retained.append(entry) } else { removed = true }
+        }
+        manifests[bucket] = retained
+        if removed { manifestCount -= 1 }
+    }
+
+    function resizeManifests(borrow mut self, size: Int) {
+        var grown: [[PackageManifestEntry]] = []
+        for bucket in 0..size {
+            let empty: [PackageManifestEntry] = []
+            grown.append(empty)
+        }
+        for bucket in manifests {
+            for entry in bucket { grown[entry.file % size].append(entry) }
+        }
+        manifests = grown
+        manifestBucketCount = size
+    }
+
+    function bundledFile(borrow self, name: String) -> Optional<PackageBundleEntry> {
+        let bucket = nameHash(name) % bundleBucketCount
+        for entry in bundled[bucket] {
+            if entry.name == name { return .Some(entry) }
+        }
+        return .None
+    }
+
+    function insertBundledFile(borrow mut self, name: String, file: Optional<Int>) {
+        let bucket = nameHash(name) % bundleBucketCount
+        let entry = PackageBundleEntry { name = name, file = file }
+        for index in 0..bundled[bucket].count {
+            if bundled[bucket][index].name == name {
+                bundled[bucket][index] = entry
+                return
+            }
+        }
+        bundled[bucket].append(entry)
+        bundleCount += 1
+        if bundleCount > bundleBucketCount * 4 { resizeBundled(bundleBucketCount * 2) }
+    }
+
+    function resizeBundled(borrow mut self, size: Int) {
+        var grown: [[PackageBundleEntry]] = []
+        for bucket in 0..size {
+            let empty: [PackageBundleEntry] = []
+            grown.append(empty)
+        }
+        for bucket in bundled {
+            for entry in bucket { grown[nameHash(entry.name) % size].append(entry) }
+        }
+        bundled = grown
+        bundleBucketCount = size
+    }
+
+    function packagePath(borrow self, named: String) -> Optional<PackageManifestPathEntry> {
+        let bucket = nameHash(named) % packagePathBucketCount
+        for entry in packagePaths[bucket] {
+            if entry.named == named { return .Some(entry) }
+        }
+        return .None
+    }
+
+    function insertPackagePath(borrow mut self, named: String, package: Optional<PackageRoot>) {
+        let bucket = nameHash(named) % packagePathBucketCount
+        let entry = PackageManifestPathEntry { named = named, package = package }
+        for index in 0..packagePaths[bucket].count {
+            if packagePaths[bucket][index].named == named {
+                packagePaths[bucket][index] = entry
+                return
+            }
+        }
+        packagePaths[bucket].append(entry)
+        packagePathCount += 1
+        if packagePathCount > packagePathBucketCount * 4 {
+            resizePackagePaths(packagePathBucketCount * 2)
+        }
+    }
+
+    function resizePackagePaths(borrow mut self, size: Int) {
+        var grown: [[PackageManifestPathEntry]] = []
+        for bucket in 0..size {
+            let empty: [PackageManifestPathEntry] = []
+            grown.append(empty)
+        }
+        for bucket in packagePaths {
+            for entry in bucket { grown[nameHash(entry.named) % size].append(entry) }
+        }
+        packagePaths = grown
+        packagePathBucketCount = size
+    }
+}
+
+function emptyPackageSourceIndex(n: Int) -> PackageSourceIndex {
+    var buckets: [[PackageSourceEntry]] = []
+    var directories: [[PackageSourceDirectory]] = []
+    var manifests: [[PackageManifestEntry]] = []
+    var bundled: [[PackageBundleEntry]] = []
+    var packagePaths: [[PackageManifestPathEntry]] = []
+    let initialBucketCount = 32 + n / 4
+    for bucket in 0..initialBucketCount {
+        let empty: [PackageSourceEntry] = []
+        buckets.append(empty)
+        let emptyDirectories: [PackageSourceDirectory] = []
+        directories.append(emptyDirectories)
+        let emptyManifests: [PackageManifestEntry] = []
+        manifests.append(emptyManifests)
+        let emptyBundled: [PackageBundleEntry] = []
+        bundled.append(emptyBundled)
+        let emptyPackagePaths: [PackageManifestPathEntry] = []
+        packagePaths.append(emptyPackagePaths)
+    }
+    return PackageSourceIndex {
+        buckets = buckets, directories = directories, manifests = manifests,
+        bundled = bundled, packagePaths = packagePaths,
+        sourceBucketCount = initialBucketCount, sourceCount = 0,
+        directoryBucketCount = initialBucketCount, directoryCount = 0,
+        manifestBucketCount = initialBucketCount, manifestCount = 0,
+        bundleBucketCount = initialBucketCount, bundleCount = 0,
+        packagePathBucketCount = initialBucketCount, packagePathCount = 0
+    }
+}
+
+function readCachedManifest(session: Session, file: Int, borrow mut sources: PackageSourceIndex) -> Result<Manifest, Failure> {
+    match sources.manifest(file) {
+        Some(manifest) -> return .Ok(manifest)
+        None -> {}
+    }
+    let manifest = try readManifest(fileText(session, file as SourceFile), file)
+    sources.insertManifest(file, manifest)
+    return .Ok(manifest)
+}
+
+// Reuse parsed imports; packageImports handles unparsed sources.
+function seedPackageSourceIndex(tree: borrow SyntaxTree, borrow mut index: PackageSourceIndex) {
     for source in tree.sources {
-        for item in source.imports {
-            if !listsText(imported, item.name.text) { imported.append(item.name.text) }
+        var imports: [String] = []
+        for imported in source.imports { imports.append(imported.name.text) }
+        match index.value(source.file) {
+            Some(entry) -> match entry.lexed {
+                Some(lexed) -> index.insert(PackageSourceEntry {
+                    file = source.file, source = entry.source, imports = imports, lexed = .Some(lexed)
+                })
+                None -> index.insert(PackageSourceEntry {
+                    file = source.file, source = entry.source, imports = imports, lexed = .None
+                })
+            }
+            None -> index.insert(PackageSourceEntry {
+                file = source.file, source = "", imports = imports, lexed = .None
+            })
+        }
+    }
+}
+
+function packageAppFiles(session: Session, directory: String, borrow mut index: PackageSourceIndex) -> [Int] {
+    match index.directoryFiles(directory) {
+        Some(files) -> return files
+        None -> {}
+    }
+    var files: [Int] = []
+    let count = readDirectory(session, joinPath(directory, "app"), "kira")
+    for position in 0..count { files.append(source_directory_file(session, position)) }
+    index.insertDirectory(directory, files)
+    return files
+}
+
+function parsePackageSource(session: Session, move tree: SyntaxTree, file: Int, module: Int, borrow mut sources: PackageSourceIndex) -> Result<SyntaxTree, Failure> {
+    match sources.value(file) {
+        Some(entry) -> match entry.lexed {
+            Some(lexed) -> return parseFileLexed(move tree, entry.source, file, module, lexed)
+            None -> {}
+        }
+        None -> {}
+    }
+    let source = fileText(session, file as SourceFile)
+    match lexDocumented(source, file) {
+        Ok(lexed) -> {
+            sources.insert(PackageSourceEntry {
+                file = file, source = source, imports = [], lexed = .Some(lexed)
+            })
+            return parseFileLexed(move tree, source, file, module, lexed)
+        }
+        Error(failure) -> return .Error(failure)
+    }
+}
+
+function packageImports(session: Session, directory: String, borrow mut sources: PackageSourceIndex) -> Optional<DependencyNameSet> {
+    let files = packageAppFiles(session, directory, sources)
+    var imported = emptyDependencyNameSet()
+    for file in files {
+        match sources.value(file) {
+            Some(source) -> {
+                for name in source.imports { imported.insert(name) }
+            }
+            None -> match importsInSource(session, fileText(session, file as SourceFile), file) {
+                Some(source) -> {
+                    for name in source.imports { imported.insert(name) }
+                    sources.insert(source)
+                }
+                None -> return .None
+            }
         }
     }
     return .Some(imported)
 }
+
+// Read only import declarations during graph discovery. Full parsing happens
+// once later, when the package is added to the shared syntax tree.
+function importsInSource(session: Session, source: String, file: Int) -> Optional<PackageSourceEntry> {
+    match lexDocumented(source, file) {
+        Ok(lexed) -> {
+            let tokens = lexed.tokens
+            var imported = emptyDependencyNameSet()
+            var braces = 0
+            var parentheses = 0
+            var brackets = 0
+            var included = true
+            let building = buildPlatform(targetTriple(session))
+            for index in 0..tokens.count {
+                let kind = tokens[index].kind
+                if braces == 0 && parentheses == 0 && brackets == 0 && kind == .Import {
+                    let nameIndex = index + 1
+                    if nameIndex < tokens.count && tokens[nameIndex].kind == .Identifier {
+                        let nameToken = tokens[nameIndex]
+                        let name = utf8Slice(source, nameToken.span.start, nameToken.span.end)
+                        imported.insert(name)
+                        var option = nameIndex + 1
+                        if option < tokens.count && tokens[option].kind == .As { option += 2 }
+                        if option < tokens.count && tokens[option].kind == .Identifier && utf8Slice(source, tokens[option].span.start, tokens[option].span.end) == "on" {
+                            option += 1
+                            var named = false
+                            var reading = true
+                            while reading && option < tokens.count {
+                                if tokens[option].kind != .Identifier { break }
+                                let platform = utf8Slice(source, tokens[option].span.start, tokens[option].span.end)
+                                if platform != "tessera" && platform != "ios" && platform != "macos" && platform != "windows" && platform != "android" && platform != "linux" && platform != "web" && platform != "unknown" { return .None }
+                                if platform == building { named = true }
+                                option += 1
+                                if option < tokens.count && tokens[option].kind == .Comma { option += 1 }
+                                else { reading = false }
+                            }
+                            if !named { included = false }
+                        }
+                    }
+                }
+                if kind == .LeftBrace { braces += 1 }
+                else if kind == .RightBrace { braces -= 1 }
+                else if kind == .LeftParen { parentheses += 1 }
+                else if kind == .RightParen { parentheses -= 1 }
+                else if kind == .LeftBracket { brackets += 1 }
+                else if kind == .RightBracket { brackets -= 1 }
+            }
+            if !included { imported = emptyDependencyNameSet() }
+            return .Some(PackageSourceEntry {
+                file = file, source = source, imports = imported.values,
+                lexed = .Some(lexed)
+            })
+        }
+        Error(failure) -> return .None
+    }
+}
+                                                                 

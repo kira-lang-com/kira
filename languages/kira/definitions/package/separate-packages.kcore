@@ -1,97 +1,470 @@
-// Packages built as units of their own (KLF-RIDL sections 9.1 and 9.3).
-//
-// A program's build is one unit per package: the bundled Foundation, every
-// package its manifests reach by path, and the program itself, dependencies
-// first. Each unit checks and lowers the bodies of its own package, and only
-// declares what it calls of the others, whose units define it; the driver
-// merges the modules. An edit then re-runs the queries of the edited
-// package's unit, and every other unit is answered from the cache.
-//
-// A generic instance belongs to no package: the unit that names it builds it,
-// and two units building the same instance build the same function.
+// The package dependency graph is indexed once per program. Its graph nodes
+// provide both dependencies-first loading and reverse consumer discovery.
 
-// Whether this build splits the program into one unit per package. A format
-// run lays out one file, a framework is one binary of its own, a test build
-// runs the package's tests alone, and with an SDK a dependency may resolve
-// to the system's framework rather than its package.
-function splitsPackages(session: Session) -> Bool {
-    return !formatRun(session) && !frameworkBuild(session) && !testBuild(session) && utf8Count(sdkRoot(session)) == 0
+struct PackageModuleEntry {
+    let manifest: Int
+    let module: Int
 }
 
-// The packages a build of the package at `root` gives units of their own,
-// dependencies first: Foundation, then every package the manifests reach by
-// path, each once. A manifest that does not read is left to the load of the
-// package naming it to report.
-function separatePackages(session: Session, root: PackageRoot) -> [PackageRoot] {
-    var order: [PackageRoot] = []
-    var visiting: [String] = [normalizedPath(root.directory)]
+struct PackageModuleIndex {
+    var buckets: [[PackageModuleEntry]]
+    var bucketCount: Int
+    var entryCount: Int
+
+    function set(borrow mut self, manifest: Int, module: Int) {
+        let bucket = manifest % bucketCount
+        for entry in buckets[bucket] {
+            if entry.manifest == manifest { return }
+        }
+        buckets[bucket].append(PackageModuleEntry { manifest = manifest, module = module })
+        entryCount += 1
+        if entryCount > bucketCount * 4 { resize(bucketCount * 2) }
+    }
+
+    function value(borrow self, manifest: Int) -> Optional<Int> {
+        let bucket = manifest % bucketCount
+        for entry in buckets[bucket] {
+            if entry.manifest == manifest { return .Some(entry.module) }
+        }
+        return .None
+    }
+
+    function resize(borrow mut self, size: Int) {
+        var grown: [[PackageModuleEntry]] = []
+        for bucket in 0..size {
+            let empty: [PackageModuleEntry] = []
+            grown.append(empty)
+        }
+        for bucket in buckets {
+            for entry in bucket { grown[entry.manifest % size].append(entry) }
+        }
+        buckets = grown
+        bucketCount = size
+    }
+}
+
+function emptyPackageModuleIndex(n: Int) -> PackageModuleIndex {
+    var buckets: [[PackageModuleEntry]] = []
+    let initialBucketCount = 32 + n / 4
+    for bucket in 0..initialBucketCount {
+        let empty: [PackageModuleEntry] = []
+        buckets.append(empty)
+    }
+    return PackageModuleIndex { buckets = buckets, bucketCount = initialBucketCount, entryCount = 0 }
+}
+
+
+struct ModuleSet {
+    var values: [Int]
+    var buckets: [[Int]]
+    var bucketCount: Int
+    var indexed: Bool
+
+    function contains(borrow self, value: Int) -> Bool {
+        if !indexed {
+            for earlier in values { if earlier == value { return true } }
+            return false
+        }
+        for earlier in buckets[value % bucketCount] {
+            if earlier == value { return true }
+        }
+        return false
+    }
+
+    function insert(borrow mut self, value: Int) {
+        if self.contains(value) { return }
+        values.append(value)
+        if !indexed {
+            if values.count > 16 { self.resize(32) }
+            return
+        }
+        buckets[value % bucketCount].append(value)
+        if values.count > bucketCount * 4 { self.resize(bucketCount * 2) }
+    }
+
+    function resize(borrow mut self, size: Int) {
+        var grown: [[Int]] = []
+        for bucket in 0..size {
+            let empty: [Int] = []
+            grown.append(empty)
+        }
+        for value in values { grown[value % size].append(value) }
+        buckets = grown
+        bucketCount = size
+        indexed = true
+    }
+}
+
+function emptyModuleSet() -> ModuleSet {
+    return ModuleSet { values = [], buckets = [], bucketCount = 0, indexed = false }
+}
+
+
+struct DependencyNameSet {
+    var values: [String]
+    var buckets: [[String]]
+    var bucketCount: Int
+    var indexed: Bool
+
+    function contains(borrow self, value: String) -> Bool {
+        if !indexed {
+            for earlier in values { if earlier == value { return true } }
+            return false
+        }
+        for earlier in buckets[nameHash(value) % bucketCount] {
+            if earlier == value { return true }
+        }
+        return false
+    }
+
+    function insert(borrow mut self, value: String) {
+        if self.contains(value) { return }
+        values.append(value)
+        if !indexed {
+            if values.count > 16 { self.resize(32) }
+            return
+        }
+        buckets[nameHash(value) % bucketCount].append(value)
+        if values.count > bucketCount * 4 { self.resize(bucketCount * 2) }
+    }
+
+    function resize(borrow mut self, size: Int) {
+        var grown: [[String]] = []
+        for bucket in 0..size {
+            let empty: [String] = []
+            grown.append(empty)
+        }
+        for value in values { grown[nameHash(value) % size].append(value) }
+        buckets = grown
+        bucketCount = size
+        indexed = true
+    }
+}
+
+function emptyDependencyNameSet() -> DependencyNameSet {
+    return DependencyNameSet { values = [], buckets = [], bucketCount = 0, indexed = false }
+}
+
+struct PackageGraphNode {
+    let path: String
+    let package: PackageRoot
+    var dependencies: [Int]
+    var consumers: [Int]
+    var program: Bool
+    var related: Bool
+    var consumerVisited: Bool
+    var dependencyVisited: Bool
+}
+
+struct PackageDependencyIndex {
+    var nodes: [PackageGraphNode]
+    var buckets: [[Int]]
+    var pending: [Int]
+    var bucketCount: Int
+
+    function resize(borrow mut self, size: Int) {
+        var grown: [[Int]] = []
+        for bucket in 0..size {
+            let empty: [Int] = []
+            grown.append(empty)
+        }
+        for node in 0..nodes.count {
+            grown[nameHash(nodes[node].path) % size].append(node)
+        }
+        self.buckets = grown
+        self.bucketCount = size
+    }
+
+    function position(borrow self, path: String) -> Optional<Int> {
+        let bucket = nameHash(path) % bucketCount
+        for node in buckets[bucket] {
+            if nodes[node].path == path { return .Some(node) }
+        }
+        return .None
+    }
+
+    function enqueue(borrow mut self, package: PackageRoot, path: String, program: Bool) -> Int {
+        let bucket = nameHash(path) % bucketCount
+        for node in buckets[bucket] {
+            if nodes[node].path == path {
+                if program && !nodes[node].program { nodes[node].program = true }
+                return node
+            }
+        }
+        let node = nodes.count
+        nodes.append(PackageGraphNode {
+            path = path, package = package, dependencies = [], consumers = [],
+            program = program, related = false, consumerVisited = false,
+            dependencyVisited = false
+        })
+        buckets[bucket].append(node)
+        pending.append(node)
+        if nodes.count > bucketCount * 4 { resize(bucketCount * 2) }
+        return node
+    }
+
+    function pathAt(borrow self, node: Int) -> String {
+        return nodes[node].path
+    }
+
+    function packageAt(borrow self, node: Int) -> PackageRoot {
+        return nodes[node].package
+    }
+
+    function dependenciesFor(borrow self, node: Int) -> [Int] {
+        return nodes[node].dependencies
+    }
+
+    function consumersFor(borrow self, node: Int) -> [Int] {
+        return nodes[node].consumers
+    }
+
+    function addConsumer(borrow mut self, dependency: Int, consumer: Int) {
+        nodes[dependency].consumers.append(consumer)
+    }
+
+    function programRoot(borrow self, node: Int) -> Bool {
+        return nodes[node].program
+    }
+
+    function isRelated(borrow self, node: Int) -> Bool {
+        return nodes[node].related
+    }
+
+    function markRelated(borrow mut self, node: Int) {
+        nodes[node].related = true
+    }
+
+    function consumerVisited(borrow self, node: Int) -> Bool {
+        return nodes[node].consumerVisited
+    }
+
+    function markConsumerVisited(borrow mut self, node: Int) {
+        nodes[node].consumerVisited = true
+    }
+
+    function dependencyVisited(borrow self, node: Int) -> Bool {
+        return nodes[node].dependencyVisited
+    }
+
+    function markDependencyVisited(borrow mut self, node: Int) {
+        nodes[node].dependencyVisited = true
+    }
+}
+
+function emptyPackageDependencyIndex(expectedNodes: Int) -> PackageDependencyIndex {
+    var buckets: [[Int]] = []
+    let initialBucketCount = 32 + expectedNodes / 4
+    for bucket in 0..initialBucketCount {
+        let empty: [Int] = []
+        buckets.append(empty)
+    }
+    return PackageDependencyIndex { nodes = [], buckets = buckets, pending = [], bucketCount = initialBucketCount }
+}
+
+function directPackageDependencies(session: Session, package: PackageRoot, packagePath: String, packageNode: Int, borrow mut sources: PackageSourceIndex, borrow mut index: PackageDependencyIndex) {
+    match readCachedManifest(session, package.manifest, sources) {
+        Ok(manifest) -> {
+            let imported = packageImports(session, package.directory, sources)
+            for dependency in manifest.dependencies {
+                if dependency.source != .Path { continue }
+                match imported {
+                    Some(names) -> { if !importsDependency(session, package.directory, names, dependency, sources) { continue } }
+                    None -> {}
+                }
+                let named = normalizedPath(joinPath(package.directory, dependency.path))
+                if named == packagePath { continue }
+                match index.position(named) {
+                    Some(dependencyNode) -> {
+                        if dependencyNode != packageNode {
+                            index.nodes[packageNode].dependencies.append(dependencyNode)
+                            index.addConsumer(dependencyNode, packageNode)
+                        }
+                        continue
+                    }
+                    None -> {}
+                }
+                match resolvePackagePath(session, named, sources) {
+                    Some(resolved) -> {
+                        let dependencyNode = index.enqueue(resolved, resolved.directory, false)
+                        if dependencyNode != packageNode {
+                            index.nodes[packageNode].dependencies.append(dependencyNode)
+                            index.addConsumer(dependencyNode, packageNode)
+                        }
+                    }
+                    None -> {}
+                }
+            }
+        }
+        Error(failure) -> {}
+    }
+}
+
+function packageDependencyGraph(session: Session, packages: [PackageRoot], own: PackageRoot, borrow mut sources: PackageSourceIndex) -> PackageDependencyIndex {
+    var index = emptyPackageDependencyIndex(packages.count + 2)
+    for package in packages { index.enqueue(package, normalizedPath(package.directory), true) }
+    index.enqueue(own, normalizedPath(own.directory), false)
     let std = stdRoot(session)
     if utf8Count(std) > 0 {
         let directory = joinPath(std, "Foundation")
         let manifest = readFile(session, joinPath(directory, "package.kira"))
-        if manifest >= 0 && manifest != root.manifest && !listsText(visiting, normalizedPath(directory)) {
-            let foundation = PackageRoot { directory = directory, manifest = manifest }
-            visiting.append(normalizedPath(directory))
-            appendDependencies(session, foundation, order, visiting)
-            order.append(foundation)
+        if manifest >= 0 && manifest != own.manifest {
+            index.enqueue(PackageRoot { directory = directory, manifest = manifest }, normalizedPath(directory), false)
         }
     }
-    appendDependencies(session, root, order, visiting)
+    var cursor = 0
+    while cursor < index.pending.count {
+        let node = index.pending[cursor]
+        cursor += 1
+        let package = index.packageAt(node)
+        let path = index.pathAt(node)
+        directPackageDependencies(session, package, path, node, sources, index)
+    }
+    return index
+}
+
+function appendIndexedDependencies(
+    borrow mut index: PackageDependencyIndex,
+    root: Int,
+    output: borrow mut [PackageRoot]
+) {
+    var stackRoots: [Int] = [root]
+    var nextDependencies: [Int] = [0]
+    index.markDependencyVisited(root)
+    var depth = 1
+    while depth > 0 {
+        let frame = depth - 1
+        let current = stackRoots[frame]
+        let dependencies = index.dependenciesFor(current)
+        let childIndex = nextDependencies[frame]
+        if childIndex < dependencies.count {
+            let child = dependencies[childIndex]
+            nextDependencies[frame] = childIndex + 1
+            if index.dependencyVisited(child) { continue }
+            index.markDependencyVisited(child)
+            if depth < stackRoots.count {
+                stackRoots[depth] = child
+                nextDependencies[depth] = 0
+            } else {
+                stackRoots.append(child)
+                nextDependencies.append(0)
+            }
+            depth += 1
+            continue
+        }
+        depth -= 1
+        if current == root { continue }
+        output.append(index.packageAt(current))
+    }
+}
+
+function indexedPackageDependencies(session: Session, borrow mut index: PackageDependencyIndex, root: PackageRoot) -> [PackageRoot] {
+    var order: [PackageRoot] = []
+    let rootPath = normalizedPath(root.directory)
+    match index.position(rootPath) {
+        Some(rootNode) -> index.markDependencyVisited(rootNode)
+        None -> return order
+    }
+    let std = stdRoot(session)
+    if utf8Count(std) > 0 {
+        let directory = joinPath(std, "Foundation")
+        let manifest = readFile(session, joinPath(directory, "package.kira"))
+        let normalized = normalizedPath(directory)
+        if manifest >= 0 && manifest != root.manifest {
+            match index.position(normalized) {
+                Some(foundation) -> {
+                    if !index.dependencyVisited(foundation) {
+                        appendIndexedDependencies(index, foundation, order)
+                        order.append(index.packageAt(foundation))
+                    }
+                }
+                None -> {}
+            }
+        }
+    }
+    match index.position(rootPath) {
+        Some(rootNode) -> appendIndexedDependencies(index, rootNode, order)
+        None -> {}
+    }
     return order
 }
 
-function appendDependencies(session: Session, package: PackageRoot, order: borrow mut [PackageRoot], visiting: borrow mut [String]) {
-    match readManifest(fileText(session, package.manifest as SourceFile), package.manifest) {
-        Ok(manifest) -> {
-            let imported = packageImports(session, package.directory)
-            for dependency in manifest.dependencies {
-                if dependency.source != .Path { continue }
-                match imported {
-                    Some(names) -> { if !importsDependency(session, package.directory, names, dependency) { continue } }
-                    None -> {}
-                }
-                let named = joinPath(package.directory, dependency.path)
-                let manifestFile = readFile(session, joinPath(named, "package.kira"))
-                if manifestFile < 0 { continue }
-                let directory = bundledDirectory(session, named, manifestFile)
-                let normalized = normalizedPath(directory)
-                if listsPackage(order, normalized) || listsText(visiting, normalized) { continue }
-                let file = readFile(session, joinPath(directory, "package.kira"))
-                visiting.append(normalized)
-                let found = PackageRoot { directory = directory, manifest = file }
-                appendDependencies(session, found, order, visiting)
-                order.append(found)
+function relatedPackages(session: Session, packages: [PackageRoot], own: PackageRoot, borrow mut sources: PackageSourceIndex) -> [PackageRoot] {
+    var graphPackages = packages
+    let bundled = bundledRoot(session, own.directory)
+    if bundled { graphPackages = [] }
+    var index = packageDependencyGraph(session, graphPackages, own, sources)
+    var related: [PackageRoot] = [own]
+    for dependency in indexedPackageDependencies(session, index, own) { related.append(dependency) }
+    if bundled { return related }
+    var queue: [Int] = []
+    for package in related {
+        let path = normalizedPath(package.directory)
+        match index.position(path) {
+            Some(node) -> {
+                index.markRelated(node)
+                if bundledRoot(session, path) || index.consumerVisited(node) { continue }
+                index.markConsumerVisited(node)
+                queue.append(node)
             }
+            None -> {}
         }
-        Error(failure) -> {}
     }
+    var cursor = 0
+    while cursor < queue.count {
+        let dependency = queue[cursor]
+        cursor += 1
+        let consumers = index.consumersFor(dependency)
+        for consumer in consumers {
+            if index.consumerVisited(consumer) { continue }
+            index.markConsumerVisited(consumer)
+            queue.append(consumer)
+            if !index.programRoot(consumer) || index.isRelated(consumer) { continue }
+            index.markRelated(consumer)
+            related.append(index.packageAt(consumer))
+        }
+    }
+    return related
 }
 
-// Where a path dependency on the package at `directory` loads from: the
-// package the toolchain bundles when `directory` is it, spelled another way
-// (a relative path), or holds a copy of it with the same manifest (the
-// repository's std reached from a toolchain that ships its own), so one
-// program holds one Foundation, spelled one way; else `directory` itself.
-function bundledDirectory(session: Session, directory: String, file: Int) -> String {
+function resolvePackagePath(session: Session, named: String, borrow mut sources: PackageSourceIndex) -> Optional<PackageRoot> {
+    match sources.packagePath(named) {
+        Some(cached) -> return cached.package
+        None -> {}
+    }
+    let manifestFile = readFile(session, joinPath(named, "package.kira"))
+    if manifestFile < 0 {
+        sources.insertPackagePath(named, .None)
+        return .None
+    }
+    let directory = normalizedPath(bundledDirectory(session, named, manifestFile, sources))
+    let file = packageManifestFile(session, named, manifestFile, directory)
+    let resolved = PackageRoot { directory = directory, manifest = file }
+    sources.insertPackagePath(named, .Some(resolved))
+    return .Some(resolved)
+}
+
+function bundledDirectory(session: Session, directory: String, file: Int, borrow mut sources: PackageSourceIndex) -> String {
     let std = stdRoot(session)
     if utf8Count(std) == 0 { return directory }
-    match readManifest(fileText(session, file as SourceFile), file) {
+    match readCachedManifest(session, file, sources) {
         Ok(manifest) -> {
-            let bundled = joinPath(std, manifest.moduleRoot)
-            let shipped = readFile(session, joinPath(bundled, "package.kira"))
-            if shipped >= 0 && (shipped == file || fileText(session, shipped as SourceFile) == fileText(session, file as SourceFile)) {
-                return bundled
+            let bundled = normalizedPath(joinPath(std, manifest.moduleRoot))
+            if bundled == normalizedPath(directory) { return directory }
+            match packageBundleManifestFile(session, manifest.moduleRoot, bundled, sources) {
+                Some(shipped) -> {
+                    if shipped == file || fileText(session, shipped as SourceFile) == fileText(session, file as SourceFile) {
+                        return bundled
+                    }
+                }
+                None -> {}
             }
         }
-        Error(failure) -> {}
+        Error(_) -> {}
     }
     return directory
 }
 
-// Whether the package at `root`, whose manifest is `manifest` and names the
-// module `name`, is one the toolchain bundles: under the bundled packages'
-// directory, or, reached by a path spelled another way, the same manifest
-// file as the bundled package of that name.
 function bundledPackage(session: Session, root: String, name: String, manifest: Int) -> Bool {
     let std = stdRoot(session)
     if utf8Count(std) == 0 { return false }
@@ -99,44 +472,23 @@ function bundledPackage(session: Session, root: String, name: String, manifest: 
     return readFile(session, joinPath(joinPath(std, name), "package.kira")) == manifest
 }
 
-function listsPackage(packages: [PackageRoot], normalized: String) -> Bool {
-    for package in packages {
-        if normalizedPath(package.directory) == normalized { return true }
+function listsText(texts: [String], wanted: String) -> Bool {
+    for text in texts {
+        if text == wanted { return true }
     }
     return false
 }
 
-function listsText(texts: [String], wanted: String) -> Bool {
-    return textPosition(texts, wanted) >= 0
-}
-
-// Where `wanted` is among `texts`, or -1.
-function textPosition(texts: [String], wanted: String) -> Int {
-    for index in 0..texts.count {
-        if texts[index] == wanted { return index }
-    }
-    return -1
-}
-
-// The units of the programs whose entries are `entries`: one per package
-// they build apart, each once, then each entry's own.
+// The input program has one compilation unit. Package roots remain separate
+// modules in its shared compilation graph.
 function programUnits(session: Session, entries: [SourceFile]) -> [Unit] {
-    var units: [Unit] = []
-    if splitsPackages(session) {
-        var built: [PackageRoot] = []
-        for entry in entries {
-            match findPackage(session, directoryOf(fileName(session, entry))) {
-                Some(package) -> {
-                    for dependency in separatePackages(session, package) {
-                        if listsPackage(built, normalizedPath(dependency.directory)) { continue }
-                        built.append(dependency)
-                        units.append(definition_unit(session, dependency.manifest as SourceFile))
-                    }
-                }
-                None -> {}
-            }
-        }
-    }
-    for entry in entries { units.append(definition_unit(session, entry)) }
-    return units
+    if entries.count == 0 { return [] }
+    return [definition_unit(session, entries[0])]
 }
+
+
+function packageManifestFile(session: Session, named: String, manifest: Int, directory: String) -> Int {
+    if normalizedPath(named) == normalizedPath(directory) { return manifest }
+    return readFile(session, joinPath(directory, "package.kira"))
+}
+                                                                                                                                                                                                                                             

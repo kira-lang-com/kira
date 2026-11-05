@@ -98,24 +98,111 @@ function inputsDirectory(session: Session, inputs: [SourceFile]) -> String {
     return directory
 }
 
-// The package `path` belongs to: the nearest directory at or under `top`
-// holding a `package.kira`, or none.
-function packageRootOf(session: Session, path: String, top: String) -> Optional<String> {
-    var directory = directoryOf(path)
+struct PackageRootCacheEntry {
+    let directory: String
+    let package: Optional<PackageRoot>
+}
+
+struct PackageRootCache {
+    var buckets: [[PackageRootCacheEntry]]
+    var bucketCount: Int
+    var entryCount: Int
+
+    function value(borrow self, directory: String) -> Optional<PackageRootCacheEntry> {
+        let bucket = nameHash(directory) % bucketCount
+        for entry in buckets[bucket] {
+            if entry.directory == directory { return .Some(entry) }
+        }
+        return .None
+    }
+
+    function insertMissing(borrow mut self, directory: String, package: Optional<PackageRoot>) {
+        let bucket = nameHash(directory) % bucketCount
+        buckets[bucket].append(PackageRootCacheEntry { directory = directory, package = package })
+        entryCount += 1
+        if entryCount > bucketCount * 4 { resize(bucketCount * 2) }
+    }
+
+    function resize(borrow mut self, size: Int) {
+        var grown: [[PackageRootCacheEntry]] = []
+        for index in 0..size {
+            let empty: [PackageRootCacheEntry] = []
+            grown.append(empty)
+        }
+        for bucket in buckets {
+            for entry in bucket {
+                grown[nameHash(entry.directory) % size].append(entry)
+            }
+        }
+        buckets = grown
+        bucketCount = size
+    }
+}
+
+function emptyPackageRootCache() -> PackageRootCache {
+    var buckets: [[PackageRootCacheEntry]] = []
+    let initialBucketCount = 32
+    for index in 0..initialBucketCount {
+        let empty: [PackageRootCacheEntry] = []
+        buckets.append(empty)
+    }
+    return PackageRootCache { buckets = buckets, bucketCount = initialBucketCount, entryCount = 0 }
+}
+
+function packageSearchTop(directory: String) -> String {
+    let root = rootLength(directory)
+    if root == 1 { return "/" }
+    if root == 3 { return utf8Slice(directory, 0, root) }
+    return "."
+}
+
+// The nearest package root for a file, within `top`, or none.
+function packageRootOf(session: Session, path: String, top: String, borrow mut cache: PackageRootCache) -> Optional<String> {
+    match packageRootDirectoryOf(session, directoryOf(path), top, cache) {
+        Some(package) -> return .Some(package.directory)
+        None -> return .None
+    }
+}
+
+// The package `directory` belongs to: the nearest directory at or under `top`
+// holding a `package.kira`, or none. Checked directories and manifest IDs are
+// reused for the rest of this input set.
+function packageRootDirectoryOf(session: Session, start: String, top: String, borrow mut cache: PackageRootCache) -> Optional<PackageRoot> {
+    var directory = start
+    var checked: [String] = []
     while true {
-        if readFile(session, joinPath(directory, "package.kira")) >= 0 { return .Some(directory) }
-        if directory == top { return .None }
+        match cache.value(directory) {
+            Some(cached) -> {
+                for earlier in checked { cache.insertMissing(earlier, cached.package) }
+                return cached.package
+            }
+            None -> {}
+        }
+        let manifest = readFile(session, joinPath(directory, "package.kira"))
+        if manifest >= 0 {
+            let package: Optional<PackageRoot> = .Some(PackageRoot { directory = directory, manifest = manifest })
+            cache.insertMissing(directory, package)
+            for earlier in checked { cache.insertMissing(earlier, package) }
+            return package
+        }
+        checked.append(directory)
+        if directory == top {
+            for earlier in checked { cache.insertMissing(earlier, .None) }
+            return .None
+        }
         let parent = directoryOf(directory)
-        if parent == directory { return .None }
+        if parent == directory {
+            for earlier in checked { cache.insertMissing(earlier, .None) }
+            return .None
+        }
         directory = parent
     }
     return .None
 }
 
-// One unit for each package `inputs` come from that no other of them depends
-// on, named by its first file under that package's `app/`, after the units of
-// the packages they depend on (`separate-packages.klfd`). A manifest stands
-// for nothing of its own. None when a file lies
+// One unit for each program root among `inputs`, named by its first file
+// under that package's `app/`. Package dependencies stay in that root's graph.
+// None when a file lies
 // outside every package, or a package has no `app/` file.
 // The nearest directory at or above `directory` holding a `package.kira`, or
 // `directory` itself when none does.
@@ -133,10 +220,12 @@ function enclosingPackageDirectory(session: Session, directory: String) -> Strin
 function packageUnits(session: Session, inputs: [SourceFile], top: String) -> Optional<[Unit]> {
     var roots: [String] = []
     var entries: [SourceFile] = []
+    var rootIndex = emptyNameSet()
+    var rootCache = emptyPackageRootCache()
     for input in inputs {
         let name = fileName(session, input)
         var root = ""
-        match packageRootOf(session, name, top) {
+        match packageRootOf(session, name, top, rootCache) {
             Some(found) -> root = found
             None -> return .None
         }
@@ -147,40 +236,39 @@ function packageUnits(session: Session, inputs: [SourceFile], top: String) -> Op
         if startsWithText(normalizedPath(name), tests) { continue }
         let app = joinPath(normalizedPath(joinPath(root, "app")), "")
         if !startsWithText(normalizedPath(name), app) { return .None }
-        var seen = false
-        for known in roots {
-            if known == root { seen = true }
-        }
-        if !seen {
+        root = normalizedPath(root)
+        if !rootIndex.contains(root) {
+            rootIndex.insert(root)
             roots.append(root)
             entries.append(input)
         }
     }
+    let needed = packagesNeededByAnother(session, roots, rootIndex)
     var kept: [SourceFile] = []
     for index in 0..roots.count {
-        if !neededByAnother(session, roots, index) { kept.append(entries[index]) }
+        if !needed.contains(roots[index]) { kept.append(entries[index]) }
     }
     if kept.count == 0 { return .None }
     return .Some(programUnits(session, kept))
 }
 
-// Whether a package in `roots` other than `roots[index]` names it as a path
-// dependency. A manifest that does not read is left to the package's own
-// load to report.
-function neededByAnother(session: Session, roots: [String], index: Int) -> Bool {
-    let wanted = normalizedPath(roots[index])
-    for other in 0..roots.count {
-        if other == index { continue }
-        let file = readFile(session, joinPath(roots[other], "package.kira"))
+// Index path dependencies among the input packages in one manifest pass.
+// A manifest that does not read is left to the package's own load to report.
+function packagesNeededByAnother(session: Session, roots: [String], rootIndex: NameSet) -> NameSet {
+    var needed = emptyNameSet()
+    for root in roots {
+        let file = readFile(session, joinPath(root, "package.kira"))
         if file < 0 { continue }
         match readManifest(fileText(session, file as SourceFile), file) {
             Ok(manifest) -> {
                 for dependency in manifest.dependencies {
-                    if normalizedPath(joinPath(roots[other], dependency.path)) == wanted { return true }
+                    let target = normalizedPath(joinPath(root, dependency.path))
+                    if target != root && rootIndex.contains(target) { needed.insert(target) }
                 }
             }
             Error(failure) -> {}
         }
     }
-    return false
+    return needed
 }
+                                                                                                                                                                                                              

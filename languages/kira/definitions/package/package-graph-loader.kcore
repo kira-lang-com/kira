@@ -1,0 +1,152 @@
+// Iterative package loading keeps dependency depth out of the compiler call
+// stack and stores direct edges in one shared module graph.
+
+extend Loader {
+    // Parses the package at `root` as a new module and loads what it imports.
+    // The module's index.
+    function loadPackage(borrow mut self, root: String, manifestFile: Int) -> Result<Int, Failure> {
+        match loadedModules.value(manifestFile) {
+            Some(module) -> return .Ok(module)
+            None -> {}
+        }
+        let manifest = try readCachedManifest(session, manifestFile, packageSources)
+        let module = registerPackage(root, manifestFile, manifest)
+        return loadPackageSources(root, manifestFile, manifest, module)
+    }
+
+    function registerPackage(borrow mut self, root: String, manifestFile: Int, manifest: Manifest) -> Int {
+        let module = tree.modules.count
+        let rootPath = normalizedPath(root)
+        var package = ""
+        if module > 0 { package = joinText([manifest.name.text, "@", manifest.version, "#", rootPath]) }
+        tree.modules.append(Module {
+            name = manifest.moduleRoot, root = root, manifest = .Some(manifestFile),
+            package = package, library = manifest.library, loading = true, libraries = [],
+            separate = false, apartPosition = -1,
+            namedApart = module > 0 && !bundledPackage(session, root, manifest.moduleRoot, manifestFile),
+            compileTime = listsText(compileTime, manifest.moduleRoot),
+            systemCalls = manifest.systemCalls
+        })
+        loadedRoots.insert(rootPath)
+        loadedModules.set(manifestFile, module)
+        return module
+    }
+
+    function queuePackage(borrow mut self, root: String, manifestFile: Int) -> Result<Int, Failure> {
+        match loadedModules.value(manifestFile) {
+            Some(module) -> return .Ok(module)
+            None -> {}
+        }
+        let manifest = try readCachedManifest(session, manifestFile, packageSources)
+        let module = registerPackage(root, manifestFile, manifest)
+        pendingPackages.append(PendingPackage {
+            root = root, manifestFile = manifestFile, manifest = manifest, module = module
+        })
+        return .Ok(module)
+    }
+
+    // Parses the queued modules in insertion order; dependencies may add more
+    // work to the tail, so graph depth does not affect stack depth.
+    function loadQueuedPackages(borrow mut self) -> Result<Bool, Failure> {
+        var cursor = 0
+        while cursor < pendingPackages.count {
+            let pending = pendingPackages[cursor]
+            cursor += 1
+            try loadPackageSources(pending.root, pending.manifestFile, pending.manifest, pending.module)
+        }
+        let loaded = cursor > 0
+        pendingPackages = []
+        return .Ok(loaded)
+    }
+
+    function loadPendingPackages(borrow mut self) -> Result<Bool, Failure> {
+        var loaded = false
+        while true {
+            if pendingPackages.count > 0 {
+                let parsed = try loadQueuedPackages()
+                if parsed { loaded = true }
+            }
+            try resolvePendingImports()
+            if pendingPackages.count == 0 { break }
+        }
+        deferPackageDependencies = false
+        return .Ok(loaded)
+    }
+
+    function resolvePendingImports(borrow mut self) -> Result<Bool, Failure> {
+        var resolved = false
+        for index in 0..tree.sources.count {
+            let module = tree.sources[index].module
+            if module < 0 || module >= tree.modules.count { continue }
+            var imports: [Import] = []
+            for imported in tree.sources[index].imports {
+                match imported.module {
+                    Some(_) -> imports.append(imported)
+                    None -> {
+                        imports.append(Import {
+                            name = imported.name, alias = imported.alias,
+                            module = .Some(try resolveImport(imported, tree.modules[module].libraries))
+                        })
+                        resolved = true
+                    }
+                }
+            }
+            tree.sources[index].imports = imports
+        }
+        return .Ok(resolved)
+    }
+
+    function loadPackageSources(borrow mut self, root: String, manifestFile: Int, manifest: Manifest, module: Int) -> Result<Int, Failure> {
+        try addNativeLibraries(root, manifest)
+        addAssets(root, manifest)
+        let first = tree.sources.count
+        var files = packageAppFiles(session, root, packageSources)
+        let count = files.count
+        let testCount = testDirectoryCount(session, joinPath(root, "tests"), tree.testing && module == 0)
+        // The package under test joins its tests to its own namespace. A
+        // dependency's tests are never read; test-only packages use tests
+        // when their app directory is empty.
+        if testCount > 0 {
+            for index in 0..testCount { files.append(source_directory_file(session, index)) }
+        }
+        if count <= 0 && testCount <= 0 { return .Error(Failure { diagnostic = .NoSources, span = manifest.name.span }) }
+        for library in manifest.nativeLibraries {
+            if utf8Count(library.klffi) > 0 {
+                let file = readFile(session, joinPath(root, library.klffi))
+                if file < 0 {
+                    return .Error(Failure { diagnostic = .NativeDeclarationsUnreadable, span = library.klffiSpan })
+                }
+                files.append(file)
+            }
+            for file in try autobound(root, manifestFile, library) { files.append(file) }
+        }
+        for file in files {
+            let macros = tree.proceduralMacros.count
+            let functions = tree.functions.count
+            let sources = tree.sources.count
+            tree = try parsePackageSource(session, move tree, file, module, packageSources)
+            if tree.sources.count > sources && (tree.modules[module].compileTime || declaresCompileTime(tree, macros, functions)) {
+                for imported in tree.sources[sources].imports {
+                    if !listsText(compileTime, imported.name.text) { compileTime.append(imported.name.text) }
+                }
+            }
+        }
+        let last = tree.sources.count
+        let libraries = try loadDependencies(root, manifest, first, last)
+        tree.modules[module].libraries = libraries
+        if !deferPackageDependencies {
+            for index in first..last {
+                var imports: [Import] = []
+                for imported in tree.sources[index].imports {
+                    imports.append(Import {
+                        name = imported.name, alias = imported.alias,
+                        module = .Some(try resolveImport(imported, libraries))
+                    })
+                }
+                tree.sources[index].imports = imports
+            }
+        }
+        tree.modules[module].loading = false
+        return .Ok(module)
+    }
+}

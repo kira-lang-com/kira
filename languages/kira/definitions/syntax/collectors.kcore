@@ -8,14 +8,22 @@
 function runCollectors(session: Session, unit: Unit, tree: SyntaxTree) -> Result<SyntaxTree, Failure> {
     var collected = tree
     var declarations = ""
+    var tests = ""
     for declared in tree.proceduralMacros {
         match declared.kind {
             MacroCollector -> {
                 // The test runner contributes an entrypoint only to test
                 // builds; normal library builds must not evaluate its macro.
                 if tree.testing || declared.name.text != "TestRunner" {
-                    if declarations == "" { declarations = collectedDeclarations(session, tree) }
-                    let file = try evaluateSourceMacroArguments(session, unit, collected, declared, [declarations], declared.name.span)
+                    var reflected = declarations
+                    if declared.name.text == "TestRunner" {
+                        if tests == "" { tests = collectedDeclarations(session, tree, true) }
+                        reflected = tests
+                    } else {
+                        if declarations == "" { declarations = collectedDeclarations(session, tree, false) }
+                        reflected = declarations
+                    }
+                    let file = try evaluateSourceMacroArguments(session, unit, collected, declared, [reflected], declared.name.span)
                     collected = try parseCollected(session, collected, file, declared)
                 }
             }
@@ -75,15 +83,28 @@ function sameImport(left: Import, right: Import) -> Bool {
 // The `[Declaration]` a collector is handed, written as Kira source that
 // decodes it: each file of the program's own modules in the order it was
 // read, each declaration in the order its file writes it.
-function collectedDeclarations(session: Session, tree: SyntaxTree) -> String {
+function collectedDeclarations(session: Session, tree: SyntaxTree, testsOnly: Bool) -> String {
     var parts: [String] = []
+    var lastFile = 0
+    for unit in tree.sources { if unit.file > lastFile { lastFile = unit.file } }
+    var sitesByFile: [[DeclarationSite]] = []
+    for _ in 0..lastFile + 1 {
+        let empty: [DeclarationSite] = []
+        sitesByFile.append(empty)
+    }
+    for site in tree.declarationSites {
+        let file = site.span.file
+        if file >= 0 && file < sitesByFile.count { sitesByFile[file].append(site) }
+    }
     for unit in tree.sources {
         if !ownModule(tree, unit.module) { continue }
-        var sites: [DeclarationSite] = []
-        for site in tree.declarationSites { if site.span.file == unit.file { sites.append(site) } }
+        let sites = sitesByFile[unit.file]
         if sites.count == 0 { continue }
         let source = fileText(session, unit.file as SourceFile)
-        for site in sites { parts.append(encodedDeclaration(tree, source, site)) }
+        for site in sites {
+            if testsOnly && site.family != "Test" && site.family != "TestFunction" { continue }
+            parts.append(encodedDeclaration(tree, source, site))
+        }
     }
     let encoded = joinText([encodedItem(decimalText(parts.count)), joinText(parts)])
     return joinText(["reflectedDeclarations(", escapedSourceString(encoded), ")"])

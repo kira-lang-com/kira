@@ -8,8 +8,15 @@
 // Parses one file of `module` into `tree`, which gathers every file of the
 // program.
 function parseFile(move tree: SyntaxTree, source: String, file: Int, module: Int) -> Result<SyntaxTree, Failure> {
-    let bodiesElsewhere = module >= 0 && module < tree.modules.count && tree.modules[module].separate && !(tree.modules[module].compileTime && tree.compileTimeBodies)
     let lexed = try lexDocumented(source, file)
+    return parseFileLexed(move tree, source, file, module, lexed)
+}
+
+// Parses with tokens retained by package graph discovery. Import discovery
+// and parsing must share this lexical result rather than tokenize a source
+// twice in one build.
+function parseFileLexed(move tree: SyntaxTree, source: String, file: Int, module: Int, lexed: Lexed) -> Result<SyntaxTree, Failure> {
+    let bodiesElsewhere = module >= 0 && module < tree.modules.count && tree.modules[module].separate && !(tree.modules[module].compileTime && tree.compileTimeBodies)
     var parser = Parser {
         source = source,
         tokens = lexed.tokens,

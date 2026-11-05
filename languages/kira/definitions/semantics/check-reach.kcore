@@ -135,6 +135,33 @@ function dispatchRoots(program: CheckedProgram) -> [Int] {
 
 // The modules of the packages built apart that see `Any`: its own, and every
 // one depending on it.
+function modulesDependingOn(tree: borrow SyntaxTree, target: Int) -> ModuleSet {
+    var consumers: [[Int]] = []
+    for module in 0..tree.modules.count {
+        let empty: [Int] = []
+        consumers.append(empty)
+    }
+    for module in 0..tree.modules.count {
+        for dependency in tree.modules[module].libraries {
+            if dependency >= 0 && dependency < consumers.count { consumers[dependency].append(module) }
+        }
+    }
+    var reachable = emptyModuleSet()
+    var pending: [Int] = [target]
+    reachable.insert(target)
+    var cursor = 0
+    while cursor < pending.count {
+        let dependency = pending[cursor]
+        cursor += 1
+        for consumer in consumers[dependency] {
+            if reachable.contains(consumer) { continue }
+            reachable.insert(consumer)
+            pending.append(consumer)
+        }
+    }
+    return reachable
+}
+
 function boxingModules(tree: borrow SyntaxTree, declarations: Declarations) -> [String] {
     var modules: [String] = []
     for structType in declarations.structs {
@@ -142,12 +169,16 @@ function boxingModules(tree: borrow SyntaxTree, declarations: Declarations) -> [
         let position = declarations.sourcePosition(structType.name.span.file)
         if position < 0 { continue }
         let any = declarations.sources[position].module
+        var hasSeparate = false
+        for index in 0..tree.modules.count {
+            if tree.modules[index].separate { hasSeparate = true }
+        }
+        if !hasSeparate { return modules }
+        let dependents = modulesDependingOn(tree, any)
         for index in 0..tree.modules.count {
             let module = tree.modules[index]
             if !module.separate { continue }
-            var sees = index == any
-            for library in module.libraries { if library == any { sees = true } }
-            if sees { modules.append(module.name) }
+            if dependents.contains(index) { modules.append(module.name) }
         }
     }
     return modules
