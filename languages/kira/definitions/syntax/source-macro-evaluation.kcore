@@ -329,7 +329,8 @@ function evaluateSourceMacroArguments(session: Session, unit: Unit, tree: Syntax
     let file = addSource(session, declared.name.span.file as SourceFile, wrapper)
     if file < 0 { return .Error(Failure { diagnostic = .MacroResultUnreadable, span = origin }) }
     let evaluator = try withMacroEntry(macroEvaluationTree(tree, [declared.expansion]), tree, declared, wrapper, file)
-    let program = check(evaluator, .Some([entry]))
+    var program = check(evaluator, .Some([entry]))
+    program.typeNames = .None
     var target = -1
     for index in 0..program.functions.count {
         if program.functions[index].symbol == entry { target = index }
