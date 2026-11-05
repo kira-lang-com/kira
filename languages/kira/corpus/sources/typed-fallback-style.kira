@@ -1,0 +1,52 @@
+import Foundation
+
+enum Failure { Unavailable }
+
+function fetch(fail: Bool) -> Result<String, Failure> {
+    if fail { return .Error(.Unavailable) }
+    return .Ok("ready")
+}
+
+function missing() -> String? { return .None }
+
+function disguisedText() -> String {
+    let content = try fetch(true) otherwise return ""
+    return content
+}
+
+function optionalIsNotFailure() -> String {
+    let content = try missing() otherwise return ""
+    return content
+}
+
+function disguisedBoolean() -> Bool {
+    let success = try fetch(true) otherwise return false
+    return success == "ready"
+}
+
+function disguisedArray() -> [String] {
+    let content = try fetch(true) otherwise return []
+    return [content]
+}
+
+function disguisedIndex() -> Int {
+    let content = try fetch(true) otherwise return -1
+    return 1
+}
+
+function explicitPropagation() -> Result<String, Failure> {
+    let content = try fetch(true) otherwise return .Error(.Unavailable)
+    return .Ok(content)
+}
+
+function ordinaryEmpty() -> String {
+    let empty = ""
+    return empty
+}
+
+@Main
+function main() -> Int {
+    print(optionalIsNotFailure())
+    print(ordinaryEmpty())
+    return 0
+}

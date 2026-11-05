@@ -72,6 +72,13 @@ extend Checker {
 
     function checkArms(borrow mut self, subject: Int, arms: [MatchArm], expected: Optional<Type>, valued: Bool, span: Span) -> CheckedChoice {
         let subjectType = typeOf(subject)
+        // The parser preserves a `try ... otherwise ...` fallback as a
+        // Fallen arm. Do not treat an Optional's None as an operation error.
+        if !tree.dependencyUnit && ownSource(program.expressions[subject].span.file) && resultTypes(program, subjectType).isSome() {
+            for arm in arms {
+                if arm.pattern.isFallen() { lintFailureFallback(arm) }
+            }
+        }
         let literal = subjectType.isInteger() || subjectType.kind == .Boolean || subjectType.kind == .Decimal
         if subjectType.kind != .Enumeration && !literal && !isStringType(program, subjectType) {
             if !subjectType.isInvalid() { report(.MatchSubjectNotEnum, program.expressions[subject].span) }

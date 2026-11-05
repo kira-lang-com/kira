@@ -41,6 +41,17 @@ a status code inside `.Ok`. Do not turn a failure into an invented empty value.
 `otherwise` takes an optional value too: `try cache.lookup(key) otherwise
 return .None` is the value `Some` holds, or the fallback for `None`.
 
+`kira check` warns (6010) when a `Result` failure is replaced directly with
+`""`, `[]`, `false`, or `-1` in an `otherwise return`: these can turn a failed
+operation into a plausible success. An `Optional` fallback is not flagged. If
+the application deliberately accepts a failed operation as an empty value,
+write the explicit `match` and document that recovery policy where it occurs.
+The same type-aware check warns (6012) when a `Result`'s `otherwise`
+contains only a bare `return`, leaving the failure behind with no explicit
+handling. An `Optional`'s `None` early return remains an ordinary control-flow
+choice. A `match` arm that handles the error and a deliberate nonempty
+recovery value are not the same as silently dropping it.
+
 ```kira
 let contents = try readFile(path) otherwise return .Error(.MissingConfiguration)
 match writeFile(path, contents.text) {
@@ -66,6 +77,12 @@ match writeFile(path, contents.text) {
 - Keep functions around 40 lines and files below 700 lines. Split long match
   arms into functions; replace long parameter lists with a request struct.
 - Constants are namespaced `let` declarations, not zero-argument functions.
+  Warning 6011 detects private free functions with no inputs whose single
+  statement returns a literal; public APIs and computed values are excluded.
+- Warning 6008 prefers `enabled`/`!enabled` to comparisons with Boolean
+  literals, and warning 6009 removes only a redundant final bare `return`.
+  These warnings also inspect expressions inside closure bodies, task bodies,
+  and computed assignment targets such as `items[index(flag == true)] = value`.
 - A function returning nothing has no trailing `return`; retain early returns.
 - `@Native` is not a Kira annotation. Foreign declarations use `@FFI.*`.
 - Name what an operation answers or does, not vague steps such as `handle` or

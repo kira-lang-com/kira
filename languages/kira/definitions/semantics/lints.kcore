@@ -13,6 +13,7 @@ extend Checker {
             // A foreign function is named by the symbol it binds, which is
             // the foreign library's name, prefix and all.
             if !hasAttribute(declared.annotations, .Foreign) { lintName(declared.name) }
+            lintConstantAccessor(declared)
             lintBody(declared.body, linted)
         }
         for structure in tree.structs {
@@ -21,11 +22,99 @@ extend Checker {
         }
     }
 
+    // A private free function with no inputs and a literal-only body has
+    // no computation or state to hide. Keep public and attributed functions:
+    // their callable identity may itself be a contract or entry point.
+    function lintConstantAccessor(borrow self, declared: FunctionDeclaration) {
+        if declared.receiver != .Free || declared.parameters.count != 0 || declared.typeParameters.count != 0 { return }
+        if declared.body.count != 1 || declared.annotations.count != 0 { return }
+        if isExportedName(tree, declared.name.span) { return }
+        match tree.statements[declared.body[0]].kind {
+            Return(value) -> {
+                match value {
+                    Some(expression) -> {
+                        if isLiteralConstant(expression) { report(.ConstantAccessor, declared.name.span) }
+                    }
+                    None -> {}
+                }
+            }
+            Binding -> {}
+            Assignment -> {}
+            CompoundAssignment -> {}
+            Evaluation -> {}
+            If -> {}
+            While -> {}
+            For -> {}
+            ForEach -> {}
+            Match -> {}
+            Attempt -> {}
+            Unsafe -> {}
+            Break -> {}
+            Continue -> {}
+        }
+    }
+
+    function isLiteralConstant(borrow self, index: Int) -> Bool {
+        match tree.expressions[index].kind {
+            IntegerLiteral -> return true
+            FloatLiteral -> return true
+            BooleanLiteral -> return true
+            StringLiteral -> return true
+            ArrayLiteral -> return false
+            Index -> return false
+            Transfer -> return false
+            Labelled -> return false
+            TypeQuery -> return false
+            Name -> return false
+            Member -> return false
+            Quote -> return false
+            ExpandedMacro -> return false
+            MacroCall -> return false
+            Call -> return false
+            GenericCall -> return false
+            MethodCall -> return false
+            IndirectCall -> return false
+            Lambda -> return false
+            KeyPath -> return false
+            Task -> return false
+            Try -> return false
+            Variant -> return false
+            StructLiteral -> return false
+            Unary -> return false
+            Binary -> return false
+            Conditional -> return false
+            MatchValue -> return false
+            Content -> return false
+        }
+    }
+
     // A method can reach the tree both as a function and as a member, so
     // each body is linted once.
     function lintBody(borrow self, body: [Int], linted: borrow mut [Int]) {
         if body.count == 0 || contains(linted, body[0]) { return }
         linted.append(body[0])
+        let last = tree.statements[body[body.count - 1]]
+        match last.kind {
+            Return(value) -> {
+                match value {
+                    None -> report(.RedundantVoidReturn, last.span)
+                    Some -> {}
+                }
+            }
+            Binding -> {}
+            Assignment -> {}
+            CompoundAssignment -> {}
+            Evaluation -> {}
+            If -> {}
+            While -> {}
+            For -> {}
+            ForEach -> {}
+            Match -> {}
+            Attempt -> {}
+            Unsafe -> {}
+            Break -> {}
+            Continue -> {}
+        }
         lintStatements(body)
     }
 
@@ -134,8 +223,14 @@ extend Checker {
             match statement.kind {
                 Binding(binding) -> lintExpression(binding.value)
                 Evaluation(value) -> lintExpression(value)
-                Assignment(target, value) -> lintExpression(value)
-                CompoundAssignment(operator, target, value) -> lintExpression(value)
+                Assignment(target, value) -> {
+                    lintExpression(target)
+                    lintExpression(value)
+                }
+                CompoundAssignment(operator, target, value) -> {
+                    lintExpression(target)
+                    lintExpression(value)
+                }
                 Return(value) -> { match value { Some(value) -> lintExpression(value) None -> {} } }
                 If(condition, yes, no) -> {
                     lintExpression(condition)
@@ -203,11 +298,22 @@ extend Checker {
                         MatchValue -> {}
                         Content -> {}
                     }
+                    lintExpression(condition)
                     lintStatements(body)
                 }
-                For(name, low, high, body) -> lintStatements(body)
-                ForEach(name, source, body) -> lintStatements(body)
-                Match(subject, arms) -> { for arm in arms { lintStatements(arm.body) } }
+                For(name, low, high, body) -> {
+                    lintExpression(low)
+                    lintExpression(high)
+                    lintStatements(body)
+                }
+                ForEach(name, source, body) -> {
+                    lintExpression(source)
+                    lintStatements(body)
+                }
+                Match(subject, arms) -> {
+                    lintExpression(subject)
+                    for arm in arms { lintStatements(arm.body) }
+                }
                 Attempt(body, arms) -> {
                     lintStatements(body)
                     for arm in arms { lintStatements(arm.body) }
@@ -239,16 +345,212 @@ extend Checker {
     }
 
     function lintExpression(borrow self, index: Int) {
-        match tree.expressions[index].kind.binaryOperands(.Equal) {
-            Some(operands) -> {
-                match tree.expressions[operands.right].kind.called() {
-                    Some(call) -> {
-                        if call.name.text == "U32" { report(.IntegerCodeComparison, tree.expressions[index].span) }
+        let expression = tree.expressions[index]
+        match expression.kind {
+            Binary(operator, left, right) -> {
+                if operator == .Equal || operator == .NotEqual {
+                    if isBooleanLiteral(left) || isBooleanLiteral(right) {
+                        report(.BooleanLiteralComparison, expression.span)
+                    }
+                }
+                if operator == .Equal {
+                    match tree.expressions[right].kind.called() {
+                        Some(call) -> {
+                            if call.name.text == "U32" { report(.IntegerCodeComparison, expression.span) }
+                        }
+                        None -> {}
+                    }
+                }
+                lintExpression(left)
+                lintExpression(right)
+            }
+            Unary(operator, value) -> lintExpression(value)
+            Try(value) -> lintExpression(value)
+            Transfer(mode, value) -> lintExpression(value)
+            Labelled(name, value) -> lintExpression(value)
+            Member(value, name) -> lintExpression(value)
+            Index(value, position) -> {
+                lintExpression(value)
+                lintExpression(position)
+            }
+            Conditional(condition, yes, no) -> {
+                lintExpression(condition)
+                lintExpression(yes)
+                lintExpression(no)
+            }
+            ArrayLiteral(values) -> { for value in values { lintExpression(value) } }
+            Call(name, arguments) -> { for argument in arguments { lintExpression(argument) } }
+            GenericCall(name, types, arguments) -> { for argument in arguments { lintExpression(argument) } }
+            MethodCall(receiver, name, arguments) -> {
+                lintExpression(receiver)
+                for argument in arguments { lintExpression(argument) }
+            }
+            IndirectCall(callee, arguments) -> {
+                lintExpression(callee)
+                for argument in arguments { lintExpression(argument) }
+            }
+            Variant(name, payload) -> {
+                match payload {
+                    Some(value) -> lintExpression(value)
+                    None -> {}
+                }
+            }
+            StructLiteral(name, types, fields) -> {
+                for field in fields { lintExpression(field.value) }
+            }
+            MatchValue(subject, arms) -> {
+                lintExpression(subject)
+                for arm in arms { lintStatements(arm.body) }
+            }
+            IntegerLiteral -> {}
+            FloatLiteral -> {}
+            BooleanLiteral -> {}
+            StringLiteral -> {}
+            Name -> {}
+            Quote -> {}
+            TypeQuery -> {}
+            ExpandedMacro -> {}
+            MacroCall -> {}
+            Lambda(declaration) -> lintStatements(declaration.body)
+            KeyPath -> {}
+            Task(declaration) -> {
+                for written in declaration.written { lintExpression(written) }
+                lintStatements(declaration.body)
+            }
+            Content -> {}
+        }
+    }
+
+    // Called only for a typed Result's `otherwise` arm, not for an Optional.
+    // The parser puts one synthetic failure-trail record BEFORE the user's
+    // fallback statement. That record documents absorption; it is not a
+    // deliberate handler. With only that record and `return`, this error is
+    // silently dropped. A direct placeholder return remains a separate warning.
+    function lintFailureFallback(borrow self, arm: MatchArm) {
+        if arm.body.count == 0 { return }
+        if arm.body.count == 2 {
+            let sole = tree.statements[arm.body[1]]
+            match sole.kind {
+                Return(value) -> {
+                    match value {
+                        None -> report(.SilentFailureReturn, sole.span)
+                        Some -> {}
+                    }
+                }
+                Binding -> {}
+                Assignment -> {}
+                CompoundAssignment -> {}
+                Evaluation -> {}
+                If -> {}
+                While -> {}
+                For -> {}
+                ForEach -> {}
+                Match -> {}
+                Attempt -> {}
+                Unsafe -> {}
+                Break -> {}
+                Continue -> {}
+            }
+        }
+        let last = tree.statements[arm.body[arm.body.count - 1]]
+        match last.kind {
+            Return(value) -> {
+                match value {
+                    Some(returned) -> {
+                        if emptyFailurePlaceholder(returned) {
+                            report(.FailureFallbackPlaceholder, tree.expressions[returned].span)
+                        }
                     }
                     None -> {}
                 }
             }
-            None -> {}
+            Binding -> {}
+            Assignment -> {}
+            CompoundAssignment -> {}
+            Evaluation -> {}
+            If -> {}
+            While -> {}
+            For -> {}
+            ForEach -> {}
+            Match -> {}
+            Attempt -> {}
+            Unsafe -> {}
+            Break -> {}
+            Continue -> {}
+        }
+    }
+
+    function emptyFailurePlaceholder(borrow self, expression: Int) -> Bool {
+        let syntax = tree.expressions[expression]
+        match syntax.kind {
+            StringLiteral(decoded) -> {
+                match decoded {
+                    Some(value) -> return utf8Count(value) == 0
+                    None -> return syntax.span.end - syntax.span.start == 2
+                }
+            }
+            ArrayLiteral(values) -> return values.count == 0
+            BooleanLiteral(value) -> return !value
+            IntegerLiteral(value, hexadecimal) -> return value == -1
+            Name -> return false
+            FloatLiteral -> return false
+            Index -> return false
+            Transfer -> return false
+            Labelled -> return false
+            TypeQuery -> return false
+            Member -> return false
+            Quote -> return false
+            ExpandedMacro -> return false
+            MacroCall -> return false
+            Call -> return false
+            GenericCall -> return false
+            MethodCall -> return false
+            IndirectCall -> return false
+            Lambda -> return false
+            KeyPath -> return false
+            Task -> return false
+            Try -> return false
+            Variant -> return false
+            StructLiteral -> return false
+            Unary -> return false
+            Binary -> return false
+            Conditional -> return false
+            MatchValue -> return false
+            Content -> return false
+        }
+    }
+
+    function isBooleanLiteral(borrow self, index: Int) -> Bool {
+        match tree.expressions[index].kind {
+            BooleanLiteral -> return true
+            IntegerLiteral -> return false
+            FloatLiteral -> return false
+            StringLiteral -> return false
+            ArrayLiteral -> return false
+            Index -> return false
+            Transfer -> return false
+            Labelled -> return false
+            TypeQuery -> return false
+            Name -> return false
+            Member -> return false
+            Quote -> return false
+            ExpandedMacro -> return false
+            MacroCall -> return false
+            Call -> return false
+            GenericCall -> return false
+            MethodCall -> return false
+            IndirectCall -> return false
+            Lambda -> return false
+            KeyPath -> return false
+            Task -> return false
+            Try -> return false
+            Variant -> return false
+            StructLiteral -> return false
+            Unary -> return false
+            Binary -> return false
+            Conditional -> return false
+            MatchValue -> return false
+            Content -> return false
         }
     }
 }

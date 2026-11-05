@@ -1,0 +1,52 @@
+import Foundation
+
+enum Failure { Unavailable }
+
+function fetch(failed: Bool) -> Result<String, Failure> {
+    if failed { return .Error(.Unavailable) }
+    return .Ok("ready")
+}
+
+function optionalText() -> String? { return .None }
+
+function dropsResultFailure() {
+    let text = try fetch(true) otherwise return
+    print(text)
+}
+
+function optionalEarlyExit() {
+    let text = try optionalText() otherwise return
+    print(text)
+}
+
+function explicitlyHandlesFailure() {
+    match fetch(true) {
+        Ok(text) -> print(text)
+        Error(failure) -> print(traceText(failure))
+    }
+}
+
+function propagatesFailure() -> Result<String, Failure> {
+    let text = try fetch(true) otherwise return .Error(.Unavailable)
+    return .Ok(text)
+}
+
+function perform(failed: Bool) -> Result<Void, Failure> {
+    if failed { return .Error(.Unavailable) }
+    return .Ok
+}
+
+function dropsResultStatement() {
+    try perform(true) otherwise return
+}
+
+function intentionalDefault() -> String {
+    let text = try fetch(true) otherwise "recovered"
+    return text
+}
+
+@Main
+function main() -> Int {
+    optionalEarlyExit()
+    return 0
+}

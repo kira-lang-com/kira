@@ -308,6 +308,11 @@ band identifies the phase: 1xxx lexer, 2xxx parser, 3xxx semantics,
 | 6005 | warning | counted while loop | use a for range or iterate over the collection |
 | 6006 | warning | flag-controlled loop | use while true and leave with break or return |
 | 6007 | warning | fallback over an owned enum | list every case of an enum this package owns so new cases require a decision |
+| 6008 | warning | boolean literal comparison | a Boolean is already a condition: compare neither to true nor false, and use ! to invert it |
+| 6009 | warning | redundant final return | a function that returns no value needs no return at the end of its body; keep early returns that control flow depends on |
+| 6010 | warning | failure replaced with an empty value | a Result's Error is being converted by otherwise into an empty string, empty array, false or -1; preserve the failure unless the caller intentionally handles this case |
+| 6011 | warning | literal-only function | a private free function with no parameters and a single literal return is a constant, not a computation |
+| 6012 | warning | Result failure absorbed by bare return | a Result-typed try uses otherwise return: the failure is recorded in the trail but neither propagated to the caller nor explicitly handled |
 | 9001 | error | outside the supported subset | kira does not compile this construct yet; see docs/subset.md |
 
 <!-- hand-written: diagnostic standards -->
