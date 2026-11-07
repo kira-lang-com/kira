@@ -1,6 +1,6 @@
 name: Release
 
-# Every language `toolchain.klfd` lists, and knvm, for every host: the newest
+# Every language `toolchain.kcore` lists, and knvm, for every host: the newest
 # released klf (`klf setup`) builds a first kira, that kira builds knvm, and
 # `knvm binstall` builds every language as knvm installs one. Each installed
 # tree is packed as `<language>-<version>-<host>.tar.gz`, and knvm with the
@@ -68,6 +68,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Use the Xcode linker on macOS
+        if: runner.os == 'macOS'
+        run: echo "KLF_USE_SYSTEM_LINKER=1" >> "$GITHUB_ENV"
+
       - name: Install klf
         run: |
           temp="$RUNNER_TEMP"
@@ -116,7 +120,7 @@ jobs:
           mkdir -p "$tools"
           kira="$temp/bootstrap/kira"
           "$kira" build tools/knvm -o "$tools/knvm"
-          for name in klf $(sed -n 's/^ *binary = "\(.*\)",*$/\1/p' toolchain.klfd); do
+          for name in klf $(sed -n 's/^ *binary = "\(.*\)",*$/\1/p' toolchain.kcore); do
             "$kira" build tools/launcher -o "$tools/$name"
           done
           pack knvm "$temp/tools"
