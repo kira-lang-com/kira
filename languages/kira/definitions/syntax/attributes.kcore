@@ -9,6 +9,7 @@
 // The engine, entry and export attributes are KLF-RIDL.md section 27.3's.
 enum Attribute {
     Main
+    Plugin
     MainThread
     AtExit
     Runtime
@@ -63,6 +64,7 @@ enum AttributeSite {
 function writtenAttributes() -> [Attribute] {
     var attributes: [Attribute] = []
     listAttribute(attributes, .Main)
+    listAttribute(attributes, .Plugin)
     listAttribute(attributes, .MainThread)
     listAttribute(attributes, .AtExit)
     listAttribute(attributes, .Runtime)
@@ -90,6 +92,7 @@ function listAttribute(attributes: borrow mut [Attribute], attribute: Attribute)
 function attributeSpelling(attribute: Attribute) -> String {
     match attribute {
         Main -> return "Main"
+        Plugin -> return "Plugin"
         MainThread -> return "MainThread"
         AtExit -> return "AtExit"
         Runtime -> return "Runtime"
@@ -120,6 +123,7 @@ function attributeSpelling(attribute: Attribute) -> String {
 function attributeApplies(attribute: Attribute, site: AttributeSite) -> Bool {
     match attribute {
         Main -> return site == .OnFunction || site == .OnTypeDeclaration
+        Plugin -> return site == .OnFunction
         MainThread -> return site == .OnFunction
         AtExit -> return site == .OnFunction
         Runtime -> return site == .OnFunction

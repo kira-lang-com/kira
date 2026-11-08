@@ -28,6 +28,7 @@
 struct Manifest {
     let name: Identifier
     let library: Bool
+    let ridlImports: RidlImportMode
     // What `import` spells to reach this package.
     let moduleRoot: String
     let version: String
@@ -37,6 +38,11 @@ struct Manifest {
     let assets: [String]
     // Whether its `@FFI.Syscall` declarations may reach the kernel directly.
     let systemCalls: Bool
+}
+
+enum RidlImportMode {
+    Linked
+    Host
 }
 
 
@@ -82,6 +88,7 @@ extend Parser {
         }
         try expectAs(.LeftBrace, .MalformedManifest)
         var library = false
+        var ridlImports: RidlImportMode = .Linked
         var moduleRoot = name.text
         var version = ""
         var dependencies: [Dependency] = []
@@ -95,6 +102,10 @@ extend Parser {
                 "kind" -> {
                     try memberValue(key, "PackageKind", typed)
                     library = try packageKind()
+                }
+                "ridlImports" -> {
+                    try memberValue(key, "RidlImportMode", typed)
+                    ridlImports = try ridlImportMode()
                 }
                 "moduleRoot" -> {
                     try memberValue(key, "String", typed)
@@ -151,7 +162,7 @@ extend Parser {
         advance()
         if !at(.End) { return .Error(failure(.MalformedManifest)) }
         return .Ok(Manifest {
-            name = name, library = library, moduleRoot = moduleRoot, version = version,
+            name = name, library = library, ridlImports = ridlImports, moduleRoot = moduleRoot, version = version,
             dependencies = dependencies, nativeLibraries = nativeLibraries, assets = assets,
             systemCalls = systemCalls
         })
@@ -213,6 +224,20 @@ extend Parser {
         if atWord("App") {
             advance()
             return .Ok(false)
+        }
+        return .Error(failure(.PackageMemberType))
+    }
+
+    function ridlImportMode(borrow mut self) -> Result<RidlImportMode, Failure> {
+        if atWord("RidlImportMode") { advance() }
+        try expectAs(.Dot, .PackageMemberType)
+        if atWord("Linked") {
+            advance()
+            return .Ok(.Linked)
+        }
+        if atWord("Host") {
+            advance()
+            return .Ok(.Host)
         }
         return .Error(failure(.PackageMemberType))
     }

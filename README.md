@@ -98,6 +98,11 @@ the detail.
   `.ridl`, `.so`); without either, `-o`'s extension decides.
 - `kira run <sources>` — build an executable and run it. Everything after `--`
   is the program's own arguments.
+- `kira build <sources> --backend runtime|native` — select runtime bytecode
+  (`.klbc`) or a native executable. An explicitly selected backend determines
+  the default output kind; `--emit` can still request intermediate KIR.
+- `kira run <sources> --backend runtime|native` — use the KLF bytecode runner
+  or build and run a native executable. `native` remains the default.
 - `kira check <sources>` — report diagnostics and write nothing. Given no
   path, the package in the current directory.
 - `kira test <package>` — run the `@Test` functions under the package's

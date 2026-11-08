@@ -540,7 +540,7 @@ function privateSymbol(declarations: Declarations, tree: SyntaxTree, declared: F
     if startsWithText(declared.name.text, "__source_macro_entry") { return false }
     if isExportedName(tree, declared.name.span) { return false }
     let annotations = declared.annotations
-    if hasAttribute(annotations, .Main) || hasAttribute(annotations, .Service) || hasAttribute(annotations, .Ridl) { return false }
+    if hasAttribute(annotations, .Main) || hasAttribute(annotations, .Plugin) || hasAttribute(annotations, .Service) || hasAttribute(annotations, .Ridl) { return false }
     if hasAttribute(annotations, .Foreign) || hasAttribute(annotations, .Export) || hasAttribute(annotations, .Native) { return false }
     return !hasAttribute(annotations, .Runtime) && !hasAttribute(annotations, .Comptime)
 }
@@ -573,7 +573,7 @@ function entryResult(declared: FunctionDeclaration, result: Type) -> Type {
 }
 
 function isEntry(declared: FunctionDeclaration) -> Bool {
-    return hasAttribute(declared.annotations, .Main)
+    return hasAttribute(declared.annotations, .Main) || hasAttribute(declared.annotations, .Plugin)
 }
 
 // A test build is entered through the `kiraTestMain` its test runner
@@ -598,7 +598,7 @@ function nameEntry(declarations: borrow mut Declarations) {
     }
 }
 
-// A program has exactly one `@Main` function, and it takes no parameters. A
+// A program has exactly one `@Main` or `@Plugin` entry, with no parameters. A
 // library is entered by the program that imports it and declares none, and
 // a package that is itself a library needs none.
 function checkEntry(declarations: Declarations, testing: Bool) {
@@ -615,6 +615,9 @@ function checkEntry(declarations: Declarations, testing: Bool) {
                 if declarations.modules[module].library && !testing {
                     report(.MainInLibrary, signature.name.span)
                     continue
+                }
+                if hasAttribute(signature.declaration.annotations, .Plugin) && declarations.modules[module].ridlImports != .Host {
+                    report(.PluginRequiresHostImports, signature.name.span)
                 }
                 entries += 1
                 if entries > 1 { report(.DuplicateMain, signature.name.span) }

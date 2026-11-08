@@ -1,6 +1,6 @@
 # Handoff
 
-This is Kira hosted on the Kira Language Framework: the Kira compiler written as `.klfd` definitions (KLF-RIDL section 27).
+This is Kira hosted on the Kira Language Framework: the Kira compiler written as `.kcore` definitions (KLF-RIDL section 27).
 
 ## Ground rules
 
@@ -11,8 +11,8 @@ This is Kira hosted on the Kira Language Framework: the Kira compiler written as
 
 ## Layout
 
-- `definitions/language.klfd`: the `Kira` construct, the `DiagnosticSpec` list, and the four phases. `parse` produces a `SyntaxTree` artifact, `elaborate` produces a `CheckedProgram` artifact, and `lower` produces KIR.
-- `definitions/diagnostics.klfd`: the `Diagnostic` enum and its `code()`. Kira's code families become number bands: KLEX is 1xxx, KPAR is 2xxx, KSEM is 3xxx, and 9001 means outside the subset.
+- `languages/kira/definitions/language.kcore`: the `Kira` construct, the `DiagnosticSpec` list, and the four phases. `parse` produces a `SyntaxTree` artifact, `elaborate` produces a `CheckedProgram` artifact, and `lower` produces KIR.
+- `languages/kira/definitions/diagnostics.kcore`: the `Diagnostic` enum and its `code()`. Kira's code families become number bands: KLEX is 1xxx, KPAR is 2xxx, KSEM is 3xxx, and 9001 means outside the subset.
 - `definitions/syntax/`: token, lexer, tree, parser (the cursor), declarations, statements, expressions. It fails at the first error.
 - `definitions/semantics/`: types, program (the checked IR), declarations, checker, statements, expressions, calls. It reports every error and poisons the failed expression with `Invalid`.
 - `definitions/lowering/`: kir (the only file that calls `klf.kir.*`, as methods on handles), types, module, function, values, operations.
@@ -33,6 +33,7 @@ This is Kira hosted on the Kira Language Framework: the Kira compiler written as
   - A leading-dot argument (`.Case`, `.Case(payload)`) fits only a parameter whose enum declares that case (`variantFits` in `semantics/overloads.klfd`, used by `overloadScore` and `headerScore`). Before this, `HStack(spacing: .Length(4))` inside HStack's own `init(spacing: Number)` chose that init again, which reported 3119.
   - A `private` method is not exported to RIDL (`isPublic` in `semantics/checker.klfd`).
   - The framework's compile-time evaluation runs only the initializers a folded call needs (`needed_initializers` in `klf-defsvc/src/evaluation.rs`). Before this, KiraDB's `comptime function remainderTable` ran every module's initializer, KiraUI's native ones included, and trapped with `KLF-VM-0024`.
+- **Unsafe boundaries:** `unsafe function` and `unsafe { ... }` are parsed and checked in the current frontend. The checker emits 3410 (`UnsafeRequired`) for guarded operations outside a permitted scope, including foreign-pointer and selected native-state operations. Closure and async boundaries have explicit unsafe-scope handling. This is implemented functionality, not an outstanding parser port; exhaustive Rust-reference `KSEM400` parity remains unverified. See `languages/kira/docs/subset.md` and `languages/kira/docs/diagnostics.md`.
 - **Next:**
   1. Implicit Foundation for a lone file, as in kira.
   2. Memory on large builds: the live KLFD data (`Expression` is 168 B, `TypedExpression` 128 B) and the Rust KIR module (2.2M instructions for the harness) dominate the peak.

@@ -73,9 +73,10 @@ band identifies the phase: 1xxx lexer, 2xxx parser, 3xxx semantics,
 | 3004 | error | duplicate type | a type with this name is already defined |
 | 3005 | error | duplicate field | the struct already has a field with this name |
 | 3007 | error | duplicate variant | the enum already has a variant with this name |
-| 3010 | error | more than one `@Main` | a program declares one entrypoint |
-| 3011 | error | no `@Main` function | the program has no `@Main` function to run |
-| 3012 | error | an entrypoint takes no parameters | `@Main` marks a function with no parameters |
+| 3010 | error | more than one `@Main` or `@Plugin` entry | a program declares one entrypoint |
+| 3011 | error | no `@Main` or `@Plugin` entry | the program has no `@Main` or `@Plugin` function to run |
+| 3012 | error | an entrypoint takes no parameters | `@Main` and `@Plugin` mark functions with no parameters; RIDL host imports are bound automatically |
+| 3013 | error | `@Plugin` requires host RIDL imports | a plugin lifecycle entry runs with its host RIDL imports bound by the runtime |
 | 3020 | error | binding type mismatch | the value does not have the type the binding is annotated with |
 | 3021 | error | mutation through an immutable binding | declare the binding with `var` to mutate it or pass it as `borrow mut` |
 | 3022 | error | assignment type mismatch | the value does not have the type of the place it is assigned to |
@@ -259,8 +260,8 @@ band identifies the phase: 1xxx lexer, 2xxx parser, 3xxx semantics,
 | 3410 | error | unsafe operation outside an unsafe boundary | raw pointer construction, foreign calls and callback handles may expose memory or cross the C boundary: put the operation in an `unsafe` block or mark its function `unsafe`; permission does not carry into a closure |
 | 4001 | error | no package manifest | several files form one program only as the `app/` sources of a package declared in `package.kira` |
 | 4002 | error | malformed package manifest | `package.kira` declares `construct Name extends Package { ... }` with typed `let` members |
-| 4003 | error | unknown package member | `Package` declares `kind`, `version`, `moduleRoot`, `dependencies`, `nativeLibraries` and `systemCalls`, a dependency takes `name`, `path`, `version`, `url`, `rev` and `tag`, a native library `name`, `binary`, `header`, `klffi`, `linkerFlags`, `linkMode`, `availability`, `headers`, `sources`, `autobind` and `nativeTargets`, and a target row `triple`, `staticLib`, `dynamicLib`, `defines`, `frameworks`, `systemLibs`, `compilerFlags`, `linkerFlags` and `runtimeFiles` |
-| 4004 | error | package member has the wrong type | `kind` is a `PackageKind`, `version` and `moduleRoot` are `String`s, `dependencies` is a `[Dependency]` and `nativeLibraries` a `[NativeLibrary]` |
+| 4003 | error | unknown package member | `Package` declares `kind`, `version`, `moduleRoot`, `dependencies`, `nativeLibraries`, `systemCalls` and `ridlImports`, a dependency takes `name`, `path`, `version`, `url`, `rev` and `tag`, a native library `name`, `binary`, `header`, `klffi`, `linkerFlags`, `linkMode`, `availability`, `headers`, `sources`, `autobind` and `nativeTargets`, and a target row `triple`, `staticLib`, `dynamicLib`, `defines`, `frameworks`, `systemLibs`, `compilerFlags`, `linkerFlags` and `runtimeFiles` |
+| 4004 | error | package member has the wrong type | `kind` is a `PackageKind`, `ridlImports` is a `RidlImportMode`, `version` and `moduleRoot` are `String`s, `dependencies` is a `[Dependency]` and `nativeLibraries` a `[NativeLibrary]` |
 | 4010 | error | no sources in `app/` | a package's Kira sources live in its `app/` directory |
 | 4020 | error | dependency has no readable manifest | a path dependency names a directory holding a `package.kira` |
 | 4021 | error | dependency cycle | this dependency leads back to a package that depends on it |

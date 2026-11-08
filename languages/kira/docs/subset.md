@@ -122,6 +122,7 @@ it changes:
 | `moduleRoot` | `String` | the construct's name |
 | `dependencies` | `[Dependency]` | `[]` |
 | `nativeLibraries` | `[NativeLibrary]` | `[]` |
+| `ridlImports` | `RidlImportMode` (`.Linked` or `.Host`) | `.Linked` |
 | `assets` | `[String]` | `[]` |
 | `kira` | `String` | not read |
 | `packages` | `[String]` | not read |
@@ -133,6 +134,14 @@ The last four are accepted at their written type and then discarded. So is
 ecosystem packages: a `Defaults { ... }` member has never been load-bearing
 here, and if it ever was, the symptom is an unexplained target rather than an
 error.
+
+`ridlImports: RidlImportMode = .Host` selects an isolated Kira app whose `@Ridl`
+imports are provided by its launching host. `.Linked` is the default and
+retains the existing local provider linkage. Host-mode native/hybrid builds use
+the host's private RIDL connection instead of linking a provider's entry
+symbols into the plugin process. The current remote native adapters accept
+only scalar declarations (integers up to 64 bits, booleans and floating-point
+numbers); they refuse pointer-bearing, aggregate, borrowed and generic APIs.
 
 A member `Package` does not declare is 4003 in the `construct` form, and one
 written at another type is 4004. A `Dependency` takes `name` and one of `path`,
@@ -152,7 +161,8 @@ Package Shop {
 Both compile, and both refuse a member kira does not recognise with 4003, so a
 typo such as `dependancies` or `nativeLibrarys` is an error rather than a
 package that silently declares nothing. The declared set is `kind`, `version`,
-`moduleRoot`, `dependencies` and `nativeLibraries`, and a `NativeLibrary` takes
+`moduleRoot`, `dependencies`, `nativeLibraries`, `systemCalls` and
+`ridlImports`, and a `NativeLibrary` takes
 `name`, `binary`, `header`, `klffi`, `linkerFlags`, `linkMode`, `availability`,
 `headers`, `sources`, `autobind` and `nativeTargets`.
 
@@ -996,13 +1006,23 @@ The generated [diagnostic reference](diagnostics.md) is the source for current
 codes. [Idiomatic Kira](idiomatic-kira.md) describes the intended style.
 
 
-## Unsafe language parity (pending)
+## Unsafe operations (implemented; full parity not yet proven)
 
-The reference Kira compiler has added `unsafe function` and `unsafe { ... }`
-with `KSEM400` enforcement for raw pointers, FFI and callback-state handles.
-**This KLFD-hosted frontend has not implemented those constructs yet.** Do not
-accept or silently strip `unsafe` in the parser: parsing must be accompanied
-by safety-qualified callable types, effect checking on direct/indirect/FFI
-calls, lexical permission boundaries (including closures), and matching tests.
-Updated downstream packages use this syntax and require that port before they
-can build with this frontend.
+This frontend parses `unsafe function` declarations and `unsafe { ... }`
+statement blocks. Unsafe permission is checked during semantic analysis;
+diagnostic **3410** (`UnsafeRequired`) rejects protected operations outside
+an unsafe boundary. The checks cover unsafe direct calls, foreign-pointer
+calls, and selected native-state operations. Unsafe permission is scoped:
+closures and async bodies do not automatically inherit their surrounding
+permission. See `definitions/syntax/declarations.kcore`,
+`definitions/syntax/statements.kcore`, `definitions/semantics/calls.kcore`,
+`definitions/semantics/foreign-pointer-calls.kcore`,
+`definitions/semantics/native-state.kcore`, and
+`definitions/semantics/lambdas.kcore`.
+
+Examples exercising unsafe boundaries exist in
+`corpus/ffi/ffi-state-callback`, `corpus/packages/heap-library`, and
+`corpus/sources/native-state-owned.kira`. This establishes implementation,
+**not** exhaustive equivalence with the Rust reference compiler's `KSEM400`
+checks. The new frontend reports **3410**, not `KSEM400`; cross-compiler
+negative-test and indirect-call parity still require explicit verification.

@@ -9,14 +9,14 @@ for Kira is M7: parity with `tests-kik` and successful Kira ecosystem builds.
 
 Kira is split into three layers, following KLF-RIDL section 27.2:
 
-1. **Core** is this repository's `.klfd` definition. `definitions/` owns the
+1. **Core** is this repository's `.kcore` definitions. `languages/kira/definitions/` owns the
    lexer, parser, semantic analysis, lowering, diagnostics and package loading.
    It defines the language and lowers checked programs to shared KIR. Changes
    to language syntax or semantics belong here.
-2. **Heap** is Kira source under `std/`. It owns allocation, reference counting,
+2. **Heap** is Kira source under `languages/kira/std/`. It owns allocation, reference counting,
    copy-on-write buffers and destruction, implemented using shared KIR/runtime
    services. It must not add Kira-specific VM or backend behavior.
-3. **Std** is Kira source under `std/`, layered over core and heap. It owns the
+3. **Std** is Kira source under `languages/kira/std/`, layered over core and heap. It owns the
    public language items and APIs, including `String`, `Array`, `Optional`,
    `Result`, `Drop`, `Copyable`, `Number` and `Any`.
 
@@ -30,10 +30,10 @@ from section 27.3, not permission to add language-specific backend shortcuts.
 
 ### Working
 
-- `definitions/language.klfd` declares the `Kira` language profile and its
+- `languages/kira/definitions/language.kcore` declares the `Kira` language profile and its
   parse, elaborate and lower phases. The package loader handles one package
   manifest, app modules, per-file imports and recursive path dependencies.
-- The current executable subset supports integer widths and conversions,
+- The compiler supports integer widths and conversions,
   booleans, functions and recursion, conditionals and loops, structs and
   methods, enums and exhaustive `match`, checked arithmetic and runtime traps.
 - Generic enums and structs with direct type-parameter payloads or fields are
@@ -66,17 +66,18 @@ from section 27.3, not permission to add language-specific backend shortcuts.
   have a VM/native proof returning 94. Derive reflection over structs, enums
   and distincts, with Foundation Equatable, Clone, Hashable and Ordered source
   macros, plus a Serializable distinct round trip with exact tagged wire text,
-  has a VM/native proof returning 5. Collector expansion remains unfinished.
+  has a VM/native proof returning 5. Whole-program collector expansion is
+  also exercised by the source-level test runner; broader parity remains to be checked.
 - Quoted syntax has a focused VM/native proof returning 42, including identifier
   and integer splices, escaped strings and newline-separated syntax arrays.
   `Syntax` and `Identifier` values are ordinary Foundation source types.
 - Diagnostics have Kira spelling and phase mappings in
   `docs/diagnostics.md`; `docs/subset.md` records accepted syntax and rejected
   constructs.
-- The last full baseline passed 46 cases. Work since then is checked through
-  focused corpora: arrays (3), heap (1), constructs (1), strings (1), floats
-  (1), Any (1), and the unchanged original aliases section (1, checksum 161).
-  These focused runs pass; there has been no new full-corpus run.
+- Historical corpus baseline: 46 cases, followed by focused corpora for
+  arrays, heap, constructs, strings, floats, Any and aliases. This is a
+  historical measurement, not the current full-corpus pass count; see
+  `HANDOFF.md` for later run status and framework blockers.
 - `tests/app` holds this language's own suite, run by the compiler built here:
   `kira test tests` runs 1,611 cases through Kira's test protocol and they all
   pass (`1611 passed, 0 failed, 0 skipped, 1611 total`, exit 0).
@@ -90,30 +91,41 @@ from section 27.3, not permission to add language-specific backend shortcuts.
   `binstall` and `sinstall` paths have been run end to end against a fixture feed
   and this checkout.
 
-### Not implemented or not yet proven
+### Remaining limitations and parity work
 
-- `T?`, `Drop`, `Copyable`, `Number`, complete lexical destruction and full
-  ownership analysis remain unfinished. Owned header layouts are implemented;
-  borrowed/exported RIDL ABI parity is not yet proven.
-- Generic functions, generic methods, and nested generic type declarations are
-  not fully supported. Traits remain unfinished. Classes, closures and async
-  tasks pass every harness case that uses them.
-- Compile-time function coverage beyond constant scalars and strings remains
-  unfinished; the harness's derive and collector macros expand. KLF-RIDL
-  section 14.4 requires execution of KIR in a VM with no host capabilities or
-  foreign calls, a private bounded heap and a step budget. Runtime execution
-  of a `comptime` call does not meet that requirement.
-- Source-level `kira test` is distinct from `klf test`, and it works: the
-  `Test` family is ordinary library source, a whole-program collector macro
-  generates `kiraTestMain`, and the CLI runs that entrypoint. `kira test tests`
-  runs the harness's 1611 cases through it.
-- Registry and git dependencies, `@Export`, and broad `tests-kik`/ecosystem
-  parity remain unimplemented or unverified.
-- No release of this compiler is published, so the release half of `knvm` has
-  never run against a live feed: `install latest` and `list --remote` are proven
-  only against a local `KNVM_KIRA_RELEASE_DIR` fixture. `install-llvm`,
-  `install libffi` and `self-update` are not ported — the first two provision
-  what belongs to the framework, and `sinstall` already covers the third.
+The items below distinguish a documented restriction from an unverified
+reference-compiler compatibility claim. The newer `HANDOFF.md` and
+`languages/kira/docs/subset.md` describe capabilities added since some early
+roadmap milestones; do not treat those historical milestones as a current
+missing-feature inventory.
+
+- **Implemented, parity unverified:** `unsafe function` and `unsafe { ... }`
+  are parsed and semantically checked, with diagnostic 3410 for unsafe
+  operations outside a permitted boundary. This includes foreign-pointer and
+  selected native-state operations. The Rust reference's `KSEM400` is a
+  different diagnostic; exhaustive direct/indirect-call and boundary parity
+  has not been demonstrated.
+- **Implemented with restrictions:** generic functions and methods, traits,
+  classes, closures, async tasks, derive macros, collectors, serialization
+  examples, ownership checks and destruction lowering all have implementation
+  paths. They must not be listed as wholly absent. Specific restrictions are
+  tracked in `languages/kira/docs/subset.md`, including mutable-borrow
+  captures, certain task bodies, macro parameter forms, and compile-time
+  aggregate results. Complete lexical destruction and borrowed/exported RIDL
+  ABI parity still require cross-backend verification.
+- **Documented limitations:** dotted `import A.B` syntax is not accepted;
+  registry and Git dependency declarations can be parsed, but automatic
+  checkout/fetch is not supplied by the package loader (external checkouts
+  are required). Do not conflate manifest parsing with fetching support.
+- **Not yet established:** full reference `tests-kik` equivalence, diagnostics
+  and runtime behavior across supported backends, full ecosystem builds,
+  and `@Export` annotation compatibility. The 1,611 passing source-level tests
+  and the documented 1,544 passing adjusted oracle are useful evidence, but
+  neither by itself proves unrestricted compatibility.
+- **Distribution:** no release of this compiler is published, so the release
+  half of `knvm` has not been exercised against a live feed. `install latest`
+  and `list --remote` were tested against a local fixture;
+  `install-llvm`, `install libffi` and `self-update` are not ported.
 
 ## Work plan
 
@@ -129,21 +141,20 @@ from section 27.3, not permission to add language-specific backend shortcuts.
 
 ### 2. Complete the language mechanisms needed by std and tests
 
-- Extend generic support from direct enum payloads and struct fields to nested
-  generic types, generic methods and functions, using checked specialization
-  to concrete KIR.
+- Extend and verify existing generic type, method and function support against
+  reference cases, including nested specializations and diagnostics.
 - Expand the implemented Array/String/Any verticals to all harness cases,
   including ownership diagnostics and borrowed/exported RIDL conventions.
-- Extend static construct inheritance to full construct behavior and add
-  whole-program collector expansion. Keep test discovery generic over the
-  declared construct, rather than naming Test in the compiler.
-- Add test build mode and the generated `kiraTestMain` contract, then exercise
-  it through the `kira test` command across supported backends. Preserve the
-  reference behavior for empty suites, suites with `@Main`, and test failures.
+- Verify construct inheritance and existing whole-program collector expansion
+  against reference cases. Keep test discovery generic over the declared
+  construct, rather than naming Test in the compiler.
+- Extend the implemented `kira test` / `kiraTestMain` contract across supported
+  backends; check reference behavior for empty suites, suites with `@Main`,
+  and test failures.
 
 ### 3. Build the heap layer
 
-- Establish the `std/` source layout and package boundaries before adding public
+- Establish the `languages/kira/std/` source layout and package boundaries before adding public
   APIs.
 - Expand the working counted buffer primitives to complete scoped destruction,
   task-safe lifetime behavior and all target alignments.

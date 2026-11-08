@@ -172,6 +172,14 @@ extend Checker {
             Some(target) -> return call(target, .Some(bareReceiverRead(name.span)), [], name.span)
             None -> {}
         }
+        match declarations.globalInModule(name.text, name.span.file) {
+            Some(global) -> return readGlobal(global, name.span)
+            None -> {}
+        }
+        match declarations.globalVisibleAt(name.text, name.span.file) {
+            Some(global) -> return readGlobal(global, name.span)
+            None -> {}
+        }
         match declarations.globalNamed(name.text) {
             Some(global) -> return readGlobal(global, name.span)
             None -> {}

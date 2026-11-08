@@ -4,7 +4,7 @@
 // arguments after `--`. A path left out is the package in the current
 // directory. `kira build [step...]` without `-o` or `--emit`, inside a
 // project, runs the project's build program (`std/Build/DESIGN.md`
-// section 7).
+// section 7). An explicit execution backend instead selects compilation.
 
 enum Subcommand {
     Test
@@ -64,7 +64,7 @@ function subcommandRequest(arguments: [String]) -> Optional<DriverRequest> {
 // Whether the driver option `argument` is followed by its value.
 function takesValue(argument: String) -> Bool {
     match argument {
-        "-o", "--emit", "--export", "--target" -> return true
+        "-o", "--emit", "--export", "--target", "--backend" -> return true
         else -> return false
     }
 }
@@ -84,14 +84,16 @@ function requestsTests(driverArguments: [String]) -> Bool {
 // `kira build` as the run of the project's build program, with every
 // argument after `build` handed to it: a project is the nearest directory at
 // or above the working directory holding `build/package.kira`. With `-o` or
-// `--emit` it is a compile, and outside a project it stays one.
+// `--emit` or `--backend` it is a compile, and outside a project it stays one.
 function buildRequest(arguments: [String]) -> Optional<DriverRequest> {
     for argument in arguments {
         match argument {
             "--" -> break
-            "-o", "--emit" -> return .None
+            "-o", "--emit", "--backend" -> return .None
             else -> {
-                if startsWithText(argument, "--emit=") { return .None }
+                if startsWithText(argument, "--emit=") || startsWithText(argument, "--backend=") {
+                    return .None
+                }
             }
         }
     }

@@ -1,0 +1,38 @@
+import Foundation
+
+@Main
+function main() {
+    let started = Plugin.start("marketplace.example")
+    match started {
+        Ok(plugin) -> {
+            match openFileHandle("plugin-assets.txt", .Read) {
+                Ok(file) -> {
+                    match plugin.shareFile(file, PluginResourceId(7)) {
+                        Ok -> {}
+                        Error(failure) -> absorb failure
+                    }
+                    match file.close() {
+                        Ok -> {}
+                        Error(failure) -> absorb failure
+                    }
+                }
+                Error(failure) -> absorb failure
+            }
+            match plugin.wait() {
+                Ok(exit) -> match exit {
+                    Status(code) -> print(code)
+                    Signalled(signal) -> print(signal)
+                }
+                Error(failure) -> {
+                    absorb failure
+                    print("plugin wait failed")
+                }
+            }
+        }
+        Error(failure) -> match failure {
+            Unavailable -> print("plugin runtime unavailable")
+            NotInstalled -> print("plugin is not installed")
+            else -> print("plugin launch failed")
+        }
+    }
+}

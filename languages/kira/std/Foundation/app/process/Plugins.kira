@@ -1,0 +1,96 @@
+// Installed Kira applications managed by the runtime. No executable names,
+// arguments, IPC addresses, or process commands enter this API.
+
+@Service("klfsvc_plugin_start")
+function kernelPluginStart(id: RawPtr, length: Int) -> Int
+
+@Service("klfsvc_plugin_poll")
+function kernelPluginPoll(handle: Int) -> Int
+
+@Service("klfsvc_plugin_wait")
+function kernelPluginWait(handle: Int) -> Int
+
+@Service("klfsvc_plugin_stop")
+function kernelPluginStop(handle: Int) -> Int
+
+@Service("klfsvc_plugin_share_file")
+function kernelPluginShareFile(plugin: Int, resource: Int, file: Int) -> Int
+
+public enum PluginFailure {
+    Unavailable
+    NotInstalled
+    StartFailed
+    InvalidHandle
+    InvalidResource
+    AlreadyShared
+    Io
+}
+
+public distinct PluginResourceId = UNumber
+
+public enum PluginExit {
+    Status(Number)
+    Signalled(Number)
+}
+
+public struct PluginHandle {
+    let id: Number
+
+    // A running process is distinct from a failed lookup or a finished child.
+    function poll(borrow self) -> Result<PluginExit?, PluginFailure> {
+        let answer = Number(kernelPluginPoll(Int(id)))
+        if answer == -100 { return .Ok(.None) }
+        return match pluginExit(answer) {
+            Ok(exit) -> .Ok(.Some(exit))
+            Error(failure) -> .Error(failure)
+        }
+    }
+
+    // Reaps the helper and its RIDL service loop, consuming the kernel handle.
+    function wait(borrow self) -> Result<PluginExit, PluginFailure> {
+        return pluginExit(Number(kernelPluginWait(Int(id))))
+    }
+
+    // Terminates the helper, also releasing its handle and RIDL connection.
+    function stop(borrow self) -> Result<PluginExit, PluginFailure> {
+        return pluginExit(Number(kernelPluginStop(Int(id))))
+    }
+
+    function shareFile(
+        borrow self,
+        file: borrow FileHandle,
+        resource: PluginResourceId
+    ) -> Result<Void, PluginFailure> {
+        let answer = Number(kernelPluginShareFile(Int(id), Int(resource.raw), file.id.raw))
+        if answer < 0 { return .Error(pluginFailure(answer)) }
+        return .Ok
+    }
+}
+
+public namespace Plugin {
+    // Loads an installed marketplace plugin by its catalog identity. The
+    // runtime checks its RIDL imports against the host before launching it.
+    function start(installedId: borrow String) -> Result<PluginHandle, PluginFailure> {
+        let handle = Number(kernelPluginStart(installedId.data, Int(installedId.count)))
+        if handle < 0 { return .Error(pluginFailure(handle)) }
+        return .Ok(PluginHandle { id: handle })
+    }
+}
+
+function pluginExit(word: Number) -> Result<PluginExit, PluginFailure> {
+    if word >= 0 { return .Ok(.Status(word)) }
+    if word <= -200 { return .Ok(.Signalled(-200 - word)) }
+    return .Error(pluginFailure(word))
+}
+
+function pluginFailure(word: Number) -> PluginFailure {
+    return match word {
+        -1 -> .Unavailable
+        -2 -> .NotInstalled
+        -3 -> .StartFailed
+        -4 -> .InvalidHandle
+        -6 -> .InvalidResource
+        -7 -> .AlreadyShared
+        else -> .Io
+    }
+}

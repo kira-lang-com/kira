@@ -64,11 +64,13 @@ extend Checker {
         let value = expression(argument, .None)
         let boxed = typeOf(value)
         if boxed.isInvalid() { return add(.Integer(0), Type.invalid(), span) }
-        if !nativeStateEligible(boxed, []) {
+        var eligibleSeen: [Type] = []
+        if !nativeStateEligible(boxed, eligibleSeen) {
             report(.NativeStateIneligible, span)
             return add(.Integer(0), Type.invalid(), span)
         }
-        if runsUserDrop(boxed, []) {
+        var dropSeen: [Type] = []
+        if runsUserDrop(boxed, dropSeen) {
             report(.NativeStateUserDrop, span)
             return add(.Integer(0), Type.invalid(), span)
         }
@@ -142,11 +144,13 @@ extend Checker {
             return add(.Integer(0), Type.invalid(), span)
         }
         if target.isInvalid() { return add(.Integer(0), Type.invalid(), span) }
-        if !nativeStateEligible(target, []) {
+        var eligibleSeen: [Type] = []
+        if !nativeStateEligible(target, eligibleSeen) {
             report(.NativeStateIneligible, span)
             return add(.Integer(0), Type.invalid(), span)
         }
-        if runsUserDrop(target, []) {
+        var dropSeen: [Type] = []
+        if runsUserDrop(target, dropSeen) {
             report(.NativeStateUserDrop, span)
             return add(.Integer(0), Type.invalid(), span)
         }
@@ -212,30 +216,31 @@ extend Checker {
     // A value the program owns outright: no `Any`, whose type a recovery
     // could not check, no descriptor, task or handle, and nothing holding
     // one.
-    function nativeStateEligible(borrow self, valueType: Type, visiting: [Type]) -> Bool {
-        for seen in visiting {
+    // Each reachable type is checked once, including across sibling fields.
+    // Recopying a path-local visiting list rewalks shared subgraphs and is
+    // exponential for deep types assembled from repeated smaller types.
+    function nativeStateEligible(borrow self, valueType: Type, seenTypes: borrow mut [Type]) -> Bool {
+        for seen in seenTypes {
             if seen.equals(valueType) { return true }
         }
-        var inner: [Type] = []
-        for seen in visiting { inner.append(seen) }
-        inner.append(valueType)
+        seenTypes.append(valueType)
         match valueType.kind {
             Structure -> {
                 if isStringType(program, valueType) { return true }
                 if isAnyType(program, valueType) || isNativeStateType(program, declarations, valueType) { return true }
                 if isTaskType(program, valueType) || isDescriptorType(declarations, valueType) { return false }
                 if isArrayType(program, valueType) {
-                    return nativeStateEligible(program.structs[valueType.declaration].typeArguments[0], inner)
+                    return nativeStateEligible(program.structs[valueType.declaration].typeArguments[0], seenTypes)
                 }
                 for field in program.structs[valueType.declaration].fields {
-                    if !nativeStateEligible(field.valueType, inner) { return false }
+                    if !nativeStateEligible(field.valueType, seenTypes) { return false }
                 }
                 return true
             }
             Enumeration -> {
                 for variant in program.enums[valueType.declaration].variants {
                     match variant.payload {
-                        Some(payload) -> { if !nativeStateEligible(payload, inner) { return false } }
+                        Some(payload) -> { if !nativeStateEligible(payload, seenTypes) { return false } }
                         None -> {}
                     }
                 }
@@ -252,29 +257,29 @@ extend Checker {
     }
 
     // Whether releasing a value of `valueType` enters a user `Drop` body.
-    function runsUserDrop(borrow self, valueType: Type, visiting: [Type]) -> Bool {
-        for seen in visiting {
+    // The first branch to find a user Drop terminates the whole search, so
+    // paths already found drop-free can be skipped in all later branches.
+    function runsUserDrop(borrow self, valueType: Type, seenTypes: borrow mut [Type]) -> Bool {
+        for seen in seenTypes {
             if seen.equals(valueType) { return false }
         }
-        var inner: [Type] = []
-        for seen in visiting { inner.append(seen) }
-        inner.append(valueType)
+        seenTypes.append(valueType)
         match valueType.kind {
             Structure -> {
                 if isNativeStateType(program, declarations, valueType) { return false }
                 if program.dropFunctions[valueType.declaration] >= 0 { return true }
                 if isArrayType(program, valueType) {
-                    return runsUserDrop(program.structs[valueType.declaration].typeArguments[0], inner)
+                    return runsUserDrop(program.structs[valueType.declaration].typeArguments[0], seenTypes)
                 }
                 for field in program.structs[valueType.declaration].fields {
-                    if runsUserDrop(field.valueType, inner) { return true }
+                    if runsUserDrop(field.valueType, seenTypes) { return true }
                 }
                 return false
             }
             Enumeration -> {
                 for variant in program.enums[valueType.declaration].variants {
                     match variant.payload {
-                        Some(payload) -> { if runsUserDrop(payload, inner) { return true } }
+                        Some(payload) -> { if runsUserDrop(payload, seenTypes) { return true } }
                         None -> {}
                     }
                 }

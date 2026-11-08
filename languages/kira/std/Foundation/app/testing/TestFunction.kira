@@ -88,6 +88,7 @@ comptime macro expect {
                 let (left, right) = sides
                 return quote {
                     expectEqual!(
+                        #{input},
                         #{Syntax { text = left }},
                         #{Syntax { text = right }},
                         #{left},
@@ -152,9 +153,16 @@ function expectTrue(condition: Bool, source: borrow String) {
 
 // `left` and `right` are the sides as written. Each value is shown where it
 // is compared, as its own type shows it.
-macro expectEqual(got: expr, expected: expr, left: expr, right: expr) {
+// The original condition must be checked as written. In Kira 26.11.1 the
+// compiler contextualizes numeric literals in a comparison, but independently
+// elaborating the two sides inside a second macro loses that context (e.g.
+// a Number property compared to `0.0`) and rejects a valid `expect!` before
+// any tests run. Keeping the whole condition as one typed expression also
+// preserves the source's actual equality semantics, while we still print
+// each side separately after a failure for diagnostics.
+macro expectEqual(condition: expr, got: expr, expected: expr, left: expr, right: expr) {
     expand {
-        if !(got == expected) {
+        if !condition {
             recordTestIssue(
                 "expectation failed: " + shownSide(left, traceText(got)) + " == " + shownSide(
                     right,
